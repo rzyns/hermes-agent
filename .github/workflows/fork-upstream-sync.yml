@@ -1,0 +1,78 @@
+name: Fork upstream sync
+
+on:
+  # Poll because GitHub does not emit events in forks when the upstream repo
+  # advances. The workflow can also be run manually from the Actions tab.
+  schedule:
+    - cron: "17 */6 * * *"
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "Merge and validate without pushing"
+        required: false
+        default: false
+        type: boolean
+
+permissions:
+  contents: write
+
+concurrency:
+  group: fork-upstream-sync-main
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    name: Merge upstream/main into fork main
+    if: github.repository == 'rzyns/hermes-agent'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Checkout fork main
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4
+        with:
+          ref: main
+          fetch-depth: 0
+
+      - name: Configure git identity
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+      - name: Fetch upstream main
+        run: |
+          git remote add upstream https://github.com/NousResearch/hermes-agent.git
+          git fetch --no-tags upstream main
+
+      - name: Merge upstream if needed
+        id: merge
+        run: |
+          set -euo pipefail
+          echo "fork_head=$(git rev-parse --short=12 HEAD)" >> "$GITHUB_OUTPUT"
+          echo "upstream_head=$(git rev-parse --short=12 upstream/main)" >> "$GITHUB_OUTPUT"
+
+          if git merge-base --is-ancestor upstream/main HEAD; then
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+            echo "Fork main already contains upstream/main."
+            exit 0
+          fi
+
+          git merge --no-edit --no-ff upstream/main
+          echo "changed=true" >> "$GITHUB_OUTPUT"
+          echo "merged_head=$(git rev-parse --short=12 HEAD)" >> "$GITHUB_OUTPUT"
+
+      - name: Syntax smoke after merge
+        if: steps.merge.outputs.changed == 'true'
+        run: |
+          python -m compileall -q hermes_cli gateway agent tools
+
+      - name: Push updated fork main
+        if: steps.merge.outputs.changed == 'true' && github.event.inputs.dry_run != 'true'
+        run: |
+          git push origin HEAD:main
+
+      - name: Dry-run summary
+        if: steps.merge.outputs.changed == 'true' && github.event.inputs.dry_run == 'true'
+        run: |
+          echo "Dry run requested; merged upstream/main locally but did not push."
+          git --no-pager log --oneline --decorate -n 5
