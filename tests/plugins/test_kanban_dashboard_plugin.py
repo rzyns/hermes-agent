@@ -164,6 +164,23 @@ def test_dashboard_client_side_filtering_includes_tenant_filter():
     assert "[boardData, tenantFilter, assigneeFilter, search]" in js
 
 
+def test_dashboard_column_header_uses_current_label_helper():
+    """Column rendering must not reference the removed COLUMN_LABEL constant.
+
+    The bundle now routes labels through getColumnLabel(t, status) so i18n and
+    English fallbacks share one path. A stale COLUMN_LABEL reference crashes the
+    whole Kanban tab at render time.
+    """
+
+    repo_root = Path(__file__).resolve().parents[2]
+    bundle = repo_root / "plugins" / "kanban" / "dashboard" / "dist" / "index.js"
+    js = bundle.read_text()
+
+    assert "const FALLBACK_COLUMN_LABEL" in js
+    assert "const COLUMN_LABEL" not in js
+    assert "aria-label\": `Select all tasks in ${colLabel || props.column.name}`" in js
+
+
 # ---------------------------------------------------------------------------
 # GET /tasks/:id returns body + comments + events + links
 # ---------------------------------------------------------------------------
