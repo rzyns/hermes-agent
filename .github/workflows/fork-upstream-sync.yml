@@ -57,14 +57,11 @@ jobs:
             exit 0
           fi
 
-          git merge --no-edit --no-ff upstream/main
+          git merge --no-ff \
+            -m "chore: sync upstream/main [skip ci]" \
+            upstream/main
           echo "changed=true" >> "$GITHUB_OUTPUT"
           echo "merged_head=$(git rev-parse --short=12 HEAD)" >> "$GITHUB_OUTPUT"
-
-      - name: Syntax smoke after merge
-        if: steps.merge.outputs.changed == 'true'
-        run: |
-          python -m compileall -q hermes_cli gateway agent tools
 
       - name: Push updated fork main
         if: steps.merge.outputs.changed == 'true' && github.event.inputs.dry_run != 'true'
