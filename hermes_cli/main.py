@@ -7313,6 +7313,34 @@ def cmd_update(args):
         _cmd_update_check()
         return
 
+    # Local policy hook for update-safe source-patch lifecycles. Built-in CLI
+    # commands normally skip plugin discovery during argparse setup, so discover
+    # enabled plugins here before any update mutation. Hooks may return:
+    #   {"decision": "deny", "message": "..."}
+    #   {"decision": "handled", "message": "..."}
+    #   {"decision": "allow"} or None
+    try:
+        from hermes_cli.plugins import discover_plugins, invoke_hook
+
+        discover_plugins()
+        for hook_result in invoke_hook("cli:update", args=args, command="update"):
+            if not isinstance(hook_result, dict):
+                continue
+            decision = str(hook_result.get("decision", "")).strip().lower()
+            if not decision or decision == "allow":
+                continue
+            message = hook_result.get("message")
+            if isinstance(message, str) and message:
+                print(message)
+            if decision == "deny":
+                sys.exit(1)
+            if decision == "handled":
+                return
+    except SystemExit:
+        raise
+    except Exception as exc:
+        print(f"⚠ update policy hook failed open: {exc}")
+
     gateway_mode = getattr(args, "gateway", False)
 
     # Protect against mid-update terminal disconnects (SIGHUP) and tolerate

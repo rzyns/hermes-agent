@@ -151,6 +151,14 @@ VALID_HOOKS: Set[str] = {
     #   {"action": "allow"}  /  None             -> normal dispatch
     # Kwargs: event: MessageEvent, gateway: GatewayRunner, session_store.
     "pre_gateway_dispatch",
+    # CLI command policy hooks. ``cli:update`` runs from the built-in terminal
+    # updater before any update mutation, allowing local policy plugins to
+    # deny/handle the update path without replacing the built-in subcommand.
+    "cli:update",
+    # Gateway command policy hooks. Gateway dispatch also supports
+    # ``command:<name>`` hooks dynamically; list the update hook to avoid a
+    # spurious warning for local update-safety plugins.
+    "command:update",
     # Approval lifecycle hooks. Fired by tools/approval.py when a dangerous
     # command needs user approval -- fires BOTH for CLI-interactive prompts
     # and for gateway/ACP approvals (Telegram, Discord, Slack, TUI, etc.).
