@@ -273,7 +273,9 @@ _SCHEMA_OVERRIDES: Dict[str, Dict[str, Any]] = {
     "stt.provider": {
         "type": "select",
         "description": "Speech-to-text provider",
-        "options": ["local", "openai", "mistral"],
+        # "mistral" temporarily removed — mistralai PyPI package quarantined
+        # (malicious 2.4.6 release on 2026-05-12). Restore once available.
+        "options": ["local", "openai"],
     },
     "display.skin": {
         "type": "select",
@@ -2053,6 +2055,7 @@ def _minimax_poller(session_id: str) -> None:
     """
     from hermes_cli.auth import (
         _minimax_poll_token,
+        _minimax_resolve_token_expiry_unix,
         _minimax_save_auth_state,
         MINIMAX_OAUTH_GLOBAL_INFERENCE,
         MINIMAX_OAUTH_SCOPE,
@@ -2090,8 +2093,10 @@ def _minimax_poller(session_id: str) -> None:
         # dashboard path; cn-region operators can still use the CLI
         # flow which supports `--region cn`.
         now = datetime.now(timezone.utc)
-        expires_in_s = int(token_data["expired_in"])
-        expires_at_ts = now.timestamp() + expires_in_s
+        expires_at_ts = _minimax_resolve_token_expiry_unix(
+            int(token_data["expired_in"]), now=now,
+        )
+        expires_in_s = max(0, int(expires_at_ts - now.timestamp()))
         auth_state = {
             "provider": "minimax-oauth",
             "region": sess.get("region", "global"),
