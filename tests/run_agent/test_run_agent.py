@@ -2082,6 +2082,7 @@ class TestConcurrentToolExecution:
 
     def test_invoke_tool_dispatches_to_handle_function_call(self, agent):
         """_invoke_tool should route regular tools through handle_function_call."""
+        agent._current_turn_id = "turn-invoke-123"
         with patch("run_agent.handle_function_call", return_value="result") as mock_hfc:
             result = agent._invoke_tool("web_search", {"q": "test"}, "task-1")
             mock_hfc.assert_called_once_with(
@@ -2090,8 +2091,58 @@ class TestConcurrentToolExecution:
                 session_id=agent.session_id,
                 enabled_tools=list(agent.valid_tool_names),
                 skip_pre_tool_call_hook=True,
+                turn_id="turn-invoke-123",
             )
             assert result == "result"
+
+    def test_sequential_registry_tool_passes_current_turn_id_to_handle_function_call(self, agent):
+        """Sequential registry tools must close post hooks under the pre-hook turn key."""
+        agent._current_turn_id = "turn-seq-123"
+        tool_call = _mock_tool_call(name="web_search", arguments='{"query":"hello"}', call_id="c1")
+        mock_msg = _mock_assistant_msg(content="", tool_calls=[tool_call])
+        messages = []
+
+        with patch("run_agent.handle_function_call", return_value='{"success": true}') as mock_hfc:
+            agent._execute_tool_calls_sequential(mock_msg, messages, "task-1")
+
+        assert mock_hfc.call_args.kwargs["turn_id"] == "turn-seq-123"
+        assert len(messages) == 1
+
+    def test_concurrent_direct_tool_emits_matching_post_tool_call_hook(self, agent, monkeypatch):
+        """Concurrent direct/special tools must emit post_tool_call after a non-blocked pre hook."""
+        agent._current_turn_id = "turn-concurrent-123"
+        tc1 = _mock_tool_call(name="todo", arguments='{"todos":[]}', call_id="c1")
+        tc2 = _mock_tool_call(name="web_search", arguments='{"q":"parallel"}', call_id="c2")
+        mock_msg = _mock_assistant_msg(content="", tool_calls=[tc1, tc2])
+        messages = []
+        post_calls = []
+
+        monkeypatch.setattr(
+            "hermes_cli.plugins.get_pre_tool_call_block_message",
+            lambda *args, **kwargs: None,
+        )
+
+        def fake_invoke_hook(hook_name, **kwargs):
+            if hook_name == "post_tool_call":
+                post_calls.append(kwargs)
+            return []
+
+        monkeypatch.setattr("hermes_cli.plugins.invoke_hook", fake_invoke_hook)
+
+        with (
+            patch("tools.todo_tool.todo_tool", return_value='{"ok":true}'),
+            patch("run_agent.handle_function_call", return_value='{"registry":true}'),
+        ):
+            agent._execute_tool_calls_concurrent(mock_msg, messages, "task-1")
+
+        todo_posts = [call for call in post_calls if call["tool_name"] == "todo"]
+        assert len(todo_posts) == 1
+        assert todo_posts[0]["tool_call_id"] == "c1"
+        assert todo_posts[0]["task_id"] == "task-1"
+        assert todo_posts[0]["session_id"] == agent.session_id
+        assert todo_posts[0]["turn_id"] == "turn-concurrent-123"
+        assert todo_posts[0]["args"] == {"todos": []}
+        assert todo_posts[0]["result"] == messages[0]["content"]
 
     def test_sequential_tool_callbacks_fire_in_order(self, agent):
         tool_call = _mock_tool_call(name="web_search", arguments='{"query":"hello"}', call_id="c1")

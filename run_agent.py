@@ -10654,71 +10654,99 @@ class AIAgent:
         if block_message is not None:
             return json.dumps({"error": block_message}, ensure_ascii=False)
 
-        if function_name == "todo":
-            from tools.todo_tool import todo_tool as _todo_tool
-            return _todo_tool(
-                todos=function_args.get("todos"),
-                merge=function_args.get("merge", False),
-                store=self._todo_store,
-            )
-        elif function_name == "session_search":
-            session_db = self._get_session_db_for_recall()
-            if not session_db:
-                from hermes_state import format_session_db_unavailable
-                return json.dumps({"success": False, "error": format_session_db_unavailable()})
-            from tools.session_search_tool import session_search as _session_search
-            return _session_search(
-                query=function_args.get("query", ""),
-                role_filter=function_args.get("role_filter"),
-                limit=function_args.get("limit", 3),
-                db=session_db,
-                current_session_id=self.session_id,
-            )
-        elif function_name == "memory":
-            target = function_args.get("target", "memory")
-            from tools.memory_tool import memory_tool as _memory_tool
-            result = _memory_tool(
-                action=function_args.get("action"),
-                target=target,
-                content=function_args.get("content"),
-                old_text=function_args.get("old_text"),
-                store=self._memory_store,
-            )
-            # Bridge: notify external memory provider of built-in memory writes
-            if self._memory_manager and function_args.get("action") in {"add", "replace"}:
-                try:
-                    self._memory_manager.on_memory_write(
-                        function_args.get("action", ""),
-                        target,
-                        function_args.get("content", ""),
-                        metadata=self._build_memory_write_metadata(
-                            task_id=effective_task_id,
-                            tool_call_id=tool_call_id,
-                        ),
+        def _emit_direct_post_hook(result: str, duration_ms: int) -> None:
+            try:
+                from hermes_cli.plugins import invoke_hook as _invoke_hook
+                _invoke_hook(
+                    "post_tool_call",
+                    tool_name=function_name,
+                    args=function_args,
+                    result=result,
+                    task_id=effective_task_id or "",
+                    session_id=self.session_id or "",
+                    tool_call_id=tool_call_id or "",
+                    turn_id=getattr(self, "_current_turn_id", ""),
+                    duration_ms=duration_ms,
+                )
+            except Exception as _hook_err:
+                logger.debug("post_tool_call hook error for direct tool %s: %s", function_name, _hook_err)
+
+        if function_name in {"todo", "session_search", "memory", "clarify", "delegate_task"} or (
+            self._memory_manager and self._memory_manager.has_tool(function_name)
+        ):
+            _direct_start = time.monotonic()
+            try:
+                if function_name == "todo":
+                    from tools.todo_tool import todo_tool as _todo_tool
+                    result = _todo_tool(
+                        todos=function_args.get("todos"),
+                        merge=function_args.get("merge", False),
+                        store=self._todo_store,
                     )
-                except Exception:
-                    pass
+                elif function_name == "session_search":
+                    session_db = self._get_session_db_for_recall()
+                    if not session_db:
+                        from hermes_state import format_session_db_unavailable
+                        result = json.dumps({"success": False, "error": format_session_db_unavailable()})
+                    else:
+                        from tools.session_search_tool import session_search as _session_search
+                        result = _session_search(
+                            query=function_args.get("query", ""),
+                            role_filter=function_args.get("role_filter"),
+                            limit=function_args.get("limit", 3),
+                            db=session_db,
+                            current_session_id=self.session_id,
+                        )
+                elif function_name == "memory":
+                    target = function_args.get("target", "memory")
+                    from tools.memory_tool import memory_tool as _memory_tool
+                    result = _memory_tool(
+                        action=function_args.get("action"),
+                        target=target,
+                        content=function_args.get("content"),
+                        old_text=function_args.get("old_text"),
+                        store=self._memory_store,
+                    )
+                    # Bridge: notify external memory provider of built-in memory writes
+                    if self._memory_manager and function_args.get("action") in {"add", "replace"}:
+                        try:
+                            self._memory_manager.on_memory_write(
+                                function_args.get("action", ""),
+                                target,
+                                function_args.get("content", ""),
+                                metadata=self._build_memory_write_metadata(
+                                    task_id=effective_task_id,
+                                    tool_call_id=tool_call_id,
+                                ),
+                            )
+                        except Exception:
+                            pass
+                elif self._memory_manager and self._memory_manager.has_tool(function_name):
+                    result = self._memory_manager.handle_tool_call(function_name, function_args)
+                elif function_name == "clarify":
+                    from tools.clarify_tool import clarify_tool as _clarify_tool
+                    result = _clarify_tool(
+                        question=function_args.get("question", ""),
+                        choices=function_args.get("choices"),
+                        callback=self.clarify_callback,
+                    )
+                else:
+                    result = self._dispatch_delegate_task(function_args)
+            except Exception as tool_error:
+                result = f"Error executing tool '{function_name}': {tool_error}"
+                logger.error("direct tool raised for %s: %s", function_name, tool_error, exc_info=True)
+            duration_ms = int((time.monotonic() - _direct_start) * 1000)
+            _emit_direct_post_hook(result, duration_ms)
             return result
-        elif self._memory_manager and self._memory_manager.has_tool(function_name):
-            return self._memory_manager.handle_tool_call(function_name, function_args)
-        elif function_name == "clarify":
-            from tools.clarify_tool import clarify_tool as _clarify_tool
-            return _clarify_tool(
-                question=function_args.get("question", ""),
-                choices=function_args.get("choices"),
-                callback=self.clarify_callback,
-            )
-        elif function_name == "delegate_task":
-            return self._dispatch_delegate_task(function_args)
-        else:
-            return handle_function_call(
-                function_name, function_args, effective_task_id,
-                tool_call_id=tool_call_id,
-                session_id=self.session_id or "",
-                enabled_tools=list(self.valid_tool_names) if self.valid_tool_names else None,
-                skip_pre_tool_call_hook=True,
-                turn_id=getattr(self, "_current_turn_id", ""),
-            )
+
+        return handle_function_call(
+            function_name, function_args, effective_task_id,
+            tool_call_id=tool_call_id,
+            session_id=self.session_id or "",
+            enabled_tools=list(self.valid_tool_names) if self.valid_tool_names else None,
+            skip_pre_tool_call_hook=True,
+            turn_id=getattr(self, "_current_turn_id", ""),
+        )
 
     @staticmethod
     def _wrap_verbose(label: str, text: str, indent: str = "     ") -> str:
@@ -11445,6 +11473,7 @@ class AIAgent:
                         session_id=self.session_id or "",
                         enabled_tools=list(self.valid_tool_names) if self.valid_tool_names else None,
                         skip_pre_tool_call_hook=True,
+                        turn_id=getattr(self, "_current_turn_id", ""),
                     )
                     _spinner_result = function_result
                 except Exception as tool_error:
@@ -11465,6 +11494,7 @@ class AIAgent:
                         session_id=self.session_id or "",
                         enabled_tools=list(self.valid_tool_names) if self.valid_tool_names else None,
                         skip_pre_tool_call_hook=True,
+                        turn_id=getattr(self, "_current_turn_id", ""),
                     )
                 except Exception as tool_error:
                     function_result = f"Error executing tool '{function_name}': {tool_error}"
