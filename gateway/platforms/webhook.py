@@ -236,6 +236,9 @@ class WebhookAdapter(BasePlatformAdapter):
         if deliver_type == "github_comment":
             return await self._deliver_github_comment(content, delivery)
 
+        if deliver_type == "origin":
+            return await self._deliver_origin(content, delivery)
+
         # Cross-platform delivery — any platform with a gateway adapter.
         # Check both built-in names and plugin-registered platforms.
         _BUILTIN_DELIVER_PLATFORMS = {
@@ -699,11 +702,56 @@ class WebhookAdapter(BasePlatformAdapter):
         if deliver_type == "github_comment":
             return await self._deliver_github_comment(content, delivery)
 
+        if deliver_type == "origin":
+            return await self._deliver_origin(content, delivery)
+
         # Fall through to the cross-platform dispatcher, which validates the
         # target name and routes via the gateway runner.
         return await self._deliver_cross_platform(
             deliver_type, content, delivery
         )
+
+    async def _deliver_origin(self, content: str, delivery: dict) -> SendResult:
+        """Deliver to the configured origin/home channel.
+
+        Dynamic webhook subscriptions can be created from non-gateway contexts
+        (for example the CLI), so ``deliver=origin`` may not have a concrete
+        chat id captured at subscribe time.  Match cron's origin semantics:
+        prefer an explicit origin if the route supplied one, otherwise fall
+        back to the first connected gateway platform with a home channel.
+        """
+        origin = delivery.get("origin") or delivery.get("deliver_extra", {}).get("origin")
+        if isinstance(origin, dict) and origin.get("platform") and origin.get("chat_id"):
+            platform_name = str(origin["platform"])
+            resolved = {
+                "deliver_extra": {
+                    "chat_id": str(origin["chat_id"]),
+                }
+            }
+            thread_id = origin.get("thread_id") or origin.get("message_thread_id")
+            if thread_id:
+                resolved["deliver_extra"]["thread_id"] = str(thread_id)
+            return await self._deliver_cross_platform(platform_name, content, resolved)
+
+        if not self.gateway_runner:
+            return SendResult(success=False, error="No gateway runner for origin delivery")
+
+        for target_platform in getattr(self.gateway_runner, "adapters", {}):
+            if target_platform == Platform.WEBHOOK:
+                continue
+            home = self.gateway_runner.config.get_home_channel(target_platform)
+            if not home:
+                continue
+            resolved = {
+                "deliver_extra": {
+                    "chat_id": str(home.chat_id),
+                }
+            }
+            if home.thread_id:
+                resolved["deliver_extra"]["thread_id"] = str(home.thread_id)
+            return await self._deliver_cross_platform(target_platform.value, content, resolved)
+
+        return SendResult(success=False, error="No origin or home channel for webhook delivery")
 
     async def _deliver_github_comment(
         self, content: str, delivery: dict

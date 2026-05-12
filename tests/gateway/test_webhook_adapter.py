@@ -25,7 +25,7 @@ import pytest
 from aiohttp import web
 from aiohttp.test_utils import TestClient, TestServer
 
-from gateway.config import Platform, PlatformConfig
+from gateway.config import HomeChannel, Platform, PlatformConfig
 from gateway.platforms.base import MessageEvent, MessageType, SendResult
 from gateway.platforms.webhook import (
     WebhookAdapter,
@@ -697,6 +697,61 @@ class TestRawTemplateToken:
 # ===================================================================
 # Cross-platform delivery thread_id passthrough
 # ===================================================================
+
+
+class TestDeliverOrigin:
+    """Tests for deliver=origin resolution in webhook responses."""
+
+    @pytest.mark.asyncio
+    async def test_origin_uses_explicit_origin_metadata(self):
+        adapter = _make_adapter()
+        mock_target = AsyncMock()
+        mock_target.send = AsyncMock(return_value=SendResult(success=True))
+        mock_runner = MagicMock()
+        mock_runner.adapters = {Platform.DISCORD: mock_target}
+        adapter.gateway_runner = mock_runner
+
+        result = await adapter._deliver_origin(
+            "hello",
+            {
+                "origin": {
+                    "platform": "discord",
+                    "chat_id": "channel-123",
+                    "thread_id": "thread-456",
+                }
+            },
+        )
+
+        assert result.success is True
+        mock_target.send.assert_awaited_once_with(
+            "channel-123", "hello", metadata={"thread_id": "thread-456"}
+        )
+
+    @pytest.mark.asyncio
+    async def test_origin_without_metadata_falls_back_to_home_channel(self):
+        adapter = _make_adapter()
+        mock_target = AsyncMock()
+        mock_target.send = AsyncMock(return_value=SendResult(success=True))
+        mock_runner = MagicMock()
+        mock_runner.adapters = {Platform.WEBHOOK: adapter, Platform.DISCORD: mock_target}
+        mock_runner.config.get_home_channel.side_effect = lambda platform: (
+            HomeChannel(
+                platform=Platform.DISCORD,
+                chat_id="home-channel",
+                name="Home",
+                thread_id="home-thread",
+            )
+            if platform == Platform.DISCORD
+            else None
+        )
+        adapter.gateway_runner = mock_runner
+
+        result = await adapter._deliver_origin("hello", {"deliver": "origin"})
+
+        assert result.success is True
+        mock_target.send.assert_awaited_once_with(
+            "home-channel", "hello", metadata={"thread_id": "home-thread"}
+        )
 
 
 class TestDeliverCrossPlatformThreadId:
