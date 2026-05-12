@@ -168,3 +168,137 @@ class TestHooksInert:
         mod.on_post_llm_call(task_id="t", session_id="s", api_call_count=1)
         mod.on_pre_tool_call(tool_name="read_file", args={}, task_id="t", session_id="s")
         mod.on_post_tool_call(tool_name="read_file", args={}, result="ok", task_id="t", session_id="s")
+
+
+# ---------------------------------------------------------------------------
+# LF11 turn-scoped trace metadata + tool correlation
+# ---------------------------------------------------------------------------
+
+class _FakeObservation:
+    def __init__(self, observation_name="root", **kwargs):
+        self.name = observation_name
+        self.kwargs = kwargs
+        self.children = []
+        self.updates = []
+        self.ended = False
+        self.trace_io = {}
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+    def start_observation(self, **kwargs):
+        obs = _FakeObservation(kwargs.get("name", "child"), **kwargs)
+        self.children.append(obs)
+        return obs
+
+    def update(self, **kwargs):
+        self.updates.append(kwargs)
+
+    def end(self):
+        self.ended = True
+
+    def set_trace_io(self, **kwargs):
+        self.trace_io.update(kwargs)
+
+
+class _FakeLangfuse:
+    def __init__(self):
+        self.roots = []
+        self.flushed = False
+
+    def create_trace_id(self, seed):
+        return "trace-" + seed.replace(":", "-")[:80]
+
+    def start_as_current_observation(self, **kwargs):
+        obs = _FakeObservation(kwargs.get("name", "root"), **kwargs)
+        self.roots.append(obs)
+        return obs
+
+    def flush(self):
+        self.flushed = True
+
+
+class TestLF11TurnTraceContract:
+    def _fresh_plugin(self, monkeypatch):
+        sys.modules.pop("plugins.observability.langfuse", None)
+        mod = importlib.import_module("plugins.observability.langfuse")
+        fake = _FakeLangfuse()
+        monkeypatch.setattr(mod, "_get_langfuse", lambda: fake)
+        monkeypatch.setattr(mod, "propagate_attributes", None)
+        mod._TRACE_STATE.clear()
+        return mod, fake
+
+    def test_trace_key_prefers_turn_id_and_preserves_legacy_fallbacks(self):
+        mod = importlib.import_module("plugins.observability.langfuse")
+        assert mod._trace_key(turn_id="turn_a", task_id="task_a", session_id="session_a") == "turn:turn_a"
+        assert mod._trace_key(task_id="task_a", session_id="session_a") == "task:task_a"
+        assert mod._trace_key(session_id="session_a") == "session:session_a"
+
+    def test_two_turns_share_session_but_create_distinct_trace_states(self, monkeypatch):
+        mod, fake = self._fresh_plugin(monkeypatch)
+        for turn in ("turn_one", "turn_two"):
+            mod.on_pre_llm_request(
+                task_id="task_same",
+                session_id="session_same",
+                turn_id=turn,
+                platform="cli",
+                surface="cli",
+                profile="backend-eng",
+                provider="openai",
+                model="gpt-test",
+                api_mode="chat_completions",
+                api_call_count=1,
+                messages=[{"role": "user", "content": "hello"}],
+            )
+        assert set(mod._TRACE_STATE) == {"turn:turn_one", "turn:turn_two"}
+        assert len(fake.roots) == 2
+        for root, turn in zip(fake.roots, ("turn_one", "turn_two")):
+            assert root.kwargs["trace_context"]["session_id"] == "session_same"
+            assert root.kwargs["name"] == "Hermes cli turn"
+            metadata = root.kwargs["metadata"]
+            assert metadata["metadata_schema_version"] == "hermes.langfuse.v1"
+            assert metadata["turn_id"] == turn
+            assert metadata["session_id"] == "session_same"
+            assert metadata["task_id"] == "task_same"
+            assert metadata["profile"] == "backend-eng"
+            assert metadata["surface"] == "cli"
+            assert metadata["provider"] == "openai"
+            assert metadata["model"] == "gpt-test"
+            assert metadata["api_mode"] == "chat_completions"
+
+    def test_tool_exact_fallback_duplicate_and_ambiguous_correlation(self, monkeypatch):
+        mod, fake = self._fresh_plugin(monkeypatch)
+        mod.on_pre_llm_request(
+            task_id="task", session_id="session", turn_id="turn", platform="cli",
+            api_call_count=1, messages=[{"role": "user", "content": "hi"}],
+        )
+        # Exact id match closes with output.
+        mod.on_pre_tool_call(tool_name="terminal", args={"command": "date"}, task_id="task", session_id="session", turn_id="turn", tool_call_id="tc1")
+        mod.on_post_tool_call(tool_name="terminal", args={"command": "date"}, result='{"output":"ok"}', task_id="task", session_id="session", turn_id="turn", tool_call_id="tc1")
+        assert any(child.updates and child.updates[-1]["output"]["output"] == "ok" for child in fake.roots[0].children)
+        assert "tc1" not in mod._TRACE_STATE["turn:turn"].tools
+
+        # Duplicate pre with same real id is idempotent: only one open tool span.
+        mod.on_pre_tool_call(tool_name="read_file", args={"path": "a"}, task_id="task", session_id="session", turn_id="turn", tool_call_id="tc2")
+        mod.on_pre_tool_call(tool_name="read_file", args={"path": "a"}, task_id="task", session_id="session", turn_id="turn", tool_call_id="tc2")
+        assert list(mod._TRACE_STATE["turn:turn"].tools) == ["tc2"]
+        mod.on_post_tool_call(tool_name="read_file", args={"path": "a"}, result="done", task_id="task", session_id="session", turn_id="turn", tool_call_id="tc2")
+        assert "tc2" not in mod._TRACE_STATE["turn:turn"].tools
+
+        # Fallback-keyed spans disambiguate by args fingerprint.
+        mod.on_pre_tool_call(tool_name="terminal", args={"command": "one"}, task_id="task", session_id="session", turn_id="turn")
+        mod.on_pre_tool_call(tool_name="terminal", args={"command": "two"}, task_id="task", session_id="session", turn_id="turn")
+        mod.on_post_tool_call(tool_name="terminal", args={"command": "two"}, result="two-result", task_id="task", session_id="session", turn_id="turn", tool_call_id="missing")
+        remaining = list(mod._TRACE_STATE["turn:turn"].tools.values())
+        assert len(remaining) == 1
+        assert remaining[0].args_fingerprint == mod._args_fingerprint({"command": "one"})
+
+        # Ambiguous same-name/same-args fallback remains unassigned.
+        mod.on_pre_tool_call(tool_name="browser", args={"url": "x"}, task_id="task", session_id="session", turn_id="turn")
+        mod.on_pre_tool_call(tool_name="browser", args={"url": "x"}, task_id="task", session_id="session", turn_id="turn")
+        before = len(mod._TRACE_STATE["turn:turn"].tools)
+        mod.on_post_tool_call(tool_name="browser", args={"url": "x"}, result="ambiguous", task_id="task", session_id="session", turn_id="turn", tool_call_id="missing")
+        assert len(mod._TRACE_STATE["turn:turn"].tools) == before

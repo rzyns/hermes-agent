@@ -51,6 +51,7 @@ class TestHandleFunctionCall:
                 task_id="task-1",
                 tool_call_id="call-1",
                 session_id="session-1",
+                turn_id="turn-1",
             )
 
         assert result == '{"ok":true}'
@@ -62,6 +63,7 @@ class TestHandleFunctionCall:
                 task_id="task-1",
                 session_id="session-1",
                 tool_call_id="call-1",
+                turn_id="turn-1",
             ),
             call(
                 "post_tool_call",
@@ -72,6 +74,7 @@ class TestHandleFunctionCall:
                 session_id="session-1",
                 tool_call_id="call-1",
                 duration_ms=ANY,
+                turn_id="turn-1",
             ),
             call(
                 "transform_tool_result",
@@ -82,6 +85,7 @@ class TestHandleFunctionCall:
                 session_id="session-1",
                 tool_call_id="call-1",
                 duration_ms=ANY,
+                turn_id="turn-1",
             ),
         ]
 

@@ -41,12 +41,25 @@ except Exception:  # pragma: no cover - fail-open when optional dep is missing
 
 
 @dataclass
+class ToolSpanState:
+    observation: Any
+    tool_name: str
+    tool_call_id: str
+    args_fingerprint: str
+    created_at: float = field(default_factory=time.time)
+    fallback_keyed: bool = False
+
+
+@dataclass
 class TraceState:
     trace_id: str
     root_ctx: Any
     root_span: Any
+    turn_id: str = ""
+    session_id: str = ""
+    task_id: str = ""
     generations: Dict[str, Any] = field(default_factory=dict)
-    tools: Dict[str, Any] = field(default_factory=dict)
+    tools: Dict[str, ToolSpanState] = field(default_factory=dict)
     turn_tool_calls: list[dict[str, Any]] = field(default_factory=list)
     last_updated_at: float = field(default_factory=time.time)
 
@@ -141,12 +154,30 @@ def _get_langfuse() -> Optional[Langfuse]:
     return _LANGFUSE_CLIENT
 
 
-def _trace_key(task_id: str, session_id: str) -> str:
+def _trace_key(turn_id: str = "", task_id: str = "", session_id: str = "") -> str:
+    if turn_id:
+        return f"turn:{turn_id}"
     if task_id:
-        return task_id
+        return f"task:{task_id}"
     if session_id:
         return f"session:{session_id}"
     return f"thread:{threading.get_ident()}"
+
+
+def _args_fingerprint(args: Any) -> str:
+    try:
+        return json.dumps(args if args is not None else {}, sort_keys=True, separators=(",", ":"), default=str)
+    except Exception:
+        return repr(args)
+
+
+def _trace_name_for(platform: str = "", surface: str = "") -> str:
+    label = (surface or platform or "").strip().lower()
+    aliases = {"api_server": "api", "webhook": "api", "worker": "kanban", "kanban-worker": "kanban"}
+    label = aliases.get(label, label)
+    if label in {"cli", "discord", "telegram", "cron", "kanban", "api"}:
+        return f"Hermes {label} turn" if label != "cron" else "Hermes cron run"
+    return "Hermes turn"
 
 
 def _truncate_text(value: str, max_chars: int) -> str:
@@ -442,17 +473,28 @@ def _usage_and_cost(response: Any, *, provider: str, api_mode: str, model: str, 
     return usage_details, cost_details
 
 
-def _start_root_trace(task_key: str, *, task_id: str, session_id: str, platform: str, provider: str, model: str,
-                      api_mode: str, messages: Any, client: Langfuse) -> TraceState:
-    trace_id = client.create_trace_id(seed=f"{session_id or 'sessionless'}::{task_id or task_key}")
+def _start_root_trace(task_key: str, *, task_id: str, session_id: str, turn_id: str = "", platform: str = "",
+                      surface: str = "", profile: str = "", provider: str = "", model: str = "",
+                      api_mode: str = "", messages: Any = None, client: Langfuse = None) -> TraceState:
+    trace_seed = turn_id or f"{session_id or 'sessionless'}::{task_id or task_key}"
+    trace_id = client.create_trace_id(seed=trace_seed)
     trace_input = _extract_last_user_message(messages)
+    surface_value = surface or platform
+    trace_name = _trace_name_for(platform=platform, surface=surface_value)
     metadata = {
+        "metadata_schema_version": "hermes.langfuse.v1",
         "source": "hermes",
         "task_id": task_id,
+        "session_id": session_id,
+        "turn_id": turn_id,
+        "profile": profile or _env("HERMES_PROFILE", "unknown") or "unknown",
         "platform": platform,
+        "surface": surface_value,
         "provider": provider,
         "model": model,
         "api_mode": api_mode,
+        "capture_content_mode": _env("HERMES_LANGFUSE_CAPTURE_CONTENT", "default") or "default",
+        "trace_name_mode": _env("HERMES_LANGFUSE_TRACE_NAME_MODE", "static") or "static",
     }
 
     # session_id must be passed in trace_context for Langfuse session grouping.
@@ -464,12 +506,12 @@ def _start_root_trace(task_key: str, *, task_id: str, session_id: str, platform:
         try:
             with propagate_attributes(
                 session_id=session_id or task_key,
-                trace_name="Hermes turn",
+                trace_name=trace_name,
                 tags=["hermes", "langfuse"],
             ):
                 root_ctx = client.start_as_current_observation(
                     trace_context=trace_ctx,
-                    name="Hermes turn",
+                    name=trace_name,
                     as_type="chain",
                     input=trace_input,
                     metadata=metadata,
@@ -479,7 +521,7 @@ def _start_root_trace(task_key: str, *, task_id: str, session_id: str, platform:
         except Exception:
             root_ctx = client.start_as_current_observation(
                 trace_context=trace_ctx,
-                name="Hermes turn",
+                name=trace_name,
                 as_type="chain",
                 input=trace_input,
                 metadata=metadata,
@@ -489,7 +531,7 @@ def _start_root_trace(task_key: str, *, task_id: str, session_id: str, platform:
     else:
         root_ctx = client.start_as_current_observation(
             trace_context=trace_ctx,
-            name="Hermes turn",
+            name=trace_name,
             as_type="chain",
             input=trace_input,
             metadata=metadata,
@@ -503,7 +545,7 @@ def _start_root_trace(task_key: str, *, task_id: str, session_id: str, platform:
         pass
 
     _debug(f"started trace {trace_id} for {task_key}")
-    return TraceState(trace_id=trace_id, root_ctx=root_ctx, root_span=root_span)
+    return TraceState(trace_id=trace_id, root_ctx=root_ctx, root_span=root_span, turn_id=turn_id, session_id=session_id, task_id=task_id)
 
 
 def _start_child_observation(state: TraceState, *, client: Langfuse, name: str, as_type: str,
@@ -562,8 +604,8 @@ def _finish_trace(task_key: str, *, output: Any = None) -> None:
     try:
         for observation in state.generations.values():
             _end_observation(observation)
-        for observation in state.tools.values():
-            _end_observation(observation)
+        for tool_state in state.tools.values():
+            _end_observation(tool_state.observation)
         final_output = _merge_trace_output(output, state)
         if final_output is not None:
             state.root_span.set_trace_io(output=final_output)
@@ -586,9 +628,10 @@ def _request_key(api_call_count: Any) -> str:
     return str(api_call_count or 0)
 
 
-def on_pre_llm_call(*, task_id: str = "", session_id: str = "", platform: str = "", model: str = "",
-                    provider: str = "", base_url: str = "", api_mode: str = "",
-                    api_call_count: int = 0, messages: Any = None, turn_type: str = "user",
+def on_pre_llm_call(*, task_id: str = "", session_id: str = "", turn_id: str = "", platform: str = "",
+                    surface: str = "", profile: str = "", model: str = "", provider: str = "",
+                    base_url: str = "", api_mode: str = "", api_call_count: int = 0,
+                    messages: Any = None, turn_type: str = "user",
                     conversation_history: Any = None, user_message: Any = None, **_: Any) -> None:
     # Older Hermes branches used pre_llm_call for request-scoped tracing and
     # passed the actual API messages. Current Hermes also has a turn-scoped
@@ -606,7 +649,7 @@ def on_pre_llm_call(*, task_id: str = "", session_id: str = "", platform: str = 
     # pre_llm_call with API messages directly. Current Hermes fires
     # pre_llm_call for context injection (conversation_history/user_message,
     # no messages list) — tracing that would create orphan traces.
-    task_key = _trace_key(task_id, session_id)
+    task_key = _trace_key(turn_id=turn_id, task_id=task_id, session_id=session_id)
 
     with _STATE_LOCK:
         state = _TRACE_STATE.get(task_key)
@@ -615,7 +658,10 @@ def on_pre_llm_call(*, task_id: str = "", session_id: str = "", platform: str = 
                 task_key,
                 task_id=task_id,
                 session_id=session_id,
+                turn_id=turn_id,
                 platform=platform,
+                surface=surface,
+                profile=profile,
                 provider=provider,
                 model=model,
                 api_mode=api_mode,
@@ -630,7 +676,10 @@ def on_pre_llm_request(
     *,
     task_id: str = "",
     session_id: str = "",
+    turn_id: str = "",
     platform: str = "",
+    surface: str = "",
+    profile: str = "",
     model: str = "",
     provider: str = "",
     base_url: str = "",
@@ -649,7 +698,7 @@ def on_pre_llm_request(
     if client is None:
         return
 
-    task_key = _trace_key(task_id, session_id)
+    task_key = _trace_key(turn_id=turn_id, task_id=task_id, session_id=session_id)
     req_key = _request_key(api_call_count)
 
     with _STATE_LOCK:
@@ -659,7 +708,10 @@ def on_pre_llm_request(
                 task_key,
                 task_id=task_id,
                 session_id=session_id,
+                turn_id=turn_id,
                 platform=platform,
+                surface=surface,
+                profile=profile,
                 provider=provider,
                 model=model,
                 api_mode=api_mode,
@@ -688,8 +740,8 @@ def on_pre_llm_request(
         )
 
 
-def on_post_llm_call(*, task_id: str = "", session_id: str = "", provider: str = "", base_url: str = "",
-                     api_mode: str = "", model: str = "", api_call_count: int = 0,
+def on_post_llm_call(*, task_id: str = "", session_id: str = "", turn_id: str = "", provider: str = "",
+                     base_url: str = "", api_mode: str = "", model: str = "", api_call_count: int = 0,
                      assistant_message: Any = None, response: Any = None,
                      api_duration: float = 0.0, finish_reason: str = "",
                      usage: Any = None, assistant_content_chars: int = 0,
@@ -699,7 +751,7 @@ def on_post_llm_call(*, task_id: str = "", session_id: str = "", provider: str =
     if client is None:
         return
 
-    task_key = _trace_key(task_id, session_id)
+    task_key = _trace_key(turn_id=turn_id, task_id=task_id, session_id=session_id)
     req_key = _request_key(api_call_count)
 
     with _STATE_LOCK:
@@ -809,45 +861,75 @@ def on_post_llm_call(*, task_id: str = "", session_id: str = "", provider: str =
 
 
 def on_pre_tool_call(*, tool_name: str = "", args: Any = None, task_id: str = "",
-                     session_id: str = "", tool_call_id: str = "", **_: Any) -> None:
+                     session_id: str = "", turn_id: str = "", tool_call_id: str = "", **_: Any) -> None:
     client = _get_langfuse()
     if client is None:
         return
 
-    task_key = _trace_key(task_id, session_id)
-    tool_key = tool_call_id or f"{tool_name}:{time.time_ns()}"
+    task_key = _trace_key(turn_id=turn_id, task_id=task_id, session_id=session_id)
+    fallback_keyed = not bool(tool_call_id)
+    tool_key = tool_call_id or f"fallback:{tool_name}:{time.time_ns()}"
+    fingerprint = _args_fingerprint(args)
 
     with _STATE_LOCK:
         state = _TRACE_STATE.get(task_key)
         if state is None:
             return
-        state.tools[tool_key] = _start_child_observation(
+        if tool_call_id and tool_key in state.tools:
+            state.last_updated_at = time.time()
+            return
+        observation = _start_child_observation(
             state,
             client=client,
             name=f"Tool: {tool_name}",
             as_type="tool",
             input_value=_safe_value(args),
-            metadata={"tool_name": tool_name, "tool_call_id": tool_call_id},
+            metadata={
+                "tool_name": tool_name,
+                "tool_call_id": tool_call_id,
+                "turn_id": turn_id,
+                "args_fingerprint": fingerprint,
+                "fallback_keyed": fallback_keyed,
+            },
+        )
+        state.tools[tool_key] = ToolSpanState(
+            observation=observation,
+            tool_name=tool_name,
+            tool_call_id=tool_call_id,
+            args_fingerprint=fingerprint,
+            fallback_keyed=fallback_keyed,
         )
 
 
 def on_post_tool_call(*, tool_name: str = "", args: Any = None, result: Any = None,
-                      task_id: str = "", session_id: str = "", tool_call_id: str = "", **_: Any) -> None:
-    task_key = _trace_key(task_id, session_id)
-    tool_key = tool_call_id or ""
-    observation = None
+                      task_id: str = "", session_id: str = "", turn_id: str = "",
+                      tool_call_id: str = "", duration_ms: int = 0, **_: Any) -> None:
+    task_key = _trace_key(turn_id=turn_id, task_id=task_id, session_id=session_id)
+    fingerprint = _args_fingerprint(args)
+    tool_state = None
 
     with _STATE_LOCK:
         state = _TRACE_STATE.get(task_key)
         if state is None:
             return
-        if tool_key:
-            observation = state.tools.pop(tool_key, None)
-        elif state.tools:
-            _, observation = state.tools.popitem()
+        if tool_call_id:
+            tool_state = state.tools.pop(tool_call_id, None)
+        if tool_state is None:
+            candidates = [(key, value) for key, value in state.tools.items()
+                          if value.fallback_keyed and value.tool_name == tool_name]
+            arg_matches = [(key, value) for key, value in candidates if value.args_fingerprint == fingerprint]
+            chosen = None
+            if len(arg_matches) == 1:
+                chosen = arg_matches[0]
+            elif len(candidates) == 1:
+                chosen = candidates[0]
+            if chosen is not None:
+                key, tool_state = chosen
+                state.tools.pop(key, None)
 
-    if observation is None:
+    if tool_state is None:
         return
+    observation = tool_state.observation
 
     if isinstance(result, str):
         result_value = _maybe_parse_json_string(result)
@@ -858,7 +940,13 @@ def on_post_tool_call(*, tool_name: str = "", args: Any = None, result: Any = No
     _end_observation(
         observation,
         output=_safe_value(result_value, parse_json_strings=True),
-        metadata={"tool_name": tool_name, "args": _safe_value(args, parse_json_strings=True)},
+        metadata={
+            "tool_name": tool_name,
+            "tool_call_id": tool_call_id,
+            "turn_id": turn_id,
+            "args": _safe_value(args, parse_json_strings=True),
+            "duration_ms": duration_ms,
+        },
     )
 
 

@@ -703,6 +703,7 @@ def handle_function_call(
     user_task: Optional[str] = None,
     enabled_tools: Optional[List[str]] = None,
     skip_pre_tool_call_hook: bool = False,
+    turn_id: str = "",
 ) -> str:
     """
     Main function call dispatcher that routes calls to the tool registry.
@@ -747,6 +748,7 @@ def handle_function_call(
                     task_id=task_id or "",
                     session_id=session_id or "",
                     tool_call_id=tool_call_id or "",
+                    turn_id=turn_id or "",
                 )
             except Exception as _hook_err:
                 logger.debug("pre_tool_call hook error: %s", _hook_err)
@@ -799,6 +801,7 @@ def handle_function_call(
                 session_id=session_id or "",
                 tool_call_id=tool_call_id or "",
                 duration_ms=duration_ms,
+                turn_id=turn_id or "",
             )
         except Exception as _hook_err:
             logger.debug("post_tool_call hook error: %s", _hook_err)
@@ -820,6 +823,7 @@ def handle_function_call(
                 session_id=session_id or "",
                 tool_call_id=tool_call_id or "",
                 duration_ms=duration_ms,
+                turn_id=turn_id or "",
             )
             for hook_result in hook_results:
                 if isinstance(hook_result, str):

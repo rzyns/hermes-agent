@@ -1326,6 +1326,7 @@ def get_pre_tool_call_block_message(
     task_id: str = "",
     session_id: str = "",
     tool_call_id: str = "",
+    turn_id: str = "",
 ) -> Optional[str]:
     """Check ``pre_tool_call`` hooks for a blocking directive.
 
@@ -1345,6 +1346,7 @@ def get_pre_tool_call_block_message(
         task_id=task_id,
         session_id=session_id,
         tool_call_id=tool_call_id,
+        turn_id=turn_id,
     )
 
     for result in hook_results:

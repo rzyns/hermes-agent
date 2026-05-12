@@ -10645,6 +10645,9 @@ class AIAgent:
                 from hermes_cli.plugins import get_pre_tool_call_block_message
                 block_message = get_pre_tool_call_block_message(
                     function_name, function_args, task_id=effective_task_id or "",
+                    session_id=self.session_id or "",
+                    tool_call_id=tool_call_id or "",
+                    turn_id=getattr(self, "_current_turn_id", ""),
                 )
             except Exception:
                 pass
@@ -10714,6 +10717,7 @@ class AIAgent:
                 session_id=self.session_id or "",
                 enabled_tools=list(self.valid_tool_names) if self.valid_tool_names else None,
                 skip_pre_tool_call_hook=True,
+                turn_id=getattr(self, "_current_turn_id", ""),
             )
 
     @staticmethod
@@ -10808,6 +10812,9 @@ class AIAgent:
                 from hermes_cli.plugins import get_pre_tool_call_block_message
                 block_message = get_pre_tool_call_block_message(
                     function_name, function_args, task_id=effective_task_id or "",
+                    session_id=self.session_id or "",
+                    tool_call_id=tool_call.id or "",
+                    turn_id=getattr(self, "_current_turn_id", ""),
                 )
             except Exception:
                 block_message = None
@@ -11190,6 +11197,9 @@ class AIAgent:
                 from hermes_cli.plugins import get_pre_tool_call_block_message
                 _block_msg = get_pre_tool_call_block_message(
                     function_name, function_args, task_id=effective_task_id or "",
+                    session_id=self.session_id or "",
+                    tool_call_id=tool_call.id or "",
+                    turn_id=getattr(self, "_current_turn_id", ""),
                 )
             except Exception:
                 pass
@@ -11509,6 +11519,27 @@ class AIAgent:
                     )
                 except Exception as cb_err:
                     logging.debug(f"Tool progress callback error: {cb_err}")
+
+            if not _execution_blocked and (
+                function_name in {"todo", "session_search", "memory", "clarify", "delegate_task"}
+                or (self._context_engine_tool_names and function_name in self._context_engine_tool_names)
+                or (self._memory_manager and self._memory_manager.has_tool(function_name))
+            ):
+                try:
+                    from hermes_cli.plugins import invoke_hook as _invoke_hook
+                    _invoke_hook(
+                        "post_tool_call",
+                        tool_name=function_name,
+                        args=function_args,
+                        result=function_result,
+                        task_id=effective_task_id or "",
+                        session_id=self.session_id or "",
+                        tool_call_id=tool_call.id or "",
+                        turn_id=getattr(self, "_current_turn_id", ""),
+                        duration_ms=int(tool_duration * 1000),
+                    )
+                except Exception as _hook_err:
+                    logger.debug("post_tool_call hook error for direct tool %s: %s", function_name, _hook_err)
 
             self._current_tool = None
             self._touch_activity(f"tool completed: {function_name} ({tool_duration:.1f}s)")
@@ -11894,6 +11925,8 @@ class AIAgent:
         self._persist_user_message_override = persist_user_message
         # Generate unique task_id if not provided to isolate VMs between concurrent tasks
         effective_task_id = task_id or str(uuid.uuid4())
+        turn_id = f"turn_{uuid.uuid4().hex}"
+        self._current_turn_id = turn_id
         # Expose the active task_id so tools running mid-turn (e.g. delegate_task
         # in delegate_tool.py) can identify this agent for the cross-agent file
         # state registry.  Set BEFORE any tool dispatch so snapshots taken at
@@ -12170,11 +12203,15 @@ class AIAgent:
             _pre_results = _invoke_hook(
                 "pre_llm_call",
                 session_id=self.session_id,
+                task_id=effective_task_id,
+                turn_id=turn_id,
                 user_message=original_user_message,
                 conversation_history=list(messages),
                 is_first_turn=(not bool(conversation_history)),
                 model=self.model,
                 platform=getattr(self, "platform", None) or "",
+                surface=getattr(self, "platform", None) or "",
+                profile=os.getenv("HERMES_PROFILE", "") or "unknown",
                 sender_id=getattr(self, "_user_id", None) or "",
             )
             _ctx_parts: list[str] = []
@@ -12677,7 +12714,10 @@ class AIAgent:
                             "pre_api_request",
                             task_id=effective_task_id,
                             session_id=self.session_id or "",
+                            turn_id=turn_id,
                             platform=self.platform or "",
+                            surface=self.platform or "",
+                            profile=os.getenv("HERMES_PROFILE", "") or "unknown",
                             model=self.model,
                             provider=self.provider,
                             base_url=self.base_url,
@@ -12688,6 +12728,7 @@ class AIAgent:
                             approx_input_tokens=approx_tokens,
                             request_char_count=total_chars,
                             max_tokens=self.max_tokens,
+                            messages=api_messages,
                         )
                     except Exception:
                         pass
@@ -14572,6 +14613,7 @@ class AIAgent:
                         "post_api_request",
                         task_id=effective_task_id,
                         session_id=self.session_id or "",
+                        turn_id=turn_id,
                         platform=self.platform or "",
                         model=self.model,
                         provider=self.provider,
@@ -15559,6 +15601,8 @@ class AIAgent:
                     session_id=self.session_id or "",
                     model=self.model,
                     platform=getattr(self, "platform", None) or "",
+                    surface=getattr(self, "platform", None) or "",
+                    profile=os.getenv("HERMES_PROFILE", "") or "unknown",
                 )
                 for _hook_result in _transform_results:
                     if isinstance(_hook_result, str) and _hook_result:
@@ -15576,7 +15620,9 @@ class AIAgent:
                 from hermes_cli.plugins import invoke_hook as _invoke_hook
                 _invoke_hook(
                     "post_llm_call",
+                    task_id=effective_task_id,
                     session_id=self.session_id,
+                    turn_id=turn_id,
                     user_message=original_user_message,
                     assistant_response=final_response,
                     conversation_history=list(messages),
