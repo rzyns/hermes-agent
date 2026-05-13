@@ -2647,6 +2647,11 @@ class AIAgent:
         old_model = self.model
         old_provider = self.provider
 
+        # Clear the per-config context_length override so the new model's
+        # actual context window is resolved via get_model_context_length()
+        # instead of inheriting the stale value from the previous model.
+        self._config_context_length = None
+
         # ── Swap core runtime fields ──
         self.model = new_model
         self.provider = new_provider
@@ -3619,12 +3624,19 @@ class AIAgent:
         is_claude = "claude" in model_lower
         is_nous_portal = "nousresearch" in eff_base_url.lower()
 
-        # Nous Portal: Claude AND Qwen both get long-lived caching.
-        # Portal proxies to OpenRouter with identical cache_control
-        # semantics; any model on Portal that accepts envelope-layout
-        # markers via _anthropic_prompt_cache_policy also benefits from
-        # the documented 1h cross-session TTL.
-        if is_nous_portal and (is_claude or "qwen" in model_lower):
+        # Nous Portal Claude rides the 1h prefix_and_2 layout (Portal
+        # proxies to OpenRouter, which honours ttl=1h on Anthropic
+        # routes).  Qwen does NOT — Alibaba DashScope (the upstream for
+        # all Qwen routes, including Portal -> OpenRouter -> Alibaba)
+        # documents a single ``ephemeral`` TTL of 5 minutes; ttl="1h"
+        # on Qwen markers is silently ignored upstream, so the
+        # high-value tools[-1] + system-prefix breakpoints never land
+        # and only the 5m rolling-window markers on the last 2 messages
+        # get cached.  Portal Qwen still gets cache_control via
+        # _anthropic_prompt_cache_policy returning (True, False) — it
+        # just rides the standard system_and_3 5m layout instead of the
+        # mismatched prefix_and_2 1h layout.
+        if is_nous_portal and is_claude:
             return True
 
         if not is_claude:
@@ -8817,6 +8829,11 @@ class AIAgent:
                 fb_api_mode = "bedrock_converse"
 
             old_model = self.model
+
+            # Clear the per-config context_length override so the fallback
+            # model's actual context window is resolved instead of inheriting
+            # the stale value from the previous model.  See #22387.
+            self._config_context_length = None
             self.model = fb_model
             self.provider = fb_provider
             self.base_url = fb_base_url
@@ -14442,7 +14459,7 @@ class AIAgent:
                             _ra_raw = _resp_headers.get("retry-after") or _resp_headers.get("Retry-After")
                             if _ra_raw:
                                 try:
-                                    _retry_after = min(int(_ra_raw), 120)  # Cap at 2 minutes
+                                    _retry_after = min(float(_ra_raw), 120)  # Cap at 2 minutes
                                 except (TypeError, ValueError):
                                     pass
                     wait_time = _retry_after if _retry_after else jittered_backoff(retry_count, base_delay=2.0, max_delay=60.0)
