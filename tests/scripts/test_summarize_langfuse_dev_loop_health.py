@@ -124,6 +124,50 @@ def test_summary_keeps_telemetry_item_scores_and_dataset_run_aggregate_separate(
     assert summary["overall_readiness"]["scheduler_or_watchdog_authorized"] is False
 
 
+def test_cli_can_emit_lf8_smoke_review_without_aggregate_artifact(tmp_path):
+    script = load_script()
+    live_path = tmp_path / "live.json"
+    out_path = tmp_path / "lf8-review.json"
+    payload = live_smoke_payload()
+    payload["live_mutation_scope"]["run_name"] = "lf13-live-dev-loop-report-only-smoke-20260513T140319Z"
+    payload["live_mutation_scope"]["run_level_aggregate_score_enabled"] = False
+    payload["item_level_score_readback"]["dataset_run_score_summary"] = {"score_count": 0, "score_names": {}, "data_types": {}}
+    live_path.write_text(json.dumps(payload))
+
+    exit_code = script.main([
+        "--live-smoke-json", str(live_path),
+        "--output-json", str(out_path),
+    ])
+    summary = json.loads(out_path.read_text())
+
+    assert exit_code == 0
+    assert summary["schema_version"] == "lf8_exact_scope_smoke_review_summary_v1"
+    assert summary["verdict"] == "PASS_WITH_CAVEATS"
+    assert summary["report_only_non_blocking"] is True
+    assert summary["live_write_performed_by_this_helper"] is False
+    assert summary["langfuse_queries_performed_by_this_helper"] is False
+    assert summary["scope"]["dataset_name_matches_exact_lf8_scope"] is True
+    assert summary["scope"]["run_name_matches_report_only_namespace"] is True
+    assert summary["scope"]["created_exactly_one_dataset_run"] is True
+    assert summary["result_support"]["expected_vs_actual_label_matches"] == 5
+    assert summary["result_support"]["boolean_evaluator_passes"] == 5
+    assert summary["score_readback"]["total_item_level_score_count"] == 10
+    assert summary["score_readback"]["dataset_run_aggregate_score_enabled"] is False
+    assert "blocking gate" in " ".join(summary["non_claims"])
+
+
+def test_lf8_smoke_review_requires_dataset_run_id_for_pass(tmp_path):
+    script = load_script()
+    payload = live_smoke_payload()
+    payload["live_mutation_scope"]["run_level_aggregate_score_enabled"] = False
+    payload["live_mutation_scope"]["dataset_run_id"] = None
+
+    summary = script.build_lf8_smoke_review_summary(live_smoke=payload)
+
+    assert summary["scope"]["dataset_run_id_present"] is False
+    assert summary["verdict"] == "NEEDS_REVIEW"
+
+
 def test_boolean_aggregate_reconciliation_requires_expected_name_and_type():
     script = load_script()
 

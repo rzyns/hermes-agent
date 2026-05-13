@@ -291,6 +291,96 @@ def summarize_live_smoke(live_smoke: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def build_lf8_smoke_review_summary(*, live_smoke: dict[str, Any], source_artifacts: list[dict[str, Any]] | None = None) -> dict[str, Any]:
+    """Summarize one exact-scope LF8 smoke artifact without requiring aggregate readback.
+
+    This is intentionally weaker than the full dev-loop health summary: it can
+    support a PASS_WITH_CAVEATS report-only smoke verdict, but never a blocking
+    gate, scheduler, production score, or run-level aggregate claim.
+    """
+    live_summary = summarize_live_smoke(live_smoke)
+    aggregate_item_results = live_summary["aggregate_item_results"]
+    item_score_readback = live_summary["item_score_readback"]
+    safety = live_smoke.get("safety_boundary", {}) if isinstance(live_smoke.get("safety_boundary"), dict) else {}
+    exact_scope_ok = (
+        live_summary["dataset_name_matches_exact_lf8_scope"]
+        and live_summary["run_name_matches_report_only_namespace"]
+        and live_summary["dataset_run_id_present"]
+        and live_summary["live_mutation_shape"]["created_dataset_run_recorded"]
+        and live_summary["live_mutation_shape"]["mutation_count"] == 1
+    )
+    result_ok = (
+        aggregate_item_results.get("total") == 5
+        and aggregate_item_results.get("expected_vs_actual_label_matches") == 5
+        and aggregate_item_results.get("boolean_evaluator_passes") == 5
+        and aggregate_item_results.get("stop_condition_hit_count") == 0
+        and aggregate_item_results.get("secret_like_hits_in_evidence_summary") == 0
+    )
+    item_scores_ok = (
+        item_score_readback.get("trace_id_count") == 5
+        and item_score_readback.get("total_item_level_score_count") == 10
+        and item_score_readback.get("expected_item_evaluator_count") == 5
+        and item_score_readback.get("expected_label_evaluator_count") == 5
+        and item_score_readback.get("unexpected_score_name_count") == 0
+        and item_score_readback.get("unexpected_data_type_count") == 0
+    )
+    safety_ok = (
+        safety.get("non_blocking_report_only") is True
+        and safety.get("production_trace_or_session_score_writes_performed") is False
+        and safety.get("broad_trace_backfill_performed") is False
+        and safety.get("scheduler_deploy_restart_performed") is False
+        and safety.get("blocking_gate_integration_performed") is False
+        and safety.get("raw_private_trace_tool_payloads_included") is False
+        and safety.get("credential_or_env_values_persisted") is False
+        and safety.get("corpus_broadening_performed") is False
+    )
+    passed = bool(exact_scope_ok and result_ok and item_scores_ok and safety_ok)
+    return {
+        "schema_version": "lf8_exact_scope_smoke_review_summary_v1",
+        "generated_at_utc": utc_now(),
+        "verdict": "PASS_WITH_CAVEATS" if passed else "NEEDS_REVIEW",
+        "report_only_non_blocking": True,
+        "live_write_performed_by_this_helper": False,
+        "langfuse_queries_performed_by_this_helper": False,
+        "scope": {
+            "dataset_name_matches_exact_lf8_scope": live_summary["dataset_name_matches_exact_lf8_scope"],
+            "run_name_matches_report_only_namespace": live_summary["run_name_matches_report_only_namespace"],
+            "dataset_run_id_present": live_summary["dataset_run_id_present"],
+            "created_exactly_one_dataset_run": live_summary["live_mutation_shape"]["created_dataset_run_recorded"] and live_summary["live_mutation_shape"]["mutation_count"] == 1,
+        },
+        "result_support": aggregate_item_results,
+        "score_readback": {
+            **item_score_readback,
+            "dataset_run_aggregate_score_enabled": live_summary["run_level_aggregate_score_enabled"],
+            "dataset_run_aggregate_score_claimed": False,
+        },
+        "safety_boundary": {
+            "non_blocking_report_only": safety.get("non_blocking_report_only") is True,
+            "production_trace_or_session_score_writes_performed": safety.get("production_trace_or_session_score_writes_performed") is True,
+            "broad_trace_backfill_performed": safety.get("broad_trace_backfill_performed") is True,
+            "scheduler_deploy_restart_performed": safety.get("scheduler_deploy_restart_performed") is True,
+            "blocking_gate_integration_performed": safety.get("blocking_gate_integration_performed") is True,
+            "raw_private_trace_tool_payloads_included": safety.get("raw_private_trace_tool_payloads_included") is True,
+            "credential_or_env_values_persisted": safety.get("credential_or_env_values_persisted") is True,
+            "corpus_broadening_performed": safety.get("corpus_broadening_performed") is True,
+        },
+        "source_artifacts": source_artifacts or [],
+        "caveats": [
+            "Report-only/non-blocking LF8-04 smoke evidence only.",
+            "Dataset-run aggregate score is not required or claimed by this summary.",
+            "Langfuse item readback can lag; preserved readback attempts describe the observed shape.",
+        ],
+        "non_claims": [
+            "no blocking gate promotion",
+            "no scheduler/deploy/restart authorization",
+            "no production trace/session scoring authorization",
+            "no broad trace backfill authorization",
+            "no run-level aggregate score persistence claim",
+            "no raw private payload or credential persistence claim beyond artifact shape checks",
+        ],
+    }
+
+
 def build_health_summary(
     *,
     live_smoke: dict[str, Any],
@@ -389,26 +479,35 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     parser = argparse.ArgumentParser(description="Summarize existing Langfuse dev-loop health evidence without Langfuse writes or queries")
     parser.add_argument("--live-smoke-json", type=Path, required=True, help="Existing exact-scope LF8/LF13 live smoke evidence JSON")
-    parser.add_argument("--aggregate-score-json", type=Path, required=True, help="Existing dataset-run aggregate score readback JSON")
+    parser.add_argument("--aggregate-score-json", type=Path, help="Existing dataset-run aggregate score readback JSON; omit for LF8 smoke-only review summary")
     parser.add_argument("--trace-shape-text", type=Path, help="Optional output from hermes_langfuse_trace_shape_check.py")
     parser.add_argument("--tool-output-text", type=Path, help="Optional output from hermes_langfuse_recent_tool_output_check.py")
     parser.add_argument("--output-json", type=Path, required=True, help="Write report-only health summary JSON")
     ns = parser.parse_args(args_for_guard)
 
-    source_paths = [ns.live_smoke_json, ns.aggregate_score_json]
+    source_paths = [ns.live_smoke_json]
+    if ns.aggregate_score_json:
+        source_paths.append(ns.aggregate_score_json)
     if ns.trace_shape_text:
         source_paths.append(ns.trace_shape_text)
     if ns.tool_output_text:
         source_paths.append(ns.tool_output_text)
     source_artifacts = source_artifact_summary(source_paths)
+    live_smoke = load_json(ns.live_smoke_json)
 
-    report = build_health_summary(
-        live_smoke=load_json(ns.live_smoke_json),
-        aggregate_score=load_json(ns.aggregate_score_json),
-        trace_shape=parse_trace_shape_text(ns.trace_shape_text),
-        tool_output=parse_tool_output_text(ns.tool_output_text),
-        source_artifacts=source_artifacts,
-    )
+    if ns.aggregate_score_json:
+        report = build_health_summary(
+            live_smoke=live_smoke,
+            aggregate_score=load_json(ns.aggregate_score_json),
+            trace_shape=parse_trace_shape_text(ns.trace_shape_text),
+            tool_output=parse_tool_output_text(ns.tool_output_text),
+            source_artifacts=source_artifacts,
+        )
+    else:
+        report = build_lf8_smoke_review_summary(
+            live_smoke=live_smoke,
+            source_artifacts=source_artifacts,
+        )
     write_json(ns.output_json, report)
     print(json.dumps(report, indent=2, sort_keys=True))
     return 0
