@@ -95,10 +95,24 @@ RAW_PAYLOAD_KEYS = {
 RAW_PAYLOAD_KEYS_CANONICAL = frozenset(_canonical_key(key) for key in RAW_PAYLOAD_KEYS)
 
 SCRIPT_DIR = Path(__file__).resolve().parent
+SAFE_IDENTIFIER_PATTERN = re.compile(r"^[A-Za-z0-9_.:-]{1,160}$")
 
 
 class LF13NoWriteRunnerError(ValueError):
     """Raised when the LF13 runner cannot safely produce no-write artifacts."""
+
+
+def _require_safe_identifier(value: Any, *, path: str, required: bool = True) -> str:
+    if value is None or value == "":
+        if required:
+            raise LF13NoWriteRunnerError(f"identifier field is required: {path}")
+        return ""
+    if not isinstance(value, str):
+        raise LF13NoWriteRunnerError(f"identifier field must be a string: {path}")
+    text = value
+    if not SAFE_IDENTIFIER_PATTERN.fullmatch(text):
+        raise LF13NoWriteRunnerError(f"identifier field contains unsafe characters: {path}")
+    return text
 
 
 def _load_peer_module(filename: str, module_name: str) -> Any:
@@ -206,19 +220,32 @@ def _validate_seed(seed: Mapping[str, Any]) -> list[Mapping[str, Any]]:
     if privacy_findings:
         raise LF13NoWriteRunnerError(f"privacy screen failed for seed: {json.dumps(privacy_findings, sort_keys=True)}")
 
-    allowed_trace_ids = {str(item) for item in explicit_sources.get("trace_ids", []) if str(item)}
+    raw_trace_ids = explicit_sources.get("trace_ids", [])
+    if not isinstance(raw_trace_ids, list) or not all(isinstance(item, str) for item in raw_trace_ids):
+        raise LF13NoWriteRunnerError("seed explicit_sources.trace_ids must be a list of strings")
+    allowed_trace_ids = {
+        _require_safe_identifier(item, path=f"explicit_sources.trace_ids[{index}]")
+        for index, item in enumerate(raw_trace_ids)
+    }
     candidates = explicit_sources.get("candidates")
     if not isinstance(candidates, list) or not all(isinstance(item, Mapping) for item in candidates):
         raise LF13NoWriteRunnerError("seed explicit_sources.candidates must be a list of objects")
     if not candidates:
         raise LF13NoWriteRunnerError("at least one explicit candidate is required")
 
-    for candidate in candidates:
-        trace_id = str(candidate.get("source_trace_id") or "")
-        if not trace_id:
-            raise LF13NoWriteRunnerError("each candidate requires source_trace_id")
+    for candidate_index, candidate in enumerate(candidates):
+        candidate_path = f"explicit_sources.candidates[{candidate_index}]"
+        trace_id = _require_safe_identifier(candidate.get("source_trace_id"), path=f"{candidate_path}.source_trace_id")
+        _require_safe_identifier(candidate.get("dataset_item_id"), path=f"{candidate_path}.dataset_item_id")
+        _require_safe_identifier(candidate.get("session_id"), path=f"{candidate_path}.session_id", required=False)
+        _require_safe_identifier(candidate.get("turn_id"), path=f"{candidate_path}.turn_id", required=False)
+        promotion_reason = candidate.get("promotion_reason")
+        _require_safe_identifier(
+            "explicit_reviewed_source" if promotion_reason is None or promotion_reason == "" else promotion_reason,
+            path=f"{candidate_path}.promotion_reason",
+        )
         if allowed_trace_ids and trace_id not in allowed_trace_ids:
-            raise LF13NoWriteRunnerError(f"candidate source_trace_id is outside explicit trace allowlist: {redact_text(trace_id)}")
+            raise LF13NoWriteRunnerError("candidate source_trace_id is outside explicit trace allowlist")
     return candidates
 
 

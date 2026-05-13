@@ -215,6 +215,93 @@ def test_privacy_screen_fails_closed_on_structured_secret_keys(tmp_path):
             raise AssertionError(f"{secret_key} must fail closed")
 
 
+def test_identifier_fields_reject_unsafe_strings_without_persisting_artifacts(tmp_path):
+    script = load_script()
+    payload = seed_payload()
+    payload["explicit_sources"]["trace_ids"] = ["safe-trace-id"]
+    payload["explicit_sources"]["candidates"][0]["source_trace_id"] = "private trace id should not persist"
+    seed_path = write_json(tmp_path / "seed.json", payload)
+    output_dir = tmp_path / "out"
+
+    try:
+        script.run_lf13_local_no_write(seed_path, output_dir)
+    except script.LF13NoWriteRunnerError as exc:
+        message = str(exc)
+        assert "identifier field contains unsafe characters" in message
+        assert "source_trace_id" in message
+        assert "private trace id should not persist" not in message
+    else:  # pragma: no cover - documents fail-closed expectation
+        raise AssertionError("unsafe identifier strings must fail closed")
+    assert not output_dir.exists() or not any(output_dir.iterdir())
+
+
+def test_trace_allowlist_rejects_unsafe_strings_without_echoing_values(tmp_path):
+    script = load_script()
+    payload = seed_payload()
+    payload["explicit_sources"]["trace_ids"] = ["private trace id should not persist"]
+    seed_path = write_json(tmp_path / "seed.json", payload)
+    output_dir = tmp_path / "out"
+
+    try:
+        script.run_lf13_local_no_write(seed_path, output_dir)
+    except script.LF13NoWriteRunnerError as exc:
+        message = str(exc)
+        assert "identifier field contains unsafe characters" in message
+        assert "explicit_sources.trace_ids[0]" in message
+        assert "private trace id should not persist" not in message
+    else:  # pragma: no cover - documents fail-closed expectation
+        raise AssertionError("unsafe trace allowlist identifiers must fail closed")
+    assert not output_dir.exists() or not any(output_dir.iterdir())
+
+
+def test_trace_allowlist_rejects_malformed_non_list(tmp_path):
+    script = load_script()
+    payload = seed_payload()
+    payload["explicit_sources"]["trace_ids"] = "02edc631b32cd0378abdcfb26936611a"
+    seed_path = write_json(tmp_path / "seed.json", payload)
+
+    try:
+        script.run_lf13_local_no_write(seed_path, tmp_path / "out")
+    except script.LF13NoWriteRunnerError as exc:
+        assert "seed explicit_sources.trace_ids must be a list of strings" in str(exc)
+    else:  # pragma: no cover - documents fail-closed expectation
+        raise AssertionError("malformed trace allowlist must fail closed")
+
+
+def test_identifier_fields_reject_non_string_values(tmp_path):
+    script = load_script()
+    payload = seed_payload()
+    payload["explicit_sources"]["candidates"][0]["source_trace_id"] = True
+    seed_path = write_json(tmp_path / "seed.json", payload)
+
+    try:
+        script.run_lf13_local_no_write(seed_path, tmp_path / "out")
+    except script.LF13NoWriteRunnerError as exc:
+        message = str(exc)
+        assert "identifier field must be a string" in message
+        assert "source_trace_id" in message
+    else:  # pragma: no cover - documents fail-closed expectation
+        raise AssertionError("non-string identifiers must fail closed")
+
+
+def test_promotion_reason_rejects_falsy_non_string_without_persisting_artifacts(tmp_path):
+    script = load_script()
+    payload = seed_payload()
+    payload["explicit_sources"]["candidates"][0]["promotion_reason"] = False
+    seed_path = write_json(tmp_path / "seed.json", payload)
+    output_dir = tmp_path / "out"
+
+    try:
+        script.run_lf13_local_no_write(seed_path, output_dir)
+    except script.LF13NoWriteRunnerError as exc:
+        message = str(exc)
+        assert "identifier field must be a string" in message
+        assert "promotion_reason" in message
+    else:  # pragma: no cover - documents fail-closed expectation
+        raise AssertionError("falsy non-string promotion_reason must fail closed")
+    assert not output_dir.exists() or not any(output_dir.iterdir())
+
+
 def test_summary_counts_reject_strings_without_persisting_artifacts(tmp_path):
     script = load_script()
     payload = seed_payload()
