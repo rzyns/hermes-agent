@@ -157,6 +157,65 @@ def test_write_requires_double_confirmation(tmp_path):
         ])
 
 
+def test_run_level_aggregate_score_requires_live_write_confirmation(tmp_path):
+    script = load_script()
+    candidate_path, review_path = write_inputs(tmp_path, script)
+
+    with pytest.raises(script.LiveSmokeError, match="run-level aggregate score requires"):
+        script.main([
+            "--candidate-json", str(candidate_path),
+            "--review-json", str(review_path),
+            "--run-name", "lf13-live-dev-loop-report-only-smoke-20260513T000000Z",
+            "--enable-run-level-aggregate-score",
+        ])
+
+
+def aggregate_rows(script, *, label_mismatch: bool = False):
+    rows = []
+    for idx, fixture_id in enumerate(script.SELECTED_FIXTURE_IDS):
+        expected = "PASS"
+        actual = "FAIL" if label_mismatch and idx == 0 else expected
+        rows.append({
+            "fixture_id": fixture_id,
+            "expected_label": expected,
+            "actual_label": actual,
+            "evaluations": [{"name": script.EVALUATOR_NAME, "value": actual == expected, "data_type": "BOOLEAN", "metadata": {}}],
+        })
+    return rows
+
+
+def test_run_level_aggregate_is_true_only_for_exact_report_only_pass():
+    script = load_script()
+
+    aggregate = script.build_run_level_aggregate(result_rows=aggregate_rows(script), stop_condition_hits=[], safety=script.safety_boundary())
+
+    assert aggregate["name"] == script.RUN_LEVEL_AGGREGATE_EVALUATOR_NAME
+    assert aggregate["value"] is True
+    assert aggregate["data_type"] == "BOOLEAN"
+    assert aggregate["metadata"]["report_only"] is True
+    assert aggregate["metadata"]["blocking_gate_authorized"] is False
+    assert aggregate["metadata"]["production_trace_or_session_score_write"] is False
+    assert "production quality gate pass" in aggregate["metadata"]["not_authorized_meanings"]
+
+
+def test_run_level_aggregate_is_false_on_label_mismatch_stop_condition_or_forbidden_flag():
+    script = load_script()
+
+    assert script.build_run_level_aggregate(
+        result_rows=aggregate_rows(script, label_mismatch=True),
+        stop_condition_hits=[],
+        safety=script.safety_boundary(),
+    )["value"] is False
+    assert script.build_run_level_aggregate(
+        result_rows=aggregate_rows(script),
+        stop_condition_hits=[{"fixture_id": "x", "condition": "missed_abstain"}],
+        safety=script.safety_boundary(),
+    )["value"] is False
+    unsafe = script.safety_boundary()
+    unsafe["blocking_gate_integration_performed"] = True
+    assert script.build_run_level_aggregate(result_rows=aggregate_rows(script), stop_condition_hits=[], safety=unsafe)["value"] is False
+
+
 def test_dataset_run_score_zero_is_interpreted_as_item_evaluator_target_mismatch():
     script = load_script()
 

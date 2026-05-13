@@ -30,6 +30,7 @@ BOARD = "observability"
 DATASET_NAME = "hermes/live-evaluator/lf8-pilot-smoke-20260512"
 EVALUATOR_NAME = "lf8_report_only_semantic_match_v1"
 LABEL_EVALUATOR_NAME = "lf8_report_only_label"
+RUN_LEVEL_AGGREGATE_EVALUATOR_NAME = "lf8_report_only_all_items_passed_v1"
 DEFAULT_ARTIFACT_ROOT = Path("/home/openclaw/.hermes/artifacts/hermes-agent/langfuse-live-dev-loop-20260513")
 DEFAULT_LF8_ROOT = Path("/home/openclaw/.hermes/artifacts/hermes-agent/langfuse-quality-lf8-live-evaluator-substrate")
 DEFAULT_CANDIDATE_JSON = DEFAULT_LF8_ROOT / "lf8-02-live-evaluator-candidate-set-20260512T004627Z.json"
@@ -306,9 +307,13 @@ def summarize_dataset(dataset: Any) -> dict[str, Any]:
 
 
 def summarize_result_items(result: Any) -> tuple[list[dict[str, Any]], list[dict[str, str]]]:
+    return summarize_experiment_item_results(getattr(result, "item_results", []) or [])
+
+
+def summarize_experiment_item_results(item_results: Sequence[Any]) -> tuple[list[dict[str, Any]], list[dict[str, str]]]:
     rows: list[dict[str, Any]] = []
     stop_condition_hits: list[dict[str, str]] = []
-    for item_result in getattr(result, "item_results", []) or []:
+    for item_result in item_results:
         item = item_result.item
         item_id = getattr(item, "id", None)
         meta = getattr(item, "metadata", {}) or {}
@@ -344,7 +349,92 @@ def summarize_result_items(result: Any) -> tuple[list[dict[str, Any]], list[dict
     return rows, stop_condition_hits
 
 
-def run_live_smoke(*, run_name: str, items: Sequence[dict[str, Any]], env: dict[str, str], require_existing_items: bool = True) -> dict[str, Any]:
+def build_run_level_aggregate(*, result_rows: Sequence[dict[str, Any]], stop_condition_hits: Sequence[dict[str, str]], safety: dict[str, bool]) -> dict[str, Any]:
+    """Build the proposed report-only dataset-run aggregate score payload.
+
+    This summarizes only the exact LF8-04 five-fixture smoke and deliberately
+    does not imply production scoring, blocking gates, scheduler/deploy approval,
+    or broad evaluator readiness.
+    """
+    total = len(result_rows)
+    label_matches = sum(1 for row in result_rows if row.get("expected_label") == row.get("actual_label"))
+    boolean_passes = sum(
+        1
+        for row in result_rows
+        for ev in row.get("evaluations", [])
+        if ev.get("name") == EVALUATOR_NAME and ev.get("value") is True
+    )
+    forbidden_flags = {
+        "production_trace_or_session_score_writes_performed": safety.get("production_trace_or_session_score_writes_performed"),
+        "broad_trace_backfill_performed": safety.get("broad_trace_backfill_performed"),
+        "scheduler_deploy_restart_performed": safety.get("scheduler_deploy_restart_performed"),
+        "blocking_gate_integration_performed": safety.get("blocking_gate_integration_performed"),
+        "raw_private_trace_tool_payloads_included": safety.get("raw_private_trace_tool_payloads_included"),
+        "credential_or_env_values_persisted": safety.get("credential_or_env_values_persisted"),
+        "corpus_broadening_performed": safety.get("corpus_broadening_performed"),
+    }
+    secret_hits = len(secret_findings({"rows": result_rows, "stop_condition_hits": list(stop_condition_hits)}))
+    expected_fixture_ids = sorted(SELECTED_FIXTURE_IDS)
+    actual_fixture_ids = sorted(str(row.get("fixture_id")) for row in result_rows)
+    pass_bool = all([
+        total == len(SELECTED_FIXTURE_IDS),
+        actual_fixture_ids == expected_fixture_ids,
+        label_matches == total,
+        boolean_passes == total,
+        not stop_condition_hits,
+        secret_hits == 0,
+        safety.get("non_blocking_report_only") is True,
+        all(value is False for value in forbidden_flags.values()),
+    ])
+    return {
+        "name": RUN_LEVEL_AGGREGATE_EVALUATOR_NAME,
+        "value": bool(pass_bool),
+        "data_type": "BOOLEAN",
+        "comment": (
+            f"Report-only LF8 exact-scope aggregate: {label_matches}/{total} label matches, "
+            f"{boolean_passes}/{total} item boolean passes, {len(stop_condition_hits)} stop-condition hits; "
+            "not a production gate or deployment approval."
+        ),
+        "metadata": {
+            "schema_version": "lf13_report_only_run_level_aggregate_v1",
+            "report_only": True,
+            "blocking_gate_authorized": False,
+            "production_trace_or_session_score_write": False,
+            "score_target_note": "dataset-run-level aggregate score; item evaluator details remain trace/observation-targeted",
+            "scope": "LF8-04 exact five-fixture smoke only",
+            "total": total,
+            "expected_fixture_ids_match": actual_fixture_ids == expected_fixture_ids,
+            "expected_vs_actual_label_matches": label_matches,
+            "boolean_evaluator_passes": boolean_passes,
+            "stop_condition_hit_count": len(stop_condition_hits),
+            "secret_like_hits_in_evidence_summary": secret_hits,
+            "forbidden_safety_flags": forbidden_flags,
+            "not_authorized_meanings": [
+                "production quality gate pass",
+                "deployment approval",
+                "scheduler enablement",
+                "broad regression pass",
+                "privacy certification beyond minimized smoke artifacts",
+            ],
+        },
+    }
+
+
+def run_level_aggregate_evaluator(*, item_results: Sequence[Any], **_: Any):
+    from langfuse.experiment import Evaluation
+
+    result_rows, stop_condition_hits = summarize_experiment_item_results(item_results)
+    aggregate = build_run_level_aggregate(result_rows=result_rows, stop_condition_hits=stop_condition_hits, safety=safety_boundary())
+    return Evaluation(
+        name=aggregate["name"],
+        value=aggregate["value"],
+        data_type=aggregate["data_type"],
+        comment=aggregate["comment"],
+        metadata=aggregate["metadata"],
+    )
+
+
+def run_live_smoke(*, run_name: str, items: Sequence[dict[str, Any]], env: dict[str, str], require_existing_items: bool = True, enable_run_level_aggregate_score: bool = False) -> dict[str, Any]:
     require_credentials(env)
     os.environ.update({
         "LANGFUSE_PUBLIC_KEY": env["LANGFUSE_PUBLIC_KEY"],
@@ -373,6 +463,7 @@ def run_live_smoke(*, run_name: str, items: Sequence[dict[str, Any]], env: dict[
         data=selected_live_items,
         task=smoke_task,
         evaluators=[smoke_evaluator],
+        run_evaluators=[run_level_aggregate_evaluator] if enable_run_level_aggregate_score else [],
         max_concurrency=1,
         metadata={
             "task_id": TASK_ID,
@@ -383,6 +474,8 @@ def run_live_smoke(*, run_name: str, items: Sequence[dict[str, Any]], env: dict[
             "blocking_gate_authorized": "false",
             "production_trace_or_session_score_writes": "false",
             "score_target_semantics": "item_evaluator_scores_target_trace_observation_not_dataset_run",
+            "run_level_aggregate_score_enabled": "true" if enable_run_level_aggregate_score else "false",
+            "run_level_aggregate_evaluator_name": RUN_LEVEL_AGGREGATE_EVALUATOR_NAME if enable_run_level_aggregate_score else "not_enabled",
         },
     )
     langfuse.flush()
@@ -397,6 +490,7 @@ def run_live_smoke(*, run_name: str, items: Sequence[dict[str, Any]], env: dict[
         "run_items_shape_count": len(run_items) if hasattr(run_items, "__len__") else None,
         "result_rows": result_rows,
         "stop_condition_hits": stop_condition_hits,
+        "run_level_aggregate_score_enabled": enable_run_level_aggregate_score,
     }
 
 
@@ -600,6 +694,8 @@ def build_live_evidence(*, run_name: str, preflight: dict[str, Any], live: dict[
             "dataset_run_url": getattr(live["result"], "dataset_run_url", None),
             "evaluator_name": EVALUATOR_NAME,
             "score_target_semantics": "item-level evaluator outputs are trace/observation-targeted scores; datasetRunId score readback is for run-level scores",
+            "run_level_aggregate_score_enabled": live.get("run_level_aggregate_score_enabled", False),
+            "run_level_aggregate_evaluator_name": RUN_LEVEL_AGGREGATE_EVALUATOR_NAME if live.get("run_level_aggregate_score_enabled", False) else "not_enabled",
         },
         "readback_shape": {
             "auth_check_ok": live["auth_check_ok"],
@@ -646,6 +742,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--readback-item-scores", action="store_true", help="Read item-level evaluator scores via dataset run item trace IDs; read-only")
     parser.add_argument("--readback-attempts", type=int, default=4, help="Dataset-run item readback attempts for eventual consistency")
     parser.add_argument("--readback-retry-delay-seconds", type=float, default=5.0, help="Delay between dataset-run item readback attempts")
+    parser.add_argument("--enable-run-level-aggregate-score", action="store_true", help="Also create the report-only dataset-run aggregate score; requires live write confirmation")
     args = parser.parse_args(argv)
 
     env = prepare_langfuse_env(args.env_file)
@@ -653,11 +750,18 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     if args.write != args.confirm_experiment_write:
         raise LiveSmokeError("live smoke writes require both --write and --confirm-experiment-write")
+    if args.enable_run_level_aggregate_score and not (args.write and args.confirm_experiment_write):
+        raise LiveSmokeError("run-level aggregate score requires --write and --confirm-experiment-write")
 
     report: dict[str, Any] = preflight
     if args.write:
         items = build_items(args.candidate_json)
-        live = run_live_smoke(run_name=args.run_name, items=items, env=env)
+        live = run_live_smoke(
+            run_name=args.run_name,
+            items=items,
+            env=env,
+            enable_run_level_aggregate_score=args.enable_run_level_aggregate_score,
+        )
         report = build_live_evidence(run_name=args.run_name, preflight=preflight, live=live, output_json=None)
 
     if args.summarize_run_readback_json:
