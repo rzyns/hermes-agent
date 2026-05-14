@@ -147,6 +147,37 @@ def test_dashboard_select_filters_use_sdk_value_change_handler():
     assert "selectChangeHandler(props.setAssigneeFilter)" in js
 
 
+def test_dashboard_exposes_kanban_page_plugin_slots():
+    """The bundled Kanban dashboard plugin must expose stable page slots.
+
+    These hooks let slot-only dashboard plugins augment /kanban without
+    replacing the built-in Kanban route or changing behavior when no plugin
+    registers for the slot.
+    """
+
+    repo_root = Path(__file__).resolve().parents[2]
+    bundle = repo_root / "plugins" / "kanban" / "dashboard" / "dist" / "index.js"
+    js = bundle.read_text()
+
+    assert "Card, CardContent, PluginSlot," in js
+    assert 'h(PluginSlot, { name: "kanban:top" })' in js
+    assert 'h(PluginSlot, { name: "kanban:bottom" })' in js
+
+
+def test_dashboard_slot_catalog_documents_kanban_slots():
+    repo_root = Path(__file__).resolve().parents[2]
+    slots_ts = repo_root / "web" / "src" / "plugins" / "slots.ts"
+    docs_md = repo_root / "website" / "docs" / "user-guide" / "features" / "extending-the-dashboard.md"
+
+    slots = slots_ts.read_text()
+    docs = docs_md.read_text()
+
+    assert '"kanban:top"' in slots
+    assert '"kanban:bottom"' in slots
+    assert "`kanban:top` / `kanban:bottom`" in docs
+    assert "bundled Kanban dashboard plugin" in docs
+
+
 def test_dashboard_client_side_filtering_includes_tenant_filter():
     """The rendered board must also filter by tenant.
 

@@ -18,7 +18,7 @@
   const { React } = SDK;
   const h = React.createElement;
   const {
-    Card, CardContent,
+    Card, CardContent, PluginSlot,
     Badge, Button, Input, Label, Select, SelectOption,
   } = SDK.components;
   const { useState, useEffect, useCallback, useMemo, useRef } = SDK.hooks;
@@ -908,6 +908,7 @@
             return createNewBoard(payload).then(function () { setShowNewBoard(false); });
           },
         }) : null,
+        h(PluginSlot, { name: "kanban:top" }),
         h(AttentionStrip, {
           boardData,
           onOpen: setSelectedTaskId,
@@ -951,6 +952,7 @@
           onCreate: createTask,
           allTasks: boardData.columns.reduce(function (acc, c) { return acc.concat(c.tasks); }, []),
         }),
+        h(PluginSlot, { name: "kanban:bottom" }),
         selectedTaskId ? h(TaskDrawer, {
           taskId: selectedTaskId,
           boardSlug: board,

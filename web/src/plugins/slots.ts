@@ -48,6 +48,8 @@ import React, { Fragment, useEffect, useState } from "react";
  *  - `skills:bottom`    — bottom of /skills page
  *  - `plugins:top`       — top of /plugins page
  *  - `plugins:bottom`    — bottom of /plugins page
+ *  - `kanban:top`        — top of bundled /kanban plugin page (below board switcher)
+ *  - `kanban:bottom`     — bottom of bundled /kanban plugin page
  *  - `config:top`       — top of /config page
  *  - `config:bottom`    — bottom of /config page
  *  - `env:top`          — top of /env (Keys) page
@@ -82,6 +84,8 @@ export const KNOWN_SLOT_NAMES = [
   "skills:bottom",
   "plugins:top",
   "plugins:bottom",
+  "kanban:top",
+  "kanban:bottom",
   "config:top",
   "config:bottom",
   "env:top",
