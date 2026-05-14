@@ -1869,6 +1869,18 @@ class TestPluginAPIAuth:
         resp = self.auth_client.get("/api/plugins/example/hello")
         assert resp.status_code == 200
 
+    def test_example_dashboard_bundle_exists(self):
+        """The bundled example dashboard manifest must not publish a dead JS URL.
+
+        The dashboard eagerly loads every manifest returned by
+        /api/dashboard/plugins, so the example plugin's declared entry must be
+        present even though its main purpose is API-auth test coverage.
+        """
+        resp = self.client.get("/dashboard-plugins/example/dist/index.js")
+        assert resp.status_code == 200
+        assert "application/javascript" in resp.headers["content-type"]
+        assert "registry.register(\"example\"" in resp.text
+
     def test_plugin_post_requires_auth(self):
         """Plugin POST routes should return 401 without a valid session token."""
         resp = self.client.post("/api/plugins/kanban/tasks", json={"title": "test"})
@@ -2049,6 +2061,46 @@ class TestDashboardPluginManifestExtensions:
             "cron:bottom",
             "chat:top",
         ]
+
+    def test_rescan_mounts_late_dashboard_plugin_api_before_spa(self, tmp_path, monkeypatch):
+        """Dashboard rescan should make APIs from newly linked plugins reachable.
+
+        User-owned dashboard plugins can be symlinked into HERMES_HOME after the
+        dashboard process has already mounted its SPA fallback. A rescan must
+        mount the plugin API before that catch-all, otherwise authenticated
+        plugin API requests return index.html and frontend JSON parsing fails.
+        """
+        from starlette.testclient import TestClient
+        from hermes_cli import web_server
+
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        plugin_dir = self._write_plugin(tmp_path, "late-api-plugin", {
+            "name": "late-api-plugin",
+            "label": "Late API Plugin",
+            "tab": {"path": "/late-api-plugin", "hidden": True},
+            "entry": "dist/index.js",
+            "api": "plugin_api.py",
+        })
+        (plugin_dir / "plugin_api.py").write_text(
+            "from fastapi import APIRouter\n"
+            "router = APIRouter()\n"
+            "@router.get('/ping')\n"
+            "async def ping():\n"
+            "    return {'ok': True}\n",
+            encoding="utf-8",
+        )
+
+        web_server._dashboard_plugins_cache = None
+        web_server._mounted_dashboard_plugin_apis.discard("late-api-plugin")
+        client = TestClient(web_server.app)
+        client.headers[web_server._SESSION_HEADER_NAME] = web_server._SESSION_TOKEN
+
+        rescan = client.get("/api/dashboard/plugins/rescan")
+        assert rescan.status_code == 200
+        resp = client.get("/api/plugins/late-api-plugin/ping")
+        assert resp.status_code == 200
+        assert resp.headers["content-type"].startswith("application/json")
+        assert resp.json() == {"ok": True}
 
 
 # ---------------------------------------------------------------------------

@@ -153,6 +153,7 @@
 
   const API = "/api/plugins/kanban";
   const MIME_TASK = "text/x-hermes-task";
+  const OPEN_TASK_EVENT = "hermes-kanban:open-task";
 
   // Docs link — surfaced as a `?` icon next to the board switcher and as
   // `title=` hints on unlabelled controls. Kept in one place so rebrands or
@@ -849,6 +850,19 @@
       setIncludeArchived(false);
       clearSelected();
     }, [board, clearSelected]);
+
+    useEffect(function () {
+      function onOpenTask(ev) {
+        const detail = (ev && ev.detail) || {};
+        const taskId = detail.taskId || detail.task_id || detail.id;
+        const nextBoard = detail.boardSlug || detail.board || detail.board_slug;
+        if (!taskId) return;
+        if (nextBoard && nextBoard !== board) switchBoard(nextBoard);
+        setSelectedTaskId(taskId);
+      }
+      window.addEventListener(OPEN_TASK_EVENT, onOpenTask);
+      return function () { window.removeEventListener(OPEN_TASK_EVENT, onOpenTask); };
+    }, [board, switchBoard]);
 
     const createNewBoard = useCallback(function (payload) {
       return SDK.fetchJSON(`${API}/boards`, {

@@ -212,6 +212,22 @@ def test_dashboard_column_header_uses_current_label_helper():
     assert "aria-label\": `Select all tasks in ${colLabel || props.column.name}`" in js
 
 
+def test_dashboard_blocked_card_event_opens_existing_task_drawer():
+    """Slot plugins can ask the bundled Kanban page to open its native drawer."""
+
+    repo_root = Path(__file__).resolve().parents[2]
+    bundle = repo_root / "plugins" / "kanban" / "dashboard" / "dist" / "index.js"
+    js = bundle.read_text()
+
+    assert 'const OPEN_TASK_EVENT = "hermes-kanban:open-task";' in js
+    assert "window.addEventListener(OPEN_TASK_EVENT, onOpenTask);" in js
+    assert "window.removeEventListener(OPEN_TASK_EVENT, onOpenTask);" in js
+    assert "const taskId = detail.taskId || detail.task_id || detail.id;" in js
+    assert "const nextBoard = detail.boardSlug || detail.board || detail.board_slug;" in js
+    assert "if (nextBoard && nextBoard !== board) switchBoard(nextBoard);" in js
+    assert "setSelectedTaskId(taskId);" in js
+
+
 # ---------------------------------------------------------------------------
 # GET /tasks/:id returns body + comments + events + links
 # ---------------------------------------------------------------------------

@@ -3985,6 +3985,7 @@ def _discover_dashboard_plugins() -> list:
 
 # Cache discovered plugins per-process (refresh on explicit re-scan).
 _dashboard_plugins_cache: Optional[list] = None
+_mounted_dashboard_plugin_apis: set[str] = set()
 
 
 def _get_dashboard_plugins(force_rescan: bool = False) -> list:
@@ -4014,8 +4015,9 @@ async def get_dashboard_plugins():
 
 @app.get("/api/dashboard/plugins/rescan")
 async def rescan_dashboard_plugins():
-    """Force re-scan of dashboard plugins."""
+    """Force re-scan of dashboard plugins and mount newly discovered APIs."""
     plugins = _get_dashboard_plugins(force_rescan=True)
+    _mount_plugin_api_routes()
     return {"ok": True, "count": len(plugins)}
 
 
@@ -4319,47 +4321,78 @@ async def serve_plugin_asset(plugin_name: str, file_path: str):
     return FileResponse(target, media_type=media_type)
 
 
+def _move_spa_catch_all_routes_to_end() -> list:
+    """Temporarily remove SPA catch-all routes so late API mounts stay reachable.
+
+    Starlette evaluates routes in insertion order. Dashboard plugin APIs are
+    normally mounted before ``mount_spa(app)`` at process start, but a plugin
+    added later via a dashboard rescan needs its API routes inserted before the
+    SPA ``/{full_path:path}`` fallback.  Return removed route objects so the
+    caller can append them after mounting plugin routes.
+    """
+    routes = app.router.routes
+    catch_all = [route for route in routes if getattr(route, "path", None) == "/{full_path:path}"]
+    if not catch_all:
+        return []
+    app.router.routes = [route for route in routes if route not in catch_all]
+    return catch_all
+
+
+def _restore_routes(routes: list) -> None:
+    if routes:
+        app.router.routes.extend(routes)
+
+
 def _mount_plugin_api_routes():
     """Import and mount backend API routes from plugins that declare them.
 
     Each plugin's ``api`` field points to a Python file that must expose
     a ``router`` (FastAPI APIRouter).  Routes are mounted under
-    ``/api/plugins/<name>/``.
+    ``/api/plugins/<name>/``.  The function is idempotent so dashboard
+    plugin rescans can mount APIs from plugins added after process start.
     """
-    for plugin in _get_dashboard_plugins():
-        api_file_name = plugin.get("_api_file")
-        if not api_file_name:
-            continue
-        api_path = Path(plugin["_dir"]) / api_file_name
-        if not api_path.exists():
-            _log.warning("Plugin %s declares api=%s but file not found", plugin["name"], api_file_name)
-            continue
-        try:
-            module_name = f"hermes_dashboard_plugin_{plugin['name']}"
-            spec = importlib.util.spec_from_file_location(module_name, api_path)
-            if spec is None or spec.loader is None:
+    spa_catch_all_routes = _move_spa_catch_all_routes_to_end()
+    try:
+        for plugin in _get_dashboard_plugins():
+            api_file_name = plugin.get("_api_file")
+            plugin_name = str(plugin["name"])
+            if plugin_name in _mounted_dashboard_plugin_apis:
                 continue
-            mod = importlib.util.module_from_spec(spec)
-            # Register in sys.modules BEFORE exec_module so pydantic/FastAPI
-            # can resolve forward references (e.g. models defined in a file
-            # that uses `from __future__ import annotations`). Without this,
-            # TypeAdapter lazy-build fails at first request with
-            # "is not fully defined" because the module namespace isn't
-            # reachable by name for string-annotation resolution.
-            sys.modules[module_name] = mod
+            if not api_file_name:
+                continue
+            api_path = Path(plugin["_dir"]) / api_file_name
+            if not api_path.exists():
+                _log.warning("Plugin %s declares api=%s but file not found", plugin_name, api_file_name)
+                continue
             try:
-                spec.loader.exec_module(mod)
-            except Exception:
-                sys.modules.pop(module_name, None)
-                raise
-            router = getattr(mod, "router", None)
-            if router is None:
-                _log.warning("Plugin %s api file has no 'router' attribute", plugin["name"])
-                continue
-            app.include_router(router, prefix=f"/api/plugins/{plugin['name']}")
-            _log.info("Mounted plugin API routes: /api/plugins/%s/", plugin["name"])
-        except Exception as exc:
-            _log.warning("Failed to load plugin %s API routes: %s", plugin["name"], exc)
+                module_name = f"hermes_dashboard_plugin_{plugin_name.replace('-', '_')}"
+                spec = importlib.util.spec_from_file_location(module_name, api_path)
+                if spec is None or spec.loader is None:
+                    continue
+                mod = importlib.util.module_from_spec(spec)
+                # Register in sys.modules BEFORE exec_module so pydantic/FastAPI
+                # can resolve forward references (e.g. models defined in a file
+                # that uses `from __future__ import annotations`). Without this,
+                # TypeAdapter lazy-build fails at first request with
+                # "is not fully defined" because the module namespace isn't
+                # reachable by name for string-annotation resolution.
+                sys.modules[module_name] = mod
+                try:
+                    spec.loader.exec_module(mod)
+                except Exception:
+                    sys.modules.pop(module_name, None)
+                    raise
+                router = getattr(mod, "router", None)
+                if router is None:
+                    _log.warning("Plugin %s api file has no 'router' attribute", plugin_name)
+                    continue
+                app.include_router(router, prefix=f"/api/plugins/{plugin_name}")
+                _mounted_dashboard_plugin_apis.add(plugin_name)
+                _log.info("Mounted plugin API routes: /api/plugins/%s/", plugin_name)
+            except Exception as exc:
+                _log.warning("Failed to load plugin %s API routes: %s", plugin_name, exc)
+    finally:
+        _restore_routes(spa_catch_all_routes)
 
 
 # Mount plugin API routes before the SPA catch-all.
