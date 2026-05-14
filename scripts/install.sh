@@ -1281,6 +1281,10 @@ setup_path() {
     # We intentionally clear PYTHONPATH/PYTHONHOME here so inherited env vars
     # can't make this launcher import modules from another checkout.
     mkdir -p "$command_link_dir"
+    # Older installs created this path as a symlink to $HERMES_BIN. Without
+    # the rm, `cat >` follows the symlink and overwrites the venv pip entry
+    # point with this shim — making `exec "$HERMES_BIN"` self-recurse. (#21454)
+    rm -f "$command_link_dir/hermes"
     cat > "$command_link_dir/hermes" <<EOF
 #!/usr/bin/env bash
 unset PYTHONPATH
@@ -1422,6 +1426,10 @@ copy_config_templates() {
     else
         log_info "~/.hermes/.env already exists, keeping it"
     fi
+    # Restrict .env permissions — this file holds API keys and tokens.
+    # 0600 ensures only the file owner can read/write, matching standard
+    # practice for credential files (.netrc, .aws/credentials, .ssh/config).
+    chmod 600 "$HERMES_HOME/.env"
     configure_browser_env_from_system_browser
 
     # Create config.yaml at ~/.hermes/config.yaml (top level, easy to find)
