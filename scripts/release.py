@@ -41,6 +41,7 @@ PYPROJECT_FILE = REPO_ROOT / "pyproject.toml"
 AUTHOR_MAP = {
     # teknium (multiple emails)
     "teknium1@gmail.com": "teknium1",
+    "mgongzai@gmail.com": "vKongv",
     "0x.badfriend@gmail.com": "discodirector",
     "altriatree@gmail.com": "TruaShamu",
     "m@mobrienv.dev": "mikeyobrien",
@@ -53,6 +54,7 @@ AUTHOR_MAP = {
     "421774554@qq.com": "wuli666",
     "harish.kukreja@gmail.com": "counterposition",
     "1046611633@qq.com": "zhengyn0001",
+    "1095245867@qq.com": "littlewwwhite",
     "db@project-aeon.com": "db-aeon",
     "ahmed@abadr.net": "ahmedbadr3",
     "cleo@edaphic.xyz": "curiouscleo",
