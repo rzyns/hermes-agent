@@ -578,6 +578,7 @@ window.__HERMES_PLUGINS__.registerSlot("my-plugin", "header-left", MyCrest);
 | `logs:top` / `logs:bottom` | Top (above filter toolbar) / bottom (below log viewer) of `/logs`. |
 | `cron:top` / `cron:bottom` | Top / bottom of the `/cron` page. |
 | `skills:top` / `skills:bottom` | Top / bottom of the `/skills` page. |
+| `kanban:top` / `kanban:bottom` | Top (below board switching and new-board dialog) / bottom of `/kanban`. These hooks are rendered by the bundled Kanban dashboard plugin. |
 | `config:top` / `config:bottom` | Top / bottom of the `/config` page. |
 | `env:top` / `env:bottom` | Top / bottom of the `/env` (Keys) page. |
 | `docs:top` / `docs:bottom` | Top (above the iframe) / bottom of `/docs`. |
@@ -637,7 +638,7 @@ Full replacement via `tab.override` is heavy — your plugin now owns the entire
 
 Every built-in page exposes `<page>:top` and `<page>:bottom` slots rendered at the top and bottom of its content area. Your plugin populates one by calling `registerSlot()` — the built-in page keeps working normally, and your component renders alongside it.
 
-Available slots: `sessions:*`, `analytics:*`, `logs:*`, `cron:*`, `skills:*`, `config:*`, `env:*`, `docs:*`, `chat:*` (each with `:top` and `:bottom`). See the full catalogue in [Shell slots → Slot catalogue](#slot-catalogue).
+Available slots: `sessions:*`, `analytics:*`, `logs:*`, `cron:*`, `skills:*`, `kanban:*`, `config:*`, `env:*`, `docs:*`, `chat:*` (each with `:top` and `:bottom`). See the full catalogue in [Shell slots → Slot catalogue](#slot-catalogue). The Kanban hooks are exposed by the bundled Kanban dashboard plugin rather than a `web/src/pages/*` route component.
 
 Minimal example — pin a banner to the top of the Sessions page:
 
