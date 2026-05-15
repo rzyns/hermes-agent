@@ -21,6 +21,7 @@ Usage:
 """
 
 import argparse
+import json
 import re
 import shutil
 import subprocess
@@ -33,6 +34,11 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 VERSION_FILE = REPO_ROOT / "hermes_cli" / "__init__.py"
 PYPROJECT_FILE = REPO_ROOT / "pyproject.toml"
 
+# ACP Registry manifest must stay version-locked with pyproject.toml.
+# tests/acp/test_registry_manifest.py enforces this lockstep so the release
+# bump touches both files atomically.
+ACP_REGISTRY_MANIFEST = REPO_ROOT / "acp_registry" / "agent.json"
+
 # ──────────────────────────────────────────────────────────────────────
 # Git email → GitHub username mapping
 # ──────────────────────────────────────────────────────────────────────
@@ -43,6 +49,7 @@ AUTHOR_MAP = {
     "teknium1@gmail.com": "teknium1",
     "30366221+WorldWriter@users.noreply.github.com": "WorldWriter",
     "dafeng@DafengdeMacBook-Pro.local": "WorldWriter",
+    "anadi.jaggia@gmail.com": "Jaggia",
     "32201324+simpolism@users.noreply.github.com": "simpolism",
     "simpolism@gmail.com": "simpolism",
     "jake@nousresearch.com": "simpolism",
@@ -52,14 +59,17 @@ AUTHOR_MAP = {
     "m@mobrienv.dev": "mikeyobrien",
     "qiyin.zuo@pcitc.com": "qiyin-code",
     "oleksii.lisikh@gmail.com": "olisikh",
+    "jeremy@geocaching.com": "outdoorsea",
     "leone.parise@gmail.com": "leoneparise",
     "mr@shu.io": "mrshu",
+    "adam.manning@gmail.com": "am423",
     "buraysandro9@gmail.com": "ygd58",
     "yanglongwei06@gmail.com": "Alex-yang00",
     "teknium@nousresearch.com": "teknium1",
     "piyushvp1@gmail.com": "thelumiereguy",
     "421774554@qq.com": "wuli666",
     "harish.kukreja@gmail.com": "counterposition",
+    "korkyzer@gmail.com": "Korkyzer",
     "1046611633@qq.com": "zhengyn0001",
     "1095245867@qq.com": "littlewwwhite",
     "db@project-aeon.com": "db-aeon",
@@ -1150,6 +1160,29 @@ def update_version_files(semver: str, calver_date: str):
         flags=re.MULTILINE,
     )
     PYPROJECT_FILE.write_text(pyproject)
+
+    # Update ACP Registry manifest + npm launcher (must stay version-locked
+    # with pyproject — enforced by tests/acp/test_registry_manifest.py).
+    _update_acp_registry_versions(semver)
+
+
+def _update_acp_registry_versions(semver: str) -> None:
+    """Bump the ACP Registry manifest's version + uvx package pin in lockstep
+    with pyproject.
+
+    Skips silently if the manifest is missing — older release branches predate
+    the ACP Registry assets.
+    """
+    if ACP_REGISTRY_MANIFEST.exists():
+        manifest = json.loads(ACP_REGISTRY_MANIFEST.read_text(encoding="utf-8"))
+        manifest["version"] = semver
+        uvx = manifest.get("distribution", {}).get("uvx", {})
+        if "package" in uvx:
+            uvx["package"] = f"hermes-agent[acp]=={semver}"
+        # Preserve trailing newline + 2-space indent the file already uses.
+        ACP_REGISTRY_MANIFEST.write_text(
+            json.dumps(manifest, indent=2) + "\n", encoding="utf-8"
+        )
 
 
 def build_release_artifacts(semver: str) -> list[Path]:
