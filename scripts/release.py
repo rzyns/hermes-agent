@@ -62,6 +62,7 @@ AUTHOR_MAP = {
     "nidhi2894@gmail.com": "nidhi-singh02",
     "30312689+aashizpoudel@users.noreply.github.com": "aashizpoudel",
     "oleksii.lisikh@gmail.com": "olisikh",
+    "jithendranaidunara@gmail.com": "JithendraNara",
     "jeremy@geocaching.com": "outdoorsea",
     "leone.parise@gmail.com": "leoneparise",
     "mr@shu.io": "mrshu",
@@ -1074,6 +1075,7 @@ AUTHOR_MAP = {
     "16034932+Arkmusn@users.noreply.github.com": "Arkmusn",  # PR #25559 salvage (approvals.timeout from config)
     "nidhi2894@gmail.com": "nidhi-singh02",  # PR #2752 salvage (slack whitespace-only IndexError guard)
     "38173192+nidhi-singh02@users.noreply.github.com": "nidhi-singh02",
+    "Jaaneek@users.noreply.github.com": "Jaaneek",  # PR #26457 (xAI Grok OAuth provider)
 }
 
 
