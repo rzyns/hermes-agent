@@ -393,6 +393,19 @@ def _is_destructive_command(cmd: str) -> bool:
     return False
 
 
+def _is_mcp_tool_parallel_safe(tool_name: str) -> bool:
+    """Check if an MCP tool comes from a server with parallel tool calls enabled.
+
+    Lazy-imports from ``tools.mcp_tool`` to avoid circular dependencies.
+    Returns False if the MCP module is not available.
+    """
+    try:
+        from tools.mcp_tool import is_mcp_tool_parallel_safe
+        return is_mcp_tool_parallel_safe(tool_name)
+    except Exception:
+        return False
+
+
 def _should_parallelize_tool_batch(tool_calls) -> bool:
     """Return True when a tool-call batch is safe to run concurrently."""
     if len(tool_calls) <= 1:
@@ -432,7 +445,9 @@ def _should_parallelize_tool_batch(tool_calls) -> bool:
             continue
 
         if tool_name not in _PARALLEL_SAFE_TOOLS:
-            return False
+            # Check if it's an MCP tool from a server that opted into parallel calls.
+            if not _is_mcp_tool_parallel_safe(tool_name):
+                return False
 
     return True
 
@@ -14239,6 +14254,39 @@ class AIAgent:
                             "interrupted": True,
                         }
                     
+                    # Actionable hint for GitHub Models (Azure) 413 errors.
+                    # The free tier enforces a hard 8K token cap per request,
+                    # which Hermes' system prompt + tool schemas alone exceed.
+                    # Compression can't help — the floor is the system prompt
+                    # itself, not the conversation — so surface a clear "not
+                    # compatible" message instead of looping into three futile
+                    # compression attempts.
+                    if (
+                        status_code == 413
+                        and isinstance(_base, str)
+                        and "models.inference.ai.azure.com" in _base
+                    ):
+                        self._vprint(
+                            f"{self.log_prefix}   💡 GitHub Models free tier (models.inference.ai.azure.com) caps every",
+                            force=True,
+                        )
+                        self._vprint(
+                            f"{self.log_prefix}      request at ~8K tokens. Hermes' system prompt + tool schemas baseline",
+                            force=True,
+                        )
+                        self._vprint(
+                            f"{self.log_prefix}      exceeds that floor, so this endpoint cannot run an agentic loop.",
+                            force=True,
+                        )
+                        self._vprint(
+                            f"{self.log_prefix}      Use the `copilot` provider with a Copilot subscription token (`hermes",
+                            force=True,
+                        )
+                        self._vprint(
+                            f"{self.log_prefix}      setup` → GitHub Copilot), or pick any other provider.",
+                            force=True,
+                        )
+
                     # Check for 413 payload-too-large BEFORE generic 4xx handler.
                     # A 413 is a payload-size error — the correct response is to
                     # compress history and retry, not abort immediately.
