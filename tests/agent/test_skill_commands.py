@@ -4,6 +4,8 @@ import os
 from pathlib import Path
 from unittest.mock import patch
 
+import pytest
+
 import tools.skills_tool as skills_tool_module
 from agent.skill_commands import (
     build_preloaded_skills_prompt,
@@ -124,6 +126,37 @@ class TestScanSkillCommands:
 
         assert "/knowledge-brain" in result
         assert result["/knowledge-brain"]["name"] == "knowledge-brain"
+
+    def test_invokes_skill_from_symlinked_category_dir(self, tmp_path):
+        """Slash invocation should load skills discovered through local symlinks.
+
+        Regression: scan_skill_commands records the symlink path under the local
+        skills dir. _load_skill_payload used to resolve that path first, turning
+        it into an absolute external path that skill_view rejected as a
+        non-relative pattern.
+        """
+        import agent.skill_commands as sc_mod
+
+        external_root = tmp_path / "repo"
+        skills_root = tmp_path / "skills"
+        skills_root.mkdir()
+        external_category = _symlink_category(skills_root, external_root, "linked")
+        _make_skill(external_category.parent, "knowledge-brain", category="linked")
+
+        with (
+            patch("tools.skills_tool.SKILLS_DIR", skills_root),
+            patch.object(sc_mod, "_skill_commands", {}),
+            patch.object(sc_mod, "_skill_commands_platform", None),
+        ):
+            result = scan_skill_commands()
+            assert result["/knowledge-brain"]["skill_dir"] == str(
+                skills_root / "linked" / "knowledge-brain"
+            )
+            message = build_skill_invocation_message("/knowledge-brain")
+
+        assert message is not None
+        assert not message.startswith("[Failed to load skill:")
+        assert "knowledge-brain" in message
 
     def test_get_skill_commands_rescans_when_platform_scope_changes(self, tmp_path):
         """Platform-specific disabled-skill caches must not leak across platforms.

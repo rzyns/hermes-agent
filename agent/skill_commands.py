@@ -61,10 +61,27 @@ def _load_skill_payload(skill_identifier: str, task_id: str | None = None) -> tu
 
         identifier_path = Path(raw_identifier).expanduser()
         if identifier_path.is_absolute():
+            # Prefer lexical normalization under the local skills dir before
+            # resolving symlinks. Slash-command scanning records the symlinked
+            # path under ~/.hermes/skills; resolving it first can escape the
+            # local root and make skill_view receive an unsupported absolute
+            # pattern (e.g. /home/.../.hermes/skills/link/foo).
             try:
-                normalized = str(identifier_path.resolve().relative_to(SKILLS_DIR.resolve()))
+                normalized = str(identifier_path.relative_to(SKILLS_DIR))
             except Exception:
-                normalized = raw_identifier
+                try:
+                    resolved_identifier = identifier_path.resolve()
+                    normalized = raw_identifier
+                    from agent.skill_utils import get_external_skills_dirs
+
+                    for root in [SKILLS_DIR.resolve(), *get_external_skills_dirs()]:
+                        try:
+                            normalized = str(resolved_identifier.relative_to(root.resolve()))
+                            break
+                        except Exception:
+                            continue
+                except Exception:
+                    normalized = raw_identifier
         else:
             normalized = raw_identifier.lstrip("/")
 
