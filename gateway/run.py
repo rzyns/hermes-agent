@@ -8863,7 +8863,7 @@ class GatewayRunner:
                 lines.append("Failed/paused: (none)")
             return "\n".join(lines)
 
-        if action in ("pause", "resume"):
+        if action in {"pause", "resume"}:
             if not target:
                 return f"Usage: /platform {action} <name>"
             platform = _resolve_platform(target)
@@ -12546,6 +12546,12 @@ class GatewayRunner:
             and getattr(source, "chat_type", None) == "dm"
         ):
             metadata["telegram_dm_topic_reply_fallback"] = True
+            # Telegram DM topic lanes need direct_messages_topic_id in metadata
+            # so synthetic/queued messages (goal continuations, status notices)
+            # route to the correct topic even when reply anchor is unavailable.
+            tid = str(thread_id)
+            if tid and tid not in {"", "1"}:
+                metadata["direct_messages_topic_id"] = tid
             anchor = reply_to_message_id or getattr(source, "message_id", None)
             if anchor is not None:
                 metadata["telegram_reply_to_message_id"] = str(anchor)
@@ -12831,7 +12837,11 @@ class GatewayRunner:
                 update_cmd = (
                     f"PYTHONUNBUFFERED=1 {hermes_cmd_str} update --gateway"
                     f" > {shlex.quote(str(output_path))} 2>&1; "
-                    f"status=$?; printf '%s' \"$status\" > {shlex.quote(str(exit_code_path))}"
+                    # Avoid `status=$?`: `status` is a read-only special parameter
+                    # in zsh, and this command string is copied/reused in macOS/zsh
+                    # operator wrappers. Keep the template zsh-safe even though this
+                    # specific subprocess currently runs under bash.
+                    f"rc=$?; printf '%s' \"$rc\" > {shlex.quote(str(exit_code_path))}"
                 )
                 setsid_bin = shutil.which("setsid")
                 if setsid_bin:
