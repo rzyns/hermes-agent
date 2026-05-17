@@ -160,19 +160,25 @@ def _has_healthy_oauth_fallback_for_apikey_provider(provider_label: str) -> bool
     still show a failed API-key connectivity row, but it should not promote
     that direct-key problem into the final blocking summary.
     """
-    try:
-        from hermes_cli.auth import (
-            get_gemini_oauth_auth_status,
-            get_minimax_oauth_auth_status,
-        )
-    except Exception:
-        return False
-
     normalized = (provider_label or "").strip().lower()
     if normalized in {"google / gemini", "gemini"}:
-        return bool((get_gemini_oauth_auth_status() or {}).get("logged_in"))
+        try:
+            from hermes_cli.auth import get_gemini_oauth_auth_status
+            return bool((get_gemini_oauth_auth_status() or {}).get("logged_in"))
+        except Exception:
+            return False
     if normalized == "minimax":
-        return bool((get_minimax_oauth_auth_status() or {}).get("logged_in"))
+        try:
+            from hermes_cli.auth import get_minimax_oauth_auth_status
+            return bool((get_minimax_oauth_auth_status() or {}).get("logged_in"))
+        except Exception:
+            return False
+    if normalized == "xai":
+        try:
+            from hermes_cli.auth import get_xai_oauth_auth_status
+            return bool((get_xai_oauth_auth_status() or {}).get("logged_in"))
+        except Exception:
+            return False
     return False
 
 
@@ -816,6 +822,20 @@ def run_doctor(args):
             check_warn("MiniMax OAuth", "(not logged in)")
     except Exception as e:
         check_warn("Auth provider status", f"(could not check: {e})")
+
+    # xAI OAuth — separate try/except so an import failure here cannot
+    # disrupt the already-printed Nous/Codex/Gemini/MiniMax rows above.
+    try:
+        from hermes_cli.auth import get_xai_oauth_auth_status
+        xai_oauth_status = get_xai_oauth_auth_status() or {}
+        if xai_oauth_status.get("logged_in"):
+            check_ok("xAI OAuth", "(logged in)")
+        else:
+            check_warn("xAI OAuth", "(not logged in)")
+            if xai_oauth_status.get("error"):
+                check_info(xai_oauth_status["error"])
+    except Exception:
+        pass
 
     if _safe_which("codex"):
         check_ok("codex CLI")
