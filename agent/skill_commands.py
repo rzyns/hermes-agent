@@ -58,30 +58,47 @@ def _load_skill_payload(skill_identifier: str, task_id: str | None = None) -> tu
 
     try:
         from tools.skills_tool import SKILLS_DIR, skill_view
+        from agent.skill_utils import get_external_skills_dirs
 
         identifier_path = Path(raw_identifier).expanduser()
         if identifier_path.is_absolute():
-            # Prefer lexical normalization under the local skills dir before
-            # resolving symlinks. Slash-command scanning records the symlinked
-            # path under ~/.hermes/skills; resolving it first can escape the
-            # local root and make skill_view receive an unsupported absolute
-            # pattern (e.g. /home/.../.hermes/skills/link/foo).
+            normalized = None
+            trusted_roots = [SKILLS_DIR]
             try:
-                normalized = str(identifier_path.relative_to(SKILLS_DIR))
+                trusted_roots.extend(get_external_skills_dirs())
             except Exception:
+                pass
+
+            # Prefer lexical normalization under a trusted visible skill root
+            # before resolving symlinks. Slash-command discovery can record a
+            # symlink path under ~/.hermes/skills; resolving it first can escape
+            # that trusted root and make skill_view() receive an unsupported
+            # arbitrary absolute path.
+            for root in trusted_roots:
+                try:
+                    normalized = str(identifier_path.relative_to(root))
+                    break
+                except Exception:
+                    continue
+
+            # If lexical normalization did not match, allow already-resolved
+            # absolute paths that are still under a trusted local/external skill
+            # root. This preserves support for explicit external skill dirs
+            # without accepting arbitrary absolute paths.
+            if normalized is None:
                 try:
                     resolved_identifier = identifier_path.resolve()
-                    normalized = raw_identifier
-                    from agent.skill_utils import get_external_skills_dirs
-
-                    for root in [SKILLS_DIR.resolve(), *get_external_skills_dirs()]:
+                    for root in trusted_roots:
                         try:
                             normalized = str(resolved_identifier.relative_to(root.resolve()))
                             break
                         except Exception:
                             continue
                 except Exception:
-                    normalized = raw_identifier
+                    pass
+
+            if normalized is None:
+                normalized = raw_identifier
         else:
             normalized = raw_identifier.lstrip("/")
 

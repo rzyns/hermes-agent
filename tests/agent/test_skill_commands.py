@@ -158,6 +158,30 @@ class TestScanSkillCommands:
         assert not message.startswith("[Failed to load skill:")
         assert "knowledge-brain" in message
 
+    def test_loads_skill_invocation_from_symlinked_skill_dir(self, tmp_path):
+        """Slash commands should load skills symlinked under the local skills dir."""
+        external_root = tmp_path / "external"
+        skills_root = tmp_path / "skills"
+        skills_root.mkdir()
+        real_skill_dir = _make_skill(
+            external_root,
+            "impeccable",
+            body="Apply impeccable design craft.",
+        )
+        symlink_path = skills_root / "impeccable"
+        try:
+            symlink_path.symlink_to(real_skill_dir, target_is_directory=True)
+        except (OSError, NotImplementedError) as exc:
+            pytest.skip(f"symlinks unavailable in test environment: {exc}")
+
+        with patch("tools.skills_tool.SKILLS_DIR", skills_root):
+            result = scan_skill_commands()
+            message = build_skill_invocation_message("/impeccable")
+
+        assert "/impeccable" in result
+        assert message is not None
+        assert "Apply impeccable design craft." in message
+
     def test_get_skill_commands_rescans_when_platform_scope_changes(self, tmp_path):
         """Platform-specific disabled-skill caches must not leak across platforms.
 
