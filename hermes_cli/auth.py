@@ -39,7 +39,7 @@ import webbrowser
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
-from http.server import BaseHTTPRequestHandler, HTTPServer
+from http.server import BaseHTTPRequestHandler, HTTPServer, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple
 from urllib.parse import parse_qs, urlencode, urlparse
@@ -2372,6 +2372,7 @@ def _make_xai_callback_handler(expected_path: str) -> tuple[type[BaseHTTPRequest
         "error": None,
         "error_description": None,
     }
+    result_lock = threading.Lock()
 
     class _XAICallbackHandler(BaseHTTPRequestHandler):
         def _maybe_write_cors_headers(self) -> None:
@@ -2398,16 +2399,49 @@ def _make_xai_callback_handler(expected_path: str) -> tuple[type[BaseHTTPRequest
                 return
 
             params = parse_qs(parsed.query)
-            result["code"] = params.get("code", [None])[0]
-            result["state"] = params.get("state", [None])[0]
-            result["error"] = params.get("error", [None])[0]
-            result["error_description"] = params.get("error_description", [None])[0]
+            incoming = {
+                "code": params.get("code", [None])[0],
+                "state": params.get("state", [None])[0],
+                "error": params.get("error", [None])[0],
+                "error_description": params.get("error_description", [None])[0],
+            }
+
+            # Treat a hit on the callback path with neither `code` nor `error`
+            # as a missing OAuth callback (e.g. xAI's auth backend failed to
+            # redirect and the user navigated to the bare loopback URL by hand).
+            # Show an explicit "not received" page rather than the success page —
+            # otherwise the browser claims authorization succeeded while the CLI
+            # is still waiting for a real callback and eventually times out.
+            if incoming["code"] is None and incoming["error"] is None:
+                self.send_response(400)
+                self._maybe_write_cors_headers()
+                self.send_header("Content-Type", "text/html; charset=utf-8")
+                self.end_headers()
+                body = (
+                    "<html><body>"
+                    "<h1>xAI authorization not received.</h1>"
+                    "<p>No authorization code was present in this callback URL. "
+                    "Return to the terminal and re-run "
+                    "<code>hermes auth add xai-oauth</code> to retry.</p>"
+                    "</body></html>"
+                )
+                self.wfile.write(body.encode("utf-8"))
+                return
+
+            # ThreadingHTTPServer allows a fallback/manual callback to complete
+            # while a browser connection is stuck.  Once we have a terminal
+            # OAuth result (code or error), keep the first one so a later
+            # concurrent/invalid callback cannot overwrite state before
+            # validation in _xai_oauth_loopback_login().
+            with result_lock:
+                if not (result["code"] or result["error"]):
+                    result.update(incoming)
 
             self.send_response(200)
             self._maybe_write_cors_headers()
             self.send_header("Content-Type", "text/html; charset=utf-8")
             self.end_headers()
-            if result["error"]:
+            if incoming["error"]:
                 body = "<html><body><h1>xAI authorization failed.</h1>You can close this tab.</body></html>"
             else:
                 body = "<html><body><h1>xAI authorization received.</h1>You can close this tab.</body></html>"
@@ -2426,8 +2460,9 @@ def _xai_start_callback_server(
     expected_path = XAI_OAUTH_REDIRECT_PATH
     handler_cls, result = _make_xai_callback_handler(expected_path)
 
-    class _ReuseHTTPServer(HTTPServer):
+    class _ReuseHTTPServer(ThreadingHTTPServer):
         allow_reuse_address = True
+        daemon_threads = True
 
     ports_to_try = [preferred_port]
     if preferred_port != 0:
@@ -2860,6 +2895,21 @@ def _is_remote_session() -> bool:
     return bool(os.getenv("SSH_CLIENT") or os.getenv("SSH_TTY"))
 
 
+def _ssh_user_at_host() -> str:
+    """Return best-effort 'user@hostname' for the SSH tunnel hint command.
+
+    Falls back to placeholder tokens when the values cannot be determined so
+    the hint is always syntactically valid even if not copy-pasteable.
+    """
+    try:
+        import socket as _socket
+        hostname = _socket.gethostname() or "<this-host>"
+    except OSError:
+        hostname = "<this-host>"
+    user = os.getenv("USER") or os.getenv("LOGNAME") or "<user>"
+    return f"{user}@{hostname}"
+
+
 def _print_loopback_ssh_hint(redirect_uri: str, *, docs_url: str | None = None) -> None:
     """Print an SSH tunnel hint when running a loopback-redirect OAuth flow on a
     remote host. The auth server (xAI, Spotify, ...) will redirect the user's
@@ -2883,19 +2933,22 @@ def _print_loopback_ssh_hint(redirect_uri: str, *, docs_url: str | None = None) 
     port = parsed.port
     if host not in {"127.0.0.1", "::1", "localhost"} or not port:
         return
+    divider = "-" * 60
     print()
-    print("Remote session detected. Your browser will redirect to")
-    print(f"  {redirect_uri}")
-    print("which the loopback listener on THIS machine is waiting on. If your")
-    print("browser is on a different machine, forward the port first from your")
-    print("local machine in a separate terminal:")
+    print(divider)
+    print("Remote session detected — SSH tunnel required")
+    print(divider)
+    print(f"Hermes is waiting for the OAuth callback on {redirect_uri}")
+    print("but your browser is on a different machine. Run this command")
+    print("in a NEW terminal on your local machine BEFORE opening the URL:")
     print()
-    print(f"  ssh -N -L {port}:127.0.0.1:{port} <user>@<this-host>")
+    print(f"  ssh -N -L {port}:127.0.0.1:{port} {_ssh_user_at_host()}")
     print()
     print("Then open the authorize URL above in your local browser.")
     if docs_url:
         print(f"Provider docs:      {docs_url}")
     print(f"SSH/jump-box guide: {OAUTH_OVER_SSH_DOCS_URL}")
+    print(divider)
     print()
 
 
@@ -3987,6 +4040,46 @@ def _is_terminal_nous_refresh_error(exc: Exception) -> bool:
         isinstance(exc, AuthError)
         and exc.provider == "nous"
         and exc.code in {"invalid_grant", "invalid_token", "refresh_token_reused"}
+        and bool(exc.relogin_required)
+    )
+
+
+def _is_terminal_xai_oauth_refresh_error(exc: Exception) -> bool:
+    """True when retrying the same xAI OAuth refresh token cannot succeed.
+
+    ``xai_refresh_failed`` covers HTTP 400/401/403 from the token endpoint
+    (invalid_grant, token revoked, refresh_token_reused).
+    ``xai_auth_missing_refresh_token`` means the pool entry has no refresh
+    token at all — retrying will never work.
+    Both carry ``relogin_required=True``; transient failures (429, 5xx) do not.
+    """
+    return (
+        isinstance(exc, AuthError)
+        and exc.provider == "xai-oauth"
+        and exc.code in {"xai_refresh_failed", "xai_auth_missing_refresh_token"}
+        and bool(exc.relogin_required)
+    )
+
+
+def _is_terminal_codex_oauth_refresh_error(exc: Exception) -> bool:
+    """True when retrying the same Codex OAuth refresh token cannot succeed.
+
+    ``codex_refresh_failed`` covers HTTP 400/401/403 from the token endpoint
+    (invalid_grant, token revoked, refresh_token_reused).
+    ``codex_auth_missing_refresh_token`` means the pool entry has no refresh
+    token at all — retrying will never work.
+    Both carry ``relogin_required=True``; transient failures (429, 5xx) do not.
+    """
+    return (
+        isinstance(exc, AuthError)
+        and exc.provider == "openai-codex"
+        and exc.code in {
+            "codex_refresh_failed",
+            "codex_auth_missing_refresh_token",
+            "invalid_grant",
+            "invalid_token",
+            "refresh_token_reused",
+        }
         and bool(exc.relogin_required)
     )
 
@@ -5334,7 +5427,9 @@ def get_external_process_provider_status(provider_id: str) -> Dict[str, Any]:
 
 def get_auth_status(provider_id: Optional[str] = None) -> Dict[str, Any]:
     """Generic auth status dispatcher."""
-    target = provider_id or get_active_provider()
+    target = (provider_id or get_active_provider() or "").strip().lower()
+    if not target:
+        return {"logged_in": False}
     if target == "spotify":
         return get_spotify_auth_status()
     if target == "nous":
@@ -5351,6 +5446,8 @@ def get_auth_status(provider_id: Optional[str] = None) -> Dict[str, Any]:
         return get_minimax_oauth_auth_status()
     if target == "copilot-acp":
         return get_external_process_provider_status(target)
+    if target == "azure-foundry":
+        return _get_azure_foundry_auth_status()
     # API-key providers
     pconfig = PROVIDER_REGISTRY.get(target)
     if pconfig and pconfig.auth_type == "api_key":
@@ -5363,6 +5460,83 @@ def get_auth_status(provider_id: Optional[str] = None) -> Dict[str, Any]:
         except ImportError:
             return {"logged_in": False, "provider": target, "error": "boto3 not installed"}
     return {"logged_in": False}
+
+
+def _get_azure_foundry_auth_status() -> Dict[str, Any]:
+    """Return structural auth status for Azure Foundry.
+
+    ``logged_in`` is structural, matching other non-OAuth provider status
+    checks:
+
+      * ``auth_mode == "entra_id"`` AND ``azure-identity`` is importable
+        (we do NOT mint a token here; ``hermes doctor`` runs the live
+        probe and reports whether the credential chain can acquire one).
+      * ``auth_mode == "api_key"`` (default) AND ``AZURE_FOUNDRY_API_KEY``
+        is set with a usable value.
+
+    Never invokes the Entra credential chain — keeps CLI startup latency
+    flat regardless of token-service / az login state.
+    """
+    info: Dict[str, Any] = {"provider": "azure-foundry"}
+    try:
+        from hermes_cli.config import load_config, get_env_value
+        cfg = load_config()
+    except Exception:
+        cfg = {}
+
+    model_cfg = cfg.get("model") if isinstance(cfg, dict) else None
+    auth_mode = "api_key"
+    base_url = ""
+    if isinstance(model_cfg, dict):
+        auth_mode = str(model_cfg.get("auth_mode") or "api_key").strip().lower() or "api_key"
+        base_url = str(model_cfg.get("base_url") or "").strip()
+    info["auth_mode"] = auth_mode
+    info["base_url"] = base_url
+
+    if auth_mode == "entra_id":
+        try:
+            from agent.azure_identity_adapter import (
+                EntraIdentityConfig,
+                SCOPE_AI_AZURE_DEFAULT,
+                has_azure_identity_installed,
+            )
+            installed = has_azure_identity_installed()
+            entra_cfg = {}
+            if isinstance(model_cfg, dict) and isinstance(model_cfg.get("entra"), dict):
+                entra_cfg = model_cfg["entra"]
+            identity_config = EntraIdentityConfig.from_dict(
+                entra_cfg,
+                default_scope=SCOPE_AI_AZURE_DEFAULT,
+            )
+            info["azure_identity_installed"] = installed
+            info["scope"] = identity_config.scope
+            info["credential_probe"] = "not_run"
+            info["credential_verified"] = False
+            info["logged_in"] = bool(installed)
+            if not installed:
+                info["hint"] = (
+                    "azure-identity not installed. Install with: "
+                    "pip install azure-identity  (or rely on Hermes' "
+                    "lazy-install at first use)."
+                )
+            else:
+                info["hint"] = (
+                    "azure-identity is installed; live credential validation "
+                    "is skipped here. Run `hermes doctor` to verify token acquisition."
+                )
+            return info
+        except Exception as exc:
+            info["logged_in"] = False
+            info["error"] = f"azure-identity check failed: {exc}"
+            return info
+
+    # api_key mode (default)
+    try:
+        api_key = get_env_value("AZURE_FOUNDRY_API_KEY") or os.getenv("AZURE_FOUNDRY_API_KEY", "")
+    except Exception:
+        api_key = os.getenv("AZURE_FOUNDRY_API_KEY", "")
+    info["logged_in"] = has_usable_secret(api_key)
+    return info
 
 
 def resolve_api_key_provider_credentials(provider_id: str) -> Dict[str, Any]:
@@ -6614,7 +6788,28 @@ def resolve_minimax_oauth_runtime_credentials(
             "MiniMax (OAuth).",
             provider="minimax-oauth", code="not_logged_in", relogin_required=True,
         )
-    state = _refresh_minimax_oauth_state(state)
+    try:
+        state = _refresh_minimax_oauth_state(state)
+    except AuthError as exc:
+        if exc.relogin_required and state.get("refresh_token"):
+            # Terminal refresh failure — clear dead tokens from auth.json so
+            # subsequent calls fail fast without a network retry, mirroring
+            # the Nous / xAI-OAuth / Codex-OAuth quarantine pattern.
+            for _k in ("access_token", "refresh_token", "expires_at", "expires_in", "obtained_at"):
+                state.pop(_k, None)
+            state["last_auth_error"] = {
+                "provider": "minimax-oauth",
+                "code": exc.code or "refresh_failed",
+                "message": str(exc),
+                "reason": "runtime_refresh_failure",
+                "relogin_required": True,
+                "at": datetime.now(timezone.utc).isoformat(),
+            }
+            try:
+                _minimax_save_auth_state(state)
+            except Exception as _save_exc:
+                logger.debug("MiniMax OAuth: failed to persist quarantined state: %s", _save_exc)
+        raise
     return {
         "provider": "minimax-oauth",
         "api_key": state["access_token"],
