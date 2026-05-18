@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+from datetime import datetime, timezone
 import base64
 import contextvars
 import json
@@ -46,6 +47,7 @@ from acp.schema import (
     ResourceContentBlock,
     SessionCapabilities,
     SessionForkCapabilities,
+    SessionInfoUpdate,
     SessionListCapabilities,
     SessionMode,
     SessionModeState,
@@ -706,6 +708,37 @@ class HermesACPAgent(acp.Agent):
                 state.session_id,
                 exc_info=True,
             )
+
+    async def _send_session_info_update(self, session_id: str) -> None:
+        """Send ACP native session metadata after Hermes changes it."""
+        if not self._conn:
+            return
+        try:
+            row = self.session_manager._get_db().get_session(session_id)
+        except Exception:
+            logger.debug("Could not read ACP session info for %s", session_id, exc_info=True)
+            return
+        if not row:
+            return
+
+        title = row.get("title")
+        # The `sessions` table does not have an `updated_at` column (see
+        # hermes_state.py schema — only started_at/ended_at). Use "now" as
+        # the updated_at since we're emitting this notification precisely
+        # because the title was just refreshed.
+        updated_at = datetime.now(timezone.utc).isoformat()
+        update = SessionInfoUpdate(
+            session_update="session_info_update",
+            title=title if isinstance(title, str) and title.strip() else None,
+            updated_at=updated_at,
+        )
+        try:
+            await self._conn.session_update(
+                session_id=session_id,
+                update=update,
+            )
+        except Exception:
+            logger.debug("Could not send ACP session info update for %s", session_id, exc_info=True)
 
     def _schedule_usage_update(self, state: SessionState) -> None:
         """Schedule native context indicator refresh after ACP responses."""
@@ -1471,12 +1504,20 @@ class HermesACPAgent(acp.Agent):
             try:
                 from agent.title_generator import maybe_auto_title
 
+                def _notify_title_update(_title: str) -> None:
+                    if conn:
+                        loop.call_soon_threadsafe(
+                            asyncio.create_task,
+                            self._send_session_info_update(session_id),
+                        )
+
                 maybe_auto_title(
                     self.session_manager._get_db(),
                     session_id,
                     user_text,
                     final_response,
                     state.history,
+                    title_callback=_notify_title_update,
                 )
             except Exception:
                 logger.debug("Failed to auto-title ACP session %s", session_id, exc_info=True)
