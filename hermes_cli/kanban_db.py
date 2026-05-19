@@ -1179,8 +1179,12 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
     conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_tasks_idempotency ON tasks(idempotency_key)"
     )
+    # Keep the per-session lookup index in the migration pass, not in
+    # SCHEMA_SQL: CREATE INDEX in SCHEMA_SQL runs before additive ALTERs on
+    # existing DBs, so indexing a newly-added column there breaks upgrades.
     conn.execute(
-        "CREATE INDEX IF NOT EXISTS idx_tasks_session_id ON tasks(session_id)"
+        "CREATE INDEX IF NOT EXISTS idx_tasks_session_id "
+        "ON tasks(session_id)"
     )
 
     # task_events gained a run_id column; back-fill it as NULL for

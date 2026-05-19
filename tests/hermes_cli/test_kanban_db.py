@@ -39,6 +39,72 @@ def test_init_db_is_idempotent(kanban_home):
     assert tasks[0].title == "persisted"
 
 
+def test_connect_migrates_existing_db_missing_session_id(tmp_path):
+    """Legacy board DBs missing session_id must migrate without data loss.
+
+    Regression coverage for the dashboard-wide 500 where SCHEMA_SQL tried to
+    create idx_tasks_session_id before the additive migration had added the
+    column on existing board databases.
+    """
+    db_path = tmp_path / "legacy-kanban.db"
+    con = sqlite3.connect(db_path)
+    con.executescript(
+        """
+        CREATE TABLE tasks (
+            id TEXT PRIMARY KEY,
+            title TEXT NOT NULL,
+            body TEXT,
+            status TEXT NOT NULL,
+            assignee TEXT,
+            tenant TEXT,
+            priority INTEGER NOT NULL DEFAULT 0,
+            created_at INTEGER NOT NULL,
+            updated_at INTEGER NOT NULL,
+            started_at INTEGER,
+            completed_at INTEGER,
+            result TEXT,
+            block_reason TEXT,
+            workspace_kind TEXT NOT NULL DEFAULT 'scratch',
+            workspace_path TEXT,
+            branch_name TEXT,
+            created_by TEXT,
+            idempotency_key TEXT,
+            claim_lock TEXT,
+            claim_expires INTEGER,
+            consecutive_failures INTEGER NOT NULL DEFAULT 0,
+            worker_pid INTEGER,
+            last_failure_error TEXT,
+            max_runtime_seconds INTEGER,
+            last_heartbeat_at INTEGER,
+            current_run_id INTEGER,
+            workflow_template_id TEXT,
+            current_step_key TEXT,
+            skills TEXT,
+            model_override TEXT,
+            max_retries INTEGER
+        );
+        INSERT INTO tasks (id, title, status, created_at, updated_at)
+        VALUES ('t_legacy', 'preserve me', 'todo', 1, 1);
+        CREATE TABLE task_links (parent_id TEXT NOT NULL, child_id TEXT NOT NULL, PRIMARY KEY (parent_id, child_id));
+        CREATE TABLE task_comments (id INTEGER PRIMARY KEY AUTOINCREMENT, task_id TEXT NOT NULL, author TEXT NOT NULL, body TEXT NOT NULL, created_at INTEGER NOT NULL);
+        CREATE TABLE task_events (id INTEGER PRIMARY KEY AUTOINCREMENT, task_id TEXT NOT NULL, run_id INTEGER, kind TEXT NOT NULL, payload TEXT, created_at INTEGER NOT NULL);
+        CREATE TABLE task_runs (id INTEGER PRIMARY KEY AUTOINCREMENT, task_id TEXT NOT NULL, profile TEXT, step_key TEXT, status TEXT NOT NULL, claim_lock TEXT, claim_expires INTEGER, worker_pid INTEGER, max_runtime_seconds INTEGER, last_heartbeat_at INTEGER, started_at INTEGER NOT NULL, ended_at INTEGER, outcome TEXT, summary TEXT, metadata TEXT, error TEXT);
+        CREATE TABLE kanban_notify_subs (id INTEGER PRIMARY KEY AUTOINCREMENT, task_id TEXT NOT NULL, discord_channel_id TEXT NOT NULL, discord_thread_id TEXT, created_by TEXT, created_at INTEGER NOT NULL, active INTEGER NOT NULL DEFAULT 1);
+        """
+    )
+    con.close()
+
+    kb._INITIALIZED_PATHS.discard(str(db_path.resolve()))
+    with kb.connect(db_path) as conn:
+        cols = {row["name"] for row in conn.execute("PRAGMA table_info(tasks)")}
+        indexes = {row["name"] for row in conn.execute("PRAGMA index_list(tasks)")}
+        title = conn.execute("SELECT title FROM tasks WHERE id='t_legacy'").fetchone()["title"]
+
+    assert "session_id" in cols
+    assert "idx_tasks_session_id" in indexes
+    assert title == "preserve me"
+
+
 def test_init_creates_expected_tables(kanban_home):
     with kb.connect() as conn:
         rows = conn.execute(
