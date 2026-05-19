@@ -11562,6 +11562,7 @@ Examples:
             "github",
             "clawhub",
             "lobehub",
+            "browse-sh",
         ],
         help="Filter by source (default: all)",
     )
@@ -11581,6 +11582,7 @@ Examples:
             "github",
             "clawhub",
             "lobehub",
+            "browse-sh",
         ],
     )
     skills_search.add_argument("--limit", type=int, default=10, help="Max results")
