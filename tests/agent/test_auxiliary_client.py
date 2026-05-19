@@ -348,6 +348,33 @@ class TestAnthropicOAuthFlag:
         assert mock_build.call_args.args[0] == "sk-ant-oat01-pooled"
 
 
+class TestMiniMaxOAuthAuxiliaryClient:
+    def test_minimax_oauth_resolves_to_anthropic_auxiliary_client(self):
+        """MiniMax OAuth auxiliary/fallback routing should use OAuth runtime creds."""
+        with (
+            patch("hermes_cli.auth.resolve_minimax_oauth_runtime_credentials", return_value={
+                "api_key": "minimax-oauth-access-token",
+                "base_url": "https://api.minimax.io/anthropic",
+                "source": "oauth",
+            }) as mock_resolve,
+            patch("agent.anthropic_adapter.build_anthropic_client", return_value=MagicMock()) as mock_build,
+        ):
+            from agent.auxiliary_client import AnthropicAuxiliaryClient
+
+            client, model = resolve_provider_client("minimax-oauth", "MiniMax-M2.7")
+
+        assert isinstance(client, AnthropicAuxiliaryClient)
+        assert model == "MiniMax-M2.7"
+        mock_resolve.assert_called_once()
+        assert mock_build.call_args.args == (
+            "minimax-oauth-access-token",
+            "https://api.minimax.io/anthropic",
+        )
+        assert client.api_key == "minimax-oauth-access-token"
+        assert client.base_url == "https://api.minimax.io/anthropic"
+        assert client.chat.completions._is_oauth is True
+
+
 class TestBuildCodexClient:
     def test_pool_without_selected_entry_falls_back_to_auth_store(self):
         with (

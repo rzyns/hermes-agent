@@ -3483,6 +3483,36 @@ def resolve_provider_client(
         logger.warning("resolve_provider_client: unknown provider %r", provider)
         return None, None
 
+    if pconfig.auth_type == "oauth_minimax":
+        try:
+            from hermes_cli.auth import resolve_minimax_oauth_runtime_credentials
+            from agent.anthropic_adapter import build_anthropic_client
+
+            creds = resolve_minimax_oauth_runtime_credentials()
+            api_key = str(creds.get("api_key", "")).strip()
+            base_url = str(creds.get("base_url", "")).strip().rstrip("/")
+            if not api_key or not base_url:
+                logger.warning(
+                    "resolve_provider_client: minimax-oauth credentials are incomplete "
+                    "(run: hermes auth add minimax-oauth)"
+                )
+                return None, None
+            default_model = _get_aux_model_for_provider(provider) or "MiniMax-M2.7-highspeed"
+            final_model = _normalize_resolved_model(model or default_model, provider) or default_model
+            real_client = build_anthropic_client(api_key, base_url)
+            client = AnthropicAuxiliaryClient(
+                real_client, final_model, api_key, base_url, is_oauth=True,
+            )
+            logger.debug("resolve_provider_client: %s (%s)", provider, final_model)
+            return (_to_async_client(client, final_model, is_vision=is_vision) if async_mode
+                    else (client, final_model))
+        except Exception as exc:
+            logger.warning(
+                "resolve_provider_client: minimax-oauth runtime credentials failed: %s",
+                exc,
+            )
+            return None, None
+
     if pconfig.auth_type == "api_key":
         if provider == "anthropic":
             client, default_model = _try_anthropic(explicit_api_key=explicit_api_key)

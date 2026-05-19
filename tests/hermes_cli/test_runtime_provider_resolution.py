@@ -199,6 +199,44 @@ def test_resolve_runtime_provider_uses_qwen_pool_entry(monkeypatch):
     assert resolved["source"] == "manual:qwen_cli"
 
 
+def test_resolve_runtime_provider_minimax_oauth_uses_refreshing_resolver_not_pool(monkeypatch):
+    """MiniMax OAuth must not use possibly stale credential-pool access tokens."""
+    class _Entry:
+        access_token = "stale-pool-minimax-token"
+        source = "oauth"
+        base_url = "https://api.minimax.io/anthropic"
+
+    class _Pool:
+        def has_credentials(self):
+            return True
+
+        def select(self):
+            return _Entry()
+
+    monkeypatch.setattr(rp, "resolve_provider", lambda *a, **k: "minimax-oauth")
+    monkeypatch.setattr(rp, "load_pool", lambda provider: _Pool())
+    monkeypatch.setattr(rp, "_get_model_config", lambda: {"provider": "minimax-oauth", "default": "MiniMax-M2.7"})
+    monkeypatch.setattr(
+        "hermes_cli.auth.resolve_minimax_oauth_runtime_credentials",
+        lambda: {
+            "provider": "minimax-oauth",
+            "base_url": "https://api.minimax.io/anthropic",
+            "api_key": "fresh-minimax-token",
+            "source": "oauth",
+        },
+    )
+
+    resolved = rp.resolve_runtime_provider(requested="minimax-oauth")
+
+    assert resolved["provider"] == "minimax-oauth"
+    assert resolved["api_mode"] == "anthropic_messages"
+    assert resolved["base_url"] == "https://api.minimax.io/anthropic"
+    assert resolved["api_key"] == "fresh-minimax-token"
+    assert resolved["source"] == "oauth"
+    assert resolved.get("credential_pool") is None
+
+
+
 def test_resolve_provider_alias_qwen(monkeypatch):
     monkeypatch.setattr(rp.auth_mod, "_load_auth_store", lambda: {})
     monkeypatch.delenv("OPENAI_API_KEY", raising=False)
@@ -2287,20 +2325,8 @@ def test_minimax_oauth_runtime_uses_inference_base_url(monkeypatch):
     assert MINIMAX_OAUTH_CN_INFERENCE.rstrip("/") in resolved["base_url"]
 
 
-def test_minimax_oauth_pool_forces_anthropic_messages_despite_stale_config(monkeypatch):
-    """A pooled MiniMax OAuth token must not inherit stale chat_completions config."""
-
-    class _Entry:
-        access_token = "oauth-token"
-        source = "manual:minimax_oauth"
-        base_url = "https://api.minimax.io/anthropic"
-
-    class _Pool:
-        def has_credentials(self):
-            return True
-
-        def select(self):
-            return _Entry()
+def test_minimax_oauth_runtime_resolver_forces_anthropic_messages_despite_stale_config(monkeypatch):
+    """MiniMax OAuth runtime credentials must not inherit stale chat_completions config."""
 
     monkeypatch.setattr(rp, "resolve_provider", lambda *a, **k: "minimax-oauth")
     monkeypatch.setattr(
@@ -2312,12 +2338,22 @@ def test_minimax_oauth_pool_forces_anthropic_messages_despite_stale_config(monke
             "api_mode": "chat_completions",
         },
     )
-    monkeypatch.setattr(rp, "load_pool", lambda provider: _Pool())
+    monkeypatch.setattr(rp, "load_pool", lambda provider: (_ for _ in ()).throw(AssertionError("pool should be skipped")))
     monkeypatch.setattr(rp, "_resolve_named_custom_runtime", lambda **k: None)
     monkeypatch.setattr(rp, "_resolve_explicit_runtime", lambda **k: None)
+    monkeypatch.setattr(
+        "hermes_cli.auth.resolve_minimax_oauth_runtime_credentials",
+        lambda: {
+            "provider": "minimax-oauth",
+            "base_url": "https://api.minimax.io/anthropic",
+            "api_key": "fresh-minimax-token",
+            "source": "oauth",
+        },
+    )
 
     resolved = rp.resolve_runtime_provider(requested="minimax-oauth")
 
     assert resolved["provider"] == "minimax-oauth"
     assert resolved["api_mode"] == "anthropic_messages"
     assert resolved["base_url"] == "https://api.minimax.io/anthropic"
+    assert resolved["api_key"] == "fresh-minimax-token"
