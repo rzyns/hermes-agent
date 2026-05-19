@@ -80,6 +80,18 @@ Through a jump box / bastion: add `-J jump-user@jump-host`.
 
 See [OAuth over SSH / Remote Hosts](./oauth-over-ssh.md) for the full step-by-step, including ProxyJump chains, mosh/tmux, and ControlMaster gotchas.
 
+### Browser-only remotes (Cloud Shell, Codespaces, EC2 Instance Connect)
+
+If you don't have a regular SSH client (e.g. you're running Hermes inside GCP Cloud Shell, GitHub Codespaces, AWS EC2 Instance Connect, Gitpod, or another browser-based console), the `ssh -L` recipe above isn't available. Use `--manual-paste` instead — Hermes skips the loopback listener and lets you paste the failed callback URL straight from your browser:
+
+```bash
+hermes auth add xai-oauth --manual-paste
+# Or via the model picker:
+hermes model --manual-paste
+```
+
+See [OAuth over SSH / Remote Hosts](./oauth-over-ssh.md#browser-only-remote-cloud-shell--codespaces--ec2-instance-connect) for the full walkthrough. Regression fix for [#26923](https://github.com/NousResearch/hermes-agent/issues/26923).
+
 ## How the Login Works
 
 1. Hermes opens your browser to `accounts.x.ai`.
@@ -152,8 +164,8 @@ If OAuth tokens are already stored, the picker confirms it and skips the credent
 The `video_gen` toolset is disabled by default. Enable it in `hermes tools` → `🎬 Video Generation` (press space) before the agent can call `video_generate`. Otherwise the agent may fall back to the bundled ComfyUI skill, which is also tagged for video generation.
 :::
 
-:::note X search is off by default
-The `x_search` toolset is disabled by default. Enable it in `hermes tools` → `🐦 X (Twitter) Search` (press space) before the agent can call `x_search`. The tool routes through xAI's built-in `x_search` Responses API — it works with **either** your SuperGrok OAuth login or a paid `XAI_API_KEY`, and prefers OAuth when both are configured (uses your subscription quota instead of API spend). The tool schema is hidden from the model when no xAI credentials are configured, regardless of whether the toolset is enabled.
+:::note X search auto-enables when xAI credentials are present
+The `x_search` toolset auto-enables whenever xAI credentials (a SuperGrok OAuth token or `XAI_API_KEY`) are configured. Disable explicitly via `hermes tools` → `🐦 X (Twitter) Search` (press space) if you don't want this. The tool routes through xAI's built-in `x_search` Responses API — it works with **either** your SuperGrok OAuth login or a paid `XAI_API_KEY`, and prefers OAuth when both are configured (uses your subscription quota instead of API spend). The tool schema is hidden from the model when no xAI credentials are configured, regardless of whether the toolset is enabled.
 :::
 
 ### Models
@@ -184,7 +196,9 @@ The chat catalog is derived live from the on-disk `models.dev` cache; new xAI re
 
 Hermes refreshes the token before each session and again reactively on a 401. If refresh fails with `invalid_grant` (the refresh token was revoked, or the account was rotated), Hermes surfaces a typed re-auth message instead of crashing.
 
-**Fix:** run `hermes auth add xai-oauth` again to start a fresh login.
+When the refresh failure is terminal (HTTP 4xx, `invalid_grant`, revoked grant, etc.), Hermes marks the refresh token as dead and quarantines it locally — subsequent calls skip the doomed refresh attempt instead of replaying the same 401 over and over. The agent surfaces a single "re-authentication required" message and stays out of the way until you log in again.
+
+**Fix:** run `hermes auth add xai-oauth` again to start a fresh login. The quarantine clears on the next successful exchange.
 
 ### Authorization timed out
 

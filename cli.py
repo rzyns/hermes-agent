@@ -1835,13 +1835,26 @@ def _cprint(text: str):
     # prompt, prints, and redraws.  Fire-and-forget — if scheduling
     # fails we fall back to a direct print so the line isn't lost.
     def _schedule():
+        # run_in_terminal() may return either:
+        #   • a coroutine / Future (prompt_toolkit ≥ 3.0) — must be scheduled
+        #     via ensure_future so the coroutine is actually awaited; calling
+        #     it bare would leave it unawaited and silently drop the output
+        #     (fixes #23185 Bug A).
+        #   • None (some mocks / older PT builds) — just call the inner
+        #     function directly since PT already executed it synchronously.
+        # Do NOT fall back to a bare _pt_print when ensure_future raises,
+        # because run_in_terminal already invoked the lambda in that case
+        # (the mock path), which would double-print the line.
         try:
-            run_in_terminal(lambda: _pt_print(_PT_ANSI(text)))
+            import asyncio as _aio
+            import inspect as _inspect
+            coro = run_in_terminal(lambda: _pt_print(_PT_ANSI(text)))
+            if coro is not None and (_inspect.isawaitable(coro) or _inspect.iscoroutine(coro)):
+                _aio.ensure_future(coro)
+            # else: run_in_terminal ran the lambda synchronously; nothing more
+            # to do (double-scheduling would print twice).
         except Exception:
-            try:
-                _pt_print(_PT_ANSI(text))
-            except Exception:
-                pass
+            pass  # best-effort; the line may already have been printed
 
     try:
         loop.call_soon_threadsafe(_schedule)
@@ -2434,8 +2447,13 @@ from agent.skill_commands import (
     build_skill_invocation_message,
     build_preloaded_skills_prompt,
 )
+from agent.skill_bundles import (
+    get_skill_bundles,
+    build_bundle_invocation_message,
+)
 
 _skill_commands = scan_skill_commands()
+_skill_bundles = get_skill_bundles()
 
 
 def _get_plugin_cmd_handler_names() -> set:
@@ -5564,6 +5582,17 @@ class HermesCLI:
                     f"    [bold {_accent_hex()}]{cmd:<22}[/] [dim]-[/] {_escape(info['description'])}"
                 )
 
+        _bundles_now = get_skill_bundles()
+        if _bundles_now:
+            _cprint(f"\n  ▣ {_BOLD}Skill Bundles{_RST} ({len(_bundles_now)} installed):")
+            for cmd, info in sorted(_bundles_now.items()):
+                skill_count = len(info.get("skills", []))
+                desc = info.get("description") or f"Load {skill_count} skills"
+                ChatConsole().print(
+                    f"    [bold {_accent_hex()}]{cmd:<22}[/] [dim]-[/] "
+                    f"{_escape(desc)} [dim]({skill_count} skills)[/]"
+                )
+
         _cprint(f"\n  {_DIM}Tip: Just type your message to chat with Hermes!{_RST}")
         _cprint(f"  {_DIM}Multi-line: Alt+Enter for a new line{_RST}")
         _cprint(f"  {_DIM}Draft editor: Ctrl+G (Alt+G in VSCode/Cursor){_RST}")
@@ -7990,6 +8019,8 @@ class HermesCLI:
         elif canonical == "reload-skills":
             with self._busy_command(self._slow_command_status(cmd_original)):
                 self._reload_skills()
+        elif canonical == "bundles":
+            self._handle_bundles_command(cmd_original)
         elif canonical == "browser":
             self._handle_browser_command(cmd_original)
         elif canonical == "plugins":
@@ -8126,6 +8157,30 @@ class HermesCLI:
                             _cprint(str(result))
                     except Exception as e:
                         _cprint(f"\033[1;31mPlugin command error: {e}{_RST}")
+            # Skill bundles take precedence over individual skills — /<bundle>
+            # loads multiple skills at once. Rescans cheaply when files change.
+            elif base_cmd in get_skill_bundles():
+                user_instruction = cmd_original[len(base_cmd):].strip()
+                bundle_result = build_bundle_invocation_message(
+                    base_cmd, user_instruction, task_id=self.session_id
+                )
+                if bundle_result:
+                    msg, loaded_names, missing = bundle_result
+                    bundle_info = get_skill_bundles()[base_cmd]
+                    print(
+                        f"\n⚡ Loading bundle: {bundle_info['name']} "
+                        f"({len(loaded_names)} skills)"
+                    )
+                    if missing:
+                        ChatConsole().print(
+                            f"[yellow]Skipped missing skills: {', '.join(missing)}[/]"
+                        )
+                    if hasattr(self, '_pending_input'):
+                        self._pending_input.put(msg)
+                else:
+                    ChatConsole().print(
+                        f"[bold red]Failed to load bundle for {base_cmd}[/]"
+                    )
             # Check for skill slash commands (/gif-search, /axolotl, etc.)
             elif base_cmd in _skill_commands:
                 user_instruction = cmd_original[len(base_cmd):].strip()
@@ -8145,7 +8200,7 @@ class HermesCLI:
                 # that execution-time resolution agrees with tab-completion.
                 from hermes_cli.commands import COMMANDS
                 typed_base = cmd_lower.split()[0]
-                all_known = set(COMMANDS) | set(_skill_commands)
+                all_known = set(COMMANDS) | set(_skill_commands) | set(get_skill_bundles())
                 matches = [c for c in all_known if c.startswith(typed_base)]
                 if len(matches) > 1:
                     # Prefer an exact match (typed the full command name)
@@ -8345,6 +8400,44 @@ class HermesCLI:
         Returns True if a launch command was executed (doesn't guarantee success).
         """
         return try_launch_chrome_debug(port, system)
+
+    def _handle_bundles_command(self, cmd: str) -> None:
+        """In-session ``/bundles`` — show installed skill bundles.
+
+        Mirrors ``hermes bundles list`` but renders inside the running
+        CLI so users can discover what's available without dropping out
+        of their session. Bundles are loaded via ``/<bundle-name>``.
+        """
+        try:
+            from agent.skill_bundles import list_bundles, _bundles_dir
+        except Exception as exc:
+            _cprint(f"\033[1;31mBundle subsystem unavailable: {exc}{_RST}")
+            return
+
+        bundles = list_bundles()
+        if not bundles:
+            _cprint("  No skill bundles installed.")
+            _cprint(
+                f"  {_DIM}Create one with: hermes bundles create "
+                f"<name> --skill <s1> --skill <s2>{_RST}"
+            )
+            _cprint(f"  {_DIM}Directory: {_bundles_dir()}{_RST}")
+            return
+
+        _cprint(f"\n  ▣ {_BOLD}Skill Bundles{_RST} ({len(bundles)} installed):")
+        for info in bundles:
+            skill_count = len(info.get("skills", []))
+            desc = info.get("description") or f"Load {skill_count} skills"
+            ChatConsole().print(
+                f"    [bold {_accent_hex()}]/{info['slug']:<20}[/] "
+                f"[dim]-[/] {_escape(desc)} [dim]({skill_count} skills)[/]"
+            )
+            for s in info.get("skills", []):
+                ChatConsole().print(f"        [dim]· {_escape(s)}[/]")
+        _cprint(
+            f"\n  {_DIM}Invoke a bundle with /<slug>. "
+            f"Manage with `hermes bundles`.{_RST}"
+        )
 
     def _handle_browser_command(self, cmd: str):
         """Handle /browser connect|disconnect|status — manage live Chrome CDP connection."""
@@ -12769,6 +12862,7 @@ class HermesCLI:
         _completer = SlashCommandCompleter(
             skill_commands_provider=lambda: get_skill_commands(),
             command_filter=cli_ref._command_available,
+            skill_bundles_provider=lambda: get_skill_bundles(),
         )
         input_area = TextArea(
             height=Dimension(min=1, max=8, preferred=1),
@@ -13813,7 +13907,31 @@ class HermesCLI:
                         time.sleep(_grace)
             except Exception:
                 pass  # never block signal handling
-            raise KeyboardInterrupt()
+            # Prefer a clean prompt_toolkit exit over `raise KeyboardInterrupt()`.
+            # Raising KBI from a signal handler unwinds into whatever Python
+            # frame the interpreter happens to be running — typically an
+            # `await asyncio.sleep()` inside prompt_toolkit's
+            # `_poll_output_size` coroutine.  The KBI becomes a Task
+            # exception, prompt_toolkit's `_handle_exception` prints
+            # "Unhandled exception in event loop" + the full traceback, and
+            # parks the terminal on "Press ENTER to continue..." (#13710
+            # variant — same root cause, different surface).
+            #
+            # `app.exit()` scheduled via `call_soon_threadsafe` lets the
+            # event loop unwind normally; `app.run()` returns and our
+            # existing `except (EOFError, KeyboardInterrupt, BrokenPipeError)`
+            # block at the bottom of the input loop handles the rest.
+            try:
+                from prompt_toolkit.application.current import get_app_or_none
+                _app = get_app_or_none()
+                if _app is not None:
+                    _loop = getattr(_app, "loop", None)
+                    if _loop is not None:
+                        _loop.call_soon_threadsafe(_app.exit)
+                        return  # clean unwind — no traceback, no ENTER pause
+            except Exception:
+                pass
+            raise KeyboardInterrupt()  # fallback for non-prompt_toolkit contexts
         
         try:
             import signal as _signal
