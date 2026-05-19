@@ -3474,7 +3474,7 @@ class GatewayRunner:
             from hermes_cli.plugins import discover_plugins
             discover_plugins()
         except Exception:
-            logger.debug(
+            logger.warning(
                 "plugin discovery failed at gateway startup", exc_info=True,
             )
 
@@ -4680,7 +4680,7 @@ class GatewayRunner:
         if not candidates:
             return
 
-        _IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp", ".tiff", ".svg"}
+        _IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".gif", ".webp"}
         _VIDEO_EXTS = {".mp4", ".mov", ".avi", ".mkv", ".webm", ".3gp"}
 
         from urllib.parse import quote as _quote
@@ -10592,7 +10592,11 @@ class GatewayRunner:
             result_json = await asyncio.to_thread(
                 text_to_speech_tool, text=tts_text, output_path=audio_path
             )
-            result = json.loads(result_json)
+            try:
+                result = json.loads(result_json)
+            except (json.JSONDecodeError, TypeError):
+                logger.warning("Auto voice reply TTS returned invalid JSON: %s", result_json[:200] if result_json else result_json)
+                return
 
             # Use the actual file path from result (may differ after opus conversion)
             actual_path = result.get("file_path", audio_path)
@@ -15059,7 +15063,7 @@ class GatewayRunner:
         ) if _progress_thread_id else None
         _progress_reply_to = (
             event_message_id
-            if source.platform == Platform.FEISHU and source.thread_id and event_message_id
+            if source.platform in (Platform.FEISHU, Platform.MATTERMOST) and source.thread_id and event_message_id
             else None
         )
 
@@ -15774,7 +15778,14 @@ class GatewayRunner:
                 if _hm.get("role") in {"tool", "function"}:
                     _hc = _hm.get("content", "")
                     if "MEDIA:" in _hc:
-                        for _match in re.finditer(r'MEDIA:(\S+)', _hc):
+                        _TOOL_MEDIA_RE = re.compile(
+                            r'MEDIA:((?:/|~\/)\S+\.(?:png|jpe?g|gif|webp|'
+                            r'mp4|mov|avi|mkv|webm|ogg|opus|mp3|wav|m4a|'
+                            r'flac|epub|pdf|zip|rar|7z|docx?|xlsx?|pptx?|'
+                            r'txt|csv|apk|ipa))',
+                            re.IGNORECASE
+                        )
+                        for _match in _TOOL_MEDIA_RE.finditer(_hc):
                             _p = _match.group(1).strip().rstrip('",}')
                             if _p:
                                 _history_media_paths.add(_p)
@@ -16063,7 +16074,14 @@ class GatewayRunner:
                     if msg.get("role") in {"tool", "function"}:
                         content = msg.get("content", "")
                         if "MEDIA:" in content:
-                            for match in re.finditer(r'MEDIA:(\S+)', content):
+                            _TOOL_MEDIA_RE = re.compile(
+                                r'MEDIA:((?:/|~\/)\S+\.(?:png|jpe?g|gif|webp|'
+                                r'mp4|mov|avi|mkv|webm|ogg|opus|mp3|wav|m4a|'
+                                r'flac|epub|pdf|zip|rar|7z|docx?|xlsx?|pptx?|'
+                                r'txt|csv|apk|ipa))',
+                                re.IGNORECASE
+                            )
+                            for match in _TOOL_MEDIA_RE.finditer(content):
                                 path = match.group(1).strip().rstrip('",}')
                                 if path and path not in _history_media_paths:
                                     media_tags.append(f"MEDIA:{path}")
@@ -17345,6 +17363,19 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
             "request) so systemd Restart=on-failure can revive the gateway."
         )
         return False  # → sys.exit(1) in the caller
+
+    # When the gateway is restarting via the service manager (SIGUSR1 →
+    # launchd_restart or /restart / /update commands), exit with code 75 so
+    # that launchd's ``KeepAlive → SuccessfulExit → false`` policy treats
+    # the exit as *unsuccessful* and relaunches the service.  This mirrors
+    # the systemd ``RestartForceExitStatus=75`` convention already used by
+    # the systemd unit template.
+    if runner._restart_via_service:
+        logger.info(
+            "Exiting with code 75 (service-restart requested) so "
+            "launchd KeepAlive relaunches the gateway."
+        )
+        raise SystemExit(75)
 
     return True
 

@@ -3443,12 +3443,34 @@ def refresh_xai_oauth_pure(
         )
     if response.status_code != 200:
         detail = response.text.strip()
+        # ``403`` from xAI's token endpoint is almost always a tier /
+        # entitlement gate (the OAuth grant exists but the account isn't
+        # on the allowlist for API access).  Re-running ``hermes model``
+        # won't fix that — surface a separate error code so
+        # ``format_auth_error`` doesn't append a misleading
+        # re-authenticate hint, and point users at the ``XAI_API_KEY``
+        # fallback.  See #26847.
+        if response.status_code == 403:
+            raise AuthError(
+                "xAI token refresh failed with HTTP 403."
+                + (f" Response: {detail}" if detail else "")
+                + " This OAuth account is not authorized for xAI API"
+                  " access — xAI may be restricting API/OAuth use to"
+                  " specific SuperGrok tiers despite the in-app"
+                  " subscription being active. Re-logging in won't"
+                  " change that; set ``XAI_API_KEY`` and switch to"
+                  " ``provider: xai`` (API-key path) if available, or"
+                  " upgrade your subscription at https://x.ai/grok.",
+                provider="xai-oauth",
+                code="xai_oauth_tier_denied",
+                relogin_required=False,
+            )
         raise AuthError(
             "xAI token refresh failed."
             + (f" Response: {detail}" if detail else ""),
             provider="xai-oauth",
             code="xai_refresh_failed",
-            relogin_required=(response.status_code in {400, 401, 403}),
+            relogin_required=(response.status_code in {400, 401}),
         )
     try:
         payload = response.json()
@@ -3546,13 +3568,41 @@ def resolve_xai_oauth_runtime_credentials(
             if should_refresh:
                 if not token_endpoint:
                     token_endpoint = _xai_oauth_discovery(refresh_timeout_seconds)["token_endpoint"]
-                tokens = _refresh_xai_oauth_tokens(
-                    tokens,
-                    token_endpoint=token_endpoint,
-                    redirect_uri=redirect_uri,
-                    timeout_seconds=refresh_timeout_seconds,
-                )
-                access_token = str(tokens.get("access_token", "") or "").strip()
+                try:
+                    tokens = _refresh_xai_oauth_tokens(
+                        tokens,
+                        token_endpoint=token_endpoint,
+                        redirect_uri=redirect_uri,
+                        timeout_seconds=refresh_timeout_seconds,
+                    )
+                    access_token = str(tokens.get("access_token", "") or "").strip()
+                except AuthError as exc:
+                    if _is_terminal_xai_oauth_refresh_error(exc):
+                        # Terminal failure (HTTP 400/401/403 — invalid_grant, token revoked).
+                        # Clear dead tokens from auth.json so subsequent sessions fail fast
+                        # without a network retry. Mirrors credential_pool.py quarantine.
+                        try:
+                            _q_store = _load_auth_store()
+                            _q_state = _load_provider_state(_q_store, "xai-oauth") or {}
+                            _q_tokens = dict(_q_state.get("tokens") or {})
+                            _q_tokens.pop("access_token", None)
+                            _q_tokens.pop("refresh_token", None)
+                            _q_state["tokens"] = _q_tokens
+                            _q_state["last_auth_error"] = {
+                                "provider": "xai-oauth",
+                                "code": exc.code or "xai_refresh_failed",
+                                "message": str(exc),
+                                "reason": "runtime_refresh_failure",
+                                "relogin_required": True,
+                                "at": datetime.now(timezone.utc).isoformat(),
+                            }
+                            _store_provider_state(_q_store, "xai-oauth", _q_state, set_active=False)
+                            _save_auth_store(_q_store)
+                        except Exception as _save_exc:
+                            logger.debug(
+                                "xAI OAuth: failed to persist quarantined state: %s", _save_exc,
+                            )
+                    raise
 
     base_url = (
         os.getenv("HERMES_XAI_BASE_URL", "").strip().rstrip("/")
@@ -6197,6 +6247,25 @@ def _xai_oauth_exchange_code_for_tokens(
 
     if response.status_code != 200:
         body = response.text.strip()
+        # See ``refresh_xai_oauth_pure`` — token-exchange 403 also
+        # surfaces tier/entitlement gating from xAI's backend.  Avoid
+        # the misleading "re-authenticate" hint and point at the API
+        # key fallback.  See #26847.
+        if response.status_code == 403:
+            raise AuthError(
+                f"xAI token exchange failed (HTTP 403)."
+                + (f" Response: {body}" if body else "")
+                + " This OAuth account is not authorized for xAI API"
+                  " access — xAI may be restricting API/OAuth use to"
+                  " specific SuperGrok tiers despite the in-app"
+                  " subscription being active. Set ``XAI_API_KEY``"
+                  " and switch to ``provider: xai`` (API-key path) if"
+                  " available, or upgrade your subscription at"
+                  " https://x.ai/grok.",
+                provider="xai-oauth",
+                code="xai_oauth_tier_denied",
+                relogin_required=False,
+            )
         raise AuthError(
             f"xAI token exchange failed (HTTP {response.status_code})."
             + (f" Response: {body}" if body else ""),
