@@ -1,0 +1,506 @@
+"""Expanded Surface B validator tests covering the negative case matrix.
+
+Strict TDD — each test is a single behavior.
+"""
+from __future__ import annotations
+
+import hashlib
+import json
+import subprocess
+import sys
+from pathlib import Path
+
+import pytest
+
+
+@pytest.fixture
+def hermes_main():
+    """Path to repo root for subprocess invocation."""
+    return Path(__file__).resolve().parents[2]
+
+
+def _canonical_bundle_id(data: dict) -> str:
+    """Compute correct canonical bundle ID for a manifest dict."""
+    bundle_identity_input = {k: v for k, v in data.items() if k != "bundle_id"}
+    canonical = json.dumps(bundle_identity_input, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+    return f"sha256:{hashlib.sha256(canonical.encode('utf-8')).hexdigest()}"
+
+
+def _make_manifest(**overrides) -> dict:
+    """Return a minimal valid Surface B manifest."""
+    m = {
+        "manifest_version": "hgk.surface_b.manifest.v1",
+        "schema_identity": {
+            "schema_name": "test-fixture-schema",
+            "schema_version": "1.0.0",
+            "schema_hash": "sha256:0000000000000000000000000000000000000000000000000000000000000000",
+            "policy_bundle_version": "1.0.0",
+            "policy_bundle_hash": "sha256:0000000000000000000000000000000000000000000000000000000000000000",
+        },
+        "bundle_id": "sha256:PLACEHOLDER",
+        "task_id": "t_test_fixture_001",
+        "run_id": 1,
+        "task_status": "done",
+        "run_status": "completed",
+        "run_outcome": "completed",
+        "workspace_identity": {
+            "workspace_kind": "scratch",
+            "workspace_path_class": "tmp_fixture",
+            "base_sha": "not_applicable",
+        },
+        "artifact_refs": [],
+        "collector_identity": {"name": "test-collector", "version": "0.0.0"},
+        "collection_started_at": "2026-05-20T00:00:00Z",
+        "collection_finished_at": "2026-05-20T00:00:01Z",
+        "source_vocabulary": {
+            "table_name": "test-vocab",
+            "table_hash": "sha256:0000000000000000000000000000000000000000000000000000000000000000",
+        },
+        "redaction_state": "raw_only",
+        "authority_class": "diagnostic",
+        "non_authorizations": ["no_live_db_reads"],
+        "board_identity": {
+            "board_slug": "test-board",
+            "tenant": None,
+            "kanban_db_identity": {
+                "db_path_class": "fixture_db",
+                "db_identity_sentinel": "live_db_not_read_surface_b_design_only",
+            },
+            "identity_source": "manifest_fixture",
+            "identity_source_hash": "sha256:0000000000000000000000000000000000000000000000000000000000000000",
+        },
+    }
+    m.update(overrides)
+    m["bundle_id"] = _canonical_bundle_id(m)
+    return m
+
+
+def _write_manifest(tmp_path: Path, **overrides) -> Path:
+    """Write a minimal valid manifest fixture to a temp file."""
+    fixture = tmp_path / "manifest.json"
+    fixture.write_text(json.dumps(_make_manifest(**overrides), indent=2))
+    return fixture
+
+
+def _write_schema(tmp_path: Path) -> Path:
+    fixture = tmp_path / "schema.json"
+    fixture.write_text(
+        json.dumps(
+            {
+                "schema_name": "test-fixture-schema",
+                "schema_version": "1.0.0",
+                "schema_hash": "sha256:0000000000000000000000000000000000000000000000000000000000000000",
+            },
+            indent=2,
+        )
+    )
+    return fixture
+
+
+def _run_validate_manifest(tmp_path: Path, hermes_main: Path, manifest: Path, schema: Path | None = None) -> subprocess.CompletedProcess:
+    out_dir = tmp_path / "out"
+    cmd = [
+        sys.executable, "-m", "hermes_cli.main",
+        "governance", "validate-manifest",
+        "--manifest", str(manifest),
+        "--output-dir", str(out_dir),
+    ]
+    if schema is not None:
+        cmd += ["--schema", str(schema)]
+    return subprocess.run(cmd, capture_output=True, text=True, cwd=str(hermes_main))
+
+
+# ---------------------------------------------------------------------------
+# Requirement 4: schema expectations (required fields)
+# ---------------------------------------------------------------------------
+class TestSurfaceBRequiredFields:
+    def test_missing_manifest_version_fails(self, tmp_path, hermes_main):
+        m = _make_manifest()
+        del m["manifest_version"]
+        m["bundle_id"] = _canonical_bundle_id(m)
+        manifest = tmp_path / "manifest.json"
+        manifest.write_text(json.dumps(m, indent=2))
+        result = _run_validate_manifest(tmp_path, hermes_main, manifest)
+        assert result.returncode == 10
+        report = json.loads((tmp_path / "out" / "validation_report.json").read_text())
+        assert any("missing_required_fields" in e for e in report["errors"])
+
+    def test_missing_board_identity_fails(self, tmp_path, hermes_main):
+        m = _make_manifest()
+        del m["board_identity"]
+        m["bundle_id"] = _canonical_bundle_id(m)
+        manifest = tmp_path / "manifest.json"
+        manifest.write_text(json.dumps(m, indent=2))
+        result = _run_validate_manifest(tmp_path, hermes_main, manifest)
+        assert result.returncode == 10
+        report = json.loads((tmp_path / "out" / "validation_report.json").read_text())
+        assert any("missing_required_fields" in e for e in report["errors"])
+
+
+# ---------------------------------------------------------------------------
+# Requirement 5: bundle_id canonicalization
+# ---------------------------------------------------------------------------
+class TestSurfaceBBundleId:
+    def test_random_uuid_bundle_id_fails(self, tmp_path, hermes_main):
+        m = _make_manifest()
+        m["bundle_id"] = "uuid:123e4567-e89b-12d3-a456-426614174000"
+        manifest = tmp_path / "manifest.json"
+        manifest.write_text(json.dumps(m, indent=2))
+        result = _run_validate_manifest(tmp_path, hermes_main, manifest)
+        assert result.returncode == 10
+        report = json.loads((tmp_path / "out" / "validation_report.json").read_text())
+        assert any("bundle_id_not_canonical" in e for e in report["errors"])
+
+    def test_wrong_canonical_bundle_id_fails(self, tmp_path, hermes_main):
+        m = _make_manifest()
+        m["bundle_id"] = "sha256:0000000000000000000000000000000000000000000000000000000000000000"
+        manifest = tmp_path / "manifest.json"
+        manifest.write_text(json.dumps(m, indent=2))
+        result = _run_validate_manifest(tmp_path, hermes_main, manifest)
+        assert result.returncode == 10
+        report = json.loads((tmp_path / "out" / "validation_report.json").read_text())
+        assert any("bundle_canonicalization_invalid" in e for e in report["errors"])
+
+
+# ---------------------------------------------------------------------------
+# Requirement 6: board/tenant identity
+# ---------------------------------------------------------------------------
+class TestSurfaceBBoardIdentity:
+    def test_missing_board_slug_fails(self, tmp_path, hermes_main):
+        m = _make_manifest()
+        m["board_identity"] = {
+            "tenant": None,
+            "kanban_db_identity": {},
+            "identity_source": "fixture",
+            "identity_source_hash": "sha256:0",
+        }
+        m["bundle_id"] = _canonical_bundle_id(m)
+        manifest = tmp_path / "manifest.json"
+        manifest.write_text(json.dumps(m, indent=2))
+        result = _run_validate_manifest(tmp_path, hermes_main, manifest)
+        assert result.returncode == 10
+        report = json.loads((tmp_path / "out" / "validation_report.json").read_text())
+        assert any("namespace.identity_missing" in e for e in report["errors"])
+
+    def test_tenant_mismatch_not_checked_in_local_validator(self, tmp_path, hermes_main):
+        """Local validator does not have an expected tenant to compare; it only checks presence."""
+        m = _make_manifest()
+        m["board_identity"]["tenant"] = "some_tenant"
+        m["bundle_id"] = _canonical_bundle_id(m)
+        manifest = tmp_path / "manifest.json"
+        manifest.write_text(json.dumps(m, indent=2))
+        result = _run_validate_manifest(tmp_path, hermes_main, manifest)
+        assert result.returncode == 0
+
+
+# ---------------------------------------------------------------------------
+# Requirement 7: redaction and authority class
+# ---------------------------------------------------------------------------
+class TestSurfaceBRedactionAuthority:
+    def test_invalid_redaction_state_fails(self, tmp_path, hermes_main):
+        m = _make_manifest()
+        m["redaction_state"] = "maybe"
+        m["bundle_id"] = _canonical_bundle_id(m)
+        manifest = tmp_path / "manifest.json"
+        manifest.write_text(json.dumps(m, indent=2))
+        result = _run_validate_manifest(tmp_path, hermes_main, manifest)
+        assert result.returncode == 10
+        report = json.loads((tmp_path / "out" / "validation_report.json").read_text())
+        assert any("redaction_state_invalid" in e for e in report["errors"])
+
+    def test_authoritative_decision_fails(self, tmp_path, hermes_main):
+        m = _make_manifest()
+        m["authority_class"] = "authoritative_decision"
+        m["bundle_id"] = _canonical_bundle_id(m)
+        manifest = tmp_path / "manifest.json"
+        manifest.write_text(json.dumps(m, indent=2))
+        result = _run_validate_manifest(tmp_path, hermes_main, manifest)
+        assert result.returncode == 10
+        report = json.loads((tmp_path / "out" / "validation_report.json").read_text())
+        assert any("authority_not_authorized_for_surface" in e for e in report["errors"])
+
+    def test_invalid_authority_class_fails(self, tmp_path, hermes_main):
+        m = _make_manifest()
+        m["authority_class"] = "wizard"
+        m["bundle_id"] = _canonical_bundle_id(m)
+        manifest = tmp_path / "manifest.json"
+        manifest.write_text(json.dumps(m, indent=2))
+        result = _run_validate_manifest(tmp_path, hermes_main, manifest)
+        assert result.returncode == 10
+        report = json.loads((tmp_path / "out" / "validation_report.json").read_text())
+        assert any("authority_class_invalid" in e for e in report["errors"])
+
+
+# ---------------------------------------------------------------------------
+# Requirement 8: schema identity against trusted local schema
+# ---------------------------------------------------------------------------
+class TestSurfaceBSchemaIdentity:
+    def test_schema_mismatch_fails(self, tmp_path, hermes_main):
+        schema = _write_schema(tmp_path)
+        m = _make_manifest()
+        m["schema_identity"]["schema_hash"] = "sha256:FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF"
+        m["bundle_id"] = _canonical_bundle_id(m)
+        manifest = tmp_path / "manifest.json"
+        manifest.write_text(json.dumps(m, indent=2))
+        result = _run_validate_manifest(tmp_path, hermes_main, manifest, schema)
+        assert result.returncode == 10
+        report = json.loads((tmp_path / "out" / "validation_report.json").read_text())
+        assert any("schema_identity_mismatch" in e for e in report["errors"])
+
+    def test_schema_match_passes(self, tmp_path, hermes_main):
+        schema = _write_schema(tmp_path)
+        manifest = _write_manifest(tmp_path)
+        result = _run_validate_manifest(tmp_path, hermes_main, manifest, schema)
+        assert result.returncode == 0
+
+
+# ---------------------------------------------------------------------------
+# Requirement 9: denylisted paths fail closed
+# ---------------------------------------------------------------------------
+class TestSurfaceBDenylistedPaths:
+    def test_denylisted_env_path_fails(self, tmp_path, hermes_main):
+        m = _make_manifest()
+        m["artifact_refs"] = [
+            {
+                "artifact_id": "a1",
+                "artifact_type": "raw_snapshot",
+                "authority_class": "diagnostic",
+                "path": str(tmp_path / "secret.env"),
+                "sha256": "0" * 64,
+                "size": 0,
+                "redaction_state": "raw_only",
+            }
+        ]
+        m["bundle_id"] = _canonical_bundle_id(m)
+        manifest = tmp_path / "manifest.json"
+        manifest.write_text(json.dumps(m, indent=2))
+        result = _run_validate_manifest(tmp_path, hermes_main, manifest)
+        assert result.returncode == 10
+        report = json.loads((tmp_path / "out" / "validation_report.json").read_text())
+        assert any("read_boundary_denylisted_path" in e for e in report["errors"])
+
+    def test_traversal_in_path_fails(self, tmp_path, hermes_main):
+        m = _make_manifest()
+        m["artifact_refs"] = [
+            {
+                "artifact_id": "a1",
+                "artifact_type": "raw_snapshot",
+                "authority_class": "diagnostic",
+                "path": str(tmp_path / ".." / "etc" / "passwd"),
+                "sha256": "0" * 64,
+                "size": 0,
+                "redaction_state": "raw_only",
+            }
+        ]
+        m["bundle_id"] = _canonical_bundle_id(m)
+        manifest = tmp_path / "manifest.json"
+        manifest.write_text(json.dumps(m, indent=2))
+        result = _run_validate_manifest(tmp_path, hermes_main, manifest)
+        assert result.returncode == 10
+        report = json.loads((tmp_path / "out" / "validation_report.json").read_text())
+        assert any("traversal_in_path" in e for e in report["errors"])
+
+
+# ---------------------------------------------------------------------------
+# Requirement 10: artifact ref conflicts
+# ---------------------------------------------------------------------------
+class TestSurfaceBArtifactRefConflicts:
+    def test_duplicate_artifact_id_fails(self, tmp_path, hermes_main):
+        m = _make_manifest()
+        m["artifact_refs"] = [
+            {
+                "artifact_id": "a1",
+                "artifact_type": "raw_snapshot",
+                "authority_class": "diagnostic",
+                "path": str(tmp_path / "file1.txt"),
+                "sha256": "0" * 64,
+                "size": 0,
+                "redaction_state": "raw_only",
+            },
+            {
+                "artifact_id": "a1",
+                "artifact_type": "raw_snapshot",
+                "authority_class": "diagnostic",
+                "path": str(tmp_path / "file2.txt"),
+                "sha256": "1" * 64,
+                "size": 0,
+                "redaction_state": "raw_only",
+            },
+        ]
+        m["bundle_id"] = _canonical_bundle_id(m)
+        manifest = tmp_path / "manifest.json"
+        manifest.write_text(json.dumps(m, indent=2))
+        result = _run_validate_manifest(tmp_path, hermes_main, manifest)
+        assert result.returncode == 10
+        report = json.loads((tmp_path / "out" / "validation_report.json").read_text())
+        assert any("artifact_ref_duplicate_id" in e for e in report["errors"])
+
+    def test_conflicting_hash_same_path_fails(self, tmp_path, hermes_main):
+        m = _make_manifest()
+        m["artifact_refs"] = [
+            {
+                "artifact_id": "a1",
+                "artifact_type": "raw_snapshot",
+                "authority_class": "diagnostic",
+                "path": str(tmp_path / "file.txt"),
+                "sha256": "0" * 64,
+                "size": 0,
+                "redaction_state": "raw_only",
+            },
+            {
+                "artifact_id": "a2",
+                "artifact_type": "raw_snapshot",
+                "authority_class": "diagnostic",
+                "path": str(tmp_path / "file.txt"),
+                "sha256": "1" * 64,
+                "size": 0,
+                "redaction_state": "raw_only",
+            },
+        ]
+        m["bundle_id"] = _canonical_bundle_id(m)
+        manifest = tmp_path / "manifest.json"
+        manifest.write_text(json.dumps(m, indent=2))
+        result = _run_validate_manifest(tmp_path, hermes_main, manifest)
+        assert result.returncode == 10
+        report = json.loads((tmp_path / "out" / "validation_report.json").read_text())
+        assert any("artifact_ref_conflicting_hash" in e for e in report["errors"])
+
+
+# ---------------------------------------------------------------------------
+# Requirement 11: explicit referenced file existence and hash verification
+# ---------------------------------------------------------------------------
+class TestSurfaceBArtifactHashVerification:
+    def test_missing_referenced_file_fails(self, tmp_path, hermes_main):
+        m = _make_manifest()
+        m["artifact_refs"] = [
+            {
+                "artifact_id": "a1",
+                "artifact_type": "raw_snapshot",
+                "authority_class": "diagnostic",
+                "path": str(tmp_path / "missing.txt"),
+                "sha256": "0" * 64,
+                "size": 0,
+                "redaction_state": "raw_only",
+            }
+        ]
+        m["bundle_id"] = _canonical_bundle_id(m)
+        manifest = tmp_path / "manifest.json"
+        manifest.write_text(json.dumps(m, indent=2))
+        result = _run_validate_manifest(tmp_path, hermes_main, manifest)
+        assert result.returncode == 10
+        report = json.loads((tmp_path / "out" / "validation_report.json").read_text())
+        assert any("artifact_missing" in e for e in report["errors"])
+
+    def test_stale_hash_mismatch_fails(self, tmp_path, hermes_main):
+        f = tmp_path / "test.txt"
+        f.write_text("actual content")
+        m = _make_manifest()
+        m["artifact_refs"] = [
+            {
+                "artifact_id": "a1",
+                "artifact_type": "raw_snapshot",
+                "authority_class": "diagnostic",
+                "path": str(f),
+                "sha256": "0" * 64,
+                "size": len(b"actual content"),
+                "redaction_state": "raw_only",
+            }
+        ]
+        m["bundle_id"] = _canonical_bundle_id(m)
+        manifest = tmp_path / "manifest.json"
+        manifest.write_text(json.dumps(m, indent=2))
+        result = _run_validate_manifest(tmp_path, hermes_main, manifest)
+        assert result.returncode == 10
+        report = json.loads((tmp_path / "out" / "validation_report.json").read_text())
+        assert any("stale_manifest.artifact_hash_mismatch" in e for e in report["errors"])
+
+    def test_matching_hash_passes(self, tmp_path, hermes_main):
+        f = tmp_path / "test.txt"
+        content = b"actual content"
+        f.write_bytes(content)
+        expected_hash = hashlib.sha256(content).hexdigest()
+        m = _make_manifest()
+        m["artifact_refs"] = [
+            {
+                "artifact_id": "a1",
+                "artifact_type": "raw_snapshot",
+                "authority_class": "diagnostic",
+                "path": str(f),
+                "sha256": expected_hash,
+                "size": len(content),
+                "redaction_state": "raw_only",
+            }
+        ]
+        m["bundle_id"] = _canonical_bundle_id(m)
+        manifest = tmp_path / "manifest.json"
+        manifest.write_text(json.dumps(m, indent=2))
+        result = _run_validate_manifest(tmp_path, hermes_main, manifest)
+        assert result.returncode == 0
+        report = json.loads((tmp_path / "out" / "validation_report.json").read_text())
+        assert report["valid"] is True
+
+
+# ---------------------------------------------------------------------------
+# Requirement 12: consumer-safe report (raw paths not exposed in report)
+# ---------------------------------------------------------------------------
+class TestSurfaceBConsumerSafeReport:
+    def test_report_no_raw_paths(self, tmp_path, hermes_main):
+        f = tmp_path / "test.txt"
+        f.write_text("content")
+        m = _make_manifest()
+        m["artifact_refs"] = [
+            {
+                "artifact_id": "a1",
+                "artifact_type": "raw_snapshot",
+                "authority_class": "diagnostic",
+                "path": str(f),
+                "sha256": "0" * 64,
+                "size": 7,
+                "redaction_state": "raw_only",
+            }
+        ]
+        m["bundle_id"] = _canonical_bundle_id(m)
+        manifest = tmp_path / "manifest.json"
+        manifest.write_text(json.dumps(m, indent=2))
+        result = _run_validate_manifest(tmp_path, hermes_main, manifest)
+        assert result.returncode == 10
+        report = json.loads((tmp_path / "out" / "validation_report.json").read_text())
+        # Ensure raw artifact path is not directly exposed in report
+        raw_report = (tmp_path / "out" / "validation_report.json").read_text()
+        assert str(f) not in raw_report
+
+    def test_report_is_diagnostic(self, tmp_path, hermes_main):
+        manifest = _write_manifest(tmp_path)
+        result = _run_validate_manifest(tmp_path, hermes_main, manifest)
+        assert result.returncode == 0
+        report = json.loads((tmp_path / "out" / "validation_report.json").read_text())
+        assert report["authority_class"] == "diagnostic"
+        assert report["authorization"] is False
+
+
+# ---------------------------------------------------------------------------
+# Requirement 13: manifest file error handling
+# ---------------------------------------------------------------------------
+class TestSurfaceBManifestErrors:
+    def test_missing_manifest_file_returns_schema_mismatch(self, tmp_path, hermes_main):
+        missing = tmp_path / "no_manifest.json"
+        result = _run_validate_manifest(tmp_path, hermes_main, missing)
+        assert result.returncode == 20
+        report = json.loads((tmp_path / "out" / "validation_report.json").read_text())
+        assert report["valid"] is False
+
+    def test_malformed_manifest_returns_schema_mismatch(self, tmp_path, hermes_main):
+        bad = tmp_path / "bad.json"
+        bad.write_text("not json")
+        result = _run_validate_manifest(tmp_path, hermes_main, bad)
+        assert result.returncode == 20
+        report = json.loads((tmp_path / "out" / "validation_report.json").read_text())
+        assert any("manifest_malformed" in e or "manifest_malformed" in str(report["errors"]) for e in report["errors"])
+
+    def test_non_object_manifest_returns_schema_mismatch(self, tmp_path, hermes_main):
+        arr = tmp_path / "arr.json"
+        arr.write_text("[]")
+        result = _run_validate_manifest(tmp_path, hermes_main, arr)
+        assert result.returncode == 20
+        report = json.loads((tmp_path / "out" / "validation_report.json").read_text())
+        assert any("manifest_not_an_object" in e for e in report["errors"])
