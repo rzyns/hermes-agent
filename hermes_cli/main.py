@@ -6162,6 +6162,14 @@ def cmd_slack(args):
     return 1
 
 
+
+def cmd_governance(args):
+    """Governance evaluation (dry-run/report-only)."""
+    from hermes_cli.governance import governance_command
+
+    return governance_command(args)
+
+
 def cmd_kanban(args):
     """Multi-profile collaboration board."""
     from hermes_cli.kanban import kanban_command
@@ -12100,10 +12108,19 @@ def main():
     webhook_parser.set_defaults(func=cmd_webhook)
 
     # =========================================================================
+    # =========================================================================
     # portal command — Nous Portal status + Tool Gateway routing
     # =========================================================================
     from hermes_cli.portal_cli import add_parser as _add_portal_parser
     _add_portal_parser(subparsers)
+
+    # =========================================================================
+    # governance command — governance evaluation (dry-run/report-only)
+    # =========================================================================
+    from hermes_cli.governance import build_parser as _build_governance_parser
+
+    governance_parser = _build_governance_parser(subparsers)
+    governance_parser.set_defaults(func=cmd_governance)
 
     # =========================================================================
     # kanban command — multi-profile collaboration board
@@ -14145,7 +14162,9 @@ Examples:
 
     # Execute the command
     if hasattr(args, "func"):
-        args.func(args)
+        ret = args.func(args)
+        if isinstance(ret, int):
+            sys.exit(ret)
     else:
         parser.print_help()
 
