@@ -99,6 +99,25 @@ kanban_complete(
 
 Shape `metadata` so downstream parsers (reviewers, aggregators, schedulers) can use it without re-reading your prose.
 
+## Deliverable files in `kanban_complete`
+
+When your task produces human-consumable files — reports, charts, screenshots, rendered HTML/PDF, spreadsheets, audio/video, archives, JSON/YAML/CSV exports, or other final deliverables — attach them directly to completion:
+
+```python
+kanban_complete(
+    summary="rendered the comparison chart and packet",
+    artifacts=[
+        "/tmp/q3-revenue.png",
+        "/home/openclaw/.hermes/artifacts/project/report.pdf",
+    ],
+    metadata={"artifact_count": 2},
+)
+```
+
+Use `artifacts=[...]` for final deliverables the human should receive with the completion notification. The paths must be absolute and must exist on disk when the notifier runs; missing files are silently skipped. Do not attach transient scratch files, source files, logs, secrets, or files that merely support your internal reasoning. If the file is evidence rather than a deliverable, keep it as a compact metadata/comment path with checksum instead of uploading it by default.
+
+For evidence-heavy tasks, include compact proof pointers rather than raw dumps. Preferred keys: `evidence_bundle`, `raw_transcript`, `claim_ledger`, `commands_run`, `artifacts` with checksums, and `cleanup_verification` when runtime processes, listeners, installs, or generated artifacts were involved. Complete only from fresh evidence you personally verified in the current run; if a completion claim has no proof object, remove it, downgrade it to an assumption, or block. See `agent-qa-gates` → `references/hermes-native-evidence-bundles.md` for the full Evidence Bundle Gate.
+
 ## Claiming cards you actually created
 
 If your run produced new kanban tasks (via `kanban_create`), pass the ids in `created_cards` on `kanban_complete`. The kernel verifies each id exists and was created by your profile; any phantom id blocks the completion with an error listing what went wrong, and the rejected attempt is permanently recorded on the task's event log. **Only list ids you captured from a successful `kanban_create` return value — never invent ids from prose, never paste ids from earlier runs, never claim cards another worker created.**

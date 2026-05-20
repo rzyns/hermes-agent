@@ -150,6 +150,8 @@ Tell them what you created in plain prose, naming the actual profiles you used:
 
 ## Common patterns
 
+**Deliverable-oriented cards:** When creating a card whose expected output is a file the human should consume directly — report, chart, screenshot set, rendered HTML/PDF, spreadsheet, archive, media file, or structured export — say so in the task body and ask the worker to attach the final file path(s) via `kanban_complete(artifacts=[...])`. Keep a separate explicit artifact root for persistent files. Do not ask workers to attach source files, logs, scratch intermediates, secrets, or internal-only evidence by default; for evidence files, ask for metadata/comment paths plus checksums unless the user-facing deliverable is the evidence bundle itself.
+
 **Fan-out + fan-in (research → synthesize):** N research-style cards with no parents, one synthesis card with all of them as parents.
 
 **Parallel implementation + validation:** one implementer card makes the change while one explorer/researcher card verifies config, docs, or source mapping. A reviewer card can depend on both. Do not make the implementer own unrelated verification just because the user mentioned both in one sentence.
