@@ -989,6 +989,37 @@ def _setup_worktree(repo_root: str = None) -> Optional[Dict[str, str]]:
     return info
 
 
+def _worktree_has_unpushed_commits(worktree_path: str, timeout: int = 10) -> bool:
+    """Return whether a worktree has commits not reachable from any remote branch.
+
+    ``git log HEAD --not --remotes`` compares against remote-tracking refs under
+    ``refs/remotes/*``. If a repo has no remote-tracking refs yet, there is no
+    usable remote baseline to compare against, so treat it as having no
+    "unpushed" commits.
+    """
+    import subprocess
+
+    try:
+        remote_refs = subprocess.run(
+            ["git", "for-each-ref", "--format=%(refname)", "refs/remotes"],
+            capture_output=True, text=True, timeout=timeout, cwd=worktree_path,
+        )
+        if remote_refs.returncode != 0:
+            return True
+        if not remote_refs.stdout.strip():
+            return False
+
+        result = subprocess.run(
+            ["git", "log", "--oneline", "HEAD", "--not", "--remotes"],
+            capture_output=True, text=True, timeout=timeout, cwd=worktree_path,
+        )
+        if result.returncode != 0:
+            return True
+        return bool(result.stdout.strip())
+    except Exception:
+        return True
+
+
 def _cleanup_worktree(info: Dict[str, str] = None) -> None:
     """Remove a worktree and its branch on exit.
 
@@ -1011,18 +1042,7 @@ def _cleanup_worktree(info: Dict[str, str] = None) -> None:
     if not Path(wt_path).exists():
         return
 
-    # Check for unpushed commits — commits reachable from HEAD but not
-    # from any remote branch.  These represent real work the agent did
-    # but didn't push.
-    has_unpushed = False
-    try:
-        result = subprocess.run(
-            ["git", "log", "--oneline", "HEAD", "--not", "--remotes"],
-            capture_output=True, text=True, timeout=10, cwd=wt_path,
-        )
-        has_unpushed = bool(result.stdout.strip())
-    except Exception:
-        has_unpushed = True  # Assume unpushed on error — don't delete
+    has_unpushed = _worktree_has_unpushed_commits(wt_path, timeout=10)
 
     if has_unpushed:
         print(f"\n\033[33m⚠ Worktree has unpushed commits, keeping: {wt_path}\033[0m")
@@ -1170,15 +1190,8 @@ def _prune_stale_worktrees(repo_root: str, max_age_hours: int = 24) -> None:
 
         if not force:
             # 24h–72h tier: only remove if no unpushed commits
-            try:
-                result = subprocess.run(
-                    ["git", "log", "--oneline", "HEAD", "--not", "--remotes"],
-                    capture_output=True, text=True, timeout=5, cwd=str(entry),
-                )
-                if result.stdout.strip():
-                    continue  # Has unpushed commits — skip
-            except Exception:
-                continue  # Can't check — skip
+            if _worktree_has_unpushed_commits(str(entry), timeout=5):
+                continue  # Has unpushed commits or can't check — skip
 
         # Safe to remove
         try:
