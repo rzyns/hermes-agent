@@ -504,3 +504,300 @@ class TestSurfaceBManifestErrors:
         assert result.returncode == 20
         report = json.loads((tmp_path / "out" / "validation_report.json").read_text())
         assert any("manifest_not_an_object" in e for e in report["errors"])
+
+
+# ---------------------------------------------------------------------------
+# Regression tests for independent review repairs (t_97f80920 -> t_8bca1def)
+# ---------------------------------------------------------------------------
+class TestSurfaceBRepairDenylistBeforeRead:
+    def test_denylisted_existing_file_with_wrong_hash_no_stale_error(self, tmp_path, hermes_main):
+        """B1: an existing denylisted file must not be read/hashed after denylist detection.
+
+        Even with a deliberately wrong hash and size, the only error for that path
+        must be the denylist boundary error — no stale_manifest hash mismatch.
+        """
+        f = tmp_path / ".env"
+        f.write_text("sensitive=secret")
+        m = _make_manifest()
+        m["artifact_refs"] = [
+            {
+                "artifact_id": "a1",
+                "artifact_type": "raw_snapshot",
+                "authority_class": "diagnostic",
+                "path": str(f),
+                "sha256": "0" * 64,
+                "size": 999,
+                "redaction_state": "raw_only",
+            }
+        ]
+        m["bundle_id"] = _canonical_bundle_id(m)
+        manifest = tmp_path / "manifest.json"
+        manifest.write_text(json.dumps(m, indent=2))
+        result = _run_validate_manifest(tmp_path, hermes_main, manifest)
+        assert result.returncode == 10
+        report = json.loads((tmp_path / "out" / "validation_report.json").read_text())
+        assert any("read_boundary_denylisted_path" in e for e in report["errors"])
+        assert not any("stale_manifest.artifact_hash_mismatch" in e for e in report["errors"])
+        assert not any("artifact_hash_unreadable" in e for e in report["errors"])
+        assert not any("toctOU" in e for e in report["errors"])
+
+
+class TestSurfaceBRepairSchemaFailClosed:
+    def test_missing_trusted_schema_file_fails_closed(self, tmp_path, hermes_main):
+        """C1: --schema supplied but missing must fail closed with trusted_schema_missing."""
+        manifest = _write_manifest(tmp_path)
+        missing_schema = tmp_path / "no_schema.json"
+        result = _run_validate_manifest(tmp_path, hermes_main, manifest, schema=missing_schema)
+        assert result.returncode == 10
+        report = json.loads((tmp_path / "out" / "validation_report.json").read_text())
+        assert any("trusted_schema_missing" in e for e in report["errors"])
+
+    def test_trusted_schema_not_a_file_fails_closed(self, tmp_path, hermes_main):
+        manifest = _write_manifest(tmp_path)
+        bad = tmp_path / "not_a_file"
+        bad.mkdir()
+        result = _run_validate_manifest(tmp_path, hermes_main, manifest, schema=bad)
+        assert result.returncode == 10
+        report = json.loads((tmp_path / "out" / "validation_report.json").read_text())
+        assert any("trusted_schema_not_a_file" in e for e in report["errors"])
+
+    def test_trusted_schema_malformed_object_fails_closed(self, tmp_path, hermes_main):
+        manifest = _write_manifest(tmp_path)
+        bad = tmp_path / "bad_schema.json"
+        bad.write_text("\"not an object\"")
+        result = _run_validate_manifest(tmp_path, hermes_main, manifest, schema=bad)
+        assert result.returncode == 10
+        report = json.loads((tmp_path / "out" / "validation_report.json").read_text())
+        assert any("trusted_schema_malformed" in e for e in report["errors"])
+
+
+class TestSurfaceBRepairNoOpPolicyVocabulary:
+    def test_policy_arg_rejected(self, tmp_path, hermes_main):
+        """C2: --policy is accepted by argparse but must produce an error."""
+        manifest = _write_manifest(tmp_path)
+        out_dir = tmp_path / "out"
+        cmd = [
+            sys.executable, "-m", "hermes_cli.main",
+            "governance", "validate-manifest",
+            "--manifest", str(manifest),
+            "--output-dir", str(out_dir),
+            "--policy", str(tmp_path / "policy.json"),
+        ]
+        result = subprocess.run(cmd, capture_output=True, text=True, cwd=str(hermes_main))
+        assert result.returncode == 10
+        report = json.loads((out_dir / "validation_report.json").read_text())
+        assert any("policy_identity_check_not_implemented_surface_b" in e for e in report["errors"])
+
+    def test_vocabulary_arg_rejected(self, tmp_path, hermes_main):
+        """C2: --vocabulary is accepted by argparse but must produce an error."""
+        manifest = _write_manifest(tmp_path)
+        out_dir = tmp_path / "out"
+        cmd = [
+            sys.executable, "-m", "hermes_cli.main",
+            "governance", "validate-manifest",
+            "--manifest", str(manifest),
+            "--output-dir", str(out_dir),
+            "--vocabulary", str(tmp_path / "vocab.json"),
+        ]
+        result = subprocess.run(cmd, capture_output=True, text=True, cwd=str(hermes_main))
+        assert result.returncode == 10
+        report = json.loads((out_dir / "validation_report.json").read_text())
+        assert any("vocabulary_identity_check_not_implemented_surface_b" in e for e in report["errors"])
+
+
+class TestSurfaceBRepairArtifactRefExplicitFields:
+    def test_artifact_ref_missing_required_fields_fails(self, tmp_path, hermes_main):
+        """C3: artifact refs without explicit path/sha256/size must be rejected."""
+        m = _make_manifest()
+        m["artifact_refs"] = [
+            {
+                "artifact_id": "a1",
+                "artifact_type": "raw_snapshot",
+                "authority_class": "diagnostic",
+                "path": str(tmp_path / "file.txt"),
+                # deliberately omit sha256 and size
+                "redaction_state": "raw_only",
+            }
+        ]
+        m["bundle_id"] = _canonical_bundle_id(m)
+        manifest = tmp_path / "manifest.json"
+        manifest.write_text(json.dumps(m, indent=2))
+        result = _run_validate_manifest(tmp_path, hermes_main, manifest)
+        assert result.returncode == 10
+        report = json.loads((tmp_path / "out" / "validation_report.json").read_text())
+        assert any("artifact_ref_incomplete" in e for e in report["errors"])
+
+    def test_artifact_ref_bad_sha256_format_fails(self, tmp_path, hermes_main):
+        m = _make_manifest()
+        m["artifact_refs"] = [
+            {
+                "artifact_id": "a1",
+                "artifact_type": "raw_snapshot",
+                "authority_class": "diagnostic",
+                "path": str(tmp_path / "file.txt"),
+                "sha256": "not_a_hash",
+                "size": 0,
+                "redaction_state": "raw_only",
+            }
+        ]
+        m["bundle_id"] = _canonical_bundle_id(m)
+        manifest = tmp_path / "manifest.json"
+        manifest.write_text(json.dumps(m, indent=2))
+        result = _run_validate_manifest(tmp_path, hermes_main, manifest)
+        assert result.returncode == 10
+        report = json.loads((tmp_path / "out" / "validation_report.json").read_text())
+        assert any("artifact_ref_invalid:sha256_format" in e for e in report["errors"])
+
+    def test_artifact_ref_negative_size_fails(self, tmp_path, hermes_main):
+        m = _make_manifest()
+        m["artifact_refs"] = [
+            {
+                "artifact_id": "a1",
+                "artifact_type": "raw_snapshot",
+                "authority_class": "diagnostic",
+                "path": str(tmp_path / "file.txt"),
+                "sha256": "0" * 64,
+                "size": -1,
+                "redaction_state": "raw_only",
+            }
+        ]
+        m["bundle_id"] = _canonical_bundle_id(m)
+        manifest = tmp_path / "manifest.json"
+        manifest.write_text(json.dumps(m, indent=2))
+        result = _run_validate_manifest(tmp_path, hermes_main, manifest)
+        assert result.returncode == 10
+        report = json.loads((tmp_path / "out" / "validation_report.json").read_text())
+        assert any("artifact_ref_invalid:size_not_int" in e for e in report["errors"])
+
+
+class TestSurfaceBRepairIdentityStrength:
+    def test_blank_board_slug_fails(self, tmp_path, hermes_main):
+        """C4: blank board_slug must be invalid."""
+        m = _make_manifest()
+        m["board_identity"] = {
+            "board_slug": "   ",
+            "tenant": None,
+            "kanban_db_identity": {"k": "v"},
+            "identity_source": "fixture",
+            "identity_source_hash": "sha256:" + "0" * 64,
+        }
+        m["bundle_id"] = _canonical_bundle_id(m)
+        manifest = tmp_path / "manifest.json"
+        manifest.write_text(json.dumps(m, indent=2))
+        result = _run_validate_manifest(tmp_path, hermes_main, manifest)
+        assert result.returncode == 10
+        report = json.loads((tmp_path / "out" / "validation_report.json").read_text())
+        assert any("namespace.identity_blank:board_slug" in e for e in report["errors"])
+
+    def test_empty_tenant_string_fails(self, tmp_path, hermes_main):
+        m = _make_manifest()
+        m["board_identity"] = {
+            "board_slug": "valid-board",
+            "tenant": "",
+            "kanban_db_identity": {"k": "v"},
+            "identity_source": "fixture",
+            "identity_source_hash": "sha256:" + "0" * 64,
+        }
+        m["bundle_id"] = _canonical_bundle_id(m)
+        manifest = tmp_path / "manifest.json"
+        manifest.write_text(json.dumps(m, indent=2))
+        result = _run_validate_manifest(tmp_path, hermes_main, manifest)
+        assert result.returncode == 10
+        report = json.loads((tmp_path / "out" / "validation_report.json").read_text())
+        assert any("namespace.identity_blank:tenant" in e for e in report["errors"])
+
+    def test_empty_kanban_db_identity_fails(self, tmp_path, hermes_main):
+        m = _make_manifest()
+        m["board_identity"] = {
+            "board_slug": "valid-board",
+            "tenant": None,
+            "kanban_db_identity": {},
+            "identity_source": "fixture",
+            "identity_source_hash": "sha256:" + "0" * 64,
+        }
+        m["bundle_id"] = _canonical_bundle_id(m)
+        manifest = tmp_path / "manifest.json"
+        manifest.write_text(json.dumps(m, indent=2))
+        result = _run_validate_manifest(tmp_path, hermes_main, manifest)
+        assert result.returncode == 10
+        report = json.loads((tmp_path / "out" / "validation_report.json").read_text())
+        assert any("namespace.identity_blank:kanban_db_identity" in e for e in report["errors"])
+
+    def test_blank_identity_source_fails(self, tmp_path, hermes_main):
+        m = _make_manifest()
+        m["board_identity"] = {
+            "board_slug": "valid-board",
+            "tenant": None,
+            "kanban_db_identity": {"k": "v"},
+            "identity_source": "",
+            "identity_source_hash": "sha256:" + "0" * 64,
+        }
+        m["bundle_id"] = _canonical_bundle_id(m)
+        manifest = tmp_path / "manifest.json"
+        manifest.write_text(json.dumps(m, indent=2))
+        result = _run_validate_manifest(tmp_path, hermes_main, manifest)
+        assert result.returncode == 10
+        report = json.loads((tmp_path / "out" / "validation_report.json").read_text())
+        assert any("namespace.identity_blank:identity_source" in e for e in report["errors"])
+
+    def test_blank_identity_source_hash_fails(self, tmp_path, hermes_main):
+        m = _make_manifest()
+        m["board_identity"] = {
+            "board_slug": "valid-board",
+            "tenant": None,
+            "kanban_db_identity": {"k": "v"},
+            "identity_source": "fixture",
+            "identity_source_hash": "",
+        }
+        m["bundle_id"] = _canonical_bundle_id(m)
+        manifest = tmp_path / "manifest.json"
+        manifest.write_text(json.dumps(m, indent=2))
+        result = _run_validate_manifest(tmp_path, hermes_main, manifest)
+        assert result.returncode == 10
+        report = json.loads((tmp_path / "out" / "validation_report.json").read_text())
+        assert any("namespace.identity_blank:identity_source_hash" in e for e in report["errors"])
+
+    def test_dirty_workspace_identity_fails(self, tmp_path, hermes_main):
+        """C5: dirty/unknown workspace identity must be invalid."""
+        m = _make_manifest()
+        m["workspace_identity"] = {
+            "workspace_kind": "unknown",
+            "workspace_path_class": "",
+            "base_sha": "dirty",
+        }
+        m["bundle_id"] = _canonical_bundle_id(m)
+        manifest = tmp_path / "manifest.json"
+        manifest.write_text(json.dumps(m, indent=2))
+        result = _run_validate_manifest(tmp_path, hermes_main, manifest)
+        assert result.returncode == 10
+        report = json.loads((tmp_path / "out" / "validation_report.json").read_text())
+        assert any("workspace.identity_invalid_kind" in e for e in report["errors"])
+        assert any("workspace.identity_blank:workspace_path_class" in e for e in report["errors"])
+        assert any("workspace.identity_dirty:base_sha" in e for e in report["errors"])
+
+
+class TestSurfaceBRepairReportHardening:
+    def test_report_has_diagnostic_type_and_not_consumer_safe(self, tmp_path, hermes_main):
+        """C6: report must declare itself diagnostic and not consumer-safe."""
+        manifest = _write_manifest(tmp_path)
+        result = _run_validate_manifest(tmp_path, hermes_main, manifest)
+        assert result.returncode == 0
+        report = json.loads((tmp_path / "out" / "validation_report.json").read_text())
+        assert report.get("report_type") == "surface_b_diagnostic_validation"
+        assert report.get("consumer_safe") is False
+        assert "board_slug" not in report  # not at top level
+        assert "tenant" not in report      # not at top level
+        assert "manifest_identity_snapshot" in report
+
+    def test_report_top_level_no_raw_board_or_tenant(self, tmp_path, hermes_main):
+        """C6: raw board_slug and tenant must not appear at report top level."""
+        manifest = _write_manifest(tmp_path)
+        result = _run_validate_manifest(tmp_path, hermes_main, manifest)
+        assert result.returncode == 0
+        raw = (tmp_path / "out" / "validation_report.json").read_text()
+        report = json.loads(raw)
+        assert "board_slug" not in report
+        assert "tenant" not in report
+        snapshot = report.get("manifest_identity_snapshot", {})
+        assert snapshot.get("board_slug") == "test-board"
+        assert snapshot.get("tenant") is None
