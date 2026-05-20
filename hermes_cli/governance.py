@@ -532,24 +532,20 @@ def _validate_manifest_fields(manifest: dict, out: list[str]) -> None:
 
 
 def _validate_manifest_schema_identity(
-    manifest: dict, trusted_schema_path: Path | None, out: list[str]
+    manifest: dict, trusted_schema: dict | None, out: list[str]
 ) -> None:
-    """Validate schema identity against an explicit trusted schema file."""
+    """Validate schema identity against an explicit trusted schema dict."""
     schema_id = manifest.get("schema_identity")
     if not isinstance(schema_id, dict):
         out.append("schema_identity_mismatch:schema_identity is not an object")
         return
-    # If a trusted schema file is provided, compare hash exact-match.
-    if trusted_schema_path is not None and trusted_schema_path.exists():
-        try:
-            with trusted_schema_path.open("r", encoding="utf-8") as fh:
-                trusted = json.load(fh)
-            if isinstance(trusted, dict):
-                for key in ("schema_name", "schema_version", "schema_hash"):
-                    if schema_id.get(key) != trusted.get(key):
-                        out.append(f"schema_identity_mismatch:{key}")
-        except Exception as exc:
-            out.append(f"schema_identity_mismatch:trusted_schema_read_error:{exc}")
+    if trusted_schema is not None:
+        if not isinstance(trusted_schema, dict):
+            out.append("schema_identity_mismatch:trusted_schema_not_an_object")
+            return
+        for key in ("schema_name", "schema_version", "schema_hash"):
+            if schema_id.get(key) != trusted_schema.get(key):
+                out.append(f"schema_identity_mismatch:{key}")
 
 
 def _validate_bundle_id(manifest: dict, out: list[str]) -> None:
@@ -568,7 +564,7 @@ def _validate_bundle_id(manifest: dict, out: list[str]) -> None:
 
 
 def _validate_board_identity(manifest: dict, out: list[str]) -> None:
-    """Validate board_identity presence and shape."""
+    """Validate board_identity presence, shape, and non-empty values."""
     board = manifest.get("board_identity")
     if not isinstance(board, dict):
         out.append("namespace.identity_missing:board_identity not an object")
@@ -576,6 +572,40 @@ def _validate_board_identity(manifest: dict, out: list[str]) -> None:
     for key in ("board_slug", "tenant", "kanban_db_identity", "identity_source", "identity_source_hash"):
         if key not in board:
             out.append(f"namespace.identity_missing:{key}")
+    board_slug = board.get("board_slug")
+    if not isinstance(board_slug, str) or not board_slug.strip():
+        out.append("namespace.identity_blank:board_slug")
+    tenant = board.get("tenant")
+    if tenant is not None and (not isinstance(tenant, str) or not tenant.strip()):
+        out.append("namespace.identity_blank:tenant")
+    kanban_db_identity = board.get("kanban_db_identity")
+    if not isinstance(kanban_db_identity, dict) or not kanban_db_identity:
+        out.append("namespace.identity_blank:kanban_db_identity")
+    identity_source = board.get("identity_source")
+    if not isinstance(identity_source, str) or not identity_source.strip():
+        out.append("namespace.identity_blank:identity_source")
+    identity_source_hash = board.get("identity_source_hash")
+    if not isinstance(identity_source_hash, str) or not identity_source_hash.strip():
+        out.append("namespace.identity_blank:identity_source_hash")
+
+
+def _validate_workspace_identity(manifest: dict, out: list[str]) -> None:
+    """Validate workspace_identity presence, shape, and non-dirty state."""
+    ws = manifest.get("workspace_identity")
+    if not isinstance(ws, dict):
+        out.append("workspace.identity_missing:workspace_identity not an object")
+        return
+    kind = ws.get("workspace_kind")
+    if kind not in {"scratch", "dir", "worktree"}:
+        out.append(f"workspace.identity_invalid_kind:{kind}")
+    path_class = ws.get("workspace_path_class")
+    if not isinstance(path_class, str) or not path_class.strip():
+        out.append("workspace.identity_blank:workspace_path_class")
+    base_sha = ws.get("base_sha")
+    if not isinstance(base_sha, str) or not base_sha.strip():
+        out.append("workspace.identity_blank:base_sha")
+    elif base_sha == "dirty":
+        out.append("workspace.identity_dirty:base_sha")
 
 
 def _validate_redaction_and_authority(manifest: dict, out: list[str]) -> None:
@@ -596,7 +626,9 @@ def _validate_artifact_refs(
 ) -> list[dict]:
     """Validate explicit artifact_refs: denylisted paths, duplicate IDs, etc.
 
-    Returns the list of validated refs for downstream processing.
+    Returns the list of refs that passed boundary checks for downstream
+    TOCTOU/hash verification. Denylisted, traversal, or incomplete refs
+    are *not* returned so they are never read or hashed.
     """
     refs = manifest.get("artifact_refs", [])
     if not isinstance(refs, list):
@@ -605,9 +637,33 @@ def _validate_artifact_refs(
     seen_ids: set[str] = set()
     seen_paths: dict[str, dict] = {}
     validated: list[dict] = []
+    REQUIRED_FIELDS = ("artifact_id", "artifact_type", "path", "sha256", "size", "redaction_state", "authority_class")
     for ref in refs:
         if not isinstance(ref, dict):
             out.append("artifact_ref_invalid:not_an_object")
+            continue
+        # Require explicit file-reference fields
+        missing = [f for f in REQUIRED_FIELDS if ref.get(f) is None or ref.get(f) == ""]
+        if missing:
+            out.append(f"artifact_ref_incomplete:{','.join(missing)}")
+            continue
+        # Type/format checks
+        size = ref.get("size")
+        if not isinstance(size, int) or size < 0:
+            out.append(f"artifact_ref_invalid:size_not_int:{ref.get('artifact_id')}")
+            continue
+        sha256_val = ref.get("sha256", "")
+        raw_hex = sha256_val[7:] if sha256_val.startswith("sha256:") else sha256_val
+        if not (len(raw_hex) == 64 and all(c in "0123456789abcdefABCDEF" for c in raw_hex)):
+            out.append(f"artifact_ref_invalid:sha256_format:{ref.get('artifact_id')}")
+            continue
+        redaction = ref.get("redaction_state")
+        if redaction not in ALLOWED_REDACTION_STATES:
+            out.append(f"artifact_ref_invalid:redaction_state:{redaction}")
+            continue
+        authority = ref.get("authority_class")
+        if authority not in ALLOWED_AUTHORITY_CLASSES:
+            out.append(f"artifact_ref_invalid:authority_class:{authority}")
             continue
         aid = ref.get("artifact_id")
         if aid is not None and aid in seen_ids:
@@ -615,23 +671,27 @@ def _validate_artifact_refs(
         if aid is not None:
             seen_ids.add(aid)
         path_str = ref.get("path")
+        blocked = False
         if path_str:
             p = Path(path_str)
             if _is_denylisted_path(p):
                 out.append(f"read_boundary_denylisted_path:{path_str}")
+                blocked = True
             if ".." in p.parts:
                 out.append(f"read_boundary_denylisted_path:traversal_in_path:{path_str}")
-            # Duplicate / conflicting path checks
-            prev = seen_paths.get(str(p))
-            if prev is not None:
-                if prev.get("sha256") != ref.get("sha256"):
-                    out.append(f"artifact_ref_conflicting_hash:{path_str}")
-                if prev.get("authority_class") != ref.get("authority_class"):
-                    out.append(f"artifact_ref_conflicting_authority:{path_str}")
-                if prev.get("redaction_state") != ref.get("redaction_state"):
-                    out.append(f"artifact_ref_conflicting_redaction_or_export:{path_str}")
-            seen_paths[str(p)] = ref
-        validated.append(ref)
+                blocked = True
+            if not blocked:
+                prev = seen_paths.get(str(p))
+                if prev is not None:
+                    if prev.get("sha256") != ref.get("sha256"):
+                        out.append(f"artifact_ref_conflicting_hash:{path_str}")
+                    if prev.get("authority_class") != ref.get("authority_class"):
+                        out.append(f"artifact_ref_conflicting_authority:{path_str}")
+                    if prev.get("redaction_state") != ref.get("redaction_state"):
+                        out.append(f"artifact_ref_conflicting_redaction_or_export:{path_str}")
+                seen_paths[str(p)] = ref
+        if not blocked:
+            validated.append(ref)
     return validated
 
 
@@ -691,6 +751,12 @@ def cmd_validate_manifest(args: argparse.Namespace) -> int:
     manifest_path = Path(args.manifest)
     errors: list[str] = []
 
+    # No-op identity-check inputs are not accepted.
+    if getattr(args, "policy", None):
+        errors.append("policy_identity_check_not_implemented_surface_b")
+    if getattr(args, "vocabulary", None):
+        errors.append("vocabulary_identity_check_not_implemented_surface_b")
+
     # -- Load manifest --------------------------------------------------------
     try:
         with manifest_path.open("r", encoding="utf-8") as fh:
@@ -711,13 +777,28 @@ def cmd_validate_manifest(args: argparse.Namespace) -> int:
 
     # -- Field-level validations -----------------------------------------------
     _validate_manifest_fields(manifest, errors)
-    _validate_manifest_schema_identity(
-        manifest,
-        Path(args.schema) if getattr(args, "schema", None) else None,
-        errors,
-    )
+    trusted_schema: dict | None = None
+    schema_arg = getattr(args, "schema", None)
+    if schema_arg:
+        sp = Path(schema_arg)
+        if not sp.exists():
+            errors.append("trusted_schema_missing")
+        elif not sp.is_file():
+            errors.append("trusted_schema_not_a_file")
+        else:
+            try:
+                with sp.open("r", encoding="utf-8") as fh:
+                    raw = json.load(fh)
+                if isinstance(raw, dict):
+                    trusted_schema = raw
+                else:
+                    errors.append("trusted_schema_malformed:not_an_object")
+            except Exception as exc:
+                errors.append(f"trusted_schema_malformed:{exc}")
+    _validate_manifest_schema_identity(manifest, trusted_schema, errors)
     _validate_bundle_id(manifest, errors)
     _validate_board_identity(manifest, errors)
+    _validate_workspace_identity(manifest, errors)
     _validate_redaction_and_authority(manifest, errors)
     validated_refs = _validate_artifact_refs(manifest, errors)
 
@@ -745,19 +826,30 @@ def cmd_validate_manifest(args: argparse.Namespace) -> int:
 def _write_validation_report(
     output_dir: Path, valid: bool, errors: list[str], manifest: dict
 ) -> Path:
-    """Write the local Surface B validation report."""
+    """Write the local Surface B diagnostic validation report.
+
+    This report is explicitly diagnostic-only and is NOT a consumer-safe
+    manifest projection. Path redaction is applied but completeness is
+    not guaranteed.
+    """
     dest = output_dir / "validation_report.json"
-    # Redact any absolute-looking paths in error strings to avoid leaking raw paths.
     import re
-    _PATH_RE = re.compile(r"/[^\s\":\[\]{}]+")
+    _POSIX_PATH = re.compile(r"/[^\s\"\:\[\]{}]+")
+    _WIN_PATH  = re.compile(r"[A-Za-z]:[/\\][^\s\"\:\[\]{}]*")
+    _URL       = re.compile(r"https?://[^\s\"\:\[\]{}]+")
     redacted_errors = []
     for e in errors:
-        redacted_errors.append(_PATH_RE.sub("<redacted_path>", e))
+        redacted = _POSIX_PATH.sub("<redacted_path>", e)
+        redacted = _WIN_PATH.sub("<redacted_path>", redacted)
+        redacted = _URL.sub("<redacted_url>", redacted)
+        redacted_errors.append(redacted)
     report = {
         "valid": valid,
         "errors": redacted_errors,
         "authority_class": "diagnostic",
         "authorization": False,
+        "report_type": "surface_b_diagnostic_validation",
+        "consumer_safe": False,
         "non_authorizations": [
             "no_live_db_reads",
             "no_dashboard_consumption",
@@ -767,15 +859,19 @@ def _write_validation_report(
             "no_deploy_restart_credentials",
         ],
     }
-    # Include only bounded manifest identity, never raw paths.
+    # Bounded manifest identity snapshot — diagnostic only.
     if "manifest_version" in manifest:
         report["manifest_version"] = manifest["manifest_version"]
     if "bundle_id" in manifest:
         report["bundle_id"] = manifest["bundle_id"]
     if "board_identity" in manifest:
         board = manifest["board_identity"]
-        report["board_slug"] = board.get("board_slug")
-        report["tenant"] = board.get("tenant")
+        report["manifest_identity_snapshot"] = {
+            "board_slug": board.get("board_slug"),
+            "tenant": board.get("tenant"),
+            "identity_source": board.get("identity_source"),
+            "identity_source_hash": board.get("identity_source_hash"),
+        }
     with dest.open("w", encoding="utf-8") as fh:
         json.dump(report, fh, indent=2, ensure_ascii=False)
         fh.write("\n")
