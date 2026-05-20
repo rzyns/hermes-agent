@@ -86,8 +86,50 @@ EXIT_RUNTIME_ERROR = 30
 
 
 # ---------------------------------------------------------------------------
-# CLI wiring (main.py calls these)
+# Surface B — local manifest/redaction validator (non-collector, non-mutation)
 # ---------------------------------------------------------------------------
+
+MANIFEST_REQUIRED_FIELDS = {
+    "manifest_version",
+    "schema_identity",
+    "bundle_id",
+    "task_id",
+    "run_id",
+    "task_status",
+    "run_status",
+    "run_outcome",
+    "workspace_identity",
+    "artifact_refs",
+    "collector_identity",
+    "collection_started_at",
+    "collection_finished_at",
+    "source_vocabulary",
+    "redaction_state",
+    "authority_class",
+    "non_authorizations",
+    "board_identity",
+}
+
+ALLOWED_REDACTION_STATES = {
+    "raw_only",
+    "redacted",
+    "redaction_failed",
+    "not_exportable",
+}
+
+ALLOWED_AUTHORITY_CLASSES = {
+    "diagnostic",
+    "candidate_decision",
+    "authoritative_decision",
+    "export_summary",
+}
+
+SURFACE_B_EXIT_CODES = {
+    "EXIT_OK": 0,
+    "EXIT_VALIDATION_FAILED": 10,
+    "EXIT_SCHEMA_MISMATCH": 20,
+    "EXIT_RUNTIME_ERROR": 30,
+}
 
 
 def build_parser(subparsers: Any) -> Any:
@@ -141,6 +183,50 @@ def build_parser(subparsers: Any) -> Any:
         help="Include extra diagnostic fields in the artifact.",
     )
 
+    # Surface B subcommand — deliberately namespaced under governance so it
+    # is not mistaken for a live/runtime integration path.
+    validate_parser = gov_subparsers.add_parser(
+        "validate-manifest",
+        help="Validate a Surface B manifest fixture locally",
+    )
+    validate_parser.add_argument(
+        "--manifest",
+        dest="manifest",
+        required=True,
+        help="Path to the manifest JSON fixture to validate.",
+    )
+    validate_parser.add_argument(
+        "--schema",
+        dest="schema",
+        required=False,
+        help="Path to a trusted schema JSON file for identity checks.",
+    )
+    validate_parser.add_argument(
+        "--policy",
+        dest="policy",
+        required=False,
+        help="Path to a trusted policy bundle JSON file for identity checks.",
+    )
+    validate_parser.add_argument(
+        "--vocabulary",
+        dest="vocabulary",
+        required=False,
+        help="Path to a trusted vocabulary JSON file for identity checks.",
+    )
+    validate_parser.add_argument(
+        "--output-dir",
+        dest="output_dir",
+        required=True,
+        help="Directory where the validation report will be written.",
+    )
+    validate_parser.add_argument(
+        "--verbose",
+        dest="verbose",
+        action="store_true",
+        default=False,
+        help="Include extra diagnostic fields in the report.",
+    )
+
     return gov_parser
 
 
@@ -154,9 +240,11 @@ def governance_command(args: argparse.Namespace) -> int:
         sub = getattr(args, "governance_command", None)
         if sub == "evaluate":
             return cmd_evaluate(args)
+        if sub == "validate-manifest":
+            return cmd_validate_manifest(args)
         # No subcommand or unknown subcommand: print usage via argparse (which
         # already happened if parsing was triggered) and fail-closed.
-        print("governance: expected subcommand (evaluate)", file=sys.stderr)
+        print("governance: expected subcommand (evaluate, validate-manifest)", file=sys.stderr)
         return EXIT_FAIL_CLOSED
     except Exception as exc:
         logger.exception("Unhandled exception in governance_command")
@@ -377,3 +465,318 @@ def _summarize_raw(data: dict) -> dict:
         "has_status": "status" in data,
         "has_outcome": "outcome" in data,
     }
+
+
+# ---------------------------------------------------------------------------
+# Surface B validator implementation
+# ---------------------------------------------------------------------------
+
+# Minimal deterministic canonical JSON with sorted keys for bundle ID.
+_CANONICAL_JSON_SEPARATOR = (",".encode("utf-8"), ":".encode("utf-8"))
+
+
+def _canonical_json(obj: Any) -> str:
+    """Serialize *obj* as canonical JSON (sorted keys, no extra whitespace)."""
+    return json.dumps(obj, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+
+
+def _compute_canonical_bundle_id(manifest: dict) -> str:
+    """Compute canonical sha256 bundle digest excluding bundle_id itself."""
+    bundle_identity_input = {k: v for k, v in manifest.items() if k != "bundle_id"}
+    canonical_bytes = _canonical_json(bundle_identity_input).encode("utf-8")
+    import hashlib
+
+    return f"sha256:{hashlib.sha256(canonical_bytes).hexdigest()}"
+
+
+# Denylisted path classes for referenced local files.
+# Fail closed before reading/hash if any referenced path matches.
+_DENYLISTED_PATH_PATTERNS = (
+    ".env",
+    ".env.",
+    ".ssh",
+    ".git",
+    "kanban.db",
+    "id_rsa",
+    "id_dsa",
+    "id_ecdsa",
+    "id_ed25519",
+    "secret",
+    "token",
+    "password",
+    "credential",
+    "api_key",
+    "private_key",
+)
+
+
+def _is_denylisted_path(path: Path) -> bool:
+    """Return True if any path component matches denylisted patterns."""
+    try:
+        resolved = path.resolve()
+    except Exception:
+        resolved = path
+    for part in resolved.parts:
+        lowered = str(part).lower()
+        for pat in _DENYLISTED_PATH_PATTERNS:
+            if pat in lowered:
+                return True
+    return False
+
+
+def _validate_manifest_fields(manifest: dict, out: list[str]) -> None:
+    """Check required Surface B manifest fields are present."""
+    missing = MANIFEST_REQUIRED_FIELDS - manifest.keys()
+    if missing:
+        out.append(f"missing_required_fields:{','.join(sorted(missing))}")
+
+
+def _validate_manifest_schema_identity(
+    manifest: dict, trusted_schema_path: Path | None, out: list[str]
+) -> None:
+    """Validate schema identity against an explicit trusted schema file."""
+    schema_id = manifest.get("schema_identity")
+    if not isinstance(schema_id, dict):
+        out.append("schema_identity_mismatch:schema_identity is not an object")
+        return
+    # If a trusted schema file is provided, compare hash exact-match.
+    if trusted_schema_path is not None and trusted_schema_path.exists():
+        try:
+            with trusted_schema_path.open("r", encoding="utf-8") as fh:
+                trusted = json.load(fh)
+            if isinstance(trusted, dict):
+                for key in ("schema_name", "schema_version", "schema_hash"):
+                    if schema_id.get(key) != trusted.get(key):
+                        out.append(f"schema_identity_mismatch:{key}")
+        except Exception as exc:
+            out.append(f"schema_identity_mismatch:trusted_schema_read_error:{exc}")
+
+
+def _validate_bundle_id(manifest: dict, out: list[str]) -> None:
+    """Validate bundle_id format and recomputed canonical digest."""
+    bundle_id = manifest.get("bundle_id")
+    if not isinstance(bundle_id, str):
+        out.append("bundle_id_not_canonical:not_a_string")
+        return
+    if not bundle_id.startswith("sha256:"):
+        out.append("bundle_id_not_canonical:missing_sha256_prefix")
+        return
+    # Recompute canonical digest and compare.
+    computed = _compute_canonical_bundle_id(manifest)
+    if bundle_id != computed:
+        out.append("bundle_canonicalization_invalid:recomputed_digest_mismatch")
+
+
+def _validate_board_identity(manifest: dict, out: list[str]) -> None:
+    """Validate board_identity presence and shape."""
+    board = manifest.get("board_identity")
+    if not isinstance(board, dict):
+        out.append("namespace.identity_missing:board_identity not an object")
+        return
+    for key in ("board_slug", "tenant", "kanban_db_identity", "identity_source", "identity_source_hash"):
+        if key not in board:
+            out.append(f"namespace.identity_missing:{key}")
+
+
+def _validate_redaction_and_authority(manifest: dict, out: list[str]) -> None:
+    """Validate redaction_state and authority_class are in allowed sets."""
+    redaction = manifest.get("redaction_state")
+    if redaction not in ALLOWED_REDACTION_STATES:
+        out.append(f"redaction_state_invalid:{redaction}")
+    authority = manifest.get("authority_class")
+    if authority not in ALLOWED_AUTHORITY_CLASSES:
+        out.append(f"authority_class_invalid:{authority}")
+    # Surface B: authoritative_decision is not authorized yet.
+    if authority == "authoritative_decision":
+        out.append("authority_not_authorized_for_surface:authoritative_decision")
+
+
+def _validate_artifact_refs(
+    manifest: dict, out: list[str]
+) -> list[dict]:
+    """Validate explicit artifact_refs: denylisted paths, duplicate IDs, etc.
+
+    Returns the list of validated refs for downstream processing.
+    """
+    refs = manifest.get("artifact_refs", [])
+    if not isinstance(refs, list):
+        out.append("artifact_refs_not_a_list")
+        return []
+    seen_ids: set[str] = set()
+    seen_paths: dict[str, dict] = {}
+    validated: list[dict] = []
+    for ref in refs:
+        if not isinstance(ref, dict):
+            out.append("artifact_ref_invalid:not_an_object")
+            continue
+        aid = ref.get("artifact_id")
+        if aid is not None and aid in seen_ids:
+            out.append(f"artifact_ref_duplicate_id:{aid}")
+        if aid is not None:
+            seen_ids.add(aid)
+        path_str = ref.get("path")
+        if path_str:
+            p = Path(path_str)
+            if _is_denylisted_path(p):
+                out.append(f"read_boundary_denylisted_path:{path_str}")
+            if ".." in p.parts:
+                out.append(f"read_boundary_denylisted_path:traversal_in_path:{path_str}")
+            # Duplicate / conflicting path checks
+            prev = seen_paths.get(str(p))
+            if prev is not None:
+                if prev.get("sha256") != ref.get("sha256"):
+                    out.append(f"artifact_ref_conflicting_hash:{path_str}")
+                if prev.get("authority_class") != ref.get("authority_class"):
+                    out.append(f"artifact_ref_conflicting_authority:{path_str}")
+                if prev.get("redaction_state") != ref.get("redaction_state"):
+                    out.append(f"artifact_ref_conflicting_redaction_or_export:{path_str}")
+            seen_paths[str(p)] = ref
+        validated.append(ref)
+    return validated
+
+
+def _toctou_check(path: Path, expected_size: int | None, out: list[str]) -> bool:
+    """Basic TOCTOU: stat file before and after opening; must be regular file.
+
+    Returns True if the file passed the check.
+    """
+    try:
+        # Pre-stat
+        pre_stat = path.stat()
+        if not path.is_file():
+            out.append(f"toctOU.unsafe_file_type:{path}")
+            return False
+        if path.is_symlink():
+            out.append(f"toctOU.unsafe_file_type:symlink:{path}")
+            return False
+        with path.open("rb") as fh:
+            # Post-stat from same handle where feasible (we re-stat path)
+            post_stat = path.stat()
+            if pre_stat.st_ino != post_stat.st_ino or pre_stat.st_size != post_stat.st_size:
+                out.append(f"toctOU.file_identity_changed:{path}")
+                return False
+            # Read bytes for hash
+            data = fh.read()
+        if expected_size is not None and len(data) != expected_size:
+            out.append(f"toctOU.file_changed_during_hash:size_mismatch:{path}")
+            return False
+        return True
+    except FileNotFoundError:
+        out.append(f"artifact_missing:{path}")
+        return False
+    except Exception as exc:
+        out.append(f"toctOU.file_identity_changed:{path}:{exc}")
+        return False
+
+
+def _compute_sha256(path: Path) -> str | None:
+    """Compute sha256 hex digest for a local file."""
+    import hashlib
+
+    try:
+        with path.open("rb") as fh:
+            return hashlib.sha256(fh.read()).hexdigest()
+    except Exception:
+        return None
+
+
+def cmd_validate_manifest(args: argparse.Namespace) -> int:
+    """Validate a Surface B manifest fixture and write a diagnostic report.
+
+    Local-only: reads explicit local files only. No live DB/API/network.
+    """
+    output_dir = Path(args.output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    manifest_path = Path(args.manifest)
+    errors: list[str] = []
+
+    # -- Load manifest --------------------------------------------------------
+    try:
+        with manifest_path.open("r", encoding="utf-8") as fh:
+            manifest = json.load(fh)
+    except FileNotFoundError:
+        errors.append("manifest_missing")
+        _write_validation_report(output_dir, False, errors, {})
+        return SURFACE_B_EXIT_CODES["EXIT_SCHEMA_MISMATCH"]
+    except json.JSONDecodeError:
+        errors.append("manifest_malformed")
+        _write_validation_report(output_dir, False, errors, {})
+        return SURFACE_B_EXIT_CODES["EXIT_SCHEMA_MISMATCH"]
+
+    if not isinstance(manifest, dict):
+        errors.append("manifest_not_an_object")
+        _write_validation_report(output_dir, False, errors, {})
+        return SURFACE_B_EXIT_CODES["EXIT_SCHEMA_MISMATCH"]
+
+    # -- Field-level validations -----------------------------------------------
+    _validate_manifest_fields(manifest, errors)
+    _validate_manifest_schema_identity(
+        manifest,
+        Path(args.schema) if getattr(args, "schema", None) else None,
+        errors,
+    )
+    _validate_bundle_id(manifest, errors)
+    _validate_board_identity(manifest, errors)
+    _validate_redaction_and_authority(manifest, errors)
+    validated_refs = _validate_artifact_refs(manifest, errors)
+
+    # -- TOCTOU + hash verification for explicit referenced files ---------------
+    for ref in validated_refs:
+        path_str = ref.get("path")
+        if not path_str:
+            continue
+        ref_path = Path(path_str)
+        if not _toctou_check(ref_path, ref.get("size"), errors):
+            continue
+        computed_hash = _compute_sha256(ref_path)
+        expected_hash = ref.get("sha256")
+        if computed_hash is None:
+            errors.append(f"artifact_hash_unreadable:{path_str}")
+        elif expected_hash and computed_hash != expected_hash:
+            errors.append(f"stale_manifest.artifact_hash_mismatch:{path_str}")
+
+    # -- Result ----------------------------------------------------------------
+    valid = len(errors) == 0
+    report = _write_validation_report(output_dir, valid, errors, manifest)
+    return SURFACE_B_EXIT_CODES["EXIT_OK"] if valid else SURFACE_B_EXIT_CODES["EXIT_VALIDATION_FAILED"]
+
+
+def _write_validation_report(
+    output_dir: Path, valid: bool, errors: list[str], manifest: dict
+) -> Path:
+    """Write the local Surface B validation report."""
+    dest = output_dir / "validation_report.json"
+    # Redact any absolute-looking paths in error strings to avoid leaking raw paths.
+    import re
+    _PATH_RE = re.compile(r"/[^\s\":\[\]{}]+")
+    redacted_errors = []
+    for e in errors:
+        redacted_errors.append(_PATH_RE.sub("<redacted_path>", e))
+    report = {
+        "valid": valid,
+        "errors": redacted_errors,
+        "authority_class": "diagnostic",
+        "authorization": False,
+        "non_authorizations": [
+            "no_live_db_reads",
+            "no_dashboard_consumption",
+            "no_network",
+            "no_mutation",
+            "no_push_merge_pr",
+            "no_deploy_restart_credentials",
+        ],
+    }
+    # Include only bounded manifest identity, never raw paths.
+    if "manifest_version" in manifest:
+        report["manifest_version"] = manifest["manifest_version"]
+    if "bundle_id" in manifest:
+        report["bundle_id"] = manifest["bundle_id"]
+    if "board_identity" in manifest:
+        board = manifest["board_identity"]
+        report["board_slug"] = board.get("board_slug")
+        report["tenant"] = board.get("tenant")
+    with dest.open("w", encoding="utf-8") as fh:
+        json.dump(report, fh, indent=2, ensure_ascii=False)
+        fh.write("\n")
+    return dest
