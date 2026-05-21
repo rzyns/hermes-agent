@@ -3193,7 +3193,9 @@ def install_from_quarantine(
     else:
         install_dir = SKILLS_DIR / safe_skill_name
 
-    if install_dir.exists():
+    if install_dir.is_symlink() or install_dir.is_file():
+        install_dir.unlink()
+    elif install_dir.exists():
         shutil.rmtree(install_dir)
 
     # Warn (but don't block) if SKILL.md is very large

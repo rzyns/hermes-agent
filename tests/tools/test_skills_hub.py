@@ -26,7 +26,63 @@ from tools.skills_hub import (
     append_audit_log,
     _skill_meta_to_dict,
     quarantine_bundle,
+    install_from_quarantine,
 )
+from tools.skills_guard import ScanResult
+
+
+# ---------------------------------------------------------------------------
+# install_from_quarantine
+# ---------------------------------------------------------------------------
+
+
+def test_install_from_quarantine_replaces_existing_skill_symlink(monkeypatch, tmp_path):
+    import tools.skills_hub as hub
+
+    skills_dir = tmp_path / "skills"
+    hub_dir = skills_dir / ".hub"
+    monkeypatch.setattr(hub, "SKILLS_DIR", skills_dir)
+    monkeypatch.setattr(hub, "HUB_DIR", hub_dir)
+    monkeypatch.setattr(hub, "LOCK_FILE", hub_dir / "lock.json")
+    monkeypatch.setattr(hub, "QUARANTINE_DIR", hub_dir / "quarantine")
+    monkeypatch.setattr(hub, "AUDIT_LOG", hub_dir / "audit.log")
+    monkeypatch.setattr(hub, "TAPS_FILE", hub_dir / "taps.json")
+    monkeypatch.setattr(hub, "INDEX_CACHE_DIR", hub_dir / "index-cache")
+    monkeypatch.setattr(hub, "HubLockFile", lambda: HubLockFile(hub.LOCK_FILE))
+
+    hub.ensure_hub_dirs()
+    source_skill = tmp_path / "source" / "plan"
+    source_skill.mkdir(parents=True)
+    (source_skill / "SKILL.md").write_text("# old dev-linked plan\n", encoding="utf-8")
+    existing_link = skills_dir / "plan"
+    existing_link.symlink_to(source_skill, target_is_directory=True)
+
+    bundle = SkillBundle(
+        name="plan",
+        files={"SKILL.md": "---\nname: plan\n---\n# new plan\n"},
+        source="github",
+        identifier="https://github.com/rzyns/hermes-stuff/tree/main/skills/plan",
+        trust_level="community",
+        metadata={"repo": "rzyns/hermes-stuff", "path": "skills/plan", "ref": "main"},
+    )
+    quarantine_path = quarantine_bundle(bundle)
+
+    install_dir = install_from_quarantine(
+        quarantine_path,
+        "plan",
+        "",
+        bundle,
+        ScanResult(skill_name="plan", source="github", trust_level="community", verdict="safe"),
+    )
+
+    assert install_dir == skills_dir / "plan"
+    assert install_dir.is_dir()
+    assert not install_dir.is_symlink()
+    assert (source_skill / "SKILL.md").read_text(encoding="utf-8") == "# old dev-linked plan\n"
+    assert "# new plan" in (install_dir / "SKILL.md").read_text(encoding="utf-8")
+    entry = HubLockFile(hub.LOCK_FILE).get_installed("plan")
+    assert entry["identifier"] == "https://github.com/rzyns/hermes-stuff/tree/main/skills/plan"
+    assert entry["metadata"] == {"repo": "rzyns/hermes-stuff", "path": "skills/plan", "ref": "main"}
 
 
 # ---------------------------------------------------------------------------
