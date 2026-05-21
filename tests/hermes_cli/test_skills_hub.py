@@ -1,3 +1,4 @@
+import json
 from io import StringIO
 from unittest.mock import patch
 
@@ -484,6 +485,68 @@ def test_resolve_source_does_not_fall_back_when_direct_github_ref_unavailable():
     assert meta is None
     assert bundle is None
     assert matched is None
+
+
+def test_do_install_github_tree_url_persists_identifier_and_ref_metadata(monkeypatch, tmp_path, hub_env):
+    import tools.skills_hub as hub
+    import tools.skills_guard as guard
+    from tools.skills_hub import SkillBundle, SkillMeta
+
+    tree_url = "https://github.com/rzyns/hermes-stuff/tree/main/skills/plan"
+
+    class _GitHubTreeSource:
+        def source_id(self):
+            return "github"
+
+        def inspect(self, identifier):
+            assert identifier == tree_url
+            return SkillMeta(
+                name="plan",
+                description="Repo plan skill",
+                source="github",
+                identifier=tree_url,
+                trust_level="community",
+                repo="rzyns/hermes-stuff",
+                path="skills/plan",
+                extra={"ref": "main"},
+            )
+
+        def fetch(self, identifier):
+            assert identifier == tree_url
+            return SkillBundle(
+                name="plan",
+                files={
+                    "SKILL.md": "---\nname: plan\n---\n",
+                    "references/kanban-artifact-planning.md": "# ref",
+                },
+                source="github",
+                identifier=tree_url,
+                trust_level="community",
+                metadata={"repo": "rzyns/hermes-stuff", "path": "skills/plan", "ref": "main"},
+            )
+
+    RealHubLockFile = hub.HubLockFile
+    monkeypatch.setattr(hub, "HubLockFile", lambda: RealHubLockFile(hub.LOCK_FILE))
+    monkeypatch.setattr(hub, "create_source_router", lambda auth: [_GitHubTreeSource()])
+    monkeypatch.setattr(
+        guard, "scan_skill",
+        lambda skill_path, source="community": guard.ScanResult(
+            skill_name="plan", source=source, trust_level="community", verdict="safe",
+        ),
+    )
+    monkeypatch.setattr(guard, "format_scan_report", lambda result: "scan ok")
+    monkeypatch.setattr(guard, "should_allow_install", lambda result, force=False: (True, "ok"))
+
+    sink = StringIO()
+    console = Console(file=sink, force_terminal=False, color_system=None)
+    do_install(tree_url, console=console, skip_confirm=True)
+
+    assert (tmp_path / "skills" / "plan" / "SKILL.md").is_file()
+    assert (tmp_path / "skills" / "plan" / "references" / "kanban-artifact-planning.md").is_file()
+    entry = json.loads((hub_env / "lock.json").read_text())["installed"]["plan"]
+    assert entry["identifier"] == tree_url
+    assert entry["metadata"] == {"repo": "rzyns/hermes-stuff", "path": "skills/plan", "ref": "main"}
+    assert entry["files"] == ["SKILL.md", "references/kanban-artifact-planning.md"]
 
 
 # ---------------------------------------------------------------------------

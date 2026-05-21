@@ -1560,7 +1560,7 @@ class TestGitHubSourceCustomTapIdentifiers:
 
     @patch.object(GitHubSource, "_download_directory")
     def test_fetch_resolves_owner_repo_skill_through_matching_tap_path(self, mock_download):
-        mock_download.side_effect = lambda repo, path: (
+        mock_download.side_effect = lambda repo, path, ref=None: (
             {"SKILL.md": "---\nname: plan\n---\n", "references/kanban-artifact-planning.md": "# ref"}
             if (repo, path) == ("rzyns/hermes-stuff", "skills/plan")
             else {}
@@ -1572,11 +1572,11 @@ class TestGitHubSourceCustomTapIdentifiers:
         assert bundle.name == "plan"
         assert bundle.identifier == "rzyns/hermes-stuff/skills/plan"
         assert "references/kanban-artifact-planning.md" in bundle.files
-        assert mock_download.call_args_list[0] == (("rzyns/hermes-stuff", "skills/plan"), {})
+        assert mock_download.call_args_list[0] == (("rzyns/hermes-stuff", "skills/plan"), {"ref": None})
 
     @patch.object(GitHubSource, "_fetch_file_content")
     def test_inspect_resolves_owner_repo_skill_through_matching_tap_path(self, mock_fetch):
-        mock_fetch.side_effect = lambda repo, path: (
+        mock_fetch.side_effect = lambda repo, path, ref=None: (
             "---\nname: plan\ndescription: Repo plan skill\n---\n"
             if (repo, path) == ("rzyns/hermes-stuff", "skills/plan/SKILL.md")
             else None
@@ -1590,14 +1590,40 @@ class TestGitHubSourceCustomTapIdentifiers:
         assert meta.identifier == "rzyns/hermes-stuff/skills/plan"
         assert meta.repo == "rzyns/hermes-stuff"
         assert meta.path == "skills/plan"
-        assert mock_fetch.call_args_list[0] == (("rzyns/hermes-stuff", "skills/plan/SKILL.md"), {})
+        assert mock_fetch.call_args_list[0] == (("rzyns/hermes-stuff", "skills/plan/SKILL.md"), {"ref": None})
 
     def test_github_tree_url_is_source_qualified_identifier(self):
         src = self._source()
 
-        assert src._identifier_candidates("https://github.com/rzyns/hermes-stuff/tree/main/skills/plan") == [
-            ("rzyns/hermes-stuff", "skills/plan", "rzyns/hermes-stuff/skills/plan")
-        ]
+        candidates = src._identifier_candidates("https://github.com/rzyns/hermes-stuff/tree/main/skills/plan")
+
+        assert len(candidates) == 1
+        assert candidates[0].repo == "rzyns/hermes-stuff"
+        assert candidates[0].path == "skills/plan"
+        assert candidates[0].ref == "main"
+        assert candidates[0].identifier == "https://github.com/rzyns/hermes-stuff/tree/main/skills/plan"
+
+    @patch.object(GitHubSource, "_download_directory")
+    def test_fetch_tree_url_carries_ref_and_preserves_provenance(self, mock_download):
+        mock_download.return_value = {"SKILL.md": "---\nname: plan\n---\n"}
+
+        bundle = self._source().fetch("https://github.com/rzyns/hermes-stuff/tree/main/skills/plan")
+
+        assert bundle is not None
+        assert bundle.identifier == "https://github.com/rzyns/hermes-stuff/tree/main/skills/plan"
+        assert bundle.metadata == {"repo": "rzyns/hermes-stuff", "path": "skills/plan", "ref": "main"}
+        mock_download.assert_called_once_with("rzyns/hermes-stuff", "skills/plan", ref="main")
+
+    @patch.object(GitHubSource, "_fetch_file_content")
+    def test_inspect_tree_url_carries_ref_and_preserves_provenance(self, mock_fetch):
+        mock_fetch.return_value = "---\nname: plan\ndescription: Repo plan skill\n---\n"
+
+        meta = self._source().inspect("https://github.com/rzyns/hermes-stuff/tree/main/skills/plan")
+
+        assert meta is not None
+        assert meta.identifier == "https://github.com/rzyns/hermes-stuff/tree/main/skills/plan"
+        assert meta.extra == {"ref": "main"}
+        mock_fetch.assert_called_once_with("rzyns/hermes-stuff", "skills/plan/SKILL.md", ref="main")
 
     def test_github_tree_url_non_main_ref_fails_closed(self):
         src = self._source()
@@ -1614,6 +1640,12 @@ class TestGitHubSourceCustomTapIdentifiers:
 
         assert src._identifier_candidates("https://github.com/rzyns/hermes-stuff/tree/main/skills/%2e%2e/evil") == []
 
+    @pytest.mark.parametrize("suffix", ["?tab=readme", "#readme"])
+    def test_github_tree_url_query_and_fragment_fail_closed(self, suffix):
+        src = self._source()
+
+        assert src._identifier_candidates(f"https://github.com/rzyns/hermes-stuff/tree/main/skills/plan{suffix}") == []
+
     @pytest.mark.parametrize(
         "identifier",
         [
@@ -1625,6 +1657,11 @@ class TestGitHubSourceCustomTapIdentifiers:
             "owner/repo/skills/--stdin",
             "owner/repo/skills\\evil",
             "owner/repo/skills/evil\x00path",
+            "owner/repo/skills/evil\x7fpath",
+            "owner/repo/skills/evil\x85path",
+            "owner/repo/skills/*/evil",
+            "owner/repo/skills/[abc]/evil",
+            "owner/repo/skills/!evil",
             "owner/repo/skills/%2e%2e/evil",
             "owner/repo/skills/%2d%2dstdin",
         ],
@@ -1649,9 +1686,9 @@ class TestGitHubSourceCustomTapIdentifiers:
 
         assert "SKILL.md" in files
         assert "references/kanban-artifact-planning.md" in files
-        mock_tree.assert_called_once_with("rzyns/hermes-stuff", "skills/plan")
-        mock_recursive.assert_called_once_with("rzyns/hermes-stuff", "skills/plan")
-        mock_git.assert_called_once_with("rzyns/hermes-stuff", "skills/plan")
+        mock_tree.assert_called_once_with("rzyns/hermes-stuff", "skills/plan", ref=None)
+        mock_recursive.assert_called_once_with("rzyns/hermes-stuff", "skills/plan", ref=None)
+        mock_git.assert_called_once_with("rzyns/hermes-stuff", "skills/plan", ref=None)
 
     @patch.object(GitHubSource, "_download_directory_via_git")
     @patch("tools.skills_hub.httpx.get")
@@ -1662,7 +1699,7 @@ class TestGitHubSourceCustomTapIdentifiers:
         content = self._source()._fetch_file_content("rzyns/hermes-stuff", "skills/plan/SKILL.md")
 
         assert content == "---\nname: plan\n---\n"
-        mock_git.assert_called_once_with("rzyns/hermes-stuff", "skills/plan")
+        mock_git.assert_called_once_with("rzyns/hermes-stuff", "skills/plan", ref=None)
 
     def test_git_fallback_rejects_option_like_paths(self):
         src = self._source()
@@ -1670,6 +1707,61 @@ class TestGitHubSourceCustomTapIdentifiers:
         assert src._download_directory_via_git("rzyns/hermes-stuff", "--stdin") == {}
         assert src._download_directory_via_git("rzyns/hermes-stuff", "skills/--stdin") == {}
         assert src._fetch_file_content_via_git("rzyns/hermes-stuff", "skills/--stdin/SKILL.md") is None
+
+    @patch("tools.skills_hub.subprocess.run")
+    def test_git_fallback_uses_explicit_ref_and_disables_terminal_prompt(self, mock_run):
+        src = self._source()
+        mock_run.return_value = MagicMock(returncode=1)
+
+        assert src._download_directory_via_git("rzyns/hermes-stuff", "skills/plan", ref="main") == {}
+
+        clone_call = mock_run.call_args_list[0]
+        assert clone_call.args[0][:7] == [
+            "git", "clone", "--depth", "1", "--filter=blob:none", "--sparse", "--branch"
+        ]
+        assert clone_call.args[0][7] == "main"
+        assert clone_call.kwargs["env"]["GIT_TERMINAL_PROMPT"] == "0"
+
+    @patch("tools.skills_hub.httpx.get")
+    def test_tree_url_fetch_uses_requested_ref_not_repo_default_branch(self, mock_get):
+        src = self._source()
+
+        tree_resp = MagicMock(status_code=200, json=lambda: {
+            "truncated": False,
+            "tree": [
+                {"type": "blob", "path": "skills/plan/SKILL.md"},
+            ],
+        })
+        raw_resp = MagicMock(status_code=200, text="# plan from main")
+        mock_get.side_effect = [tree_resp, raw_resp]
+
+        files = src._download_directory("rzyns/hermes-stuff", "skills/plan", ref="main")
+
+        assert files == {"SKILL.md": "# plan from main"}
+        requested_urls = [call.args[0] for call in mock_get.call_args_list]
+        assert "https://api.github.com/repos/rzyns/hermes-stuff" not in requested_urls
+        assert requested_urls[0] == "https://api.github.com/repos/rzyns/hermes-stuff/git/trees/main"
+        assert mock_get.call_args_list[1].kwargs["params"] == {"ref": "main"}
+
+    @patch("tools.skills_hub.httpx.get")
+    @patch.object(GitHubSource, "_fetch_file_content")
+    def test_tree_url_fallback_contents_api_keeps_requested_ref(self, mock_fetch, mock_get):
+        src = self._source()
+
+        tree_resp = MagicMock(status_code=200, json=lambda: {"truncated": True, "tree": []})
+        contents_resp = MagicMock(status_code=200, json=lambda: [
+            {"name": "SKILL.md", "type": "file", "path": "skills/plan/SKILL.md"},
+        ])
+        mock_get.side_effect = [tree_resp, contents_resp]
+        mock_fetch.return_value = "# plan from contents fallback"
+
+        files = src._download_directory("rzyns/hermes-stuff", "skills/plan", ref="main")
+
+        assert files == {"SKILL.md": "# plan from contents fallback"}
+        assert mock_get.call_args_list[0].args[0] == "https://api.github.com/repos/rzyns/hermes-stuff/git/trees/main"
+        assert mock_get.call_args_list[1].args[0] == "https://api.github.com/repos/rzyns/hermes-stuff/contents/skills/plan"
+        assert mock_get.call_args_list[1].kwargs["params"] == {"ref": "main"}
+        mock_fetch.assert_called_once_with("rzyns/hermes-stuff", "skills/plan/SKILL.md", ref="main")
 
 
 # ---------------------------------------------------------------------------
@@ -1701,7 +1793,7 @@ class TestDownloadDirectoryViaTree:
             ],
         })
         mock_get.side_effect = [repo_resp, tree_resp]
-        mock_fetch.side_effect = lambda repo, path: f"content-of-{path}"
+        mock_fetch.side_effect = lambda repo, path, ref=None: f"content-of-{path}"
 
         src = self._source()
         files = src._download_directory("owner/repo", "skills/my-skill")
@@ -1724,7 +1816,7 @@ class TestDownloadDirectoryViaTree:
         files = src._download_directory("owner/repo", "skills/my-skill")
 
         assert files == {"SKILL.md": "# ok"}
-        mock_fallback.assert_called_once_with("owner/repo", "skills/my-skill")
+        mock_fallback.assert_called_once_with("owner/repo", "skills/my-skill", ref=None)
 
     @patch.object(GitHubSource, "_download_directory_recursive", return_value={"SKILL.md": "# ok"})
     @patch("tools.skills_hub.httpx.get")
@@ -1751,7 +1843,7 @@ class TestDownloadDirectoryViaTree:
             ],
         })
         mock_get.side_effect = [repo_resp, tree_resp]
-        mock_fetch.side_effect = lambda repo, path: (
+        mock_fetch.side_effect = lambda repo, path, ref=None: (
             "# Skill" if path.endswith("SKILL.md") else None
         )
 
@@ -1793,7 +1885,7 @@ class TestDownloadDirectoryRecursive:
             {"name": "run.py", "type": "file", "path": "skill/scripts/run.py"},
         ])
         mock_get.side_effect = [root_resp, sub_resp]
-        mock_fetch.side_effect = lambda repo, path: f"content-of-{path}"
+        mock_fetch.side_effect = lambda repo, path, ref=None: f"content-of-{path}"
 
         src = self._source()
         files = src._download_directory_recursive("owner/repo", "skill")
