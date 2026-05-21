@@ -15,6 +15,7 @@ import re
 import shutil
 from pathlib import Path
 from typing import Any, Dict, List, Optional
+from urllib.parse import urlparse
 
 from rich.console import Console
 from rich.panel import Panel
@@ -106,13 +107,50 @@ def _format_extra_metadata_lines(extra: Dict[str, Any]) -> list[str]:
     return lines
 
 
+def _looks_like_direct_github_identifier(identifier: str) -> bool:
+    """Return True for source-qualified GitHub refs and GitHub tree URLs."""
+    if not isinstance(identifier, str):
+        return False
+    ident = identifier.strip()
+    if ident.lower().startswith(("http://", "https://")):
+        try:
+            parsed = urlparse(ident)
+        except ValueError:
+            return False
+        if parsed.netloc.lower() != "github.com":
+            return False
+        path_parts = [part for part in parsed.path.split("/") if part]
+        return len(path_parts) >= 5 and path_parts[2] in {"tree", "blob"}
+    known_prefixes = (
+        "official/", "skills-sh/", "skills.sh/", "skils-sh/", "skils.sh/",
+        "well-known:", "url:", "clawhub/", "claude-marketplace/", "lobehub/",
+        "browse-sh/", "hermes-index/",
+    )
+    if ident.startswith(known_prefixes):
+        return False
+    return len([part for part in ident.split("/") if part]) >= 3
+
+
 def _resolve_source_meta_and_bundle(identifier: str, sources):
-    """Resolve metadata and bundle for a specific identifier."""
+    """Resolve metadata and bundle for a specific identifier.
+
+    Direct GitHub-style identifiers are source-qualified refs, not registry
+    search terms. Try GitHub adapters first so ``owner/repo/skill`` from a
+    configured custom tap cannot be stolen by a registry entry with the same
+    display name.
+    """
     meta = None
     bundle = None
     matched_source = None
 
-    for src in sources:
+    ordered_sources = list(sources)
+    direct_github_ref = _looks_like_direct_github_identifier(identifier)
+    if direct_github_ref:
+        github_sources = [src for src in ordered_sources if getattr(src, "source_id", lambda: "")() == "github"]
+        if github_sources:
+            ordered_sources = github_sources
+
+    for src in ordered_sources:
         if meta is None:
             try:
                 meta = src.inspect(identifier)

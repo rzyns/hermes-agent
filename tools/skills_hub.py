@@ -397,67 +397,109 @@ class GitHubSource(SkillSource):
         """
         Download a skill from GitHub.
         identifier format: "owner/repo/path/to/skill-dir"
+
+        For configured custom taps, also accept the source-qualified shorthand
+        "owner/repo/skill" and resolve it through the tap path (normally
+        "skills/skill") before trying the literal repository path. This keeps
+        a tap like ``rzyns/hermes-stuff`` deterministic even when another
+        registry has an unrelated skill with the same display name.
         """
-        parts = identifier.split("/", 2)
-        if len(parts) < 3:
-            return None
+        for repo, skill_path, resolved_identifier in self._identifier_candidates(identifier):
+            files = self._download_directory(repo, skill_path)
+            if not files or "SKILL.md" not in files:
+                continue
 
-        repo = f"{parts[0]}/{parts[1]}"
-        skill_path = parts[2]
+            skill_name = skill_path.rstrip("/").split("/")[-1]
+            trust = self.trust_level_for(resolved_identifier)
 
-        files = self._download_directory(repo, skill_path)
-        if not files or "SKILL.md" not in files:
-            return None
-
-        skill_name = skill_path.rstrip("/").split("/")[-1]
-        trust = self.trust_level_for(identifier)
-
-        return SkillBundle(
-            name=skill_name,
-            files=files,
-            source="github",
-            identifier=identifier,
-            trust_level=trust,
-        )
+            bundle_files: Dict[str, Union[str, bytes]] = dict(files)
+            return SkillBundle(
+                name=skill_name,
+                files=bundle_files,
+                source="github",
+                identifier=resolved_identifier,
+                trust_level=trust,
+            )
+        return None
 
     def inspect(self, identifier: str) -> Optional[SkillMeta]:
         """Fetch just the SKILL.md metadata for preview."""
+        for repo, skill_path, resolved_identifier in self._identifier_candidates(identifier):
+            skill_md_path = f"{skill_path.rstrip('/')}/SKILL.md"
+
+            content = self._fetch_file_content(repo, skill_md_path)
+            if not content:
+                continue
+
+            fm = self._parse_frontmatter_quick(content)
+            skill_name = fm.get("name", skill_path.rstrip("/").split("/")[-1])
+            description = fm.get("description", "")
+
+            tags = []
+            metadata = fm.get("metadata", {})
+            if isinstance(metadata, dict):
+                hermes_meta = metadata.get("hermes", {})
+                if isinstance(hermes_meta, dict):
+                    tags = hermes_meta.get("tags", [])
+            if not tags:
+                raw_tags = fm.get("tags", [])
+                tags = raw_tags if isinstance(raw_tags, list) else []
+
+            return SkillMeta(
+                name=skill_name,
+                description=str(description),
+                source="github",
+                identifier=resolved_identifier,
+                trust_level=self.trust_level_for(resolved_identifier),
+                repo=repo,
+                path=skill_path.rstrip("/"),
+                tags=[str(t) for t in tags],
+            )
+        return None
+
+    def _identifier_candidates(self, identifier: str) -> List[Tuple[str, str, str]]:
+        """Return GitHub fetch candidates for an install/inspect identifier.
+
+        The literal identifier remains supported. Matching custom taps add a
+        higher-priority candidate that prefixes the tap's configured path when
+        the user supplies ``owner/repo/<skill>`` instead of the full
+        ``owner/repo/<tap-path>/<skill>``.
+        """
         parts = identifier.split("/", 2)
         if len(parts) < 3:
-            return None
+            return []
 
         repo = f"{parts[0]}/{parts[1]}"
-        skill_path = parts[2].rstrip("/")
-        skill_md_path = f"{skill_path}/SKILL.md"
+        requested_path = parts[2].strip("/")
+        if not repo or not requested_path:
+            return []
 
-        content = self._fetch_file_content(repo, skill_md_path)
-        if not content:
-            return None
+        candidates: List[Tuple[str, str, str]] = []
+        seen: set[str] = set()
 
-        fm = self._parse_frontmatter_quick(content)
-        skill_name = fm.get("name", skill_path.split("/")[-1])
-        description = fm.get("description", "")
+        def add(path: str) -> None:
+            normalized_path = path.strip("/")
+            if not normalized_path:
+                return
+            resolved = f"{repo}/{normalized_path}"
+            if resolved in seen:
+                return
+            seen.add(resolved)
+            candidates.append((repo, normalized_path, resolved))
 
-        tags = []
-        metadata = fm.get("metadata", {})
-        if isinstance(metadata, dict):
-            hermes_meta = metadata.get("hermes", {})
-            if isinstance(hermes_meta, dict):
-                tags = hermes_meta.get("tags", [])
-        if not tags:
-            raw_tags = fm.get("tags", [])
-            tags = raw_tags if isinstance(raw_tags, list) else []
+        for tap in self.taps:
+            if tap.get("repo") != repo:
+                continue
+            tap_path = str(tap.get("path", "")).strip("/")
+            if not tap_path:
+                continue
+            if requested_path == tap_path or requested_path.startswith(f"{tap_path}/"):
+                add(requested_path)
+            else:
+                add(f"{tap_path}/{requested_path}")
 
-        return SkillMeta(
-            name=skill_name,
-            description=str(description),
-            source="github",
-            identifier=identifier,
-            trust_level=self.trust_level_for(identifier),
-            repo=repo,
-            path=skill_path,
-            tags=[str(t) for t in tags],
-        )
+        add(requested_path)
+        return candidates
 
     # -- Internal helpers --
 

@@ -318,6 +318,174 @@ def test_do_install_scans_with_resolved_identifier(monkeypatch, tmp_path, hub_en
     assert scanned["source"] == canonical_identifier
 
 
+def test_looks_like_direct_github_identifier_classifies_source_boundaries():
+    from hermes_cli.skills_hub import _looks_like_direct_github_identifier
+
+    assert _looks_like_direct_github_identifier("rzyns/hermes-stuff/plan")
+    assert _looks_like_direct_github_identifier("rzyns/hermes-stuff/skills/plan")
+    assert _looks_like_direct_github_identifier("https://github.com/rzyns/hermes-stuff/tree/main/skills/plan")
+    assert _looks_like_direct_github_identifier("https://github.com/rzyns/hermes-stuff/blob/main/skills/plan/SKILL.md")
+
+    assert not _looks_like_direct_github_identifier("plan")
+    assert not _looks_like_direct_github_identifier("skills-sh/rzyns/hermes-stuff/plan")
+    assert not _looks_like_direct_github_identifier("official/plan")
+    assert not _looks_like_direct_github_identifier("https://example.com/rzyns/hermes-stuff/tree/main/skills/plan")
+    assert not _looks_like_direct_github_identifier("https://github.com/rzyns/hermes-stuff")
+
+
+def test_resolve_source_prefers_matching_github_tap_over_registry_collision():
+    from tools.skills_hub import SkillBundle, SkillMeta
+    from hermes_cli.skills_hub import _resolve_source_meta_and_bundle
+
+    class _RegistrySource:
+        def source_id(self):
+            return "hermes-index"
+
+        def inspect(self, identifier):
+            return SkillMeta(
+                name="plan",
+                description="Unrelated registry plan",
+                source="hermes-index",
+                identifier="registry/plan",
+                trust_level="community",
+            )
+
+        def fetch(self, identifier):
+            return SkillBundle(
+                name="plan",
+                files={"SKILL.md": "# wrong"},
+                source="hermes-index",
+                identifier="registry/plan",
+                trust_level="community",
+            )
+
+    class _MatchingGitHubTapSource:
+        taps = [{"repo": "rzyns/hermes-stuff", "path": "skills/"}]
+
+        def source_id(self):
+            return "github"
+
+        def inspect(self, identifier):
+            if identifier != "rzyns/hermes-stuff/plan":
+                return None
+            return SkillMeta(
+                name="plan",
+                description="Repo plan",
+                source="github",
+                identifier="rzyns/hermes-stuff/skills/plan",
+                trust_level="community",
+                repo="rzyns/hermes-stuff",
+                path="skills/plan",
+            )
+
+        def fetch(self, identifier):
+            if identifier != "rzyns/hermes-stuff/plan":
+                return None
+            return SkillBundle(
+                name="plan",
+                files={"SKILL.md": "# right", "references/kanban-artifact-planning.md": "# ref"},
+                source="github",
+                identifier="rzyns/hermes-stuff/skills/plan",
+                trust_level="community",
+            )
+
+    meta, bundle, matched = _resolve_source_meta_and_bundle(
+        "rzyns/hermes-stuff/plan",
+        [_RegistrySource(), _MatchingGitHubTapSource()],
+    )
+
+    assert matched.source_id() == "github"
+    assert meta.identifier == "rzyns/hermes-stuff/skills/plan"
+    assert bundle.identifier == "rzyns/hermes-stuff/skills/plan"
+    assert "references/kanban-artifact-planning.md" in bundle.files
+
+
+def test_resolve_source_does_not_fall_back_for_github_tree_url_collision():
+    from tools.skills_hub import SkillBundle, SkillMeta
+    from hermes_cli.skills_hub import _resolve_source_meta_and_bundle
+
+    class _UnavailableGitHubSource:
+        def source_id(self):
+            return "github"
+
+        def inspect(self, identifier):
+            return None
+
+        def fetch(self, identifier):
+            return None
+
+    class _RegistryCollisionSource:
+        def source_id(self):
+            return "clawhub"
+
+        def inspect(self, identifier):
+            return SkillMeta(
+                name="plan", description="Wrong registry plan", source="clawhub",
+                identifier="plan", trust_level="community",
+            )
+
+        def fetch(self, identifier):
+            return SkillBundle(
+                name="plan", files={"SKILL.md": "# wrong"}, source="clawhub",
+                identifier="plan", trust_level="community",
+            )
+
+    meta, bundle, matched = _resolve_source_meta_and_bundle(
+        "https://github.com/rzyns/hermes-stuff/tree/main/skills/plan",
+        [_UnavailableGitHubSource(), _RegistryCollisionSource()],
+    )
+
+    assert meta is None
+    assert bundle is None
+    assert matched is None
+
+
+def test_resolve_source_does_not_fall_back_when_direct_github_ref_unavailable():
+    from tools.skills_hub import SkillBundle, SkillMeta
+    from hermes_cli.skills_hub import _resolve_source_meta_and_bundle
+
+    class _UnavailableGitHubSource:
+        def source_id(self):
+            return "github"
+
+        def inspect(self, identifier):
+            return None
+
+        def fetch(self, identifier):
+            return None
+
+    class _RegistryCollisionSource:
+        def source_id(self):
+            return "clawhub"
+
+        def inspect(self, identifier):
+            return SkillMeta(
+                name="plan",
+                description="Wrong registry plan",
+                source="clawhub",
+                identifier="plan",
+                trust_level="community",
+            )
+
+        def fetch(self, identifier):
+            return SkillBundle(
+                name="plan",
+                files={"SKILL.md": "# wrong"},
+                source="clawhub",
+                identifier="plan",
+                trust_level="community",
+            )
+
+    meta, bundle, matched = _resolve_source_meta_and_bundle(
+        "rzyns/hermes-stuff/plan",
+        [_UnavailableGitHubSource(), _RegistryCollisionSource()],
+    )
+
+    assert meta is None
+    assert bundle is None
+    assert matched is None
+
+
 # ---------------------------------------------------------------------------
 # UrlSource-specific install paths: --name override, interactive prompts,
 # non-interactive error, existing-category scan.
