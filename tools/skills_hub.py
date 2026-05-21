@@ -20,6 +20,7 @@ import os
 import re
 import shutil
 import subprocess
+import tempfile
 import time
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
@@ -465,13 +466,20 @@ class GitHubSource(SkillSource):
         the user supplies ``owner/repo/<skill>`` instead of the full
         ``owner/repo/<tap-path>/<skill>``.
         """
+        parsed_github_url = self._parse_github_tree_url(identifier)
+        if parsed_github_url:
+            repo, requested_path = parsed_github_url
+            return [(repo, requested_path, f"{repo}/{requested_path}")]
+        if isinstance(identifier, str) and identifier.strip().lower().startswith(("http://", "https://")):
+            return []
+
         parts = identifier.split("/", 2)
         if len(parts) < 3:
             return []
 
         repo = f"{parts[0]}/{parts[1]}"
         requested_path = parts[2].strip("/")
-        if not repo or not requested_path:
+        if not self._is_safe_github_repo(repo) or not self._is_safe_git_path(requested_path):
             return []
 
         candidates: List[Tuple[str, str, str]] = []
@@ -479,7 +487,7 @@ class GitHubSource(SkillSource):
 
         def add(path: str) -> None:
             normalized_path = path.strip("/")
-            if not normalized_path:
+            if not self._is_safe_git_path(normalized_path):
                 return
             resolved = f"{repo}/{normalized_path}"
             if resolved in seen:
@@ -500,6 +508,54 @@ class GitHubSource(SkillSource):
 
         add(requested_path)
         return candidates
+
+    @staticmethod
+    def _parse_github_tree_url(identifier: str) -> Optional[Tuple[str, str]]:
+        """Parse a GitHub tree/blob URL into ``(owner/repo, path)``."""
+        if not isinstance(identifier, str):
+            return None
+        identifier = identifier.strip()
+        if not identifier.lower().startswith(("http://", "https://")):
+            return None
+        try:
+            parsed = urlparse(identifier)
+        except ValueError:
+            return None
+        if parsed.netloc.lower() != "github.com":
+            return None
+        parts = [part for part in parsed.path.split("/") if part]
+        if len(parts) < 5 or parts[2] != "tree":
+            return None
+        if parts[3] != "main":
+            return None
+        owner, repo_name = parts[0], parts[1]
+        repo = f"{owner}/{repo_name}"
+        if not GitHubSource._is_safe_github_repo(repo):
+            return None
+        skill_path = "/".join(parts[4:]).strip("/")
+        if not GitHubSource._is_safe_git_path(skill_path):
+            return None
+        return f"{owner}/{repo_name}", skill_path
+
+    @staticmethod
+    def _is_safe_github_repo(repo: str) -> bool:
+        if not re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", repo or ""):
+            return False
+        return all(part not in {".", ".."} and not part.startswith("-") for part in repo.split("/"))
+
+    @staticmethod
+    def _is_safe_git_path(path: str) -> bool:
+        raw_path = path.strip("/")
+        if "%" in raw_path or "\\" in raw_path or any(ord(ch) < 32 for ch in raw_path):
+            return False
+        posix_path = PurePosixPath(raw_path)
+        return bool(
+            str(posix_path)
+            and str(posix_path) != "."
+            and not posix_path.is_absolute()
+            and ".." not in posix_path.parts
+            and all(part and not part.startswith("-") for part in posix_path.parts)
+        )
 
     # -- Internal helpers --
 
@@ -616,7 +672,84 @@ class GitHubSource(SkillSource):
         if files is not None:
             return files
         logger.debug("Tree API unavailable for %s/%s, falling back to Contents API", repo, path)
-        return self._download_directory_recursive(repo, path)
+        files = self._download_directory_recursive(repo, path)
+        if files:
+            return files
+        logger.debug("Contents API unavailable for %s/%s, falling back to git CLI", repo, path)
+        return self._download_directory_via_git(repo, path)
+
+    def _git_clone_url(self, repo: str) -> Optional[str]:
+        """Return a safe HTTPS clone URL for an ``owner/repo`` identifier."""
+        if not self._is_safe_github_repo(repo):
+            return None
+        return f"https://github.com/{repo}.git"
+
+    def _download_directory_via_git(self, repo: str, path: str) -> Dict[str, str]:
+        """Download a skill directory using the local git client as fallback.
+
+        This covers private repos where ``git`` has a credential helper but the
+        GitHub Contents API is anonymous because ``gh``/``GITHUB_TOKEN`` are not
+        configured. It is intentionally fallback-only so public unauthenticated
+        installs keep using the lighter API path.
+        """
+        clone_url = self._git_clone_url(repo)
+        if not clone_url:
+            return {}
+
+        normalized_path = path.strip("/")
+        if not self._is_safe_git_path(normalized_path):
+            return {}
+
+        with tempfile.TemporaryDirectory(prefix="hermes-skill-git-") as tmp:
+            workdir = Path(tmp) / "repo"
+            commands = [
+                ["git", "clone", "--depth", "1", "--filter=blob:none", "--sparse", clone_url, str(workdir)],
+                ["git", "-C", str(workdir), "sparse-checkout", "set", "--no-cone", normalized_path],
+                ["git", "-C", str(workdir), "checkout"],
+            ]
+            for cmd in commands:
+                try:
+                    result = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
+                except (FileNotFoundError, subprocess.TimeoutExpired) as exc:
+                    logger.debug("git fallback command failed for %s/%s: %s", repo, path, exc)
+                    return {}
+                if result.returncode != 0:
+                    logger.debug("git fallback command returned %s for %s/%s", result.returncode, repo, path)
+                    return {}
+
+            root = workdir.resolve()
+            target = (workdir / normalized_path).resolve()
+            try:
+                target.relative_to(root)
+            except ValueError:
+                logger.warning("git fallback path escaped clone root: %s", normalized_path)
+                return {}
+            if not target.is_dir():
+                return {}
+
+            files: Dict[str, str] = {}
+            for file_path in target.rglob("*"):
+                if not file_path.is_file():
+                    continue
+                resolved_file = file_path.resolve()
+                try:
+                    resolved_file.relative_to(target)
+                except ValueError:
+                    logger.debug("Skipping escaped git fallback file: %s", file_path)
+                    continue
+                rel_path = resolved_file.relative_to(target).as_posix()
+                try:
+                    safe_rel_path = _validate_bundle_rel_path(rel_path)
+                except ValueError:
+                    logger.debug("Skipping unsafe git fallback file path: %s", rel_path)
+                    continue
+                try:
+                    files[safe_rel_path] = resolved_file.read_text(encoding="utf-8")
+                except UnicodeDecodeError:
+                    logger.debug("Skipping non-text git fallback file: %s", rel_path)
+                except OSError as exc:
+                    logger.debug("Skipping unreadable git fallback file %s: %s", rel_path, exc)
+            return files
 
     def _download_directory_via_tree(self, repo: str, path: str) -> Optional[Dict[str, str]]:
         """Download an entire directory using the Git Trees API (single request).
@@ -735,7 +868,17 @@ class GitHubSource(SkillSource):
             self._check_rate_limit_response(resp)
         except httpx.HTTPError as e:
             logger.debug("GitHub contents API fetch failed: %s", e)
-        return None
+        return self._fetch_file_content_via_git(repo, path)
+
+    def _fetch_file_content_via_git(self, repo: str, path: str) -> Optional[str]:
+        rel = PurePosixPath(path.strip("/"))
+        if not self._is_safe_git_path(path) or not rel.name:
+            return None
+        parent = "" if str(rel.parent) == "." else rel.parent.as_posix()
+        if not parent:
+            return None
+        files = self._download_directory_via_git(repo, parent)
+        return files.get(rel.name)
 
     def _read_cache(self, key: str) -> Optional[list]:
         """Read cached index if not expired."""
