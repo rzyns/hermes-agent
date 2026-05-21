@@ -1682,8 +1682,14 @@ class GatewayRunner:
             from hermes_cli.config import warn_deprecated_cwd_env_vars
 
             warn_deprecated_cwd_env_vars()
-        except Exception:
-            pass  # best-effort — don't block gateway startup
+        except Exception as _exc:
+            # Don't block gateway startup, but don't silently swallow either —
+            # the warning may be the only signal the user has about a config issue.
+            logger.warning(
+                "Deprecated CWD env-var warning suppressed after error: %s",
+                _exc,
+                exc_info=logger.isEnabledFor(logging.DEBUG),
+            )
 
         # Load ephemeral config from config.yaml / env vars.
         # Both are injected at API-call time only and never persisted.
