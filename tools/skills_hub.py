@@ -91,6 +91,16 @@ class SkillBundle:
     metadata: Dict[str, Any] = field(default_factory=dict)
 
 
+@dataclass(frozen=True)
+class _GitHubIdentifierCandidate:
+    """Resolved GitHub fetch target for install/inspect identifiers."""
+
+    repo: str
+    path: str
+    identifier: str
+    ref: Optional[str] = None
+
+
 def _normalize_bundle_path(path_value: str, *, field_name: str, allow_nested: bool) -> str:
     """Normalize and validate bundle-controlled paths before touching disk."""
     if not isinstance(path_value, str):
@@ -341,7 +351,7 @@ class GitHubSource(SkillSource):
         self.taps = list(self.DEFAULT_TAPS)
         if extra_taps:
             self.taps.extend(extra_taps)
-        # Per-instance cache: repo -> (default_branch, tree_entries)
+        # Per-instance cache: repo/ref -> (resolved_ref, tree_entries)
         # Survives within a single search/install flow, avoiding redundant API calls.
         self._tree_cache: Dict[str, Tuple[str, List[dict]]] = {}
         # Set when GitHub returns 403 with rate limit exhausted
@@ -405,35 +415,39 @@ class GitHubSource(SkillSource):
         a tap like ``rzyns/hermes-stuff`` deterministic even when another
         registry has an unrelated skill with the same display name.
         """
-        for repo, skill_path, resolved_identifier in self._identifier_candidates(identifier):
-            files = self._download_directory(repo, skill_path)
+        for candidate in self._identifier_candidates(identifier):
+            files = self._download_directory(candidate.repo, candidate.path, ref=candidate.ref)
             if not files or "SKILL.md" not in files:
                 continue
 
-            skill_name = skill_path.rstrip("/").split("/")[-1]
-            trust = self.trust_level_for(resolved_identifier)
+            skill_name = candidate.path.rstrip("/").split("/")[-1]
+            trust = self.trust_level_for(candidate.identifier)
 
             bundle_files: Dict[str, Union[str, bytes]] = dict(files)
+            metadata: Dict[str, Any] = {}
+            if candidate.ref is not None:
+                metadata.update({"repo": candidate.repo, "path": candidate.path, "ref": candidate.ref})
             return SkillBundle(
                 name=skill_name,
                 files=bundle_files,
                 source="github",
-                identifier=resolved_identifier,
+                identifier=candidate.identifier,
                 trust_level=trust,
+                metadata=metadata,
             )
         return None
 
     def inspect(self, identifier: str) -> Optional[SkillMeta]:
         """Fetch just the SKILL.md metadata for preview."""
-        for repo, skill_path, resolved_identifier in self._identifier_candidates(identifier):
-            skill_md_path = f"{skill_path.rstrip('/')}/SKILL.md"
+        for candidate in self._identifier_candidates(identifier):
+            skill_md_path = f"{candidate.path.rstrip('/')}/SKILL.md"
 
-            content = self._fetch_file_content(repo, skill_md_path)
+            content = self._fetch_file_content(candidate.repo, skill_md_path, ref=candidate.ref)
             if not content:
                 continue
 
             fm = self._parse_frontmatter_quick(content)
-            skill_name = fm.get("name", skill_path.rstrip("/").split("/")[-1])
+            skill_name = fm.get("name", candidate.path.rstrip("/").split("/")[-1])
             description = fm.get("description", "")
 
             tags = []
@@ -450,26 +464,29 @@ class GitHubSource(SkillSource):
                 name=skill_name,
                 description=str(description),
                 source="github",
-                identifier=resolved_identifier,
-                trust_level=self.trust_level_for(resolved_identifier),
-                repo=repo,
-                path=skill_path.rstrip("/"),
+                identifier=candidate.identifier,
+                trust_level=self.trust_level_for(candidate.identifier),
+                repo=candidate.repo,
+                path=candidate.path.rstrip("/"),
                 tags=[str(t) for t in tags],
+                extra={"ref": candidate.ref} if candidate.ref is not None else {},
             )
         return None
 
-    def _identifier_candidates(self, identifier: str) -> List[Tuple[str, str, str]]:
+    def _identifier_candidates(self, identifier: str) -> List[_GitHubIdentifierCandidate]:
         """Return GitHub fetch candidates for an install/inspect identifier.
 
         The literal identifier remains supported. Matching custom taps add a
         higher-priority candidate that prefixes the tap's configured path when
         the user supplies ``owner/repo/<skill>`` instead of the full
-        ``owner/repo/<tap-path>/<skill>``.
+        ``owner/repo/<tap-path>/<skill>``. Direct GitHub tree URLs are
+        exact-source candidates: the parsed tree ref is carried through every
+        download path and preserved in the bundle identifier.
         """
         parsed_github_url = self._parse_github_tree_url(identifier)
         if parsed_github_url:
-            repo, requested_path = parsed_github_url
-            return [(repo, requested_path, f"{repo}/{requested_path}")]
+            repo, ref, requested_path, resolved_identifier = parsed_github_url
+            return [_GitHubIdentifierCandidate(repo, requested_path, resolved_identifier, ref=ref)]
         if isinstance(identifier, str) and identifier.strip().lower().startswith(("http://", "https://")):
             return []
 
@@ -482,7 +499,7 @@ class GitHubSource(SkillSource):
         if not self._is_safe_github_repo(repo) or not self._is_safe_git_path(requested_path):
             return []
 
-        candidates: List[Tuple[str, str, str]] = []
+        candidates: List[_GitHubIdentifierCandidate] = []
         seen: set[str] = set()
 
         def add(path: str) -> None:
@@ -493,7 +510,7 @@ class GitHubSource(SkillSource):
             if resolved in seen:
                 return
             seen.add(resolved)
-            candidates.append((repo, normalized_path, resolved))
+            candidates.append(_GitHubIdentifierCandidate(repo, normalized_path, resolved))
 
         for tap in self.taps:
             if tap.get("repo") != repo:
@@ -510,8 +527,13 @@ class GitHubSource(SkillSource):
         return candidates
 
     @staticmethod
-    def _parse_github_tree_url(identifier: str) -> Optional[Tuple[str, str]]:
-        """Parse a GitHub tree/blob URL into ``(owner/repo, path)``."""
+    def _parse_github_tree_url(identifier: str) -> Optional[Tuple[str, str, str, str]]:
+        """Parse a GitHub tree URL into ``(owner/repo, ref, path, canonical_url)``.
+
+        Only ``/tree/main/...`` is currently supported. Query strings and
+        fragments are rejected so a direct URL install cannot appear more exact
+        than the source actually used.
+        """
         if not isinstance(identifier, str):
             return None
         identifier = identifier.strip()
@@ -521,12 +543,13 @@ class GitHubSource(SkillSource):
             parsed = urlparse(identifier)
         except ValueError:
             return None
-        if parsed.netloc.lower() != "github.com":
+        if parsed.netloc.lower() != "github.com" or parsed.query or parsed.fragment:
             return None
         parts = [part for part in parsed.path.split("/") if part]
         if len(parts) < 5 or parts[2] != "tree":
             return None
-        if parts[3] != "main":
+        ref = parts[3]
+        if ref != "main":
             return None
         owner, repo_name = parts[0], parts[1]
         repo = f"{owner}/{repo_name}"
@@ -535,7 +558,8 @@ class GitHubSource(SkillSource):
         skill_path = "/".join(parts[4:]).strip("/")
         if not GitHubSource._is_safe_git_path(skill_path):
             return None
-        return f"{owner}/{repo_name}", skill_path
+        canonical_url = f"https://github.com/{owner}/{repo_name}/tree/{ref}/{skill_path}"
+        return repo, ref, skill_path, canonical_url
 
     @staticmethod
     def _is_safe_github_repo(repo: str) -> bool:
@@ -546,7 +570,12 @@ class GitHubSource(SkillSource):
     @staticmethod
     def _is_safe_git_path(path: str) -> bool:
         raw_path = path.strip("/")
-        if "%" in raw_path or "\\" in raw_path or any(ord(ch) < 32 for ch in raw_path):
+        if (
+            "%" in raw_path
+            or "\\" in raw_path
+            or any(ord(ch) < 32 or ord(ch) == 127 or 0x80 <= ord(ch) <= 0x9F for ch in raw_path)
+            or any(ch in raw_path for ch in "*?[]")
+        ):
             return False
         posix_path = PurePosixPath(raw_path)
         return bool(
@@ -554,7 +583,7 @@ class GitHubSource(SkillSource):
             and str(posix_path) != "."
             and not posix_path.is_absolute()
             and ".." not in posix_path.parts
-            and all(part and not part.startswith("-") for part in posix_path.parts)
+            and all(part and not part.startswith(("-", "!")) for part in posix_path.parts)
         )
 
     # -- Internal helpers --
@@ -599,7 +628,7 @@ class GitHubSource(SkillSource):
 
     # -- Repo tree cache (avoids redundant API calls) --
 
-    def _get_repo_tree(self, repo: str) -> Optional[Tuple[str, List[dict]]]:
+    def _get_repo_tree(self, repo: str, ref: Optional[str] = None) -> Optional[Tuple[str, List[dict]]]:
         """Get cached or fresh repo tree.
 
         Returns ``(default_branch, tree_entries)`` or ``None``.
@@ -610,28 +639,32 @@ class GitHubSource(SkillSource):
         6 duplicated pairs per install, consuming ~12 of the 60/hr
         unauthenticated rate limit for nothing).
         """
-        if repo in self._tree_cache:
-            return self._tree_cache[repo]
+        cache_key = f"{repo}@{ref or '<default>'}"
+        if cache_key in self._tree_cache:
+            return self._tree_cache[cache_key]
 
         headers = self.auth.get_headers()
 
-        # Resolve default branch
-        try:
-            resp = httpx.get(
-                f"https://api.github.com/repos/{repo}",
-                headers=headers, timeout=15, follow_redirects=True,
-            )
-            if resp.status_code != 200:
-                self._check_rate_limit_response(resp)
+        # Resolve default branch unless a direct tree URL supplied an exact ref.
+        if ref is None:
+            try:
+                resp = httpx.get(
+                    f"https://api.github.com/repos/{repo}",
+                    headers=headers, timeout=15, follow_redirects=True,
+                )
+                if resp.status_code != 200:
+                    self._check_rate_limit_response(resp)
+                    return None
+                tree_ref = resp.json().get("default_branch", "main")
+            except (httpx.HTTPError, ValueError):
                 return None
-            default_branch = resp.json().get("default_branch", "main")
-        except (httpx.HTTPError, ValueError):
-            return None
+        else:
+            tree_ref = ref
 
         # Fetch recursive tree
         try:
             resp = httpx.get(
-                f"https://api.github.com/repos/{repo}/git/trees/{default_branch}",
+                f"https://api.github.com/repos/{repo}/git/trees/{tree_ref}",
                 params={"recursive": "1"},
                 headers=headers, timeout=30, follow_redirects=True,
             )
@@ -646,8 +679,8 @@ class GitHubSource(SkillSource):
             return None
 
         entries = tree_data.get("tree", [])
-        self._tree_cache[repo] = (default_branch, entries)
-        return (default_branch, entries)
+        self._tree_cache[cache_key] = (tree_ref, entries)
+        return (tree_ref, entries)
 
     def _check_rate_limit_response(self, resp: "httpx.Response") -> None:
         """Flag the instance as rate-limited when GitHub returns 403 + exhausted quota."""
@@ -660,7 +693,7 @@ class GitHubSource(SkillSource):
                     "Set GITHUB_TOKEN or install the gh CLI to raise the limit to 5,000/hr."
                 )
 
-    def _download_directory(self, repo: str, path: str) -> Dict[str, str]:
+    def _download_directory(self, repo: str, path: str, ref: Optional[str] = None) -> Dict[str, str]:
         """Recursively download all text files from a GitHub directory.
 
         Uses the Git Trees API first (single call for the entire tree) to
@@ -668,15 +701,15 @@ class GitHubSource(SkillSource):
         loss.  Falls back to the recursive Contents API when the tree
         endpoint is unavailable or the response is truncated.
         """
-        files = self._download_directory_via_tree(repo, path)
+        files = self._download_directory_via_tree(repo, path, ref=ref)
         if files is not None:
             return files
         logger.debug("Tree API unavailable for %s/%s, falling back to Contents API", repo, path)
-        files = self._download_directory_recursive(repo, path)
+        files = self._download_directory_recursive(repo, path, ref=ref)
         if files:
             return files
         logger.debug("Contents API unavailable for %s/%s, falling back to git CLI", repo, path)
-        return self._download_directory_via_git(repo, path)
+        return self._download_directory_via_git(repo, path, ref=ref)
 
     def _git_clone_url(self, repo: str) -> Optional[str]:
         """Return a safe HTTPS clone URL for an ``owner/repo`` identifier."""
@@ -684,7 +717,12 @@ class GitHubSource(SkillSource):
             return None
         return f"https://github.com/{repo}.git"
 
-    def _download_directory_via_git(self, repo: str, path: str) -> Dict[str, str]:
+    @staticmethod
+    def _is_safe_git_ref(ref: str) -> bool:
+        """Narrow allowlist for explicit refs accepted from direct GitHub URLs."""
+        return ref == "main"
+
+    def _download_directory_via_git(self, repo: str, path: str, ref: Optional[str] = None) -> Dict[str, str]:
         """Download a skill directory using the local git client as fallback.
 
         This covers private repos where ``git`` has a credential helper but the
@@ -699,17 +737,24 @@ class GitHubSource(SkillSource):
         normalized_path = path.strip("/")
         if not self._is_safe_git_path(normalized_path):
             return {}
+        if ref is not None and not self._is_safe_git_ref(ref):
+            return {}
 
         with tempfile.TemporaryDirectory(prefix="hermes-skill-git-") as tmp:
             workdir = Path(tmp) / "repo"
+            clone_cmd = ["git", "clone", "--depth", "1", "--filter=blob:none", "--sparse"]
+            if ref is not None:
+                clone_cmd.extend(["--branch", ref])
+            clone_cmd.extend([clone_url, str(workdir)])
             commands = [
-                ["git", "clone", "--depth", "1", "--filter=blob:none", "--sparse", clone_url, str(workdir)],
+                clone_cmd,
                 ["git", "-C", str(workdir), "sparse-checkout", "set", "--no-cone", normalized_path],
                 ["git", "-C", str(workdir), "checkout"],
             ]
+            git_env = {**os.environ, "GIT_TERMINAL_PROMPT": "0"}
             for cmd in commands:
                 try:
-                    result = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
+                    result = subprocess.run(cmd, capture_output=True, text=True, timeout=60, env=git_env)
                 except (FileNotFoundError, subprocess.TimeoutExpired) as exc:
                     logger.debug("git fallback command failed for %s/%s: %s", repo, path, exc)
                     return {}
@@ -724,12 +769,12 @@ class GitHubSource(SkillSource):
             except ValueError:
                 logger.warning("git fallback path escaped clone root: %s", normalized_path)
                 return {}
-            if not target.is_dir():
+            if not target.exists() or not target.is_dir():
                 return {}
 
             files: Dict[str, str] = {}
             for file_path in target.rglob("*"):
-                if not file_path.is_file():
+                if file_path.is_symlink() or not file_path.is_file():
                     continue
                 resolved_file = file_path.resolve()
                 try:
@@ -751,7 +796,7 @@ class GitHubSource(SkillSource):
                     logger.debug("Skipping unreadable git fallback file %s: %s", rel_path, exc)
             return files
 
-    def _download_directory_via_tree(self, repo: str, path: str) -> Optional[Dict[str, str]]:
+    def _download_directory_via_tree(self, repo: str, path: str, ref: Optional[str] = None) -> Optional[Dict[str, str]]:
         """Download an entire directory using the Git Trees API (single request).
 
         Returns:
@@ -762,7 +807,7 @@ class GitHubSource(SkillSource):
         """
         path = path.rstrip("/")
 
-        cached = self._get_repo_tree(repo)
+        cached = self._get_repo_tree(repo, ref=ref)
         if cached is None:
             return None
         _default_branch, tree_entries = cached
@@ -786,19 +831,25 @@ class GitHubSource(SkillSource):
             if not item_path.startswith(prefix):
                 continue
             rel_path = item_path[len(prefix):]
-            content = self._fetch_file_content(repo, item_path)
+            try:
+                safe_rel_path = _validate_bundle_rel_path(rel_path)
+            except ValueError:
+                logger.debug("Skipping unsafe GitHub tree path: %s", rel_path)
+                continue
+            content = self._fetch_file_content(repo, item_path, ref=ref)
             if content is not None:
-                files[rel_path] = content
+                files[safe_rel_path] = content
             else:
                 logger.debug("Skipped file (fetch failed): %s/%s", repo, item_path)
 
         return files if files else None
 
-    def _download_directory_recursive(self, repo: str, path: str) -> Dict[str, str]:
+    def _download_directory_recursive(self, repo: str, path: str, ref: Optional[str] = None) -> Dict[str, str]:
         """Recursively download via Contents API (fallback)."""
         url = f"https://api.github.com/repos/{repo}/contents/{path.rstrip('/')}"
+        params = {"ref": ref} if ref is not None else None
         try:
-            resp = httpx.get(url, headers=self.auth.get_headers(), timeout=15, follow_redirects=True)
+            resp = httpx.get(url, params=params, headers=self.auth.get_headers(), timeout=15, follow_redirects=True)
             if resp.status_code != 200:
                 logger.debug("Contents API returned %d for %s/%s", resp.status_code, repo, path)
                 return {}
@@ -814,17 +865,27 @@ class GitHubSource(SkillSource):
             name = entry.get("name", "")
             entry_type = entry.get("type", "")
 
+            try:
+                safe_name = _validate_bundle_rel_path(name)
+            except ValueError:
+                logger.debug("Skipping unsafe GitHub contents path name: %s", name)
+                continue
+
             if entry_type == "file":
-                content = self._fetch_file_content(repo, entry.get("path", ""))
+                content = self._fetch_file_content(repo, entry.get("path", ""), ref=ref)
                 if content is not None:
-                    rel_path = name
-                    files[rel_path] = content
+                    files[safe_name] = content
             elif entry_type == "dir":
-                sub_files = self._download_directory_recursive(repo, entry.get("path", ""))
+                sub_files = self._download_directory_recursive(repo, entry.get("path", ""), ref=ref)
                 if not sub_files:
                     logger.debug("Empty or failed subdirectory: %s/%s", repo, entry.get("path", ""))
                 for sub_name, sub_content in sub_files.items():
-                    files[f"{name}/{sub_name}"] = sub_content
+                    try:
+                        safe_sub_path = _validate_bundle_rel_path(f"{safe_name}/{sub_name}")
+                    except ValueError:
+                        logger.debug("Skipping unsafe GitHub contents subpath: %s/%s", safe_name, sub_name)
+                        continue
+                    files[safe_sub_path] = sub_content
 
         return files
 
@@ -854,12 +915,14 @@ class GitHubSource(SkillSource):
 
         return None
 
-    def _fetch_file_content(self, repo: str, path: str) -> Optional[str]:
+    def _fetch_file_content(self, repo: str, path: str, ref: Optional[str] = None) -> Optional[str]:
         """Fetch a single file's content from GitHub."""
         url = f"https://api.github.com/repos/{repo}/contents/{path}"
+        params = {"ref": ref} if ref is not None else None
         try:
             resp = httpx.get(
                 url,
+                params=params,
                 headers={**self.auth.get_headers(), "Accept": "application/vnd.github.v3.raw"},
                 timeout=15, follow_redirects=True,
             )
@@ -868,16 +931,16 @@ class GitHubSource(SkillSource):
             self._check_rate_limit_response(resp)
         except httpx.HTTPError as e:
             logger.debug("GitHub contents API fetch failed: %s", e)
-        return self._fetch_file_content_via_git(repo, path)
+        return self._fetch_file_content_via_git(repo, path, ref=ref)
 
-    def _fetch_file_content_via_git(self, repo: str, path: str) -> Optional[str]:
+    def _fetch_file_content_via_git(self, repo: str, path: str, ref: Optional[str] = None) -> Optional[str]:
         rel = PurePosixPath(path.strip("/"))
         if not self._is_safe_git_path(path) or not rel.name:
             return None
         parent = "" if str(rel.parent) == "." else rel.parent.as_posix()
         if not parent:
             return None
-        files = self._download_directory_via_git(repo, parent)
+        files = self._download_directory_via_git(repo, parent, ref=ref)
         return files.get(rel.name)
 
     def _read_cache(self, key: str) -> Optional[list]:
