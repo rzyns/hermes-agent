@@ -500,6 +500,8 @@ def _load_json_with_duplicate_guard(path: Path) -> tuple[dict | None, list[str]]
         with path.open("r", encoding="utf-8") as fh:
             # Duplicate-key guard: object_pairs_hook receives the raw list of
             # (key, value) pairs in document order.  We detect duplicates here.
+            # Non-finite constant guard: parse_constant receives any non-standard
+            # JSON literal (NaN, Infinity, -Infinity).  We reject them fail-closed.
             def _reject_duplicate_keys(pairs):
                 seen = set()
                 for key, _ in pairs:
@@ -510,10 +512,22 @@ def _load_json_with_duplicate_guard(path: Path) -> tuple[dict | None, list[str]]
                     seen.add(key)
                 return dict(pairs)
 
-            data = json.load(fh, object_pairs_hook=_reject_duplicate_keys)
+            def _reject_nonfinite(const_name):
+                raise json.JSONDecodeError(
+                    f"Non-finite constant: {const_name!r}", doc=str(const_name), pos=0
+                )
+
+            data = json.load(
+                fh,
+                object_pairs_hook=_reject_duplicate_keys,
+                parse_constant=_reject_nonfinite,
+            )
     except json.JSONDecodeError as exc:
-        if getattr(exc, "msg", "").startswith("Duplicate key"):
+        msg = getattr(exc, "msg", "")
+        if msg.startswith("Duplicate key"):
             return (None, ["manifest_duplicate_keys"])
+        if "Non-finite constant" in msg:
+            return (None, ["manifest_nonfinite_constant"])
         return (None, ["manifest_malformed"])
     except Exception as exc:
         return (None, [f"manifest_unreadable:{exc}"])
@@ -861,9 +875,27 @@ def cmd_validate_manifest(args: argparse.Namespace) -> int:
 
     # -- Post-load canonicalization hardening -----------------------------------
     _validate_manifest_canonicalization(manifest, errors)
-    # If canonicalization already failed, we still continue with field-level
-    # checks so the report captures every relevant issue, but we will ultimately
-    # return EXIT_SCHEMA_MISMATCH when any hardening error surfaces.
+    # If canonicalization already failed, fail-closed immediately so
+    # bundle/artifact digest/hash work is never attempted.
+    canon_errors = [
+        e
+        for e in errors
+        if e.startswith(
+            (
+                "manifest_exceeds_max",
+                "manifest_duplicate_keys",
+                "manifest_version_unsupported",
+                "manifest_nonfinite_constant",
+                "manifest_not_an_object",
+                "manifest_malformed",
+                "manifest_unreadable",
+                "bundle_canonicalization_invalid",
+            )
+        )
+    ]
+    if canon_errors:
+        _write_validation_report(output_dir, False, errors, manifest)
+        return SURFACE_B_EXIT_CODES["EXIT_SCHEMA_MISMATCH"]
 
     # -- Field-level validations -----------------------------------------------
     _validate_manifest_fields(manifest, errors)

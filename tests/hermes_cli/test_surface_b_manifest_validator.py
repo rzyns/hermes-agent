@@ -121,11 +121,13 @@ class TestSurfaceBRequiredFields:
         manifest = tmp_path / "manifest.json"
         manifest.write_text(json.dumps(m, indent=2))
         result = _run_validate_manifest(tmp_path, hermes_main, manifest)
-        # After canonicalization hardening, missing manifest_version also
-        # triggers manifest_version_unsupported → EXIT_SCHEMA_MISMATCH (20).
+        # After canonicalization hardening with short-circuit, missing
+        # manifest_version triggers manifest_version_unsupported →
+        # EXIT_SCHEMA_MISMATCH (20) immediately; missing_required_fields is
+        # not reached.
         assert result.returncode == 20
         report = json.loads((tmp_path / "out" / "validation_report.json").read_text())
-        assert any("missing_required_fields" in e for e in report["errors"])
+        assert any("manifest_version_unsupported" in e for e in report["errors"])
 
     def test_missing_board_identity_fails(self, tmp_path, hermes_main):
         m = _make_manifest()
@@ -460,6 +462,69 @@ class TestSurfaceBCanonicalization:
         assert result.returncode == 0
         report = json.loads((tmp_path / "out" / "validation_report.json").read_text())
         assert report["valid"] is True
+
+    def test_nan_value_rejected(self, tmp_path, hermes_main):
+        m = _make_manifest()
+        m["run_id"] = float("nan")
+        m["bundle_id"] = _canonical_bundle_id(m)
+        manifest = tmp_path / "manifest.json"
+        manifest.write_text(json.dumps(m, indent=2))
+        result = _run_validate_manifest(tmp_path, hermes_main, manifest)
+        assert result.returncode == 20
+        report = json.loads((tmp_path / "out" / "validation_report.json").read_text())
+        assert any("manifest_nonfinite_constant" in e for e in report["errors"])
+
+    def test_infinity_value_rejected(self, tmp_path, hermes_main):
+        m = _make_manifest()
+        m["run_id"] = float("inf")
+        m["bundle_id"] = _canonical_bundle_id(m)
+        manifest = tmp_path / "manifest.json"
+        manifest.write_text(json.dumps(m, indent=2))
+        result = _run_validate_manifest(tmp_path, hermes_main, manifest)
+        assert result.returncode == 20
+        report = json.loads((tmp_path / "out" / "validation_report.json").read_text())
+        assert any("manifest_nonfinite_constant" in e for e in report["errors"])
+
+    def test_negative_infinity_value_rejected(self, tmp_path, hermes_main):
+        m = _make_manifest()
+        m["run_id"] = float("-inf")
+        m["bundle_id"] = _canonical_bundle_id(m)
+        manifest = tmp_path / "manifest.json"
+        manifest.write_text(json.dumps(m, indent=2))
+        result = _run_validate_manifest(tmp_path, hermes_main, manifest)
+        assert result.returncode == 20
+        report = json.loads((tmp_path / "out" / "validation_report.json").read_text())
+        assert any("manifest_nonfinite_constant" in e for e in report["errors"])
+
+    def test_schema_failure_short_circuits_bundle_work(self, tmp_path, hermes_main):
+        f = tmp_path / "real.txt"
+        f.write_text("real content")
+        # Use deliberately wrong hash so that if artifact hashing is NOT
+        # short-circuited, an artifact_hash_mismatch error will appear.
+        m = _make_manifest()
+        m["manifest_version"] = "unsupported.version"
+        m["artifact_refs"] = [
+            {
+                "artifact_id": "a1",
+                "artifact_type": "raw_snapshot",
+                "authority_class": "diagnostic",
+                "path": str(f),
+                "sha256": "0" * 64,
+                "size": len(b"real content"),
+                "redaction_state": "raw_only",
+            }
+        ]
+        m["bundle_id"] = _canonical_bundle_id(m)
+        manifest = tmp_path / "manifest.json"
+        manifest.write_text(json.dumps(m, indent=2))
+        result = _run_validate_manifest(tmp_path, hermes_main, manifest)
+        assert result.returncode == 20
+        report = json.loads((tmp_path / "out" / "validation_report.json").read_text())
+        assert any("manifest_version_unsupported" in e for e in report["errors"])
+        assert not any("artifact_hash_mismatch" in e for e in report["errors"])
+        assert not any("artifact_missing" in e for e in report["errors"])
+        assert not any("artifact_hash_unreadable" in e for e in report["errors"])
+        assert not any("toctOU" in e for e in report["errors"])
 
 
 class TestSurfaceBArtifactHashVerification:
