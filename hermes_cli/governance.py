@@ -588,13 +588,23 @@ def _validate_manifest_canonicalization(manifest: dict, out: list[str]) -> None:
     bundle_input = {k: v for k, v in manifest.items() if k != "bundle_id"}
     try:
         _canonical_json(bundle_input)
-    except (TypeError, ValueError, RecursionError) as exc:
+    except ValueError as exc:
+        if "Out of range float values" in str(exc):
+            out.append("manifest_nonfinite_constant")
+        else:
+            out.append(f"manifest_canonicalization_invalid:{type(exc).__name__}")
+    except (TypeError, RecursionError) as exc:
         out.append(f"manifest_canonicalization_invalid:{type(exc).__name__}")
 
 
 def _canonical_json(obj: Any) -> str:
-    """Serialize *obj* as canonical JSON (sorted keys, no extra whitespace)."""
-    return json.dumps(obj, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+    """Serialize *obj* as canonical JSON (sorted keys, no extra whitespace).
+
+    Fail-closed: raises ``ValueError`` for non-finite floats
+    (``NaN``, ``Infinity``, ``-Infinity``) rather than emitting
+    non-standard JSON tokens.
+    """
+    return json.dumps(obj, sort_keys=True, separators=(",", ":"), ensure_ascii=False, allow_nan=False)
 
 
 def _compute_canonical_bundle_id(manifest: dict) -> str:

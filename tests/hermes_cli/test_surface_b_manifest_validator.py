@@ -430,6 +430,19 @@ class TestSurfaceBCanonicalization:
         _validate_manifest_canonicalization(m, errors)
         assert any("manifest_canonicalization_invalid" in e for e in errors)
 
+    def test_nan_inf_negative_inf_in_memory_rejected(self):
+        """Direct unit test: non-finite in-memory floats are rejected by the
+        helper-level canonicalization guard (``allow_nan=False``), producing
+        the same ``manifest_nonfinite_constant`` error code as the file-level
+        ``parse_constant`` guard so that callers see a unified error class.
+        """
+        from hermes_cli.governance import _validate_manifest_canonicalization
+        for label, val in (("nan", float("nan")), ("inf", float("inf")), ("-inf", float("-inf"))):
+            m = {"manifest_version": "hgk.surface_b.manifest.v1", "task_id": f"t_{label}", "run_id": val}
+            errors: list[str] = []
+            _validate_manifest_canonicalization(m, errors)
+            assert any("manifest_nonfinite_constant" in e for e in errors), f"failed for {label} — errors: {errors}"
+
     def test_unsupported_manifest_version_fails(self, tmp_path, hermes_main):
         m = _make_manifest()
         m["manifest_version"] = "unsupported.version"
