@@ -44,6 +44,32 @@ class TestGovernanceCliEndToEnd:
         assert result.returncode == 0
         assert (out_dir / "decision.json").exists()
 
+    def test_cli_no_profile_warning_leakage_on_governance(self, tmp_path, hermes_main):
+        """Hermetic CLI must not emit unrelated profile/bootstrap warnings before validator output.
+
+        Regression: when gateway/run.py imported GatewayRunner at module scope,
+        a plugin could trigger warn_deprecated_cwd_env_vars() before the CLI
+        command even ran, leaking deprecation warnings into stderr.
+        """
+        fixture = tmp_path / "in.json"
+        fixture.write_text(json.dumps({"status": "running"}))
+        out_dir = tmp_path / "out"
+
+        result = subprocess.run(
+            [
+                sys.executable, "-m", "hermes_cli.main",
+                "governance", "evaluate",
+                "--dry-run",
+                "--input", str(fixture),
+                "--output-dir", str(out_dir),
+            ],
+            capture_output=True,
+            text=True,
+            cwd=str(hermes_main),
+        )
+        assert result.returncode == 0
+        assert "Deprecated .env settings detected" not in result.stderr
+
     def test_cli_dispatch_returns_blocked_for_blocked_input(self, tmp_path, hermes_main):
         """Full path returns exit code 10 for a blocked-status fixture."""
         fixture = tmp_path / "in.json"
