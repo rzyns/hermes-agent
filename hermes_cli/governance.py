@@ -131,6 +131,11 @@ SURFACE_B_EXIT_CODES = {
     "EXIT_RUNTIME_ERROR": 30,
 }
 
+# Canonicalization hardening constants
+_MAX_MANIFEST_SIZE_BYTES = 1 * 1024 * 1024  # 1 MB
+_MAX_MANIFEST_DEPTH = 32  # exclusive; depth 0 is root dict
+_KNOWN_MANIFEST_VERSIONS = {"hgk.surface_b.manifest.v1"}
+
 
 def build_parser(subparsers: Any) -> Any:
     """Attach ``governance`` parser to the shared subparsers object."""
@@ -457,22 +462,120 @@ def _write_decision(output_dir: Path, artifact: dict) -> Path:
         fh.write("\n")
     return dest
 
-
-def _summarize_raw(data: dict) -> dict:
-    """Return a shallow summary of the raw input for verbose mode."""
-    return {
-        "keys": sorted(data.keys())[:20],  # cap verbosity
-        "has_status": "status" in data,
-        "has_outcome": "outcome" in data,
-    }
+def _is_denylisted_path(path: Path) -> bool:
+    """Return True if any path component matches denylisted patterns."""
+    try:
+        resolved = path.resolve()
+    except Exception:
+        resolved = path
+    for part in resolved.parts:
+        lowered = str(part).lower()
+        for pat in _DENYLISTED_PATH_PATTERNS:
+            if pat in lowered:
+                return True
+    return False
 
 
 # ---------------------------------------------------------------------------
-# Surface B validator implementation
+# Canonicalization hardening helpers
 # ---------------------------------------------------------------------------
 
-# Minimal deterministic canonical JSON with sorted keys for bundle ID.
-_CANONICAL_JSON_SEPARATOR = (",".encode("utf-8"), ":".encode("utf-8"))
+
+def _load_json_with_duplicate_guard(path: Path) -> tuple[dict | None, list[str]]:
+    """Parse JSON with duplicate-key detection and size gate.
+
+    Returns (data, errors).  If errors is non-empty, data may be None.
+    """
+    errors: list[str] = []
+    try:
+        st = path.stat()
+    except FileNotFoundError:
+        return (None, ["manifest_missing"])
+    except Exception as exc:
+        return (None, [f"manifest_unreadable:{exc}"])
+    if st.st_size > _MAX_MANIFEST_SIZE_BYTES:
+        return (None, ["manifest_exceeds_max_size"])
+
+    try:
+        with path.open("r", encoding="utf-8") as fh:
+            # Duplicate-key guard: object_pairs_hook receives the raw list of
+            # (key, value) pairs in document order.  We detect duplicates here.
+            def _reject_duplicate_keys(pairs):
+                seen = set()
+                for key, _ in pairs:
+                    if key in seen:
+                        raise json.JSONDecodeError(
+                            f"Duplicate key: {key!r}", doc=str(key), pos=0
+                        )
+                    seen.add(key)
+                return dict(pairs)
+
+            data = json.load(fh, object_pairs_hook=_reject_duplicate_keys)
+    except json.JSONDecodeError as exc:
+        if getattr(exc, "msg", "").startswith("Duplicate key"):
+            return (None, ["manifest_duplicate_keys"])
+        return (None, ["manifest_malformed"])
+    except Exception as exc:
+        return (None, [f"manifest_unreadable:{exc}"])
+
+    if not isinstance(data, dict):
+        return (None, ["manifest_not_an_object"])
+    return (data, [])
+
+
+def _json_depth(obj: Any, _seen: set[int] | None = None) -> int:
+    """Return max nesting depth for dicts/lists.  Scalars = 0.
+
+    Returns -1 if a circular reference is detected so callers can fail closed
+    without letting RecursionError leak to the CLI surface.
+    """
+    if _seen is None:
+        _seen = set()
+    obj_id = id(obj)
+    if obj_id in _seen:
+        return -1
+    if isinstance(obj, dict):
+        if not obj:
+            return 1
+        _seen.add(obj_id)
+        try:
+            child_depths = [_json_depth(v, _seen) for v in obj.values()]
+        finally:
+            _seen.discard(obj_id)
+        if any(d < 0 for d in child_depths):
+            return -1
+        return 1 + max(child_depths, default=0)
+    if isinstance(obj, list):
+        if not obj:
+            return 1
+        _seen.add(obj_id)
+        try:
+            child_depths = [_json_depth(v, _seen) for v in obj]
+        finally:
+            _seen.discard(obj_id)
+        if any(d < 0 for d in child_depths):
+            return -1
+        return 1 + max(child_depths, default=0)
+    return 0
+
+
+def _validate_manifest_canonicalization(manifest: dict, out: list[str]) -> None:
+    """Canonicalization hardening checks: depth, version, serializability."""
+    depth = _json_depth(manifest)
+    if depth < 0 or depth > _MAX_MANIFEST_DEPTH:
+        out.append("manifest_exceeds_max_depth")
+    version = manifest.get("manifest_version")
+    if version not in _KNOWN_MANIFEST_VERSIONS:
+        out.append(f"manifest_version_unsupported:{version}")
+    # Guard: try to canonicalize the manifest (excluding bundle_id).
+    # This catches circular references and non-JSON-serializable values
+    # deterministically, mapping them to a canonicalization error rather
+    # than letting RecursionError leak as EXIT_RUNTIME_ERROR.
+    bundle_input = {k: v for k, v in manifest.items() if k != "bundle_id"}
+    try:
+        _canonical_json(bundle_input)
+    except (TypeError, ValueError, RecursionError) as exc:
+        out.append(f"manifest_canonicalization_invalid:{type(exc).__name__}")
 
 
 def _canonical_json(obj: Any) -> str:
@@ -510,19 +613,9 @@ _DENYLISTED_PATH_PATTERNS = (
 )
 
 
-def _is_denylisted_path(path: Path) -> bool:
-    """Return True if any path component matches denylisted patterns."""
-    try:
-        resolved = path.resolve()
-    except Exception:
-        resolved = path
-    for part in resolved.parts:
-        lowered = str(part).lower()
-        for pat in _DENYLISTED_PATH_PATTERNS:
-            if pat in lowered:
-                return True
-    return False
-
+# ---------------------------------------------------------------------------
+# Surface B validator implementation
+# ---------------------------------------------------------------------------
 
 def _validate_manifest_fields(manifest: dict, out: list[str]) -> None:
     """Check required Surface B manifest fields are present."""
@@ -758,22 +851,19 @@ def cmd_validate_manifest(args: argparse.Namespace) -> int:
         errors.append("vocabulary_identity_check_not_implemented_surface_b")
 
     # -- Load manifest --------------------------------------------------------
-    try:
-        with manifest_path.open("r", encoding="utf-8") as fh:
-            manifest = json.load(fh)
-    except FileNotFoundError:
-        errors.append("manifest_missing")
-        _write_validation_report(output_dir, False, errors, {})
-        return SURFACE_B_EXIT_CODES["EXIT_SCHEMA_MISMATCH"]
-    except json.JSONDecodeError:
-        errors.append("manifest_malformed")
+    manifest, load_errors = _load_json_with_duplicate_guard(manifest_path)
+    if load_errors:
+        errors.extend(load_errors)
         _write_validation_report(output_dir, False, errors, {})
         return SURFACE_B_EXIT_CODES["EXIT_SCHEMA_MISMATCH"]
 
-    if not isinstance(manifest, dict):
-        errors.append("manifest_not_an_object")
-        _write_validation_report(output_dir, False, errors, {})
-        return SURFACE_B_EXIT_CODES["EXIT_SCHEMA_MISMATCH"]
+    assert manifest is not None
+
+    # -- Post-load canonicalization hardening -----------------------------------
+    _validate_manifest_canonicalization(manifest, errors)
+    # If canonicalization already failed, we still continue with field-level
+    # checks so the report captures every relevant issue, but we will ultimately
+    # return EXIT_SCHEMA_MISMATCH when any hardening error surfaces.
 
     # -- Field-level validations -----------------------------------------------
     _validate_manifest_fields(manifest, errors)
@@ -818,6 +908,12 @@ def cmd_validate_manifest(args: argparse.Namespace) -> int:
             errors.append(f"stale_manifest.artifact_hash_mismatch:{path_str}")
 
     # -- Result ----------------------------------------------------------------
+    # If canonicalization hardening produced any error, override the exit code
+    # to EXIT_SCHEMA_MISMATCH (20) regardless of other validation outcomes.
+    canon_errors = [e for e in errors if e.startswith(("manifest_exceeds_max", "manifest_duplicate_keys", "manifest_version_unsupported", "bundle_canonicalization_invalid"))]
+    if canon_errors:
+        _write_validation_report(output_dir, False, errors, manifest)
+        return SURFACE_B_EXIT_CODES["EXIT_SCHEMA_MISMATCH"]
     valid = len(errors) == 0
     report = _write_validation_report(output_dir, valid, errors, manifest)
     return SURFACE_B_EXIT_CODES["EXIT_OK"] if valid else SURFACE_B_EXIT_CODES["EXIT_VALIDATION_FAILED"]

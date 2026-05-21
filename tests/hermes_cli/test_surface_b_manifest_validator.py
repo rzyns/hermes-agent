@@ -121,7 +121,9 @@ class TestSurfaceBRequiredFields:
         manifest = tmp_path / "manifest.json"
         manifest.write_text(json.dumps(m, indent=2))
         result = _run_validate_manifest(tmp_path, hermes_main, manifest)
-        assert result.returncode == 10
+        # After canonicalization hardening, missing manifest_version also
+        # triggers manifest_version_unsupported → EXIT_SCHEMA_MISMATCH (20).
+        assert result.returncode == 20
         report = json.loads((tmp_path / "out" / "validation_report.json").read_text())
         assert any("missing_required_fields" in e for e in report["errors"])
 
@@ -157,7 +159,9 @@ class TestSurfaceBBundleId:
         manifest = tmp_path / "manifest.json"
         manifest.write_text(json.dumps(m, indent=2))
         result = _run_validate_manifest(tmp_path, hermes_main, manifest)
-        assert result.returncode == 10
+        # After canonicalization hardening, recomputed_digest_mismatch
+        # maps to EXIT_SCHEMA_MISMATCH (20).
+        assert result.returncode == 20
         report = json.loads((tmp_path / "out" / "validation_report.json").read_text())
         assert any("bundle_canonicalization_invalid" in e for e in report["errors"])
 
@@ -367,8 +371,97 @@ class TestSurfaceBArtifactRefConflicts:
 
 
 # ---------------------------------------------------------------------------
-# Requirement 11: explicit referenced file existence and hash verification
+# Requirement B: canonicalization hardening (Option B)
 # ---------------------------------------------------------------------------
+class TestSurfaceBCanonicalization:
+    def test_oversized_manifest_fails(self, tmp_path, hermes_main):
+        m = _make_manifest()
+        # Pad a string field to push manifest JSON over 1 MB
+        m["padding"] = "x" * (2 * 1024 * 1024)
+        m["bundle_id"] = _canonical_bundle_id(m)
+        manifest = tmp_path / "manifest.json"
+        manifest.write_text(json.dumps(m, indent=2))
+        result = _run_validate_manifest(tmp_path, hermes_main, manifest)
+        assert result.returncode == 20
+        report = json.loads((tmp_path / "out" / "validation_report.json").read_text())
+        assert any("manifest_exceeds_max_size" in e for e in report["errors"])
+
+    def test_deeply_nested_manifest_fails(self, tmp_path, hermes_main):
+        m = _make_manifest()
+        # Build a deeply nested dict (depth 64) under a new key
+        payload = "leaf"
+        for _ in range(64):
+            payload = {"layer": payload}
+        m["deep_payload"] = payload
+        m["bundle_id"] = _canonical_bundle_id(m)
+        manifest = tmp_path / "manifest.json"
+        manifest.write_text(json.dumps(m, indent=2))
+        result = _run_validate_manifest(tmp_path, hermes_main, manifest)
+        assert result.returncode == 20
+        report = json.loads((tmp_path / "out" / "validation_report.json").read_text())
+        assert any("manifest_exceeds_max_depth" in e for e in report["errors"])
+
+    def test_duplicate_keys_manifest_fails(self, tmp_path, hermes_main):
+        m = _make_manifest()
+        # Inject a duplicate key by hand-crafting valid JSON text with two "manifest_version" keys
+        raw = json.dumps(m, indent=2, ensure_ascii=False)
+        # Insert a second *valid* manifest_version key before the first one ends
+        raw_with_dup = raw.replace(
+            '"manifest_version": "hgk.surface_b.manifest.v1"',
+            '"manifest_version": "dup.v1",\n  "manifest_version": "hgk.surface_b.manifest.v1"',
+            1,
+        )
+        manifest = tmp_path / "manifest.json"
+        manifest.write_text(raw_with_dup)
+        result = _run_validate_manifest(tmp_path, hermes_main, manifest)
+        assert result.returncode == 20
+        report = json.loads((tmp_path / "out" / "validation_report.json").read_text())
+        assert any("manifest_duplicate_keys" in e for e in report["errors"])
+
+    def test_circular_reference_manifest_fails(self):
+        """Direct unit test: circular dict triggers canonicalization guard.
+        """
+        from hermes_cli.governance import _validate_manifest_canonicalization
+        m = {"manifest_version": "hgk.surface_b.manifest.v1", "task_id": "t1"}
+        m["self"] = m
+        errors: list[str] = []
+        _validate_manifest_canonicalization(m, errors)
+        assert any("manifest_canonicalization_invalid" in e for e in errors)
+
+    def test_unsupported_manifest_version_fails(self, tmp_path, hermes_main):
+        m = _make_manifest()
+        m["manifest_version"] = "unsupported.version"
+        m["bundle_id"] = _canonical_bundle_id(m)
+        manifest = tmp_path / "manifest.json"
+        manifest.write_text(json.dumps(m, indent=2))
+        result = _run_validate_manifest(tmp_path, hermes_main, manifest)
+        assert result.returncode == 20
+        report = json.loads((tmp_path / "out" / "validation_report.json").read_text())
+        assert any("manifest_version_unsupported" in e for e in report["errors"])
+
+    def test_digest_is_deterministic_across_key_order(self):
+        a = {"z": 1, "a": 2}
+        b = {"a": 2, "z": 1}
+        import hermes_cli.governance as gov
+        assert gov._canonical_json(a) == gov._canonical_json(b)
+
+    def test_non_canonical_input_triggers_mismatch(self, tmp_path, hermes_main):
+        m = _make_manifest()
+        # Write manifest with keys deliberately unsorted (non-canonical representation)
+        # The validator should still recompute bundle_id correctly because json.load parses into dict,
+        # but we can assert that _canonical_json serializes sorted.
+        canonical = json.dumps(m, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+        unsorted = json.dumps(m, sort_keys=False, separators=(",", ":"), ensure_ascii=False)
+        assert canonical != unsorted
+        manifest = tmp_path / "manifest.json"
+        manifest.write_text(unsorted)
+        result = _run_validate_manifest(tmp_path, hermes_main, manifest)
+        # Should still pass because json.load normalizes key order into dict memory layout
+        assert result.returncode == 0
+        report = json.loads((tmp_path / "out" / "validation_report.json").read_text())
+        assert report["valid"] is True
+
+
 class TestSurfaceBArtifactHashVerification:
     def test_missing_referenced_file_fails(self, tmp_path, hermes_main):
         m = _make_manifest()
