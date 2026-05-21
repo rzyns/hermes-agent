@@ -744,6 +744,44 @@ def _finish_trace(task_key: str, *, output: Any = None) -> None:
             pass
 
 
+def on_session_end(*, session_id: str = "", completed: Any = None, interrupted: Any = None,
+                   model: str = "", platform: str = "", **_: Any) -> None:
+    """Best-effort close for traces left open by abnormal turn exits.
+
+    Normal final-answer turns close in ``on_post_llm_call``/``post_api_request``.
+    Kanban workers and other one-shot Hermes processes can also exit because the
+    iteration budget was reached, a turn was interrupted, or an exception path
+    returned before a final assistant message. In those cases the Langfuse root
+    context manager may otherwise survive until interpreter teardown, where
+    OpenTelemetry globals can be partially destroyed and emit the noisy ignored
+    ``Langfuse._create_span_with_parent_context`` finalizer traceback.
+
+    Scope by session_id when available so long-lived gateway processes do not
+    close unrelated in-flight traces. If no session_id is provided, fail closed
+    toward cleanup and close all remaining traces in this process; current
+    callers normally provide a session id.
+    """
+    with _STATE_LOCK:
+        keys = [
+            key
+            for key, state in _TRACE_STATE.items()
+            if not session_id or state.session_id == session_id or key == _trace_key(session_id=session_id)
+        ]
+
+    if not keys:
+        return
+
+    output = {
+        "finalized_by": "on_session_end",
+        "completed": completed,
+        "interrupted": interrupted,
+        "model": model,
+        "platform": platform,
+    }
+    for key in keys:
+        _finish_trace(key, output=output)
+
+
 def _assistant_has_tool_calls(message: Any) -> bool:
     return bool(getattr(message, "tool_calls", None))
 
@@ -1108,3 +1146,4 @@ def register(ctx) -> None:
     ctx.register_hook("post_llm_call", on_post_llm_call)
     ctx.register_hook("pre_tool_call", on_pre_tool_call)
     ctx.register_hook("post_tool_call", on_post_tool_call)
+    ctx.register_hook("on_session_end", on_session_end)

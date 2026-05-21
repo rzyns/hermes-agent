@@ -29,11 +29,12 @@ class TestManifest:
         data = yaml.safe_load((PLUGIN_DIR / "plugin.yaml").read_text())
         assert data["name"] == "langfuse"
         assert data["version"]
-        # All six hooks the plugin implements.
+        # All seven hooks the plugin implements.
         assert set(data["hooks"]) == {
             "pre_api_request", "post_api_request",
             "pre_llm_call", "post_llm_call",
             "pre_tool_call", "post_tool_call",
+            "on_session_end",
         }
         # Required env vars are the user-facing HERMES_ prefixed keys.
         assert "HERMES_LANGFUSE_PUBLIC_KEY" in data["requires_env"]
@@ -169,6 +170,7 @@ class TestHooksInert:
         mod.on_post_llm_call(task_id="t", session_id="s", api_call_count=1)
         mod.on_pre_tool_call(tool_name="read_file", args={}, task_id="t", session_id="s")
         mod.on_post_tool_call(tool_name="read_file", args={}, result="ok", task_id="t", session_id="s")
+        mod.on_session_end(session_id="s", completed=False, interrupted=False)
 
 
 # ---------------------------------------------------------------------------
@@ -704,3 +706,71 @@ class TestToolObservationKeying:
         assert ended["output"] == {"status": "done"}
         assert not state.tools
 
+
+class TestSessionEndCleanup:
+    def test_session_end_closes_unfinished_trace_for_matching_session(self, monkeypatch):
+        sys.modules.pop("plugins.observability.langfuse", None)
+        mod = importlib.import_module("plugins.observability.langfuse")
+
+        class FakeClient:
+            def __init__(self):
+                self.flush_count = 0
+            def flush(self):
+                self.flush_count += 1
+
+        class FakeRootCtx:
+            def __init__(self):
+                self.exited = False
+            def __exit__(self, exc_type, exc, tb):
+                self.exited = True
+
+        class FakeRootSpan:
+            def __init__(self):
+                self.ended = False
+                self.outputs = []
+            def set_trace_io(self, **kwargs):
+                self.outputs.append(("set_trace_io", kwargs))
+            def update(self, **kwargs):
+                self.outputs.append(("update", kwargs))
+            def end(self):
+                self.ended = True
+
+        client = FakeClient()
+        root_ctx = FakeRootCtx()
+        root_span = FakeRootSpan()
+        state = mod.TraceState(
+            trace_id="trace-cleanup",
+            root_ctx=root_ctx,
+            root_span=root_span,
+            session_id="sess-cleanup",
+        )
+        task_key = mod._trace_key(task_id="task-cleanup", session_id="sess-cleanup")
+        monkeypatch.setitem(mod._TRACE_STATE, task_key, state)
+        monkeypatch.setattr(mod, "_get_langfuse", lambda: client)
+
+        mod.on_session_end(session_id="sess-cleanup", completed=False, interrupted=False, model="m", platform="kanban")
+
+        assert task_key not in mod._TRACE_STATE
+        assert root_span.ended is True
+        assert root_ctx.exited is True
+        assert client.flush_count == 1
+        assert any(
+            payload.get("output", {}).get("finalized_by") == "on_session_end"
+            for _, payload in root_span.outputs
+        )
+
+    def test_session_end_does_not_close_other_active_sessions(self, monkeypatch):
+        sys.modules.pop("plugins.observability.langfuse", None)
+        mod = importlib.import_module("plugins.observability.langfuse")
+
+        state = mod.TraceState(trace_id="trace-other", root_ctx=None, root_span=None, session_id="other-session")
+        task_key = mod._trace_key(task_id="task-other", session_id="other-session")
+        monkeypatch.setitem(mod._TRACE_STATE, task_key, state)
+
+        closed = []
+        monkeypatch.setattr(mod, "_finish_trace", lambda key, output=None: closed.append((key, output)))
+
+        mod.on_session_end(session_id="target-session", completed=True, interrupted=False)
+
+        assert closed == []
+        assert mod._TRACE_STATE[task_key] is state
