@@ -242,11 +242,24 @@ def _trace_key(turn_id: str = "", task_id: str = "", session_id: str = "") -> st
     return f"thread:{threading.get_ident()}"
 
 
+def _trace_key_candidates(turn_id: str = "", task_id: str = "", session_id: str = "") -> list[str]:
+    """Return current and legacy trace keys for hook lookup compatibility."""
+    candidates = [_trace_key(turn_id=turn_id, task_id=task_id, session_id=session_id)]
+    legacy = _trace_key(task_id, session_id)
+    if legacy not in candidates:
+        candidates.append(legacy)
+    return candidates
+
+
 def _args_fingerprint(args: Any) -> str:
     try:
         return json.dumps(args if args is not None else {}, sort_keys=True, separators=(",", ":"), default=str)
     except Exception:
         return repr(args)
+
+
+def _tool_observation(value: Any) -> Any:
+    return value.observation if isinstance(value, ToolSpanState) else value
 
 
 def _trace_name_for(platform: str = "", surface: str = "") -> str:
@@ -699,18 +712,29 @@ def _finish_trace(task_key: str, *, output: Any = None) -> None:
         return
 
     try:
+        seen_tool_observations = set()
         for observation in state.generations.values():
             _end_observation(observation)
-        for observation in state.tools.values():
+        for tool_state in state.tools.values():
+            observation = _tool_observation(tool_state)
+            if id(observation) in seen_tool_observations:
+                continue
+            seen_tool_observations.add(id(observation))
             _end_observation(observation)
         for queue in state.pending_tools_by_name.values():
-            for observation in queue:
+            for tool_state in queue:
+                observation = _tool_observation(tool_state)
+                if id(observation) in seen_tool_observations:
+                    continue
+                seen_tool_observations.add(id(observation))
                 _end_observation(observation)
         final_output = _merge_trace_output(output, state)
         if final_output is not None:
             state.root_span.set_trace_io(output=final_output)
             state.root_span.update(output=final_output)
         state.root_span.end()
+        if state.root_ctx is not None:
+            state.root_ctx.__exit__(None, None, None)
     except Exception as exc:  # pragma: no cover - fail-open
         _debug(f"finish trace failed: {exc}")
     finally:
@@ -808,7 +832,7 @@ def on_pre_llm_request(
         user_message=user_message,
     )
 
-    task_key = _trace_key(task_id, session_id)
+    task_key = _trace_key(turn_id=turn_id, task_id=task_id, session_id=session_id)
     req_key = _request_key(api_call_count)
 
     with _STATE_LOCK:
@@ -865,7 +889,13 @@ def on_post_llm_call(*, task_id: str = "", session_id: str = "", turn_id: str = 
     req_key = _request_key(api_call_count)
 
     with _STATE_LOCK:
-        state = _TRACE_STATE.get(task_key)
+        state = None
+        task_key = ""
+        for candidate_key in _trace_key_candidates(turn_id=turn_id, task_id=task_id, session_id=session_id):
+            state = _TRACE_STATE.get(candidate_key)
+            if state is not None:
+                task_key = candidate_key
+                break
         generation = state.generations.pop(req_key, None) if state else None
     if state is None or generation is None:
         return
@@ -976,10 +1006,15 @@ def on_pre_tool_call(*, tool_name: str = "", args: Any = None, task_id: str = ""
     if client is None:
         return
 
-    task_key = _trace_key(task_id, session_id)
+    fingerprint = _args_fingerprint(args)
+    fallback_keyed = not bool(tool_call_id)
 
     with _STATE_LOCK:
-        state = _TRACE_STATE.get(task_key)
+        state = None
+        for candidate_key in _trace_key_candidates(turn_id=turn_id, task_id=task_id, session_id=session_id):
+            state = _TRACE_STATE.get(candidate_key)
+            if state is not None:
+                break
         if state is None:
             return
         observation = _start_child_observation(
@@ -996,7 +1031,7 @@ def on_pre_tool_call(*, tool_name: str = "", args: Any = None, task_id: str = ""
                 "fallback_keyed": fallback_keyed,
             },
         )
-        state.tools[tool_key] = ToolSpanState(
+        tool_state = ToolSpanState(
             observation=observation,
             tool_name=tool_name,
             tool_call_id=tool_call_id,
@@ -1004,32 +1039,37 @@ def on_pre_tool_call(*, tool_name: str = "", args: Any = None, task_id: str = ""
             fallback_keyed=fallback_keyed,
         )
         if tool_call_id:
-            state.tools[tool_call_id] = observation
+            state.tools[tool_call_id] = tool_state
         else:
-            state.pending_tools_by_name.setdefault(tool_name, []).append(observation)
+            state.pending_tools_by_name.setdefault(tool_name, []).append(tool_state)
 
 
 def on_post_tool_call(*, tool_name: str = "", args: Any = None, result: Any = None,
-                      task_id: str = "", session_id: str = "", tool_call_id: str = "", **_: Any) -> None:
-    task_key = _trace_key(task_id, session_id)
-    observation = None
+                      task_id: str = "", session_id: str = "", turn_id: str = "", tool_call_id: str = "", **_: Any) -> None:
+    task_key = ""
+    tool_state = None
 
     with _STATE_LOCK:
-        state = _TRACE_STATE.get(task_key)
+        state = None
+        for candidate_key in _trace_key_candidates(turn_id=turn_id, task_id=task_id, session_id=session_id):
+            state = _TRACE_STATE.get(candidate_key)
+            if state is not None:
+                task_key = candidate_key
+                break
         if state is None:
             return
         if tool_call_id:
-            observation = state.tools.pop(tool_call_id, None)
-        if observation is None:
+            tool_state = state.tools.pop(tool_call_id, None)
+        if tool_state is None:
             queue = state.pending_tools_by_name.get(tool_name)
             if queue:
-                observation = queue.pop(0)
+                tool_state = queue.pop(0)
                 if not queue:
                     state.pending_tools_by_name.pop(tool_name, None)
 
     if tool_state is None:
         return
-    observation = tool_state.observation
+    observation = _tool_observation(tool_state)
 
     if isinstance(result, str):
         result_value = _maybe_parse_json_string(result)

@@ -1582,8 +1582,18 @@ def cmd_chat(args):
             accept_hooks=getattr(args, "accept_hooks", False),
         )
 
-    # Import and run the CLI
-    from cli import main as cli_main
+    # Import and run the root Hermes CLI entrypoint by file path. Some profiles
+    # add plugin directories to sys.path, and plugins may have their own cli.py;
+    # a bare `from cli import main` can therefore resolve to a plugin module.
+    cli_path = Path(__file__).resolve().parents[1] / "cli.py"
+    import importlib.util
+
+    spec = importlib.util.spec_from_file_location("hermes_agent_root_cli", cli_path)
+    if spec is None or spec.loader is None:
+        raise RuntimeError(f"Unable to load Hermes CLI entrypoint from {cli_path}")
+    cli_module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(cli_module)
+    cli_main = cli_module.main
 
     # Build kwargs from args
     kwargs = {
