@@ -1548,6 +1548,52 @@ class TestQuarantineBundleBinaryAssets:
 
 
 # ---------------------------------------------------------------------------
+# GitHubSource custom tap source-qualified identifiers
+# ---------------------------------------------------------------------------
+
+
+class TestGitHubSourceCustomTapIdentifiers:
+    def _source(self):
+        auth = MagicMock(spec=GitHubAuth)
+        auth.get_headers.return_value = {}
+        return GitHubSource(auth=auth, extra_taps=[{"repo": "rzyns/hermes-stuff", "path": "skills/"}])
+
+    @patch.object(GitHubSource, "_download_directory")
+    def test_fetch_resolves_owner_repo_skill_through_matching_tap_path(self, mock_download):
+        mock_download.side_effect = lambda repo, path: (
+            {"SKILL.md": "---\nname: plan\n---\n", "references/kanban-artifact-planning.md": "# ref"}
+            if (repo, path) == ("rzyns/hermes-stuff", "skills/plan")
+            else {}
+        )
+
+        bundle = self._source().fetch("rzyns/hermes-stuff/plan")
+
+        assert bundle is not None
+        assert bundle.name == "plan"
+        assert bundle.identifier == "rzyns/hermes-stuff/skills/plan"
+        assert "references/kanban-artifact-planning.md" in bundle.files
+        assert mock_download.call_args_list[0] == (("rzyns/hermes-stuff", "skills/plan"), {})
+
+    @patch.object(GitHubSource, "_fetch_file_content")
+    def test_inspect_resolves_owner_repo_skill_through_matching_tap_path(self, mock_fetch):
+        mock_fetch.side_effect = lambda repo, path: (
+            "---\nname: plan\ndescription: Repo plan skill\n---\n"
+            if (repo, path) == ("rzyns/hermes-stuff", "skills/plan/SKILL.md")
+            else None
+        )
+
+        meta = self._source().inspect("rzyns/hermes-stuff/plan")
+
+        assert meta is not None
+        assert meta.name == "plan"
+        assert meta.description == "Repo plan skill"
+        assert meta.identifier == "rzyns/hermes-stuff/skills/plan"
+        assert meta.repo == "rzyns/hermes-stuff"
+        assert meta.path == "skills/plan"
+        assert mock_fetch.call_args_list[0] == (("rzyns/hermes-stuff", "skills/plan/SKILL.md"), {})
+
+
+# ---------------------------------------------------------------------------
 # GitHubSource._download_directory — tree API + fallback (#2940)
 # ---------------------------------------------------------------------------
 
