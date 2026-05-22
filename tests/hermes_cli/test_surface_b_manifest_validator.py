@@ -438,8 +438,8 @@ class TestSurfaceBCanonicalization:
         CN-F1 addendum: The ``_find_nonfinite`` preflight scan now extends
         this coverage to dict keys, deeply nested values, and the
         previously-excluded ``bundle_id`` field.  The *helper-level* error
-        code is unified for all Python object-graph non-finite positions.
-        Generic non-serializable objects still fail closed under
+        code is unified for all manifest-like dict/list/tuple graph non-finite
+        positions.  Generic non-serializable objects still fail closed under
         ``manifest_canonicalization_invalid:*``.
         """
         from hermes_cli.governance import _validate_manifest_canonicalization
@@ -984,7 +984,7 @@ class TestSurfaceBRepairReportHardening:
 # CN-F1: non-finite canonicalization hardening evidence (local-only)
 # ---------------------------------------------------------------------------
 class TestSurfaceBCN1NonfiniteHardening:
-    """Prove that the CN-F1 preflight object-graph scan rejects non-finite
+    """Prove that the CN-F1 preflight manifest-like graph scan rejects non-finite
     floats uniformly—regardless of position (value, key, previously-excluded
     field)—while still mapping generic non-serializable types to their own
     fail-closed class.

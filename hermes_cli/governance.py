@@ -625,18 +625,18 @@ def _validate_manifest_canonicalization(manifest: dict, out: list[str]) -> None:
     """Canonicalization hardening checks: depth, version, serializability.
 
     CN-F1 addendum:  The preflight ``_find_nonfinite`` scan ensures that
-    in-memory non-finite floats anywhere in the object graph (including
-    dict keys, values, and previously-excluded fields such as *bundle_id*)
-    map to ``manifest_nonfinite_constant`` before the canonicalization pass
-    is attempted.  This addresses the prior review concern that the
-    ``allow_nan=False`` guard only covered values included in the digest
-    input and left top-level keys and excluded fields with different
-    error classes.
+    in-memory non-finite floats in manifest-like dict/list/tuple graphs,
+    including dict keys/values, nested list/tuple values, and previously-
+    excluded fields such as *bundle_id*, map to ``manifest_nonfinite_constant``
+    before the canonicalization pass is attempted.  This addresses the prior
+    review concern that the ``allow_nan=False`` guard only covered values
+    included in the digest input and left top-level keys and excluded fields
+    with different error classes.
 
     Generic non-JSON-serializable types (datetime, set, bytes, etc.) still
     fail closed under ``manifest_canonicalization_invalid:TypeError``.
     """
-    # -- CN-F1: preflight object-graph non-finite scan ------------------------
+    # -- CN-F1: preflight manifest-like graph non-finite scan ----------------
     # Catches NaN / Infinity / -Infinity in dict keys, values, and the
     # bundle_id field (which is excluded from digest recomputation).
     nonfinite_preflight = _find_nonfinite(manifest)
