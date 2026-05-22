@@ -43,6 +43,7 @@ import os
 import sqlite3
 import time
 from dataclasses import asdict
+from pathlib import Path
 from typing import Any, Optional
 
 from fastapi import APIRouter, HTTPException, Query, WebSocket, WebSocketDisconnect, status as http_status
@@ -605,6 +606,108 @@ def create_task(payload: CreateTaskBody, board: Optional[str] = Query(None)):
         return body
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
+    finally:
+        conn.close()
+
+
+# ---------------------------------------------------------------------------
+# POST /intake-links
+# ---------------------------------------------------------------------------
+
+class CreateIntakeLinkBody(BaseModel):
+    url: str
+    context: Optional[str] = None
+    note: Optional[str] = None
+    board: str = "attention-intake"
+    assignee: str = "link-analyst"
+    triage: bool = True
+    priority: int = 0
+    idempotency_key: Optional[str] = None
+    skills: Optional[list[str]] = None
+    max_runtime_seconds: Optional[int] = None
+
+
+@router.post("/intake-links")
+def create_intake_link(
+    payload: CreateIntakeLinkBody,
+    board: Optional[str] = Query(None),
+):
+    # Resolve board from query param if provided, otherwise payload.board.
+    effective_board_raw = board if board else payload.board
+    effective_board = _resolve_board(effective_board_raw)
+    conn = _conn(board=effective_board)
+    try:
+        from hermes_cli import kanban_intake_link as kil
+        task_id = kil.create_intake_link(
+            conn,
+            url=payload.url,
+            context=payload.context,
+            note=payload.note,
+            board=effective_board,
+            assignee=payload.assignee,
+            triage=payload.triage,
+            priority=payload.priority,
+            skills=payload.skills,
+            max_runtime_seconds=payload.max_runtime_seconds,
+            idempotency_key=payload.idempotency_key,
+            source="dashboard",
+        )
+        task = kanban_db.get_task(conn, task_id)
+        body: dict[str, Any] = {"task": _task_dict(task) if task else None}
+        if task and task.status == "ready" and task.assignee:
+            try:
+                from hermes_cli.kanban import _check_dispatcher_presence
+                running, message = _check_dispatcher_presence()
+                if not running and message:
+                    body["warning"] = message
+            except Exception:
+                pass
+        return body
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    finally:
+        conn.close()
+
+
+# ---------------------------------------------------------------------------
+# GET /intake-links/health (task or board)
+# ---------------------------------------------------------------------------
+
+@router.get("/intake-links/health")
+def get_intake_link_health(
+    task_id: Optional[str] = Query(None, description="Inspect single task id (omit to scan board)"),
+    board: Optional[str] = Query(None, description="Board slug (default: attention-intake)"),
+):
+    """Return register-health for Attention Intake link-drop cards.
+
+    Single-task mode when ``task_id`` is provided; board-scan mode
+    otherwise.  Read-only — no register writes.
+    """
+    from hermes_cli import kanban_intake_link_health as kih
+
+    board_resolved = board or "attention-intake"
+    conn = _conn(board=board_resolved)
+    try:
+        if task_id:
+            row = conn.execute(
+                "SELECT body FROM tasks WHERE id = ?",
+                (task_id,),
+            ).fetchone()
+            if not row:
+                raise HTTPException(status_code=404, detail=f"task {task_id!r} not found")
+            result = kih.check_register_for_task(
+                task_id, row[0] or "", hermes_home=Path("/home/openclaw/.hermes")
+            )
+        else:
+            result = kih.scan_board_for_health(
+                conn, board=board_resolved, hermes_home=Path("/home/openclaw/.hermes")
+            )
+        return result
+    except HTTPException:
+        raise
+    except Exception as exc:
+        log.exception("intake-link-health error")
+        raise HTTPException(status_code=500, detail=str(exc))
     finally:
         conn.close()
 
