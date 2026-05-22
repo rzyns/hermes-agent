@@ -25,6 +25,7 @@ from typing import Any, Optional
 
 from hermes_cli import kanban_db as kb
 from hermes_cli import kanban_intake_link as kil
+from hermes_cli import kanban_intake_link_health as kih
 from hermes_cli import kanban_swarm as ks
 from hermes_cli.profiles import get_active_profile_name, get_profile_dir, seed_profile_skills
 
@@ -376,6 +377,16 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
     p_il.add_argument("--idempotency-key", default=None,
                       help="Override canonical URL hash dedup key")
     p_il.add_argument("--json", action="store_true", help="Emit JSON output")
+
+    # --- intake-link-health ---
+    p_ilh = sub.add_parser(
+        "intake-link-health",
+        help="Check register-health for Attention Intake link-drop cards",
+    )
+    p_ilh.add_argument("--task-id", default=None, help="Inspect a single task id (omit to scan board)")
+    p_ilh.add_argument("--board", default=kih.DEFAULT_BOARD if hasattr(kih, 'DEFAULT_BOARD') else "attention-intake",
+                       help="Board slug (default: attention-intake)")
+    p_ilh.add_argument("--json", action="store_true", help="Emit JSON output")
 
     # --- swarm ---
     p_swarm = sub.add_parser(
@@ -944,6 +955,7 @@ def kanban_command(args: argparse.Namespace) -> int:
         "specify":  _cmd_specify,
         "decompose":  _cmd_decompose,
         "intake-link": _cmd_intake_link,
+        "intake-link-health": _cmd_intake_link_health,
         "gc":       _cmd_gc,
     }
     handler = handlers.get(action)
@@ -1411,6 +1423,43 @@ def _cmd_intake_link(args: argparse.Namespace) -> int:
             msg += f", dedup={task.idempotency_key[:16]}..."
         msg += ")"
         print(msg)
+    return 0
+
+
+def _cmd_intake_link_health(args: argparse.Namespace) -> int:
+    """Check register-health for intake-link cards."""
+    board = getattr(args, "board", "attention-intake")
+    task_id = getattr(args, "task_id", None)
+
+    if task_id:
+        # Single-task mode: read task body via DB and check register.
+        with kb.connect(board=board) as conn:
+            row = conn.execute(
+                "SELECT body FROM tasks WHERE id = ?",
+                (task_id,),
+            ).fetchone()
+        if not row:
+            print(f"kanban: task {task_id!r} not found on board {board!r}", file=sys.stderr)
+            return 1
+        result = kih.check_register_for_task(task_id, row[0] or "", hermes_home=Path.home() / ".hermes")
+    else:
+        # Board-scan mode.
+        with kb.connect(board=board) as conn:
+            result = kih.scan_board_for_health(conn, hermes_home=Path.home() / ".hermes")
+
+    if getattr(args, "json", False):
+        import json
+        print(json.dumps(result, indent=2, default=str, ensure_ascii=False))
+    else:
+        # Human-readable compact summary.
+        counts = result.get("counts", {})
+        total = result.get("scanned_task_count", 0)
+        print(f"Board: {result.get('board', board)}  — {total} intake-link task(s) scanned")
+        for key, value in counts.items():
+            print(f"  {key}: {value}")
+        if task_id:
+            verdict = result.get("verdict", "unknown")
+            print(f"  verdict for {task_id}: {verdict}")
     return 0
 
 
