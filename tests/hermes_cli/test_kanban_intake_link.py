@@ -222,7 +222,7 @@ def test_create_intake_link_no_url_raises():
 def test_create_intake_link_writes_register_jsonl(conn, tmp_path, monkeypatch):
     # Override artifact root to tmp_path so we can inspect without mutating real state.
     root = tmp_path / "attention-intake"
-    monkeypatch.setattr(kil, "_ARTIFACT_ROOT", root)
+    monkeypatch.setattr(kil, "_artifact_root", lambda: root)
     tid = kil.create_intake_link(conn, url="https://example.com/reg")
     jsonl = root / "register.jsonl"
     assert jsonl.exists()
@@ -269,3 +269,32 @@ def test_create_intake_link_with_board_default_workdir(conn, tmp_path, monkeypat
     assert "https://example.com/dw" in task.body
     assert "needs_assessment" in task.body
     assert task.workspace_path is not None
+
+
+# ---------------------------------------------------------------------------
+# Regression: write-path tests must not mutate the active register
+# ---------------------------------------------------------------------------
+
+
+def test_create_intake_link_does_not_mutate_active_register_jsonl(conn):
+    """Regression probe: with HERMES_HOME isolation the real active
+    register.jsonl must not be touched by any write path."""
+    real_home = Path(os.environ.get("HOME", "/home/openclaw"))
+    real_register = real_home / ".hermes" / "artifacts" / "attention-intake" / "register.jsonl"
+
+    pre_mtime = real_register.stat().st_mtime if real_register.exists() else None
+    pre_size = real_register.stat().st_size if real_register.exists() else None
+
+    tid = kil.create_intake_link(conn, url="https://example.com/regression")
+    assert tid.startswith("t_")
+
+    if real_register.exists():
+        post_stat = real_register.stat()
+        assert post_stat.st_mtime == pre_mtime
+        assert post_stat.st_size == pre_size
+    else:
+        assert not real_register.exists()
+
+    # Sanity: the isolated tree DID get the write.
+    isolated_root = Path(os.environ["HERMES_HOME"]) / "artifacts" / "attention-intake"
+    assert (isolated_root / "register.jsonl").exists()

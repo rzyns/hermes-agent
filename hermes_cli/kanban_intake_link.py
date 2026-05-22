@@ -17,6 +17,7 @@ from typing import Any, Iterable, Optional
 from urllib.parse import urlunparse, urlparse
 
 from hermes_cli import kanban_db as kb
+from hermes_constants import get_default_hermes_root
 
 log = logging.getLogger(__name__)
 
@@ -29,8 +30,10 @@ DEFAULT_ASSIGNEE = "link-analyst"
 DEFAULT_TRIAGE = True
 DEFAULT_PRIORITY = 0
 
-# The artifact directory already exists as the register root.
-_ARTIFACT_ROOT = Path("/home/openclaw/.hermes/artifacts/attention-intake")
+
+def _artifact_root() -> Path:
+    """Resolve the attention-intake artifact root from the active Hermes home."""
+    return get_default_hermes_root() / "artifacts" / "attention-intake"
 
 # ---------------------------------------------------------------------------
 # URL canonicalisation
@@ -94,6 +97,7 @@ def build_intake_link_body(
     ctx_display = context.strip() if context else None
     note_display = note.strip() if note else None
 
+    artifact_root = _artifact_root()
     return f"""## Link
 {url}
 
@@ -114,8 +118,8 @@ def build_intake_link_body(
 ---
 > This task was created via the Attention Intake link-drop path.
 > Worker must write/update the register at:
->   /home/openclaw/.hermes/artifacts/attention-intake/register.md
->   /home/openclaw/.hermes/artifacts/attention-intake/register.jsonl
+>   {artifact_root / "register.md"}
+>   {artifact_root / "register.jsonl"}
 """
 
 
@@ -155,7 +159,7 @@ def _write_register_entry(
     Best-effort: if the directory isn't writable, log a warning and move on.
     The audit/health card (HP-AILD-03) will surface orphaned task ids.
     """
-    jsonl_path = _ARTIFACT_ROOT / "register.jsonl"
+    jsonl_path = _artifact_root() / "register.jsonl"
     entry = {
         "event": "intake_link_created",
         "task_id": task_id,
@@ -166,7 +170,7 @@ def _write_register_entry(
         "status": "needs_assessment",
     }
     try:
-        _ARTIFACT_ROOT.mkdir(parents=True, exist_ok=True)
+        _artifact_root().mkdir(parents=True, exist_ok=True)
         with jsonl_path.open("a", encoding="utf-8") as fh:
             fh.write(json.dumps(entry, ensure_ascii=False) + "\n")
     except OSError as exc:
@@ -241,7 +245,7 @@ def create_intake_link(
     needs_patch = existing and (existing.body is None or "Attention Intake link-drop path." not in existing.body)
     if needs_patch:
         # Newly created by us in this call (fresh row). Patch ws_path + body.
-        task_artifact_dir = _ARTIFACT_ROOT / new_task_id
+        task_artifact_dir = _artifact_root() / new_task_id
         ws_path = str(task_artifact_dir)
 
         # Attempt mkdir; warn but don't fail.

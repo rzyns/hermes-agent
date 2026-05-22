@@ -51,6 +51,7 @@ from pydantic import BaseModel, Field
 
 from hermes_cli import kanban_db
 from hermes_cli import kanban_diagnostics as kd
+from hermes_constants import get_default_hermes_root
 
 log = logging.getLogger(__name__)
 
@@ -694,11 +695,11 @@ def get_intake_link_health(
             if not row:
                 raise HTTPException(status_code=404, detail=f"task {task_id!r} not found")
             result = kih.check_register_for_task(
-                task_id, row[0] or "", hermes_home=Path("/home/openclaw/.hermes")
+                task_id, row[0] or "", hermes_home=get_default_hermes_root()
             )
         else:
             result = kih.scan_board_for_health(
-                conn, board=board_resolved, hermes_home=Path("/home/openclaw/.hermes")
+                conn, board=board_resolved, hermes_home=get_default_hermes_root()
             )
         return result
     except HTTPException:
