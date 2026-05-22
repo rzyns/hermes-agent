@@ -1539,3 +1539,5 @@
 .hermes-kanban-trash-label {
   font-weight: 500;
 }
+
+/* Drop Link dialog reuses .hermes-kanban-dialog / .hermes-kanban-dialog-backdrop */
