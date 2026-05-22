@@ -189,3 +189,31 @@ def test_provisional_entry_count_non_empty(tmp_path):
     assert result["provisional_count"] == 1
     assert result["total_rows"] == 2
     assert result["register_jsonl_exists"] is True
+
+
+# ---------------------------------------------------------------------------
+# Regression: health scan must surface malformed/missing-body rows
+# ---------------------------------------------------------------------------
+
+
+def test_scan_board_for_health_catches_body_empty_rows(conn, tmp_path, monkeypatch):
+    """A row created with title 'Link drop: ...' but no body (e.g. due to
+    an old default_workdir bug) must still be surfaced by health scan."""
+    # Manually insert a title-only row — simulates the failure mode.
+    tid = kb.create_task(
+        conn,
+        title="Link drop: https://example.com/broken",
+        body=None,  # missing body — the old bug
+        assignee="link-analyst",
+        created_by="test",
+        workspace_kind="scratch",
+        workspace_path=None,
+        initial_status="running",
+    )
+    result = kih.scan_board_for_health(conn, board="default", hermes_home=tmp_path)
+    # The old code would have skipped this because body lacked the contract string.
+    # The fixed code selects by title LIKE 'Link drop:%' so it is included.
+    assert result["scanned_task_count"] == 1
+    assert result["tasks"][0]["task_id"] == tid
+    assert result["tasks"][0]["verdict"] == "incomplete_body"
+    assert result["counts"]["incomplete_body"] == 1

@@ -630,11 +630,9 @@ class CreateIntakeLinkBody(BaseModel):
 @router.post("/intake-links")
 def create_intake_link(
     payload: CreateIntakeLinkBody,
-    board: Optional[str] = Query(None),
 ):
-    # Resolve board from query param if provided, otherwise payload.board.
-    effective_board_raw = board if board else payload.board
-    effective_board = _resolve_board(effective_board_raw)
+    # Always target attention-intake; do not let query-string board redirect.
+    effective_board = _resolve_board("attention-intake")
     conn = _conn(board=effective_board)
     try:
         from hermes_cli import kanban_intake_link as kil

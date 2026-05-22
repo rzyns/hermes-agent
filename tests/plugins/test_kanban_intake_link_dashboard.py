@@ -107,11 +107,37 @@ def test_create_intake_link_empty_url_bad_request(client):
 
 
 def test_create_intake_link_board_override(client):
+    """Query-string board=default must be ignored; card always lands on attention-intake."""
     r = client.post("/api/plugins/kanban/intake-links?board=default", json={
         "url": "https://example.com/other",
     })
     assert r.status_code == 200, r.text
     task = r.json()["task"]
-    # board override means the DB was resolved to 'default'; body still
-    # says attention-intake unless we changed it, which we didn't.
-    assert task is not None
+    # The card MUST be on attention-intake, not "default".
+    # We verify by loading the task directly from the attention-intake connection
+    from hermes_cli import kanban_db as kb
+    with kb.connect(board="attention-intake") as conn:
+        row = kb.get_task(conn, task["id"])
+        assert row is not None
+
+
+def test_dashboard_targets_attention_intake_not_selected_board(client):
+    """Regression: dashboard Drop Link must target attention-intake even when
+    the active board in the UI is something else."""
+    # Create another board and a task there so we can verify separation.
+    from hermes_cli import kanban_db as kb
+    with kb.connect(board="attention-intake") as conn:
+        kb.create_board("other-board")
+    r = client.post("/api/plugins/kanban/intake-links", json={
+        "url": "https://example.com/dashboard-target",
+    })
+    assert r.status_code == 200
+    task = r.json()["task"]
+    with kb.connect(board="attention-intake") as conn:
+        row = kb.get_task(conn, task["id"])
+        assert row is not None
+        assert "attention-intake" in row.body
+    # It must NOT appear on "other-board"
+    with kb.connect(board="other-board") as conn:
+        row = kb.get_task(conn, task["id"])
+        assert row is None

@@ -14,6 +14,7 @@ import os
 import time
 from pathlib import Path
 from typing import Any, Iterable, Optional
+from urllib.parse import urlunparse, urlparse
 
 from hermes_cli import kanban_db as kb
 
@@ -37,11 +38,38 @@ _ARTIFACT_ROOT = Path("/home/openclaw/.hermes/artifacts/attention-intake")
 
 
 def canonical_url_hash(url: str) -> str:
-    """Return SHA-256 of normalised URL as hex.
+    """Return SHA-256 of parsed-normalised URL as hex.
 
-    Normalisation: strip whitespace, lowercase, remove trailing '/'.
+    Normalisation policy:
+    - strip whitespace, trailing '/' when path is empty or root-level
+    - lowercase scheme and host (netloc)
+    - drop default ports (:80 for http, :443 for https)
+    - preserve path case, query order, fragment, percent-encoding
+    - drop empty fragment/hash
+
+    This preserves distinct resources like ``/Foo`` vs ``/foo`` and keeps
+    percent-encoding round-trips stable.
     """
-    normalised = url.strip().lower().rstrip("/")
+    url = url.strip()
+    parts = urlparse(url)
+
+    scheme = parts.scheme.lower()
+    netloc = parts.netloc.lower()
+
+    # Drop default ports
+    if scheme == "http" and netloc.endswith(":80"):
+        netloc = netloc[:-3]
+    elif scheme == "https" and netloc.endswith(":443"):
+        netloc = netloc[:-4]
+
+    # Remove trailing slash if path is empty or just "/"
+    path = parts.path.rstrip("/") if parts.path else ""
+
+    # Drop empty fragment
+    fragment = parts.fragment if parts.fragment else ""
+
+    # Reassemble; leave query untouched (order preserved)
+    normalised = urlunparse((scheme, netloc, path, "", parts.query, fragment))
     return hashlib.sha256(normalised.encode("utf-8")).hexdigest()
 
 
@@ -205,8 +233,11 @@ def create_intake_link(
     # If this was an idempotency hit, create_task returned the existing id
     # and we must NOT overwrite the body or workspace_path.
     existing = kb.get_task(conn, new_task_id)
-    # Avoid overwriting on idempotency hit: detect by absence of body/ws_path.
-    if existing and existing.body is None and existing.workspace_path is None:
+    # Robustly detect a truly-fresh row, even when the board has a
+    # default_workdir that auto-fills workspace_path.  An idempotency-hit
+    # will already carry our contract body; anything else needs patching.
+    needs_patch = existing and (existing.body is None or "Attention Intake link-drop path." not in existing.body)
+    if needs_patch:
         # Newly created by us in this call (fresh row). Patch ws_path + body.
         task_artifact_dir = _ARTIFACT_ROOT / new_task_id
         ws_path = str(task_artifact_dir)

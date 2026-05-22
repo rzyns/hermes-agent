@@ -144,15 +144,11 @@ def scan_board_for_health(
     home = Path(home)
 
     rows = conn.execute(
-        "SELECT id, body, status FROM tasks ORDER BY created_at, id",
+        "SELECT id, body, title, status FROM tasks WHERE title LIKE 'Link drop:%' ORDER BY created_at, id",
     ).fetchall()
 
     tasks: list[dict[str, Any]] = []
     for r in rows:
-        # Only include tasks whose bodies contain the intake-link contract.
-        body = r["body"] or ""
-        if "Attention Intake link-drop path" not in body:
-            continue
         health = check_register_for_task(r["id"], r["body"], hermes_home=home)
         health["status"] = r["status"]
         tasks.append(health)

@@ -57,6 +57,34 @@ def test_canonical_url_hash_normalises():
     assert len(a) == 64
 
 
+def test_canonical_url_hash_preserves_path_case():
+    """/Foo and /foo must remain distinct."""
+    assert kil.canonical_url_hash("https://example.com/Foo") != kil.canonical_url_hash("https://example.com/foo")
+
+
+def test_canonical_url_hash_preserves_percent_encoding():
+    """%2F and %2f are semantically different before decode; keep them distinct."""
+    assert kil.canonical_url_hash("https://example.com/a%2Fb") != kil.canonical_url_hash("https://example.com/a%2fb")
+
+
+def test_canonical_url_hash_preserves_query_and_fragment():
+    a = kil.canonical_url_hash("https://example.com/foo?a=1")
+    b = kil.canonical_url_hash("https://example.com/foo?b=1")
+    assert a != b
+    c = kil.canonical_url_hash("https://example.com/foo#bar")
+    d = kil.canonical_url_hash("https://example.com/foo#baz")
+    assert c != d
+
+
+def test_canonical_url_hash_drops_default_ports():
+    a = kil.canonical_url_hash("https://example.com:443/")
+    b = kil.canonical_url_hash("https://example.com/")
+    assert a == b
+    c = kil.canonical_url_hash("http://example.com:80/")
+    d = kil.canonical_url_hash("http://example.com/")
+    assert c == d
+
+
 def test_canonical_url_hash_different_urls():
     a = kil.canonical_url_hash("https://a.com")
     b = kil.canonical_url_hash("https://b.com")
@@ -216,3 +244,21 @@ def test_create_intake_link_board_override(conn):
     # override kanban_db.create_task board arg (which defaults to None).
     # The board arg here is for the body text only.
     assert "default" in task.body
+
+
+# ---------------------------------------------------------------------------
+# Regression: default_workdir board auto-fill must not produce body-empty rows
+# ---------------------------------------------------------------------------
+
+
+def test_create_intake_link_with_board_default_workdir(conn, tmp_path, monkeypatch):
+    """When board has a default_workdir, kanban_db fills workspace_path but
+    create_intake_link must still patch body and register."""
+    # Create a board with a default_workdir
+    kb.create_board("attention-intake", default_workdir=str(tmp_path / "workdir"))
+    tid = kil.create_intake_link(conn, url="https://example.com/dw")
+    task = kb.get_task(conn, tid)
+    assert task.body is not None
+    assert "https://example.com/dw" in task.body
+    assert "needs_assessment" in task.body
+    assert task.workspace_path is not None
