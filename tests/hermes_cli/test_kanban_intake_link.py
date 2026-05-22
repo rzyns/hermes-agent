@@ -49,12 +49,19 @@ def conn(_tmp_env):
 # ---------------------------------------------------------------------------
 
 
-def test_canonical_url_hash_normalises():
-    a = kil.canonical_url_hash("HTTPS://example.com/foo/")
+def test_canonical_url_hash_normalises_scheme_host_port_and_whitespace():
+    a = kil.canonical_url_hash("  HTTPS://example.com:443/foo  ")
     b = kil.canonical_url_hash("https://example.com/foo")
-    c = kil.canonical_url_hash("  https://example.com/foo  ")
-    assert a == b == c
+    assert a == b
     assert len(a) == 64
+
+
+def test_canonical_url_hash_preserves_non_root_trailing_slash():
+    assert kil.canonical_url_hash("https://example.com/foo/") != kil.canonical_url_hash("https://example.com/foo")
+
+
+def test_canonical_url_hash_normalises_empty_and_root_path():
+    assert kil.canonical_url_hash("https://example.com") == kil.canonical_url_hash("https://example.com/")
 
 
 def test_canonical_url_hash_preserves_path_case():

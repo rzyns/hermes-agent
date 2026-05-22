@@ -41,14 +41,16 @@ def canonical_url_hash(url: str) -> str:
     """Return SHA-256 of parsed-normalised URL as hex.
 
     Normalisation policy:
-    - strip whitespace, trailing '/' when path is empty or root-level
+    - strip surrounding whitespace
+    - normalize empty/root path to an empty path
     - lowercase scheme and host (netloc)
     - drop default ports (:80 for http, :443 for https)
-    - preserve path case, query order, fragment, percent-encoding
+    - preserve non-root path trailing slashes, path case, query order,
+      fragment, and percent-encoding
     - drop empty fragment/hash
 
-    This preserves distinct resources like ``/Foo`` vs ``/foo`` and keeps
-    percent-encoding round-trips stable.
+    This preserves distinct resources like ``/foo/`` vs ``/foo``,
+    ``/Foo`` vs ``/foo``, and keeps percent-encoding round-trips stable.
     """
     url = url.strip()
     parts = urlparse(url)
@@ -62,8 +64,8 @@ def canonical_url_hash(url: str) -> str:
     elif scheme == "https" and netloc.endswith(":443"):
         netloc = netloc[:-4]
 
-    # Remove trailing slash if path is empty or just "/"
-    path = parts.path.rstrip("/") if parts.path else ""
+    # Normalize only empty/root paths; preserve non-root trailing slashes.
+    path = "" if parts.path in ("", "/") else parts.path
 
     # Drop empty fragment
     fragment = parts.fragment if parts.fragment else ""
