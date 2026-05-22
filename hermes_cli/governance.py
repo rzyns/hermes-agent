@@ -31,6 +31,7 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import math
 import os
 import sys
 from pathlib import Path
@@ -573,28 +574,98 @@ def _json_depth(obj: Any, _seen: set[int] | None = None) -> int:
     return 0
 
 
+def _find_nonfinite(obj: Any, _seen: set[int] | None = None) -> list[str]:
+    """Return path-style error strings for every non-finite float in *obj*.
+
+    Recursively traverses dict keys / values and list / tuple items.
+    Cycles detected via ``_seen`` are silently ignored because they are
+    handled by ``_json_depth()`` (which returns ``-1`` for cycles).
+    Non-float / dict / list values terminate traversal.
+    """
+    if _seen is None:
+        _seen = set()
+    obj_id = id(obj)
+    if obj_id in _seen:
+        return []
+    if isinstance(obj, float):
+        if math.isnan(obj) or math.isinf(obj):
+            return [repr(obj)]
+        return []
+    if isinstance(obj, dict):
+        if not obj:
+            return []
+        _seen.add(obj_id)
+        try:
+            out: list[str] = []
+            for k, v in obj.items():
+                key_repr = repr(k)
+                for e in _find_nonfinite(k, _seen):
+                    out.append(f"key({key_repr}):{e}")
+                for e in _find_nonfinite(v, _seen):
+                    out.append(f"{key_repr}:{e}")
+            return out
+        finally:
+            _seen.discard(obj_id)
+    if isinstance(obj, (list, tuple)):
+        if not obj:
+            return []
+        _seen.add(obj_id)
+        try:
+            out: list[str] = []
+            for idx, item in enumerate(obj):
+                for e in _find_nonfinite(item, _seen):
+                    out.append(f"[{idx}]:{e}")
+            return out
+        finally:
+            _seen.discard(obj_id)
+    return []
+
+
 def _validate_manifest_canonicalization(manifest: dict, out: list[str]) -> None:
-    """Canonicalization hardening checks: depth, version, serializability."""
+    """Canonicalization hardening checks: depth, version, serializability.
+
+    CN-F1 addendum:  The preflight ``_find_nonfinite`` scan ensures that
+    in-memory non-finite floats anywhere in the object graph (including
+    dict keys, values, and previously-excluded fields such as *bundle_id*)
+    map to ``manifest_nonfinite_constant`` before the canonicalization pass
+    is attempted.  This addresses the prior review concern that the
+    ``allow_nan=False`` guard only covered values included in the digest
+    input and left top-level keys and excluded fields with different
+    error classes.
+
+    Generic non-JSON-serializable types (datetime, set, bytes, etc.) still
+    fail closed under ``manifest_canonicalization_invalid:TypeError``.
+    """
+    # -- CN-F1: preflight object-graph non-finite scan ------------------------
+    # Catches NaN / Infinity / -Infinity in dict keys, values, and the
+    # bundle_id field (which is excluded from digest recomputation).
+    nonfinite_preflight = _find_nonfinite(manifest)
+    if nonfinite_preflight:
+        out.append("manifest_nonfinite_constant")
+        return
+
+    # -- Depth and version checks ---------------------------------------------
     depth = _json_depth(manifest)
     if depth < 0 or depth > _MAX_MANIFEST_DEPTH:
         out.append("manifest_exceeds_max_depth")
     version = manifest.get("manifest_version")
     if version not in _KNOWN_MANIFEST_VERSIONS:
         out.append(f"manifest_version_unsupported:{version}")
-    # Guard: try to canonicalize the manifest (excluding bundle_id).
+
+    # -- Canonicalization guard (excluding bundle_id) -------------------------
     # This catches circular references and non-JSON-serializable values
     # deterministically, mapping them to a canonicalization error rather
     # than letting RecursionError leak as EXIT_RUNTIME_ERROR.
     bundle_input = {k: v for k, v in manifest.items() if k != "bundle_id"}
     try:
         _canonical_json(bundle_input)
-    except ValueError as exc:
-        if "Out of range float values" in str(exc):
+    except (ValueError, TypeError, RecursionError) as exc:
+        if isinstance(exc, ValueError) and "Out of range float values" in str(exc):
+            # Should be unreachable after _find_nonfinite preflight, but kept
+            # as a safety net.
             out.append("manifest_nonfinite_constant")
         else:
             out.append(f"manifest_canonicalization_invalid:{type(exc).__name__}")
-    except (TypeError, RecursionError) as exc:
-        out.append(f"manifest_canonicalization_invalid:{type(exc).__name__}")
 
 
 def _canonical_json(obj: Any) -> str:

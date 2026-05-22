@@ -431,10 +431,16 @@ class TestSurfaceBCanonicalization:
         assert any("manifest_canonicalization_invalid" in e for e in errors)
 
     def test_nan_inf_negative_inf_in_memory_rejected(self):
-        """Direct unit test: non-finite in-memory floats are rejected by the
-        helper-level canonicalization guard (``allow_nan=False``), producing
-        the same ``manifest_nonfinite_constant`` error code as the file-level
-        ``parse_constant`` guard so that callers see a unified error class.
+        """Direct unit test: non-finite in-memory floats included in the
+        canonical-digest-input are rejected by the canonicalization guard,
+        producing ``manifest_nonfinite_constant``.
+
+        CN-F1 addendum: The ``_find_nonfinite`` preflight scan now extends
+        this coverage to dict keys, deeply nested values, and the
+        previously-excluded ``bundle_id`` field.  The *helper-level* error
+        code is unified for all Python object-graph non-finite positions.
+        Generic non-serializable objects still fail closed under
+        ``manifest_canonicalization_invalid:*``.
         """
         from hermes_cli.governance import _validate_manifest_canonicalization
         for label, val in (("nan", float("nan")), ("inf", float("inf")), ("-inf", float("-inf"))):
@@ -972,3 +978,190 @@ class TestSurfaceBRepairReportHardening:
         snapshot = report.get("manifest_identity_snapshot", {})
         assert snapshot.get("board_slug") == "test-board"
         assert snapshot.get("tenant") is None
+
+
+# ---------------------------------------------------------------------------
+# CN-F1: non-finite canonicalization hardening evidence (local-only)
+# ---------------------------------------------------------------------------
+class TestSurfaceBCN1NonfiniteHardening:
+    """Prove that the CN-F1 preflight object-graph scan rejects non-finite
+    floats uniformly—regardless of position (value, key, previously-excluded
+    field)—while still mapping generic non-serializable types to their own
+    fail-closed class.
+    """
+
+    @pytest.fixture(scope="class")
+    def _canonicalize_error_list(self):
+        """Run _validate_manifest_canonicalization and return error list."""
+        import hermes_cli.governance as gov
+        def run(manifest):
+            errors = []
+            gov._validate_manifest_canonicalization(manifest, errors)
+            return errors
+        return run
+
+    # -- Value-level non-finite (ordinary digest input) -------------------
+    def test_nan_value_in_manifest_field_maps_nonfinite_constant(
+        self, _canonicalize_error_list
+    ):
+        m = {"manifest_version": "hgk.surface_b.manifest.v1", "run_id": float("nan")}
+        errors = _canonicalize_error_list(m)
+        assert any("manifest_nonfinite_constant" in e for e in errors), f"errors: {errors}"
+
+    def test_infinity_value_in_manifest_field_maps_nonfinite_constant(
+        self, _canonicalize_error_list
+    ):
+        m = {"manifest_version": "hgk.surface_b.manifest.v1", "run_id": float("inf")}
+        errors = _canonicalize_error_list(m)
+        assert any("manifest_nonfinite_constant" in e for e in errors), f"errors: {errors}"
+
+    def test_negative_infinity_value_in_manifest_field_maps_nonfinite_constant(
+        self, _canonicalize_error_list
+    ):
+        m = {"manifest_version": "hgk.surface_b.manifest.v1", "run_id": float("-inf")}
+        errors = _canonicalize_error_list(m)
+        assert any("manifest_nonfinite_constant" in e for e in errors), f"errors: {errors}"
+
+    # -- Key-level non-finite (top-level and nested) ----------------------
+    def test_nan_dict_key_top_level_maps_nonfinite_constant(
+        self, _canonicalize_error_list
+    ):
+        m = {"manifest_version": "hgk.surface_b.manifest.v1", float("nan"): "x"}
+        errors = _canonicalize_error_list(m)
+        assert any("manifest_nonfinite_constant" in e for e in errors), f"errors: {errors}"
+
+    def test_inf_dict_key_top_level_maps_nonfinite_constant(
+        self, _canonicalize_error_list
+    ):
+        m = {"manifest_version": "hgk.surface_b.manifest.v1", float("inf"): "x"}
+        errors = _canonicalize_error_list(m)
+        assert any("manifest_nonfinite_constant" in e for e in errors), f"errors: {errors}"
+
+    def test_nested_nan_dict_key_maps_nonfinite_constant(
+        self, _canonicalize_error_list
+    ):
+        m = {"manifest_version": "hgk.surface_b.manifest.v1", "nested": {float("nan"): "x"}}
+        errors = _canonicalize_error_list(m)
+        assert any("manifest_nonfinite_constant" in e for e in errors), f"errors: {errors}"
+
+    # -- Previously-excluded field (bundle_id as float) -------------------
+    def test_nan_bundle_id_excluded_from_digest_maps_nonfinite_constant(
+        self, _canonicalize_error_list
+    ):
+        m = {"manifest_version": "hgk.surface_b.manifest.v1", "bundle_id": float("nan")}
+        errors = _canonicalize_error_list(m)
+        assert any("manifest_nonfinite_constant" in e for e in errors), f"errors: {errors}"
+
+    def test_inf_bundle_id_excluded_from_digest_maps_nonfinite_constant(
+        self, _canonicalize_error_list
+    ):
+        m = {"manifest_version": "hgk.surface_b.manifest.v1", "bundle_id": float("inf")}
+        errors = _canonicalize_error_list(m)
+        assert any("manifest_nonfinite_constant" in e for e in errors), f"errors: {errors}"
+
+    # -- Deep nesting in lists and tuples -------------------------------
+    def test_nan_in_deep_list_maps_nonfinite_constant(
+        self, _canonicalize_error_list
+    ):
+        m = {"manifest_version": "hgk.surface_b.manifest.v1", "items": [1, {"a": [2, float("nan")]}]}
+        errors = _canonicalize_error_list(m)
+        assert any("manifest_nonfinite_constant" in e for e in errors), f"errors: {errors}"
+
+    def test_neg_inf_in_tuple_maps_nonfinite_constant(
+        self, _canonicalize_error_list
+    ):
+        m = {"manifest_version": "hgk.surface_b.manifest.v1", "items": (1, float("-inf"))}
+        errors = _canonicalize_error_list(m)
+        assert any("manifest_nonfinite_constant" in e for e in errors), f"errors: {errors}"
+
+    # -- Generic non-serializable still fails under own class -----------
+    def test_non_serializable_type_maps_canonicalization_invalid(
+        self, _canonicalize_error_list
+    ):
+        import datetime
+        m = {"manifest_version": "hgk.surface_b.manifest.v1", "ts": datetime.datetime.now()}
+        errors = _canonicalize_error_list(m)
+        assert any("manifest_canonicalization_invalid:TypeError" in e for e in errors), f"errors: {errors}"
+
+    def test_set_in_value_maps_canonicalization_invalid(
+        self, _canonicalize_error_list
+    ):
+        m = {"manifest_version": "hgk.surface_b.manifest.v1", "s": {1, 2}}
+        errors = _canonicalize_error_list(m)
+        assert any("manifest_canonicalization_invalid:TypeError" in e for e in errors), f"errors: {errors}"
+
+    def test_bytes_in_value_maps_canonicalization_invalid(
+        self, _canonicalize_error_list
+    ):
+        m = {"manifest_version": "hgk.surface_b.manifest.v1", "raw": b"hello"}
+        errors = _canonicalize_error_list(m)
+        assert any("manifest_canonicalization_invalid:TypeError" in e for e in errors), f"errors: {errors}"
+
+    # -- Circular reference still works (not shadowed by preflight) ------
+    def test_circular_reference_still_maps_canonicalization_invalid(
+        self, _canonicalize_error_list
+    ):
+        import hermes_cli.governance as gov
+        m = {"manifest_version": "hgk.surface_b.manifest.v1", "task_id": "t1"}
+        m["self"] = m
+        errors = []
+        gov._validate_manifest_canonicalization(m, errors)
+        assert any("manifest_canonicalization_invalid" in e for e in errors), f"errors: {errors}"
+
+    # -- Preflight short-circuits before canonical-json call -------------
+    def test_preflight_short_circuits_before_canonical_json_call_for_bundle_id_nan(
+        self, _canonicalize_error_list
+    ):
+        """The preflight scan finds the non-finite and emits
+        manifest_nonfinite_constant without ever calling _canonical_json().
+        Previously, bundle_id=float('nan') was excluded from digest input,
+        so _canonical_json would succeed and produce [] errors.
+        """
+        import hermes_cli.governance as gov
+        m = {"manifest_version": "hgk.surface_b.manifest.v1", "bundle_id": float("nan")}
+        errors = []
+        gov._validate_manifest_canonicalization(m, errors)
+        assert "manifest_nonfinite_constant" in errors
+        # depth/version checks also not run because preflight returns early
+        assert not any("manifest_exceeds_max_depth" in e for e in errors)
+        assert not any("manifest_version_unsupported" in e for e in errors)
+
+    # -- Existing file-level non-finite token tests remain valid ------
+    def test_nan_inf_neg_inf_file_level_loader_still_rejected(self, tmp_path, hermes_main):
+        """Original file-level tests must remain green after CN-F1 changes.
+        They exercise parse_constant, not _find_nonfinite."""
+        for raw_text in [
+            '{"manifest_version": "hgk.surface_b.manifest.v1", "task_id": "t1", "run_id": NaN}',
+            '{"manifest_version": "hgk.surface_b.manifest.v1", "task_id": "t1", "run_id": Infinity}',
+            '{"manifest_version": "hgk.surface_b.manifest.v1", "task_id": "t1", "run_id": -Infinity}',
+        ]:
+            manifest = tmp_path / f"{id(raw_text)}.json"
+            manifest.write_text(raw_text)
+            result = _run_validate_manifest(tmp_path, hermes_main, manifest)
+            assert result.returncode == 20
+            report = json.loads((tmp_path / "out" / "validation_report.json").read_text())
+            assert any("manifest_nonfinite_constant" in e for e in report["errors"])
+
+    # -- Verification: _find_nonfinite helper paths -----------------------
+    def test_find_nonfinite_finds_key_and_value_paths(self):
+        import hermes_cli.governance as gov
+        m = {
+            "manifest_version": "hgk.surface_b.manifest.v1",
+            float("nan"): float("inf"),
+            "nested": {"a": [float("-inf")]},
+        }
+        found = gov._find_nonfinite(m)
+        assert any("nan" in e.lower() for e in found)
+        assert any("inf" in e.lower() for e in found)
+        assert any("-inf" in e.lower() for e in found)
+
+    def test_find_nonfinite_returns_empty_for_finite(self):
+        import hermes_cli.governance as gov
+        m = {"a": 1, "b": 1.5, "c": {"d": [2, 3.0]}}
+        assert gov._find_nonfinite(m) == []
+
+    def test_find_nonfinite_returns_empty_for_plain_string(self):
+        import hermes_cli.governance as gov
+        m = {"a": "NaN", "b": "Infinity"}
+        # String values containing the text are not Python non-finite scalars
+        assert gov._find_nonfinite(m) == []
