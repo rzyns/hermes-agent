@@ -3588,6 +3588,17 @@ def set_workspace_path(
         )
 
 
+def update_task_body(
+    conn: sqlite3.Connection, task_id: str, body: str
+) -> None:
+    """Unconditionally set body on a task row."""
+    with write_txn(conn):
+        conn.execute(
+            "UPDATE tasks SET body = ? WHERE id = ?",
+            (body, task_id),
+        )
+
+
 # ---------------------------------------------------------------------------
 def schedule_task(
     conn: sqlite3.Connection,

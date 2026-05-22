@@ -24,6 +24,7 @@ from pathlib import Path
 from typing import Any, Optional
 
 from hermes_cli import kanban_db as kb
+from hermes_cli import kanban_intake_link as kil
 from hermes_cli import kanban_swarm as ks
 from hermes_cli.profiles import get_active_profile_name, get_profile_dir, seed_profile_skills
 
@@ -348,6 +349,33 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
                                "that require immediate human ops (R3 gate) "
                                "to skip the brief running-to-blocked transition.")
     p_create.add_argument("--json", action="store_true", help="Emit JSON output")
+
+    # --- intake-link ---
+    p_il = sub.add_parser(
+        "intake-link",
+        help="Create a first-class Attention Intake link-drop card",
+    )
+    p_il.add_argument("--url", required=True, help="URL to analyse")
+    p_il.add_argument("--board", default=kil.DEFAULT_BOARD,
+                      help=f"Board slug (default: {kil.DEFAULT_BOARD})")
+    p_il.add_argument("--context", default=None, help="Why this link matters")
+    p_il.add_argument("--note", default=None, help="Operator note")
+    p_il.add_argument("--assignee", default=kil.DEFAULT_ASSIGNEE,
+                      help=f"Profile name (default: {kil.DEFAULT_ASSIGNEE})")
+    p_il.add_argument("--triage", action="store_true", default=kil.DEFAULT_TRIAGE,
+                      help="Park in triage for specifier review (default: true)")
+    p_il.add_argument("--no-triage", action="store_true", default=False,
+                      dest="no_triage",
+                      help="Skip specifier triage — go straight to ready/todo")
+    p_il.add_argument("--priority", type=int, default=kil.DEFAULT_PRIORITY,
+                      help="Priority tiebreaker")
+    p_il.add_argument("--max-runtime", default=None,
+                      help="Per-task runtime cap (seconds or 30m / 2h / 1d)")
+    p_il.add_argument("--skill", action="append", default=[], dest="skills",
+                      help="Skill to force-load (repeatable)")
+    p_il.add_argument("--idempotency-key", default=None,
+                      help="Override canonical URL hash dedup key")
+    p_il.add_argument("--json", action="store_true", help="Emit JSON output")
 
     # --- swarm ---
     p_swarm = sub.add_parser(
@@ -915,6 +943,7 @@ def kanban_command(args: argparse.Namespace) -> int:
         "context":  _cmd_context,
         "specify":  _cmd_specify,
         "decompose":  _cmd_decompose,
+        "intake-link": _cmd_intake_link,
         "gc":       _cmd_gc,
     }
     handler = handlers.get(action)
@@ -1323,6 +1352,65 @@ def _cmd_create(args: argparse.Namespace) -> int:
             running, message = _check_dispatcher_presence()
             if not running and message:
                 print(f"\n⚠  {message}", file=sys.stderr)
+    return 0
+
+
+def _cmd_intake_link(args: argparse.Namespace) -> int:
+    """Create a first-class Attention Intake link-drop card."""
+    if not getattr(args, "url", None):
+        print("kanban intake-link: --url is required", file=sys.stderr)
+        return 2
+
+    try:
+        max_runtime = _parse_duration(getattr(args, "max_runtime", None))
+    except ValueError as exc:
+        print(f"kanban: --max-runtime: {exc}", file=sys.stderr)
+        return 2
+
+    triage = not getattr(args, "no_triage", False)
+    skills = getattr(args, "skills", None) or None
+
+    # Board handling: the incoming --board must exist.
+    board_slug = getattr(args, "board", kil.DEFAULT_BOARD)
+    if board_slug and board_slug != kb.DEFAULT_BOARD and not kb.board_exists(board_slug):
+        print(
+            f"kanban: board {board_slug!r} does not exist.",
+            file=sys.stderr,
+        )
+        return 1
+
+    # We intentionally do NOT pin HERMES_KANBAN_BOARD here; the helper
+    # and kanban_db resolve board via their own mechanics, and the CLI
+    # --board override is already handled above.
+    with kb.connect() as conn:
+        task_id = kil.create_intake_link(
+            conn,
+            url=args.url,
+            context=getattr(args, "context", None),
+            note=getattr(args, "note", None),
+            board=board_slug,
+            assignee=args.assignee,
+            triage=triage,
+            priority=args.priority,
+            skills=skills,
+            max_runtime_seconds=max_runtime,
+            idempotency_key=getattr(args, "idempotency_key", None),
+            source="cli",
+        )
+        task = kb.get_task(conn, task_id)
+
+    if getattr(args, "json", False):
+        print(json.dumps(_task_to_dict(task), indent=2, ensure_ascii=False))
+    else:
+        msg = (
+            f"Intake-link {task_id}  "
+            f"({task.status}, assignee={task.assignee or '-'}"
+        )
+        if task.idempotency_key and task.title.startswith("Link drop"):
+            # We created this row; include the URL hash snippet.
+            msg += f", dedup={task.idempotency_key[:16]}..."
+        msg += ")"
+        print(msg)
     return 0
 
 

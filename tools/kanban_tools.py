@@ -720,6 +720,67 @@ def _handle_create(args: dict, **kw) -> str:
         return tool_error(f"kanban_create: {e}")
 
 
+def _handle_create_intake_link(args: dict, **kw) -> str:
+    """Create an Attention Intake link-analysis card with register contract from birth.
+
+    Thin wrapper around the shared helper in hermes_cli.kanban_intake_link.
+    """
+    url = args.get("url")
+    if not url or not str(url).strip():
+        return tool_error("url is required")
+    board = args.get("board")
+    try:
+        from hermes_cli import kanban_intake_link as kil
+        from hermes_cli import kanban_db as kb
+        conn = kb.connect(board=board)
+    except Exception as exc:
+        logger.exception("kanban_create_intake_link connect failed")
+        return tool_error(f"kanban_create_intake_link: {exc}")
+    try:
+        context = args.get("context")
+        note = args.get("note")
+        assignee = args.get("assignee") or kil.DEFAULT_ASSIGNEE
+        triage, bool_error = _parse_bool_arg(args, "triage", default=kil.DEFAULT_TRIAGE)
+        if bool_error:
+            return tool_error(bool_error)
+        priority = args.get("priority")
+        skills = args.get("skills")
+        if isinstance(skills, str):
+            skills = [skills]
+        max_runtime_seconds = args.get("max_runtime_seconds")
+        idempotency_key = args.get("idempotency_key")
+        task_id = kil.create_intake_link(
+            conn,
+            url=str(url).strip(),
+            context=context,
+            note=note,
+            board=board or kil.DEFAULT_BOARD,
+            assignee=assignee,
+            triage=triage,
+            priority=int(priority) if priority is not None else kil.DEFAULT_PRIORITY,
+            skills=skills,
+            max_runtime_seconds=(
+                int(max_runtime_seconds)
+                if max_runtime_seconds is not None else None
+            ),
+            idempotency_key=idempotency_key,
+            source="tool",
+        )
+        task = kb.get_task(conn, task_id)
+        return _ok(
+            task_id=task_id,
+            status=task.status if task else None,
+            workspace_path=task.workspace_path if task else None,
+        )
+    except ValueError as e:
+        return tool_error(f"kanban_create_intake_link: {e}")
+    except Exception as e:
+        logger.exception("kanban_create_intake_link failed")
+        return tool_error(f"kanban_create_intake_link: {e}")
+    finally:
+        conn.close()
+
+
 def _handle_unblock(args: dict, **kw) -> str:
     """Transition a blocked task back to ready."""
     guard = _require_orchestrator_tool("kanban_unblock")
@@ -1210,6 +1271,60 @@ KANBAN_LINK_SCHEMA = {
     },
 }
 
+
+KANBAN_CREATE_INTAKE_LINK_SCHEMA = {
+    "name": "kanban_create_intake_link",
+    "description": (
+        "Create an Attention Intake link-analysis card with the link-drop "
+        "contract from birth. Returns the task id. Uses canonical URL hash "
+        "as default idempotency key. Re-dropping the same URL returns the "
+        "existing task id."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "url": {
+                "type": "string",
+                "description": "The URL to analyse and register.",
+            },
+            "context": {
+                "type": "string",
+                "description": "Optional human context for why the link was dropped.",
+            },
+            "note": {
+                "type": "string",
+                "description": "Optional operator note.",
+            },
+            "board": _board_schema_prop(),
+            "assignee": {
+                "type": "string",
+                "description": "Profile name (default: link-analyst).",
+            },
+            "triage": {
+                "type": "boolean",
+                "description": "Park in triage for specifier review (default: true).",
+            },
+            "priority": {
+                "type": "integer",
+                "description": "Dispatcher tiebreaker. Higher = picked sooner.",
+            },
+            "skills": {
+                "type": "array",
+                "items": {"type": "string"},
+                "description": "Skill names to force-load into the dispatched worker.",
+            },
+            "max_runtime_seconds": {
+                "type": "integer",
+                "description": "Per-task runtime cap in seconds.",
+            },
+            "idempotency_key": {
+                "type": "string",
+                "description": "Override canonical URL hash dedup key.",
+            },
+        },
+        "required": ["url"],
+    },
+}
 
 # ---------------------------------------------------------------------------
 # Registration
