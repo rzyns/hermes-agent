@@ -8558,6 +8558,24 @@ def cmd_update(args):
         _finalize_update_output(_update_io_state)
 
 
+def cmd_update_maintenance(args):
+    """Run post-source-update maintenance without mutating git state."""
+    if getattr(args, "capabilities", False):
+        import json
+
+        print(json.dumps({"schema": 1, "command": "update-maintenance", "requires_fresh_process": True}))
+        return
+
+    gateway_mode = bool(getattr(args, "gateway", False))
+    _update_io_state = _install_hangup_protection(gateway_mode=gateway_mode)
+    try:
+        print("⚕ Running Hermes update maintenance...")
+        print()
+        _run_update_maintenance(args, gateway_mode=gateway_mode, source_updated=False)
+    finally:
+        _finalize_update_output(_update_io_state)
+
+
 def _cmd_update_pip(args):
     """Update Hermes via pip (for PyPI installs)."""
     from hermes_cli import __version__
@@ -8579,6 +8597,878 @@ def _cmd_update_pip(args):
 
     print("✓ Update complete! Restart hermes to use the new version.")
 
+
+
+def _run_update_maintenance(args, *, gateway_mode: bool = False, source_updated: bool = True) -> None:
+    """Run post-source-update maintenance shared by update paths.
+
+    This intentionally excludes git source reconciliation and fork upstream
+    synchronization. Built-in ``hermes update`` performs those before calling
+    this helper; fork-safe update flows can call this in a fresh process after
+    their own source reconciliation.
+    """
+    assume_yes = bool(getattr(args, "yes", False))
+    _invalidate_update_cache()
+
+    # Clear stale .pyc bytecode cache — prevents ImportError on gateway
+    # restart when updated source references names that didn't exist in
+    # the old bytecode (e.g. get_hermes_home added to hermes_constants).
+    removed = _clear_bytecode_cache(PROJECT_ROOT)
+    if removed:
+        print(
+            f"  ✓ Cleared {removed} stale __pycache__ director{'y' if removed == 1 else 'ies'}"
+        )
+
+    # Reinstall Python dependencies. Prefer .[all], but if one optional extra
+    # breaks on this machine, keep base deps and reinstall the remaining extras
+    # individually so update does not silently strip working capabilities.
+    print("→ Updating Python dependencies...")
+    pip_cmd = [sys.executable, "-m", "pip"]
+    uv_bin = shutil.which("uv") or _ensure_uv_for_termux(pip_cmd)
+    install_group = "all"
+
+    if uv_bin:
+        uv_env = {**os.environ, "VIRTUAL_ENV": str(PROJECT_ROOT / "venv")}
+        if _is_termux_env(uv_env):
+            uv_env.pop("PYTHONPATH", None)
+            uv_env.pop("PYTHONHOME", None)
+            install_group = "termux-all"
+            print("  → Termux detected: using uv + curated termux-all optional profile...")
+        if _is_termux_env(uv_env) and _is_android_python():
+            print("  → Termux/Android detected: prebuilding psutil with Linux source path compatibility...")
+            _install_psutil_android_compat([uv_bin, "pip"], env=uv_env)
+        _install_python_dependencies_with_optional_fallback(
+            [uv_bin, "pip"], env=uv_env, group=install_group
+        )
+    else:
+        # Use sys.executable to explicitly call the venv's pip module,
+        # avoiding PEP 668 'externally-managed-environment' errors on Debian/Ubuntu.
+        # Some environments lose pip inside the venv; bootstrap it back with
+        # ensurepip before trying the editable install.
+        pip_cmd = [sys.executable, "-m", "pip"]
+        try:
+            subprocess.run(
+                pip_cmd + ["--version"],
+                cwd=PROJECT_ROOT,
+                check=True,
+                capture_output=True,
+            )
+        except subprocess.CalledProcessError:
+            subprocess.run(
+                [sys.executable, "-m", "ensurepip", "--upgrade", "--default-pip"],
+                cwd=PROJECT_ROOT,
+                check=True,
+            )
+        if _is_termux_env():
+            install_group = "termux-all"
+            print("  → Termux detected: using curated termux-all optional profile...")
+        if _is_termux_env() and _is_android_python():
+            print("  → Termux/Android detected: prebuilding psutil with Linux source path compatibility...")
+            _install_psutil_android_compat(pip_cmd)
+        _install_python_dependencies_with_optional_fallback(pip_cmd, group=install_group)
+
+    _refresh_active_lazy_features()
+
+    _update_node_dependencies()
+    _build_web_ui(PROJECT_ROOT / "web")
+
+    print()
+    if source_updated:
+        print("✓ Code updated!")
+    else:
+        print("✓ Source already reconciled; running maintenance")
+
+    # After git pull, source files on disk are newer than cached Python
+    # modules in this process.  Reload hermes_constants so that any lazy
+    # import executed below (skills sync, gateway restart) sees new
+    # attributes like display_hermes_home() added since the last release.
+    try:
+        import importlib
+        import hermes_constants as _hc
+
+        importlib.reload(_hc)
+    except Exception:
+        pass  # non-fatal — worst case a lazy import fails gracefully
+
+    # Sync bundled skills (copies new, updates changed, respects user deletions)
+    try:
+        from tools.skills_sync import sync_skills
+
+        print()
+        print("→ Syncing bundled skills...")
+        result = sync_skills(quiet=True)
+        if result["copied"]:
+            print(f"  + {len(result['copied'])} new: {', '.join(result['copied'])}")
+        if result.get("updated"):
+            print(
+                f"  ↑ {len(result['updated'])} updated: {', '.join(result['updated'])}"
+            )
+        if result.get("user_modified"):
+            print(f"  ~ {len(result['user_modified'])} user-modified (kept)")
+        if result.get("cleaned"):
+            print(f"  − {len(result['cleaned'])} removed from manifest")
+        if not result["copied"] and not result.get("updated"):
+            print("  ✓ Skills are up to date")
+    except Exception as e:
+        logger.debug("Skills sync during update failed: %s", e)
+
+    # Sync bundled skills to all profiles (including the active one).
+    # seed_profile_skills() uses subprocess with an explicit HERMES_HOME so
+    # it is not affected by sync_skills()'s module-level HERMES_HOME cache,
+    # which means the active profile is reliably synced regardless of whether
+    # the caller's HERMES_HOME env var points at the default or a named profile.
+    try:
+        from hermes_cli.profiles import (
+            list_profiles,
+            seed_profile_skills,
+        )
+
+        all_profiles = list_profiles()
+        if all_profiles:
+            print()
+            print("→ Syncing bundled skills to all profiles...")
+            for p in all_profiles:
+                try:
+                    r = seed_profile_skills(p.path, quiet=True)
+                    if r and r.get("skipped_opt_out"):
+                        status = "opted out (--no-skills)"
+                    elif r:
+                        copied = len(r.get("copied", []))
+                        updated = len(r.get("updated", []))
+                        modified = len(r.get("user_modified", []))
+                        parts = []
+                        if copied:
+                            parts.append(f"+{copied} new")
+                        if updated:
+                            parts.append(f"↑{updated} updated")
+                        if modified:
+                            parts.append(f"~{modified} user-modified")
+                        status = ", ".join(parts) if parts else "up to date"
+                    else:
+                        status = "sync failed"
+                    print(f"  {p.name}: {status}")
+                except Exception as pe:
+                    print(f"  {p.name}: error ({pe})")
+    except Exception:
+        pass  # profiles module not available or no profiles
+
+    # Sync Honcho host blocks to all profiles
+    try:
+        from plugins.memory.honcho.cli import sync_honcho_profiles_quiet
+
+        synced = sync_honcho_profiles_quiet()
+        if synced:
+            print(f"\n-> Honcho: synced {synced} profile(s)")
+    except Exception:
+        pass  # honcho plugin not installed or not configured
+
+    # Check for config migrations
+    print()
+    print("→ Checking configuration for new options...")
+
+    from hermes_cli.config import (
+        get_missing_env_vars,
+        get_missing_config_fields,
+        check_config_version,
+        migrate_config,
+    )
+
+    missing_env = get_missing_env_vars(required_only=True)
+    missing_config = get_missing_config_fields()
+    current_ver, latest_ver = check_config_version()
+
+    needs_migration = missing_env or missing_config or current_ver < latest_ver
+
+    if needs_migration:
+        print()
+        if missing_env:
+            print(
+                f"  ⚠️  {len(missing_env)} new required setting(s) need configuration"
+            )
+        if missing_config:
+            print(f"  ℹ️  {len(missing_config)} new config option(s) available")
+
+        print()
+        if assume_yes:
+            print(
+                "  ℹ --yes: auto-applying config migration (skipping API-key prompts)."
+            )
+            response = "y"
+        elif gateway_mode:
+            response = (
+                _gateway_prompt(
+                    "Would you like to configure new options now? [Y/n]", "n"
+                )
+                .strip()
+                .lower()
+            )
+        elif not (sys.stdin.isatty() and sys.stdout.isatty()):
+            print("  ℹ Non-interactive session — applying safe config migrations.")
+            response = "auto"
+        else:
+            try:
+                response = (
+                    input("Would you like to configure them now? [Y/n]: ")
+                    .strip()
+                    .lower()
+                )
+            except EOFError:
+                response = "n"
+
+        if response in {"", "y", "yes", "auto"}:
+            print()
+            # Gateway mode, --yes, and non-interactive update contexts
+            # (dashboard / web server actions) cannot prompt for API keys.
+            # Still run the non-interactive migration pass before restarting
+            # so new default config fields and version bumps are written
+            # before the freshly updated gateway validates config at startup.
+            interactive_migration = not (
+                gateway_mode or assume_yes or response == "auto"
+            )
+            results = migrate_config(interactive=interactive_migration, quiet=False)
+
+            if results["env_added"] or results["config_added"]:
+                print()
+                print("✓ Configuration updated!")
+            if (gateway_mode or assume_yes or response == "auto") and missing_env:
+                print("  ℹ API keys require manual entry: hermes config migrate")
+        else:
+            print()
+            print("Skipped. Run 'hermes config migrate' later to configure.")
+    else:
+        print("  ✓ Configuration is up to date")
+
+    print()
+    print("✓ Update complete!")
+
+    # Curator first-run heads-up. Only prints when curator is enabled AND
+    # has never run — i.e. the window where the ticker would otherwise
+    # have fired against a fresh skill library. Kept silent on steady
+    # state so we don't nag.
+    try:
+        _print_curator_first_run_notice()
+    except Exception as e:
+        logger.debug("Curator first-run notice failed: %s", e)
+
+    # Most-recent curator run notice — show-once per run. Surfaces the
+    # rename map (`old-name → umbrella`) on the high-attention update
+    # surface so users learn about consolidations without having to
+    # check `hermes curator status`. Self-stamps after printing so it
+    # never repeats for the same run.
+    try:
+        _print_curator_recent_run_notice()
+    except Exception as e:
+        logger.debug("Curator recent-run notice failed: %s", e)
+
+    # Repair RHEL-family root installs where /usr/local/bin isn't on PATH
+    # for non-login interactive shells.  No-op on every other platform.
+    try:
+        _ensure_fhs_path_guard()
+    except Exception as e:
+        logger.debug("FHS PATH guard check failed: %s", e)
+
+    # Refresh the cua-driver binary used by the Computer Use toolset.
+    # The upstream installer is gated on macOS and on the binary already
+    # being on PATH, so this is a no-op for users who don't have it.
+    # Tying the refresh to ``hermes update`` gives users a predictable
+    # cadence (matches when they pull new agent code) without adding
+    # startup latency or a per-launch GitHub API call.
+    try:
+        if sys.platform == "darwin" and shutil.which("cua-driver"):
+            from hermes_cli.tools_config import install_cua_driver
+
+            print()
+            print("→ Refreshing cua-driver (Computer Use)...")
+            install_cua_driver(upgrade=True)
+    except Exception as e:
+        logger.debug("cua-driver refresh failed: %s", e)
+
+    # Write exit code *before* the gateway restart attempt.
+    # When running as ``hermes update --gateway`` (spawned by the gateway's
+    # /update command), this process lives inside the gateway's systemd
+    # cgroup.  A graceful SIGUSR1 restart keeps the drain loop alive long
+    # enough for the exit-code marker to be written below, but the
+    # fallback ``systemctl restart`` path (see below) kills everything in
+    # the cgroup (KillMode=mixed → SIGKILL to remaining processes),
+    # including us and the wrapping bash shell.  The shell never reaches
+    # its ``printf $status > .update_exit_code`` epilogue, so the
+    # exit-code marker file would never be created.  The new gateway's
+    # update watcher would then poll for 30 minutes and send a spurious
+    # timeout message.
+    #
+    # Writing the marker here — after git pull + pip install succeed but
+    # before we attempt the restart — ensures the new gateway sees it
+    # regardless of how we die.
+    if gateway_mode:
+        _exit_code_path = get_hermes_home() / ".update_exit_code"
+        try:
+            _exit_code_path.write_text("0")
+        except OSError:
+            pass
+
+    # Auto-restart ALL gateways after update.
+    # The code update (git pull) is shared across all profiles, so every
+    # running gateway needs restarting to pick up the new code.
+    try:
+        from hermes_cli.gateway import (
+            is_macos,
+            supports_systemd_services,
+            _ensure_user_systemd_env,
+            find_gateway_pids,
+            find_profile_gateway_processes,
+            launch_detached_profile_gateway_restart,
+            _get_service_pids,
+            _graceful_restart_via_sigusr1,
+            _wait_for_gateway_exit,
+        )
+        import signal as _signal
+
+        def _wait_for_service_active(
+            scope_cmd_: list,
+            svc_name_: str,
+            timeout: float = 10.0,
+        ) -> bool:
+            """Poll ``systemctl is-active`` until the unit reports active.
+
+            systemd's Stopped -> Started transition after a graceful exit
+            (or a hard restart) is not instantaneous; a one-shot check
+            races that window and falsely reports the unit as down.
+            Poll every 0.5s up to ``timeout`` seconds before giving up.
+            """
+            deadline = _time.monotonic() + max(timeout, 0.5)
+            while True:
+                try:
+                    _verify = subprocess.run(
+                        scope_cmd_ + ["is-active", svc_name_],
+                        capture_output=True,
+                        text=True,
+                        timeout=5,
+                    )
+                    if _verify.stdout.strip() == "active":
+                        return True
+                except (FileNotFoundError, subprocess.TimeoutExpired):
+                    pass
+                if _time.monotonic() >= deadline:
+                    return False
+                _time.sleep(0.5)
+
+        def _service_restart_sec(
+            scope_cmd_: list,
+            svc_name_: str,
+            default: float = 0.0,
+        ) -> float:
+            """Read the unit's ``RestartUSec`` (RestartSec) in seconds.
+
+            After a graceful exit-75, systemd waits ``RestartSec`` before
+            respawning the unit.  Callers that poll for ``is-active``
+            must use a timeout >= ``RestartSec`` + transition slack, or
+            they'll give up *during* the cooldown window and wrongly
+            conclude the unit didn't relaunch.
+            """
+            try:
+                _show = subprocess.run(
+                    scope_cmd_
+                    + [
+                        "show",
+                        svc_name_,
+                        "--property=RestartUSec",
+                        "--value",
+                    ],
+                    capture_output=True,
+                    text=True,
+                    timeout=5,
+                )
+            except (FileNotFoundError, subprocess.TimeoutExpired):
+                return default
+            raw = (_show.stdout or "").strip()
+            # systemd emits values like "30s", "100ms", "1min 30s", or
+            # "infinity".  Parse conservatively; on any miss return default.
+            if not raw or raw == "infinity":
+                return default
+            total = 0.0
+            matched = False
+            for part in raw.split():
+                for _suf, _mult in (
+                    ("ms", 0.001),
+                    ("us", 0.000001),
+                    ("min", 60.0),
+                    ("s", 1.0),
+                ):
+                    if part.endswith(_suf):
+                        try:
+                            total += float(part[: -len(_suf)]) * _mult
+                            matched = True
+                        except ValueError:
+                            pass
+                        break
+            return total if matched else default
+
+        # Drain budget for graceful SIGUSR1 restarts.  The gateway drains
+        # for up to ``agent.restart_drain_timeout`` (default 60s) before
+        # exiting with code 75; we wait slightly longer so the drain
+        # completes before we fall back to a hard restart.  On older
+        # systemd units without SIGUSR1 wiring this wait just times out
+        # and we fall back to ``systemctl restart`` (the old behaviour).
+        try:
+            from hermes_constants import (
+                DEFAULT_GATEWAY_RESTART_DRAIN_TIMEOUT as _DEFAULT_DRAIN,
+            )
+        except Exception:
+            _DEFAULT_DRAIN = 60.0
+        _cfg_drain = None
+        try:
+            from hermes_cli.config import load_config
+
+            _cfg_agent = load_config().get("agent") or {}
+            _cfg_drain = _cfg_agent.get("restart_drain_timeout")
+        except Exception:
+            pass
+        try:
+            _drain_budget = (
+                float(_cfg_drain)
+                if _cfg_drain is not None
+                else float(_DEFAULT_DRAIN)
+            )
+        except (TypeError, ValueError):
+            _drain_budget = float(_DEFAULT_DRAIN)
+        # Add a 15s margin so the drain loop + final exit finish before
+        # we escalate to ``systemctl restart`` / SIGTERM.
+        _drain_budget = max(_drain_budget, 30.0) + 15.0
+
+        restarted_services = []
+        killed_pids = set()
+        relaunched_profiles = []
+
+        # --- Systemd services (Linux) ---
+        # Discover all hermes-gateway* units (default + profiles)
+        if supports_systemd_services():
+            try:
+                _ensure_user_systemd_env()
+            except Exception:
+                pass
+
+            for scope, scope_cmd in [
+                ("user", ["systemctl", "--user"]),
+                ("system", ["systemctl"]),
+            ]:
+                try:
+                    result = subprocess.run(
+                        scope_cmd
+                        + [
+                            "list-units",
+                            "hermes-gateway*",
+                            "--plain",
+                            "--no-legend",
+                            "--no-pager",
+                        ],
+                        capture_output=True,
+                        text=True,
+                        timeout=10,
+                    )
+                    for line in result.stdout.strip().splitlines():
+                        parts = line.split()
+                        if not parts:
+                            continue
+                        unit = parts[
+                            0
+                        ]  # e.g. hermes-gateway.service or hermes-gateway-coder.service
+                        if not unit.endswith(".service"):
+                            continue
+                        svc_name = unit.removesuffix(".service")
+                        # Check if active
+                        check = subprocess.run(
+                            scope_cmd + ["is-active", svc_name],
+                            capture_output=True,
+                            text=True,
+                            timeout=5,
+                        )
+                        if check.stdout.strip() != "active":
+                            continue
+
+                        # Prefer a graceful SIGUSR1 restart so in-flight
+                        # agent runs drain instead of being SIGKILLed.
+                        # The gateway's SIGUSR1 handler calls
+                        # request_restart(via_service=True) → drain →
+                        # exit(75); systemd's Restart=on-failure (and
+                        # RestartForceExitStatus=75) respawns the unit.
+                        _main_pid = 0
+                        try:
+                            _show = subprocess.run(
+                                scope_cmd
+                                + [
+                                    "show",
+                                    svc_name,
+                                    "--property=MainPID",
+                                    "--value",
+                                ],
+                                capture_output=True,
+                                text=True,
+                                timeout=5,
+                            )
+                            _main_pid = int((_show.stdout or "").strip() or 0)
+                        except (
+                            ValueError,
+                            subprocess.TimeoutExpired,
+                            FileNotFoundError,
+                        ):
+                            _main_pid = 0
+
+                        _graceful_ok = False
+                        if _main_pid > 0:
+                            print(
+                                f"  → {svc_name}: draining (up to {int(_drain_budget)}s)..."
+                            )
+                            _graceful_ok = _graceful_restart_via_sigusr1(
+                                _main_pid,
+                                drain_timeout=_drain_budget,
+                            )
+
+                        if _graceful_ok:
+                            # Gateway exited 75. ``Restart=always`` +
+                            # ``RestartForceExitStatus=75`` means systemd
+                            # WILL respawn the unit — but only after
+                            # ``RestartSec`` (default 60s on our unit
+                            # file). That 60s wait is a crash-loop guard,
+                            # and is the right default when the gateway
+                            # dies unexpectedly. For a voluntary restart
+                            # on update, it's dead time the user watches.
+                            #
+                            # Shortcut it: ``reset-failed`` + ``start``
+                            # skips RestartSec entirely (we're manually
+                            # initiating the unit, not waiting for
+                            # systemd's auto-restart logic). Takes about
+                            # as long as the process takes to come up
+                            # (~1-3s on a warm box).
+                            #
+                            # If the unit is already active because
+                            # RestartSec elapsed while we were draining,
+                            # ``start`` is a no-op and we fall through to
+                            # the poll below. Either way we collapse the
+                            # 60s+ delay to a ~5s one.
+                            subprocess.run(
+                                scope_cmd + ["reset-failed", svc_name],
+                                capture_output=True,
+                                text=True,
+                                timeout=10,
+                            )
+                            subprocess.run(
+                                scope_cmd + ["start", svc_name],
+                                capture_output=True,
+                                text=True,
+                                timeout=15,
+                            )
+                            # Short poll: the gateway should be up within
+                            # a few seconds now that we bypassed
+                            # RestartSec. Fall back to the longer
+                            # RestartSec + slack budget ONLY if the
+                            # explicit start failed and we need to rely
+                            # on systemd's auto-restart.
+                            if _wait_for_service_active(
+                                scope_cmd,
+                                svc_name,
+                                timeout=10.0,
+                            ):
+                                restarted_services.append(svc_name)
+                                continue
+                            # Explicit start didn't take. Fall back to
+                            # the original passive poll (systemd's
+                            # auto-restart WILL fire after RestartSec
+                            # regardless).
+                            _restart_sec = _service_restart_sec(
+                                scope_cmd,
+                                svc_name,
+                                default=0.0,
+                            )
+                            _post_drain_timeout = max(
+                                10.0,
+                                _restart_sec + 10.0,
+                            )
+                            if _wait_for_service_active(
+                                scope_cmd,
+                                svc_name,
+                                timeout=_post_drain_timeout,
+                            ):
+                                restarted_services.append(svc_name)
+                                continue
+                            # Process exited but wasn't respawned (older
+                            # unit without Restart=on-failure or
+                            # RestartForceExitStatus=75).  Fall through
+                            # to systemctl start/restart.
+                            print(
+                                f"  ⚠ {svc_name} drained but didn't relaunch — forcing restart"
+                            )
+
+                        # Fallback: blunt systemctl restart.  This is
+                        # what the old code always did; we get here only
+                        # when the graceful path failed (unit missing
+                        # SIGUSR1 wiring, drain exceeded the budget,
+                        # restart-policy mismatch).
+                        #
+                        # Always `reset-failed` first.  If systemd's own
+                        # auto-restart attempts already parked the unit
+                        # in a failed state (transient CHDIR / OOM /
+                        # filesystem race after our drain + exit-75),
+                        # a plain `systemctl restart` can wedge against
+                        # the RestartSec backoff and leave the unit
+                        # dead.  Clearing the failed state first makes
+                        # the restart idempotent.  Mirrors the recovery
+                        # path in `hermes gateway restart`
+                        # (`systemd_restart()`) as of PR #20949.
+                        subprocess.run(
+                            scope_cmd + ["reset-failed", svc_name],
+                            capture_output=True,
+                            text=True,
+                            timeout=10,
+                        )
+                        restart = subprocess.run(
+                            scope_cmd + ["restart", svc_name],
+                            capture_output=True,
+                            text=True,
+                            timeout=15,
+                        )
+                        if restart.returncode == 0:
+                            # Verify the service actually survived the
+                            # restart.  systemctl restart returns 0 even
+                            # if the new process crashes immediately.
+                            if _wait_for_service_active(
+                                scope_cmd,
+                                svc_name,
+                                timeout=10.0,
+                            ):
+                                restarted_services.append(svc_name)
+                            else:
+                                # Retry once — transient startup failures
+                                # (stale module cache, import race) often
+                                # resolve on the second attempt.  Again
+                                # clear any failed state first so the
+                                # retry isn't blocked by the previous
+                                # crash.
+                                print(
+                                    f"  ⚠ {svc_name} died after restart, retrying..."
+                                )
+                                subprocess.run(
+                                    scope_cmd + ["reset-failed", svc_name],
+                                    capture_output=True,
+                                    text=True,
+                                    timeout=10,
+                                )
+                                subprocess.run(
+                                    scope_cmd + ["restart", svc_name],
+                                    capture_output=True,
+                                    text=True,
+                                    timeout=15,
+                                )
+                                if _wait_for_service_active(
+                                    scope_cmd,
+                                    svc_name,
+                                    timeout=10.0,
+                                ):
+                                    restarted_services.append(svc_name)
+                                    print(f"  ✓ {svc_name} recovered on retry")
+                                else:
+                                    _scope_flag = "--user " if scope == "user" else ""
+                                    print(
+                                        f"  ✗ {svc_name} failed to stay running after restart.\n"
+                                        f"    Check logs: journalctl {_scope_flag}-u {svc_name} --since '2 min ago'\n"
+                                        f"    Recover manually:\n"
+                                        f"      systemctl {_scope_flag}reset-failed {svc_name}\n"
+                                        f"      systemctl {_scope_flag}restart {svc_name}"
+                                    )
+                        else:
+                            print(
+                                f"  ⚠ Failed to restart {svc_name}: {restart.stderr.strip()}"
+                            )
+                except (FileNotFoundError, subprocess.TimeoutExpired):
+                    pass
+
+        # --- Launchd services (macOS) ---
+        if is_macos():
+            try:
+                from hermes_cli.gateway import (
+                    launchd_restart,
+                    get_launchd_label,
+                    get_launchd_plist_path,
+                )
+
+                plist_path = get_launchd_plist_path()
+                if plist_path.exists():
+                    check = subprocess.run(
+                        ["launchctl", "list", get_launchd_label()],
+                        capture_output=True,
+                        text=True,
+                        timeout=5,
+                    )
+                    if check.returncode == 0:
+                        try:
+                            launchd_restart()
+                            restarted_services.append(get_launchd_label())
+                        except subprocess.CalledProcessError as e:
+                            stderr = (getattr(e, "stderr", "") or "").strip()
+                            print(f"  ⚠ Gateway restart failed: {stderr}")
+            except (FileNotFoundError, subprocess.TimeoutExpired, ImportError):
+                pass
+
+        # --- Manual (non-service) gateways ---
+        # Kill any remaining gateway processes not managed by a service.
+        # Exclude PIDs that belong to just-restarted services so we don't
+        # immediately kill the process that systemd/launchd just spawned.
+        service_pids = _get_service_pids()
+        manual_pids = find_gateway_pids(
+            exclude_pids=service_pids, all_profiles=True
+        )
+        profile_processes = {
+            proc.pid: proc
+            for proc in find_profile_gateway_processes(exclude_pids=service_pids)
+            if proc.pid in manual_pids
+        }
+        for pid, proc in profile_processes.items():
+            if not launch_detached_profile_gateway_restart(proc.profile, pid):
+                continue
+            # Prefer a graceful SIGUSR1 drain so in-flight agent runs
+            # finish before the watcher respawns the gateway.  If the
+            # gateway doesn't support SIGUSR1 or doesn't exit within
+            # the drain budget, fall back to SIGTERM — the watcher
+            # still sees the exit and relaunches either way.
+            drained = _graceful_restart_via_sigusr1(
+                pid,
+                drain_timeout=_drain_budget,
+            )
+            if not drained:
+                try:
+                    os.kill(pid, _signal.SIGTERM)
+                except (ProcessLookupError, PermissionError):
+                    pass
+            # Wait for the old process to fully exit before the watcher
+            # spawns the new gateway.  Telegram holds the previous
+            # getUpdates long-poll session open on its servers for up to
+            # ~30s after the client disconnects.  If the new gateway
+            # connects before that window expires it receives a 409
+            # Conflict, which _handle_polling_conflict() recovers from
+            # via back-off retries — but a brief wait here reduces the
+            # chance of hitting that path at all, especially on fast
+            # machines where the watcher loop restarts in < 1s.
+            # We wait up to 5s for the process to exit (the OS-level
+            # close, not the Telegram server-side expiry), then let the
+            # watcher take over.  The Telegram adapter's retry logic
+            # handles any remaining 409s if the server session is still
+            # live when the new gateway polls.
+            _wait_for_gateway_exit(timeout=5.0, force_after=None)
+            killed_pids.add(pid)
+            relaunched_profiles.append(proc.profile)
+
+        for pid in manual_pids:
+            if pid in profile_processes:
+                continue
+            try:
+                os.kill(pid, _signal.SIGTERM)
+                killed_pids.add(pid)
+            except (ProcessLookupError, PermissionError):
+                pass
+
+        if restarted_services or killed_pids:
+            print()
+            for svc in restarted_services:
+                print(f"  ✓ Restarted {svc}")
+            if relaunched_profiles:
+                names = ", ".join(relaunched_profiles)
+                print(f"  ✓ Restarting manual gateway profile(s): {names}")
+            unmapped_count = len(killed_pids) - len(relaunched_profiles)
+            if unmapped_count:
+                print(f"  → Stopped {unmapped_count} manual gateway process(es)")
+                print("    Restart manually: hermes gateway run")
+                if unmapped_count > 1:
+                    print(
+                        "    (or: hermes -p <profile> gateway run  for each profile)"
+                    )
+
+        if not restarted_services and not killed_pids:
+            # No gateways were running — nothing to do
+            pass
+
+        # --- Post-restart survivor sweep -----------------------------
+        # Issue #17648: some gateways ignore SIGTERM (stuck drain,
+        # blocked I/O, PID dead but zombie).  The detached profile
+        # watchers wait 120s for the old PID to exit — if it never
+        # does, no respawn happens and the user keeps hitting
+        # ImportError against a stale sys.modules.  Give the
+        # graceful paths a brief window to complete, then SIGKILL
+        # any remaining pre-update PIDs so the watcher / service
+        # manager can relaunch with fresh code.
+        try:
+            _time.sleep(3.0)
+            _service_pids_after = _get_service_pids()
+            _surviving = find_gateway_pids(
+                exclude_pids=_service_pids_after,
+                all_profiles=True,
+            )
+            # Scope to PIDs we already tried to kill during this
+            # update (killed_pids).  Anything new is a gateway that
+            # started AFTER our restart attempt — respecting user
+            # intent, we don't kill those.
+            _stuck = [pid for pid in _surviving if pid in killed_pids]
+            if _stuck:
+                print()
+                print(
+                    f"  ⚠ {len(_stuck)} gateway process(es) ignored SIGTERM — force-killing"
+                )
+                from gateway.status import terminate_pid as _terminate_pid
+                for pid in _stuck:
+                    try:
+                        # Routes through taskkill /T /F on Windows,
+                        # SIGKILL on POSIX — _signal.SIGKILL doesn't
+                        # exist on Windows so the old raw os.kill call
+                        # used to crash the entire update path.
+                        _terminate_pid(pid, force=True)
+                    except (ProcessLookupError, PermissionError, OSError):
+                        pass
+                # Give the OS a beat to reap the processes so the
+                # watchers see them exit and respawn.
+                _time.sleep(1.5)
+        except Exception as _sweep_exc:
+            logger.debug("Post-restart survivor sweep failed: %s", _sweep_exc)
+
+    except Exception as e:
+        logger.debug("Gateway restart during update failed: %s", e)
+
+    # Warn if legacy Hermes gateway unit files are still installed.
+    # When both hermes.service (from a pre-rename install) and the
+    # current hermes-gateway.service are enabled, they SIGTERM-fight
+    # for the same bot token (see PR #11909). Flagging here means
+    # every `hermes update` surfaces the issue until the user migrates.
+    try:
+        from hermes_cli.gateway import (
+            has_legacy_hermes_units,
+            _find_legacy_hermes_units,
+            supports_systemd_services,
+        )
+
+        if supports_systemd_services() and has_legacy_hermes_units():
+            print()
+            print("⚠ Legacy Hermes gateway unit(s) detected:")
+            for name, path, is_sys in _find_legacy_hermes_units():
+                scope = "system" if is_sys else "user"
+                print(f"    {path}  ({scope} scope)")
+            print()
+            print("  These pre-rename units (hermes.service) fight the current")
+            print("  hermes-gateway.service for the bot token and cause SIGTERM")
+            print("  flap loops. Remove them with:")
+            print()
+            print("    hermes gateway migrate-legacy")
+            print()
+            print("  (add `sudo` if any are in system scope)")
+    except Exception as e:
+        logger.debug("Legacy unit check during update failed: %s", e)
+
+    # Kill stale dashboard processes — the dashboard has no service
+    # manager, so leaving it alive after a code update produces a
+    # silent frontend/backend mismatch.  We can't auto-restart it
+    # (no saved launch args) but we can stop it, and a hint is
+    # printed for the user to re-launch.
+    _kill_stale_dashboard_processes()
+
+    print()
+    print("Tip: You can now select a provider and model:")
+    print("  hermes model              # Select provider and model")
 
 def _cmd_update_impl(args, gateway_mode: bool):
     """Body of ``cmd_update`` — kept separate so the wrapper can always
@@ -8879,868 +9769,11 @@ def _cmd_update_impl(args, gateway_mode: bool):
                         input_fn=gw_input_fn,
                     )
 
-        _invalidate_update_cache()
-
-        # Clear stale .pyc bytecode cache — prevents ImportError on gateway
-        # restart when updated source references names that didn't exist in
-        # the old bytecode (e.g. get_hermes_home added to hermes_constants).
-        removed = _clear_bytecode_cache(PROJECT_ROOT)
-        if removed:
-            print(
-                f"  ✓ Cleared {removed} stale __pycache__ director{'y' if removed == 1 else 'ies'}"
-            )
-
         # Fork upstream sync logic (only for main branch on forks)
         if is_fork and branch == "main":
             _sync_with_upstream_if_needed(git_cmd, PROJECT_ROOT)
 
-        # Reinstall Python dependencies. Prefer .[all], but if one optional extra
-        # breaks on this machine, keep base deps and reinstall the remaining extras
-        # individually so update does not silently strip working capabilities.
-        print("→ Updating Python dependencies...")
-        pip_cmd = [sys.executable, "-m", "pip"]
-        uv_bin = shutil.which("uv") or _ensure_uv_for_termux(pip_cmd)
-        install_group = "all"
-
-        if uv_bin:
-            uv_env = {**os.environ, "VIRTUAL_ENV": str(PROJECT_ROOT / "venv")}
-            if _is_termux_env(uv_env):
-                uv_env.pop("PYTHONPATH", None)
-                uv_env.pop("PYTHONHOME", None)
-                install_group = "termux-all"
-                print("  → Termux detected: using uv + curated termux-all optional profile...")
-            if _is_termux_env(uv_env) and _is_android_python():
-                print("  → Termux/Android detected: prebuilding psutil with Linux source path compatibility...")
-                _install_psutil_android_compat([uv_bin, "pip"], env=uv_env)
-            _install_python_dependencies_with_optional_fallback(
-                [uv_bin, "pip"], env=uv_env, group=install_group
-            )
-        else:
-            # Use sys.executable to explicitly call the venv's pip module,
-            # avoiding PEP 668 'externally-managed-environment' errors on Debian/Ubuntu.
-            # Some environments lose pip inside the venv; bootstrap it back with
-            # ensurepip before trying the editable install.
-            pip_cmd = [sys.executable, "-m", "pip"]
-            try:
-                subprocess.run(
-                    pip_cmd + ["--version"],
-                    cwd=PROJECT_ROOT,
-                    check=True,
-                    capture_output=True,
-                )
-            except subprocess.CalledProcessError:
-                subprocess.run(
-                    [sys.executable, "-m", "ensurepip", "--upgrade", "--default-pip"],
-                    cwd=PROJECT_ROOT,
-                    check=True,
-                )
-            if _is_termux_env():
-                install_group = "termux-all"
-                print("  → Termux detected: using curated termux-all optional profile...")
-            if _is_termux_env() and _is_android_python():
-                print("  → Termux/Android detected: prebuilding psutil with Linux source path compatibility...")
-                _install_psutil_android_compat(pip_cmd)
-            _install_python_dependencies_with_optional_fallback(pip_cmd, group=install_group)
-
-        _refresh_active_lazy_features()
-
-        _update_node_dependencies()
-        _build_web_ui(PROJECT_ROOT / "web")
-
-        print()
-        print("✓ Code updated!")
-
-        # After git pull, source files on disk are newer than cached Python
-        # modules in this process.  Reload hermes_constants so that any lazy
-        # import executed below (skills sync, gateway restart) sees new
-        # attributes like display_hermes_home() added since the last release.
-        try:
-            import importlib
-            import hermes_constants as _hc
-
-            importlib.reload(_hc)
-        except Exception:
-            pass  # non-fatal — worst case a lazy import fails gracefully
-
-        # Sync bundled skills (copies new, updates changed, respects user deletions)
-        try:
-            from tools.skills_sync import sync_skills
-
-            print()
-            print("→ Syncing bundled skills...")
-            result = sync_skills(quiet=True)
-            if result["copied"]:
-                print(f"  + {len(result['copied'])} new: {', '.join(result['copied'])}")
-            if result.get("updated"):
-                print(
-                    f"  ↑ {len(result['updated'])} updated: {', '.join(result['updated'])}"
-                )
-            if result.get("user_modified"):
-                print(f"  ~ {len(result['user_modified'])} user-modified (kept)")
-            if result.get("cleaned"):
-                print(f"  − {len(result['cleaned'])} removed from manifest")
-            if not result["copied"] and not result.get("updated"):
-                print("  ✓ Skills are up to date")
-        except Exception as e:
-            logger.debug("Skills sync during update failed: %s", e)
-
-        # Sync bundled skills to all profiles (including the active one).
-        # seed_profile_skills() uses subprocess with an explicit HERMES_HOME so
-        # it is not affected by sync_skills()'s module-level HERMES_HOME cache,
-        # which means the active profile is reliably synced regardless of whether
-        # the caller's HERMES_HOME env var points at the default or a named profile.
-        try:
-            from hermes_cli.profiles import (
-                list_profiles,
-                seed_profile_skills,
-            )
-
-            all_profiles = list_profiles()
-            if all_profiles:
-                print()
-                print("→ Syncing bundled skills to all profiles...")
-                for p in all_profiles:
-                    try:
-                        r = seed_profile_skills(p.path, quiet=True)
-                        if r and r.get("skipped_opt_out"):
-                            status = "opted out (--no-skills)"
-                        elif r:
-                            copied = len(r.get("copied", []))
-                            updated = len(r.get("updated", []))
-                            modified = len(r.get("user_modified", []))
-                            parts = []
-                            if copied:
-                                parts.append(f"+{copied} new")
-                            if updated:
-                                parts.append(f"↑{updated} updated")
-                            if modified:
-                                parts.append(f"~{modified} user-modified")
-                            status = ", ".join(parts) if parts else "up to date"
-                        else:
-                            status = "sync failed"
-                        print(f"  {p.name}: {status}")
-                    except Exception as pe:
-                        print(f"  {p.name}: error ({pe})")
-        except Exception:
-            pass  # profiles module not available or no profiles
-
-        # Sync Honcho host blocks to all profiles
-        try:
-            from plugins.memory.honcho.cli import sync_honcho_profiles_quiet
-
-            synced = sync_honcho_profiles_quiet()
-            if synced:
-                print(f"\n-> Honcho: synced {synced} profile(s)")
-        except Exception:
-            pass  # honcho plugin not installed or not configured
-
-        # Check for config migrations
-        print()
-        print("→ Checking configuration for new options...")
-
-        from hermes_cli.config import (
-            get_missing_env_vars,
-            get_missing_config_fields,
-            check_config_version,
-            migrate_config,
-        )
-
-        missing_env = get_missing_env_vars(required_only=True)
-        missing_config = get_missing_config_fields()
-        current_ver, latest_ver = check_config_version()
-
-        needs_migration = missing_env or missing_config or current_ver < latest_ver
-
-        if needs_migration:
-            print()
-            if missing_env:
-                print(
-                    f"  ⚠️  {len(missing_env)} new required setting(s) need configuration"
-                )
-            if missing_config:
-                print(f"  ℹ️  {len(missing_config)} new config option(s) available")
-
-            print()
-            if assume_yes:
-                print(
-                    "  ℹ --yes: auto-applying config migration (skipping API-key prompts)."
-                )
-                response = "y"
-            elif gateway_mode:
-                response = (
-                    _gateway_prompt(
-                        "Would you like to configure new options now? [Y/n]", "n"
-                    )
-                    .strip()
-                    .lower()
-                )
-            elif not (sys.stdin.isatty() and sys.stdout.isatty()):
-                print("  ℹ Non-interactive session — applying safe config migrations.")
-                response = "auto"
-            else:
-                try:
-                    response = (
-                        input("Would you like to configure them now? [Y/n]: ")
-                        .strip()
-                        .lower()
-                    )
-                except EOFError:
-                    response = "n"
-
-            if response in {"", "y", "yes", "auto"}:
-                print()
-                # Gateway mode, --yes, and non-interactive update contexts
-                # (dashboard / web server actions) cannot prompt for API keys.
-                # Still run the non-interactive migration pass before restarting
-                # so new default config fields and version bumps are written
-                # before the freshly updated gateway validates config at startup.
-                interactive_migration = not (
-                    gateway_mode or assume_yes or response == "auto"
-                )
-                results = migrate_config(interactive=interactive_migration, quiet=False)
-
-                if results["env_added"] or results["config_added"]:
-                    print()
-                    print("✓ Configuration updated!")
-                if (gateway_mode or assume_yes or response == "auto") and missing_env:
-                    print("  ℹ API keys require manual entry: hermes config migrate")
-            else:
-                print()
-                print("Skipped. Run 'hermes config migrate' later to configure.")
-        else:
-            print("  ✓ Configuration is up to date")
-
-        print()
-        print("✓ Update complete!")
-
-        # Curator first-run heads-up. Only prints when curator is enabled AND
-        # has never run — i.e. the window where the ticker would otherwise
-        # have fired against a fresh skill library. Kept silent on steady
-        # state so we don't nag.
-        try:
-            _print_curator_first_run_notice()
-        except Exception as e:
-            logger.debug("Curator first-run notice failed: %s", e)
-
-        # Most-recent curator run notice — show-once per run. Surfaces the
-        # rename map (`old-name → umbrella`) on the high-attention update
-        # surface so users learn about consolidations without having to
-        # check `hermes curator status`. Self-stamps after printing so it
-        # never repeats for the same run.
-        try:
-            _print_curator_recent_run_notice()
-        except Exception as e:
-            logger.debug("Curator recent-run notice failed: %s", e)
-
-        # Repair RHEL-family root installs where /usr/local/bin isn't on PATH
-        # for non-login interactive shells.  No-op on every other platform.
-        try:
-            _ensure_fhs_path_guard()
-        except Exception as e:
-            logger.debug("FHS PATH guard check failed: %s", e)
-
-        # Refresh the cua-driver binary used by the Computer Use toolset.
-        # The upstream installer is gated on macOS and on the binary already
-        # being on PATH, so this is a no-op for users who don't have it.
-        # Tying the refresh to ``hermes update`` gives users a predictable
-        # cadence (matches when they pull new agent code) without adding
-        # startup latency or a per-launch GitHub API call.
-        try:
-            if sys.platform == "darwin" and shutil.which("cua-driver"):
-                from hermes_cli.tools_config import install_cua_driver
-
-                print()
-                print("→ Refreshing cua-driver (Computer Use)...")
-                install_cua_driver(upgrade=True)
-        except Exception as e:
-            logger.debug("cua-driver refresh failed: %s", e)
-
-        # Write exit code *before* the gateway restart attempt.
-        # When running as ``hermes update --gateway`` (spawned by the gateway's
-        # /update command), this process lives inside the gateway's systemd
-        # cgroup.  A graceful SIGUSR1 restart keeps the drain loop alive long
-        # enough for the exit-code marker to be written below, but the
-        # fallback ``systemctl restart`` path (see below) kills everything in
-        # the cgroup (KillMode=mixed → SIGKILL to remaining processes),
-        # including us and the wrapping bash shell.  The shell never reaches
-        # its ``printf $status > .update_exit_code`` epilogue, so the
-        # exit-code marker file would never be created.  The new gateway's
-        # update watcher would then poll for 30 minutes and send a spurious
-        # timeout message.
-        #
-        # Writing the marker here — after git pull + pip install succeed but
-        # before we attempt the restart — ensures the new gateway sees it
-        # regardless of how we die.
-        if gateway_mode:
-            _exit_code_path = get_hermes_home() / ".update_exit_code"
-            try:
-                _exit_code_path.write_text("0")
-            except OSError:
-                pass
-
-        # Auto-restart ALL gateways after update.
-        # The code update (git pull) is shared across all profiles, so every
-        # running gateway needs restarting to pick up the new code.
-        try:
-            from hermes_cli.gateway import (
-                is_macos,
-                supports_systemd_services,
-                _ensure_user_systemd_env,
-                find_gateway_pids,
-                find_profile_gateway_processes,
-                launch_detached_profile_gateway_restart,
-                _get_service_pids,
-                _graceful_restart_via_sigusr1,
-                _wait_for_gateway_exit,
-            )
-            import signal as _signal
-
-            def _wait_for_service_active(
-                scope_cmd_: list,
-                svc_name_: str,
-                timeout: float = 10.0,
-            ) -> bool:
-                """Poll ``systemctl is-active`` until the unit reports active.
-
-                systemd's Stopped -> Started transition after a graceful exit
-                (or a hard restart) is not instantaneous; a one-shot check
-                races that window and falsely reports the unit as down.
-                Poll every 0.5s up to ``timeout`` seconds before giving up.
-                """
-                deadline = _time.monotonic() + max(timeout, 0.5)
-                while True:
-                    try:
-                        _verify = subprocess.run(
-                            scope_cmd_ + ["is-active", svc_name_],
-                            capture_output=True,
-                            text=True,
-                            timeout=5,
-                        )
-                        if _verify.stdout.strip() == "active":
-                            return True
-                    except (FileNotFoundError, subprocess.TimeoutExpired):
-                        pass
-                    if _time.monotonic() >= deadline:
-                        return False
-                    _time.sleep(0.5)
-
-            def _service_restart_sec(
-                scope_cmd_: list,
-                svc_name_: str,
-                default: float = 0.0,
-            ) -> float:
-                """Read the unit's ``RestartUSec`` (RestartSec) in seconds.
-
-                After a graceful exit-75, systemd waits ``RestartSec`` before
-                respawning the unit.  Callers that poll for ``is-active``
-                must use a timeout >= ``RestartSec`` + transition slack, or
-                they'll give up *during* the cooldown window and wrongly
-                conclude the unit didn't relaunch.
-                """
-                try:
-                    _show = subprocess.run(
-                        scope_cmd_
-                        + [
-                            "show",
-                            svc_name_,
-                            "--property=RestartUSec",
-                            "--value",
-                        ],
-                        capture_output=True,
-                        text=True,
-                        timeout=5,
-                    )
-                except (FileNotFoundError, subprocess.TimeoutExpired):
-                    return default
-                raw = (_show.stdout or "").strip()
-                # systemd emits values like "30s", "100ms", "1min 30s", or
-                # "infinity".  Parse conservatively; on any miss return default.
-                if not raw or raw == "infinity":
-                    return default
-                total = 0.0
-                matched = False
-                for part in raw.split():
-                    for _suf, _mult in (
-                        ("ms", 0.001),
-                        ("us", 0.000001),
-                        ("min", 60.0),
-                        ("s", 1.0),
-                    ):
-                        if part.endswith(_suf):
-                            try:
-                                total += float(part[: -len(_suf)]) * _mult
-                                matched = True
-                            except ValueError:
-                                pass
-                            break
-                return total if matched else default
-
-            # Drain budget for graceful SIGUSR1 restarts.  The gateway drains
-            # for up to ``agent.restart_drain_timeout`` (default 60s) before
-            # exiting with code 75; we wait slightly longer so the drain
-            # completes before we fall back to a hard restart.  On older
-            # systemd units without SIGUSR1 wiring this wait just times out
-            # and we fall back to ``systemctl restart`` (the old behaviour).
-            try:
-                from hermes_constants import (
-                    DEFAULT_GATEWAY_RESTART_DRAIN_TIMEOUT as _DEFAULT_DRAIN,
-                )
-            except Exception:
-                _DEFAULT_DRAIN = 60.0
-            _cfg_drain = None
-            try:
-                from hermes_cli.config import load_config
-
-                _cfg_agent = load_config().get("agent") or {}
-                _cfg_drain = _cfg_agent.get("restart_drain_timeout")
-            except Exception:
-                pass
-            try:
-                _drain_budget = (
-                    float(_cfg_drain)
-                    if _cfg_drain is not None
-                    else float(_DEFAULT_DRAIN)
-                )
-            except (TypeError, ValueError):
-                _drain_budget = float(_DEFAULT_DRAIN)
-            # Add a 15s margin so the drain loop + final exit finish before
-            # we escalate to ``systemctl restart`` / SIGTERM.
-            _drain_budget = max(_drain_budget, 30.0) + 15.0
-
-            restarted_services = []
-            killed_pids = set()
-            relaunched_profiles = []
-
-            # --- Systemd services (Linux) ---
-            # Discover all hermes-gateway* units (default + profiles)
-            if supports_systemd_services():
-                try:
-                    _ensure_user_systemd_env()
-                except Exception:
-                    pass
-
-                for scope, scope_cmd in [
-                    ("user", ["systemctl", "--user"]),
-                    ("system", ["systemctl"]),
-                ]:
-                    try:
-                        result = subprocess.run(
-                            scope_cmd
-                            + [
-                                "list-units",
-                                "hermes-gateway*",
-                                "--plain",
-                                "--no-legend",
-                                "--no-pager",
-                            ],
-                            capture_output=True,
-                            text=True,
-                            timeout=10,
-                        )
-                        for line in result.stdout.strip().splitlines():
-                            parts = line.split()
-                            if not parts:
-                                continue
-                            unit = parts[
-                                0
-                            ]  # e.g. hermes-gateway.service or hermes-gateway-coder.service
-                            if not unit.endswith(".service"):
-                                continue
-                            svc_name = unit.removesuffix(".service")
-                            # Check if active
-                            check = subprocess.run(
-                                scope_cmd + ["is-active", svc_name],
-                                capture_output=True,
-                                text=True,
-                                timeout=5,
-                            )
-                            if check.stdout.strip() != "active":
-                                continue
-
-                            # Prefer a graceful SIGUSR1 restart so in-flight
-                            # agent runs drain instead of being SIGKILLed.
-                            # The gateway's SIGUSR1 handler calls
-                            # request_restart(via_service=True) → drain →
-                            # exit(75); systemd's Restart=on-failure (and
-                            # RestartForceExitStatus=75) respawns the unit.
-                            _main_pid = 0
-                            try:
-                                _show = subprocess.run(
-                                    scope_cmd
-                                    + [
-                                        "show",
-                                        svc_name,
-                                        "--property=MainPID",
-                                        "--value",
-                                    ],
-                                    capture_output=True,
-                                    text=True,
-                                    timeout=5,
-                                )
-                                _main_pid = int((_show.stdout or "").strip() or 0)
-                            except (
-                                ValueError,
-                                subprocess.TimeoutExpired,
-                                FileNotFoundError,
-                            ):
-                                _main_pid = 0
-
-                            _graceful_ok = False
-                            if _main_pid > 0:
-                                print(
-                                    f"  → {svc_name}: draining (up to {int(_drain_budget)}s)..."
-                                )
-                                _graceful_ok = _graceful_restart_via_sigusr1(
-                                    _main_pid,
-                                    drain_timeout=_drain_budget,
-                                )
-
-                            if _graceful_ok:
-                                # Gateway exited 75. ``Restart=always`` +
-                                # ``RestartForceExitStatus=75`` means systemd
-                                # WILL respawn the unit — but only after
-                                # ``RestartSec`` (default 60s on our unit
-                                # file). That 60s wait is a crash-loop guard,
-                                # and is the right default when the gateway
-                                # dies unexpectedly. For a voluntary restart
-                                # on update, it's dead time the user watches.
-                                #
-                                # Shortcut it: ``reset-failed`` + ``start``
-                                # skips RestartSec entirely (we're manually
-                                # initiating the unit, not waiting for
-                                # systemd's auto-restart logic). Takes about
-                                # as long as the process takes to come up
-                                # (~1-3s on a warm box).
-                                #
-                                # If the unit is already active because
-                                # RestartSec elapsed while we were draining,
-                                # ``start`` is a no-op and we fall through to
-                                # the poll below. Either way we collapse the
-                                # 60s+ delay to a ~5s one.
-                                subprocess.run(
-                                    scope_cmd + ["reset-failed", svc_name],
-                                    capture_output=True,
-                                    text=True,
-                                    timeout=10,
-                                )
-                                subprocess.run(
-                                    scope_cmd + ["start", svc_name],
-                                    capture_output=True,
-                                    text=True,
-                                    timeout=15,
-                                )
-                                # Short poll: the gateway should be up within
-                                # a few seconds now that we bypassed
-                                # RestartSec. Fall back to the longer
-                                # RestartSec + slack budget ONLY if the
-                                # explicit start failed and we need to rely
-                                # on systemd's auto-restart.
-                                if _wait_for_service_active(
-                                    scope_cmd,
-                                    svc_name,
-                                    timeout=10.0,
-                                ):
-                                    restarted_services.append(svc_name)
-                                    continue
-                                # Explicit start didn't take. Fall back to
-                                # the original passive poll (systemd's
-                                # auto-restart WILL fire after RestartSec
-                                # regardless).
-                                _restart_sec = _service_restart_sec(
-                                    scope_cmd,
-                                    svc_name,
-                                    default=0.0,
-                                )
-                                _post_drain_timeout = max(
-                                    10.0,
-                                    _restart_sec + 10.0,
-                                )
-                                if _wait_for_service_active(
-                                    scope_cmd,
-                                    svc_name,
-                                    timeout=_post_drain_timeout,
-                                ):
-                                    restarted_services.append(svc_name)
-                                    continue
-                                # Process exited but wasn't respawned (older
-                                # unit without Restart=on-failure or
-                                # RestartForceExitStatus=75).  Fall through
-                                # to systemctl start/restart.
-                                print(
-                                    f"  ⚠ {svc_name} drained but didn't relaunch — forcing restart"
-                                )
-
-                            # Fallback: blunt systemctl restart.  This is
-                            # what the old code always did; we get here only
-                            # when the graceful path failed (unit missing
-                            # SIGUSR1 wiring, drain exceeded the budget,
-                            # restart-policy mismatch).
-                            #
-                            # Always `reset-failed` first.  If systemd's own
-                            # auto-restart attempts already parked the unit
-                            # in a failed state (transient CHDIR / OOM /
-                            # filesystem race after our drain + exit-75),
-                            # a plain `systemctl restart` can wedge against
-                            # the RestartSec backoff and leave the unit
-                            # dead.  Clearing the failed state first makes
-                            # the restart idempotent.  Mirrors the recovery
-                            # path in `hermes gateway restart`
-                            # (`systemd_restart()`) as of PR #20949.
-                            subprocess.run(
-                                scope_cmd + ["reset-failed", svc_name],
-                                capture_output=True,
-                                text=True,
-                                timeout=10,
-                            )
-                            restart = subprocess.run(
-                                scope_cmd + ["restart", svc_name],
-                                capture_output=True,
-                                text=True,
-                                timeout=15,
-                            )
-                            if restart.returncode == 0:
-                                # Verify the service actually survived the
-                                # restart.  systemctl restart returns 0 even
-                                # if the new process crashes immediately.
-                                if _wait_for_service_active(
-                                    scope_cmd,
-                                    svc_name,
-                                    timeout=10.0,
-                                ):
-                                    restarted_services.append(svc_name)
-                                else:
-                                    # Retry once — transient startup failures
-                                    # (stale module cache, import race) often
-                                    # resolve on the second attempt.  Again
-                                    # clear any failed state first so the
-                                    # retry isn't blocked by the previous
-                                    # crash.
-                                    print(
-                                        f"  ⚠ {svc_name} died after restart, retrying..."
-                                    )
-                                    subprocess.run(
-                                        scope_cmd + ["reset-failed", svc_name],
-                                        capture_output=True,
-                                        text=True,
-                                        timeout=10,
-                                    )
-                                    subprocess.run(
-                                        scope_cmd + ["restart", svc_name],
-                                        capture_output=True,
-                                        text=True,
-                                        timeout=15,
-                                    )
-                                    if _wait_for_service_active(
-                                        scope_cmd,
-                                        svc_name,
-                                        timeout=10.0,
-                                    ):
-                                        restarted_services.append(svc_name)
-                                        print(f"  ✓ {svc_name} recovered on retry")
-                                    else:
-                                        _scope_flag = "--user " if scope == "user" else ""
-                                        print(
-                                            f"  ✗ {svc_name} failed to stay running after restart.\n"
-                                            f"    Check logs: journalctl {_scope_flag}-u {svc_name} --since '2 min ago'\n"
-                                            f"    Recover manually:\n"
-                                            f"      systemctl {_scope_flag}reset-failed {svc_name}\n"
-                                            f"      systemctl {_scope_flag}restart {svc_name}"
-                                        )
-                            else:
-                                print(
-                                    f"  ⚠ Failed to restart {svc_name}: {restart.stderr.strip()}"
-                                )
-                    except (FileNotFoundError, subprocess.TimeoutExpired):
-                        pass
-
-            # --- Launchd services (macOS) ---
-            if is_macos():
-                try:
-                    from hermes_cli.gateway import (
-                        launchd_restart,
-                        get_launchd_label,
-                        get_launchd_plist_path,
-                    )
-
-                    plist_path = get_launchd_plist_path()
-                    if plist_path.exists():
-                        check = subprocess.run(
-                            ["launchctl", "list", get_launchd_label()],
-                            capture_output=True,
-                            text=True,
-                            timeout=5,
-                        )
-                        if check.returncode == 0:
-                            try:
-                                launchd_restart()
-                                restarted_services.append(get_launchd_label())
-                            except subprocess.CalledProcessError as e:
-                                stderr = (getattr(e, "stderr", "") or "").strip()
-                                print(f"  ⚠ Gateway restart failed: {stderr}")
-                except (FileNotFoundError, subprocess.TimeoutExpired, ImportError):
-                    pass
-
-            # --- Manual (non-service) gateways ---
-            # Kill any remaining gateway processes not managed by a service.
-            # Exclude PIDs that belong to just-restarted services so we don't
-            # immediately kill the process that systemd/launchd just spawned.
-            service_pids = _get_service_pids()
-            manual_pids = find_gateway_pids(
-                exclude_pids=service_pids, all_profiles=True
-            )
-            profile_processes = {
-                proc.pid: proc
-                for proc in find_profile_gateway_processes(exclude_pids=service_pids)
-                if proc.pid in manual_pids
-            }
-            for pid, proc in profile_processes.items():
-                if not launch_detached_profile_gateway_restart(proc.profile, pid):
-                    continue
-                # Prefer a graceful SIGUSR1 drain so in-flight agent runs
-                # finish before the watcher respawns the gateway.  If the
-                # gateway doesn't support SIGUSR1 or doesn't exit within
-                # the drain budget, fall back to SIGTERM — the watcher
-                # still sees the exit and relaunches either way.
-                drained = _graceful_restart_via_sigusr1(
-                    pid,
-                    drain_timeout=_drain_budget,
-                )
-                if not drained:
-                    try:
-                        os.kill(pid, _signal.SIGTERM)
-                    except (ProcessLookupError, PermissionError):
-                        pass
-                # Wait for the old process to fully exit before the watcher
-                # spawns the new gateway.  Telegram holds the previous
-                # getUpdates long-poll session open on its servers for up to
-                # ~30s after the client disconnects.  If the new gateway
-                # connects before that window expires it receives a 409
-                # Conflict, which _handle_polling_conflict() recovers from
-                # via back-off retries — but a brief wait here reduces the
-                # chance of hitting that path at all, especially on fast
-                # machines where the watcher loop restarts in < 1s.
-                # We wait up to 5s for the process to exit (the OS-level
-                # close, not the Telegram server-side expiry), then let the
-                # watcher take over.  The Telegram adapter's retry logic
-                # handles any remaining 409s if the server session is still
-                # live when the new gateway polls.
-                _wait_for_gateway_exit(timeout=5.0, force_after=None)
-                killed_pids.add(pid)
-                relaunched_profiles.append(proc.profile)
-
-            for pid in manual_pids:
-                if pid in profile_processes:
-                    continue
-                try:
-                    os.kill(pid, _signal.SIGTERM)
-                    killed_pids.add(pid)
-                except (ProcessLookupError, PermissionError):
-                    pass
-
-            if restarted_services or killed_pids:
-                print()
-                for svc in restarted_services:
-                    print(f"  ✓ Restarted {svc}")
-                if relaunched_profiles:
-                    names = ", ".join(relaunched_profiles)
-                    print(f"  ✓ Restarting manual gateway profile(s): {names}")
-                unmapped_count = len(killed_pids) - len(relaunched_profiles)
-                if unmapped_count:
-                    print(f"  → Stopped {unmapped_count} manual gateway process(es)")
-                    print("    Restart manually: hermes gateway run")
-                    if unmapped_count > 1:
-                        print(
-                            "    (or: hermes -p <profile> gateway run  for each profile)"
-                        )
-
-            if not restarted_services and not killed_pids:
-                # No gateways were running — nothing to do
-                pass
-
-            # --- Post-restart survivor sweep -----------------------------
-            # Issue #17648: some gateways ignore SIGTERM (stuck drain,
-            # blocked I/O, PID dead but zombie).  The detached profile
-            # watchers wait 120s for the old PID to exit — if it never
-            # does, no respawn happens and the user keeps hitting
-            # ImportError against a stale sys.modules.  Give the
-            # graceful paths a brief window to complete, then SIGKILL
-            # any remaining pre-update PIDs so the watcher / service
-            # manager can relaunch with fresh code.
-            try:
-                _time.sleep(3.0)
-                _service_pids_after = _get_service_pids()
-                _surviving = find_gateway_pids(
-                    exclude_pids=_service_pids_after,
-                    all_profiles=True,
-                )
-                # Scope to PIDs we already tried to kill during this
-                # update (killed_pids).  Anything new is a gateway that
-                # started AFTER our restart attempt — respecting user
-                # intent, we don't kill those.
-                _stuck = [pid for pid in _surviving if pid in killed_pids]
-                if _stuck:
-                    print()
-                    print(
-                        f"  ⚠ {len(_stuck)} gateway process(es) ignored SIGTERM — force-killing"
-                    )
-                    from gateway.status import terminate_pid as _terminate_pid
-                    for pid in _stuck:
-                        try:
-                            # Routes through taskkill /T /F on Windows,
-                            # SIGKILL on POSIX — _signal.SIGKILL doesn't
-                            # exist on Windows so the old raw os.kill call
-                            # used to crash the entire update path.
-                            _terminate_pid(pid, force=True)
-                        except (ProcessLookupError, PermissionError, OSError):
-                            pass
-                    # Give the OS a beat to reap the processes so the
-                    # watchers see them exit and respawn.
-                    _time.sleep(1.5)
-            except Exception as _sweep_exc:
-                logger.debug("Post-restart survivor sweep failed: %s", _sweep_exc)
-
-        except Exception as e:
-            logger.debug("Gateway restart during update failed: %s", e)
-
-        # Warn if legacy Hermes gateway unit files are still installed.
-        # When both hermes.service (from a pre-rename install) and the
-        # current hermes-gateway.service are enabled, they SIGTERM-fight
-        # for the same bot token (see PR #11909). Flagging here means
-        # every `hermes update` surfaces the issue until the user migrates.
-        try:
-            from hermes_cli.gateway import (
-                has_legacy_hermes_units,
-                _find_legacy_hermes_units,
-                supports_systemd_services,
-            )
-
-            if supports_systemd_services() and has_legacy_hermes_units():
-                print()
-                print("⚠ Legacy Hermes gateway unit(s) detected:")
-                for name, path, is_sys in _find_legacy_hermes_units():
-                    scope = "system" if is_sys else "user"
-                    print(f"    {path}  ({scope} scope)")
-                print()
-                print("  These pre-rename units (hermes.service) fight the current")
-                print("  hermes-gateway.service for the bot token and cause SIGTERM")
-                print("  flap loops. Remove them with:")
-                print()
-                print("    hermes gateway migrate-legacy")
-                print()
-                print("  (add `sudo` if any are in system scope)")
-        except Exception as e:
-            logger.debug("Legacy unit check during update failed: %s", e)
-
-        # Kill stale dashboard processes — the dashboard has no service
-        # manager, so leaving it alive after a code update produces a
-        # silent frontend/backend mismatch.  We can't auto-restart it
-        # (no saved launch args) but we can stop it, and a hint is
-        # printed for the user to re-launch.
-        _kill_stale_dashboard_processes()
-
-        print()
-        print("Tip: You can now select a provider and model:")
-        print("  hermes model              # Select provider and model")
+        _run_update_maintenance(args, gateway_mode=gateway_mode, source_updated=True)
 
     except subprocess.CalledProcessError as e:
         if sys.platform == "win32":
@@ -9785,6 +9818,7 @@ def _coalesce_session_name_args(argv: list) -> list:
         "insights",
         "version",
         "update",
+        "update-maintenance",
         "uninstall",
         "profile",
         "dashboard",
@@ -13237,6 +13271,32 @@ Examples:
         help="Windows: proceed with the update even when another hermes.exe is detected. The concurrent process will likely cause WinError 32 warnings and may leave a reboot-deferred .exe replacement.",
     )
     update_parser.set_defaults(func=cmd_update)
+
+    update_maintenance_parser = subparsers.add_parser(
+        "update-maintenance",
+        help=argparse.SUPPRESS,
+        description="Run post-source-update maintenance without git source reconciliation",
+    )
+    update_maintenance_parser.add_argument(
+        "--gateway",
+        action="store_true",
+        default=False,
+        help="Gateway mode: use update/gateway-safe restart behavior",
+    )
+    update_maintenance_parser.add_argument(
+        "--yes",
+        "-y",
+        action="store_true",
+        default=False,
+        help="Assume yes for config migration prompts; API-key entry is skipped",
+    )
+    update_maintenance_parser.add_argument(
+        "--capabilities",
+        action="store_true",
+        default=False,
+        help="Print machine-readable maintenance command capabilities and exit",
+    )
+    update_maintenance_parser.set_defaults(func=cmd_update_maintenance)
 
     # =========================================================================
     # uninstall command
