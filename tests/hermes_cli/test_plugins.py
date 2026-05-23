@@ -118,6 +118,7 @@ class TestPluginDiscovery:
 
     def test_discover_project_plugins_skipped_by_default(self, tmp_path, monkeypatch):
         """Project plugins are not discovered unless explicitly enabled."""
+        monkeypatch.delenv("HERMES_ENABLE_PROJECT_PLUGINS", raising=False)
         project_dir = tmp_path / "project"
         project_dir.mkdir()
         monkeypatch.chdir(project_dir)
@@ -139,10 +140,10 @@ class TestPluginDiscovery:
         mgr.discover_and_load()
         mgr.discover_and_load()  # second call should no-op
 
-        # Filter out bundled plugins — they're always discovered.
+        # Filter out bundled and entrypoint plugins — they're always discovered.
         non_bundled = {
             n: p for n, p in mgr._plugins.items()
-            if p.manifest.source != "bundled"
+            if p.manifest.source not in {"bundled", "entrypoint"}
         }
         assert len(non_bundled) == 1
 
@@ -155,10 +156,10 @@ class TestPluginDiscovery:
         mgr = PluginManager()
         mgr.discover_and_load()
 
-        # Filter out bundled plugins — they're always discovered.
+        # Filter out bundled and entrypoint plugins — they're always discovered.
         non_bundled = {
             n: p for n, p in mgr._plugins.items()
-            if p.manifest.source != "bundled"
+            if p.manifest.source not in {"bundled", "entrypoint"}
         }
         assert len(non_bundled) == 0
 
