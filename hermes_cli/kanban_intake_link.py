@@ -212,6 +212,17 @@ def create_intake_link(
 
     effective_idempotency = idempotency_key or canonical_url_hash(url)
 
+    existing_row = None
+    if effective_idempotency:
+        existing_row = conn.execute(
+            "SELECT id FROM tasks WHERE idempotency_key = ? "
+            "AND status != 'archived' "
+            "ORDER BY created_at DESC LIMIT 1",
+            (effective_idempotency,),
+        ).fetchone()
+        if existing_row:
+            return existing_row["id"]
+
     # Generate the task id first (idempotency will reuse existing).
     # We need the id to interpolate the workspace path.
     # But create_task returns the id and already checks idempotency.
