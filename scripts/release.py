@@ -47,6 +47,7 @@ ACP_REGISTRY_MANIFEST = REPO_ROOT / "acp_registry" / "agent.json"
 AUTHOR_MAP = {
     # teknium (multiple emails)
     "teknium1@gmail.com": "teknium1",
+    "kenyon1977@gmail.com": "kenyonxu",
     "cipherframe@users.noreply.github.com": "CipherFrame",
     "me@promplate.dev": "CNSeniorious000",
     "yichengqiao21@gmail.com": "YarrowQiao",
@@ -71,6 +72,7 @@ AUTHOR_MAP = {
     "70629228+shaun0927@users.noreply.github.com": "shaun0927",
     "98262967+Bihruze@users.noreply.github.com": "Bihruze",
     "189280367+Lempkey@users.noreply.github.com": "Lempkey",
+    "34853915+m0n3r0@users.noreply.github.com": "m0n3r0",
     "leovillalbajr@gmail.com": "Lempkey",
     "nidhi2894@gmail.com": "nidhi-singh02",
     "30312689+aashizpoudel@users.noreply.github.com": "aashizpoudel",

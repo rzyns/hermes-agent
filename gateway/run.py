@@ -17048,6 +17048,7 @@ class GatewayRunner:
                 "context_length": _context_length,
                 "session_id": effective_session_id,
                 "response_previewed": result.get("response_previewed", False),
+                "response_transformed": result.get("response_transformed", False),
             }
         
         # Start progress message sender if enabled
@@ -17685,7 +17686,11 @@ class GatewayRunner:
             _content_delivered = bool(
                 _sc and getattr(_sc, "final_content_delivered", False)
             )
-            if not _is_empty_sentinel and (_streamed or _previewed or _content_delivered):
+            # Plugin hooks (e.g. transform_llm_output) may have appended content
+            # after streaming finished — when the response was transformed, always
+            # send the final version so the appended content reaches the client.
+            _transformed = bool(response.get("response_transformed"))
+            if not _is_empty_sentinel and not _transformed and (_streamed or _previewed or _content_delivered):
                 logger.info(
                     "Suppressing normal final send for session %s: final delivery already confirmed (streamed=%s previewed=%s content_delivered=%s).",
                     session_key or "?",
@@ -17694,6 +17699,28 @@ class GatewayRunner:
                     _content_delivered,
                 )
                 response["already_sent"] = True
+            elif not _is_empty_sentinel and _transformed and _sc is not None:
+                # Plugin hooks transformed the response after streaming — edit the
+                # existing streamed message instead of sending a duplicate.
+                _sc_msg_id = _sc.message_id
+                if _sc_msg_id:
+                    try:
+                        await _sc.adapter.edit_message(
+                            chat_id=source.chat_id,
+                            message_id=_sc_msg_id,
+                            content=response["final_response"],
+                            finalize=True,
+                        )
+                        response["already_sent"] = True
+                        logger.info(
+                            "Edited streamed message %s for session %s to include plugin-transformed content.",
+                            _sc_msg_id, session_key or "?",
+                        )
+                    except Exception as _edit_err:
+                        logger.warning(
+                            "Failed to edit streamed message for session %s: %s",
+                            session_key or "?", _edit_err,
+                        )
 
         # Schedule deletion of tracked temporary progress bubbles after the
         # final response lands. Failed runs skip this so bubbles remain as

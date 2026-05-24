@@ -1414,7 +1414,18 @@ def run_conversation(
                         finish_reason = "length"
 
                 if finish_reason == "length":
-                    agent._vprint(f"{agent.log_prefix}⚠️  Response truncated (finish_reason='length') - model hit max output tokens", force=True)
+                    if getattr(response, "id", "") == "partial-stream-stub":
+                        agent._vprint(
+                            f"{agent.log_prefix}⚠️  Stream interrupted by network error "
+                            f"(finish_reason='length' on partial-stream-stub)",
+                            force=True,
+                        )
+                    else:
+                        agent._vprint(
+                            f"{agent.log_prefix}⚠️  Response truncated "
+                            f"(finish_reason='length') - model hit max output tokens",
+                            force=True,
+                        )
 
                     # Normalize the truncated response to a single OpenAI-style
                     # message shape so text-continuation and tool-call retry
@@ -1507,17 +1518,40 @@ def run_conversation(
                                 truncated_response_parts.append(assistant_message.content)
 
                             if length_continue_retries < 3:
-                                agent._vprint(
-                                    f"{agent.log_prefix}↻ Requesting continuation "
-                                    f"({length_continue_retries}/3)..."
+                                # Distinguish a real output-token truncation
+                                # from a partial-stream-stub network error
+                                # (#30963).  Same continuation machinery,
+                                # but the prompt has to tell the truth or
+                                # the model goes off rails ("I wasn't
+                                # truncated, I'm done").
+                                _is_partial_stream_stub = (
+                                    getattr(response, "id", "") == "partial-stream-stub"
                                 )
-                                continue_msg = {
-                                    "role": "user",
-                                    "content": (
+                                if _is_partial_stream_stub:
+                                    agent._vprint(
+                                        f"{agent.log_prefix}↻ Stream interrupted — "
+                                        f"requesting continuation "
+                                        f"({length_continue_retries}/3)..."
+                                    )
+                                    _continue_content = (
+                                        "[System: The previous response was cut off by a "
+                                        "network error mid-stream. Continue exactly where "
+                                        "you left off. Do not restart or repeat prior text. "
+                                        "Finish the answer directly.]"
+                                    )
+                                else:
+                                    agent._vprint(
+                                        f"{agent.log_prefix}↻ Requesting continuation "
+                                        f"({length_continue_retries}/3)..."
+                                    )
+                                    _continue_content = (
                                         "[System: Your previous response was truncated by the output "
                                         "length limit. Continue exactly where you left off. Do not "
                                         "restart or repeat prior text. Finish the answer directly.]"
-                                    ),
+                                    )
+                                continue_msg = {
+                                    "role": "user",
+                                    "content": _continue_content,
                                 }
                                 messages.append(continue_msg)
                                 agent._session_messages = messages
@@ -4031,6 +4065,8 @@ def run_conversation(
         except Exception as _ver_err:
             logger.debug("file-mutation verifier footer failed: %s", _ver_err)
 
+    _response_transformed = False
+
     # Plugin hook: transform_llm_output
     # Fired once per turn after the tool-calling loop completes.
     # Plugins can transform the LLM's output text before it's returned.
@@ -4048,6 +4084,7 @@ def run_conversation(
             for _hook_result in _transform_results:
                 if isinstance(_hook_result, str) and _hook_result:
                     final_response = _hook_result
+                    _response_transformed = True
                     break  # First non-empty string wins
         except Exception as exc:
             logger.warning("transform_llm_output hook failed: %s", exc)
@@ -4099,6 +4136,7 @@ def run_conversation(
         "failed": failed,
         "partial": False,  # True only when stopped due to invalid tool calls
         "interrupted": interrupted,
+        "response_transformed": _response_transformed,
         "response_previewed": getattr(agent, "_response_was_previewed", False),
         "model": agent.model,
         "provider": agent.provider,
