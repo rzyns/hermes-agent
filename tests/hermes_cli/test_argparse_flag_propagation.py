@@ -95,12 +95,35 @@ class TestChatVerboseArg:
         setattr(fake_cli, "main", fake_main)
         fake_banner = types.ModuleType("hermes_cli.banner")
         setattr(fake_banner, "prefetch_update_check", lambda: None)
+        setattr(fake_banner, "_format_context_length", lambda value: str(value))
+        setattr(fake_banner, "format_banner_version_label", lambda: "Hermes")
+        setattr(fake_banner, "build_welcome_banner", lambda *args, **kwargs: "")
+        setattr(fake_banner, "cprint", lambda *args, **kwargs: None)
+        setattr(fake_banner, "_DIM", "")
+        setattr(fake_banner, "_RST", "")
         fake_skills_sync = types.ModuleType("tools.skills_sync")
         setattr(fake_skills_sync, "sync_skills", lambda quiet=True: None)
 
         monkeypatch.setitem(sys.modules, "cli", fake_cli)
         monkeypatch.setitem(sys.modules, "hermes_cli.banner", fake_banner)
         monkeypatch.setitem(sys.modules, "tools.skills_sync", fake_skills_sync)
+
+        import importlib.abc
+        import importlib.machinery
+        import importlib.util
+
+        class FakeCliLoader(importlib.abc.Loader):
+            def create_module(self, spec):
+                return None
+
+            def exec_module(self, module):
+                setattr(module, "main", fake_main)
+
+        monkeypatch.setattr(
+            importlib.util,
+            "spec_from_file_location",
+            lambda name, path: importlib.machinery.ModuleSpec(name, FakeCliLoader()),
+        )
         monkeypatch.setattr(main_mod, "_has_any_provider_configured", lambda: True)
         monkeypatch.setattr(main_mod, "_pin_kanban_board_env", lambda: None)
 
