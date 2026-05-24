@@ -118,7 +118,13 @@ def check_register_for_task(
         verdict = "missing_provisional"
     elif not result["has_full_entry"]:
         verdict = "provisional_only"
-    if not body_contract_ok:
+    elif not body_contract_ok:
+        # A triage/specifier pass may replace the original auto-generated
+        # intake body with an actionable worker prompt. Once both provisional
+        # and assessed register entries exist, that body rewrite should not
+        # make an otherwise completed link look failed.
+        verdict = "complete"
+    if not body_contract_ok and not result["has_full_entry"]:
         verdict = "incomplete_body"
     result["verdict"] = verdict
     return result

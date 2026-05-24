@@ -140,6 +140,43 @@ def test_check_register_incomplete_body(conn, tmp_path, monkeypatch):
     assert result["verdict"] == "incomplete_body"
 
 
+def test_check_register_complete_after_specifier_rewrites_body(conn, tmp_path, monkeypatch):
+    """Completed assessed entries should remain complete after the triage body is rewritten."""
+    tid = "t_assessed"
+    url = "https://example.com/assessed"
+    body = f"Assess the repository link {url} and update the attention-intake register."
+    _write_register_entry(
+        tmp_path,
+        {
+            "event": "intake_link_created",
+            "task_id": tid,
+            "url": url,
+            "idempotency_key": "abc",
+            "created_at": "2026-05-22T12:00:00Z",
+            "board": "attention-intake",
+            "status": "needs_assessment",
+        },
+    )
+    _write_register_entry(
+        tmp_path,
+        {
+            "event": "intake_link_assessed",
+            "task_id": tid,
+            "source_task": tid,
+            "url": url,
+            "status": "assessed",
+            "created_at": "2026-05-22T12:01:00Z",
+        },
+    )
+
+    result = kih.check_register_for_task(tid, body, hermes_home=tmp_path)
+
+    assert result["has_provisional_entry"] is True
+    assert result["has_full_entry"] is True
+    assert result["body_contract_ok"] is False
+    assert result["verdict"] == "complete"
+
+
 # ---------------------------------------------------------------------------
 # scan_board_for_health
 # ---------------------------------------------------------------------------

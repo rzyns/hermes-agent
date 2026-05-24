@@ -187,6 +187,33 @@ def test_create_intake_link_idempotency(conn):
     assert tid1 == tid2
 
 
+def test_create_intake_link_idempotency_does_not_rewrite_completed_assessment(conn, tmp_path, monkeypatch):
+    """A duplicate drop must not restore the provisional body over a completed assessment."""
+    root = tmp_path / "attention-intake"
+    monkeypatch.setattr(kil, "_artifact_root", lambda: root)
+
+    tid = kil.create_intake_link(conn, url="https://example.com/done")
+    completed_body = "Assess the link https://example.com/done and write final register entries."
+    kb.update_task_body(conn, tid, completed_body)
+    conn.execute("UPDATE tasks SET status = 'done', completed_at = 123456 WHERE id = ?", (tid,))
+    conn.commit()
+
+    before_rows = (root / "register.jsonl").read_text().splitlines()
+    duplicate_tid = kil.create_intake_link(
+        conn,
+        url="https://example.com/done",
+        context="new context should not overwrite assessment",
+        note="duplicate drop",
+    )
+
+    final_task = kb.get_task(conn, tid)
+
+    assert duplicate_tid == tid
+    assert final_task is not None
+    assert final_task.body == completed_body
+    assert (root / "register.jsonl").read_text().splitlines() == before_rows
+
+
 def test_create_intake_link_override_idempotency_key(conn):
     tid1 = kil.create_intake_link(
         conn,
