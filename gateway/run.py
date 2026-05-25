@@ -4665,6 +4665,33 @@ class GatewayRunner:
         if not notifier_profile:
             notifier_profile = self._active_profile_name()
             self._kanban_notifier_profile = notifier_profile
+        disabled_corrupt_boards: dict[str, tuple[str, int | None, int | None]] = {}
+
+        def _board_db_fingerprint(slug: str, db_path: object = None) -> tuple[str, int | None, int | None]:
+            try:
+                path = Path(str(db_path)).expanduser() if db_path else _kb.kanban_db_path(slug)
+            except Exception:
+                path = Path(f"slug:{slug}")
+            try:
+                resolved = str(path.expanduser().resolve())
+            except Exception:
+                resolved = str(path)
+            try:
+                stat = path.stat()
+            except OSError:
+                return (resolved, None, None)
+            return (resolved, stat.st_mtime_ns, stat.st_size)
+
+        def _is_corrupt_board_db_error(exc: Exception) -> bool:
+            if isinstance(exc, getattr(_kb, "KanbanDbCorruptError", ())):
+                return True
+            if not isinstance(exc, sqlite3.DatabaseError):
+                return False
+            msg = str(exc).lower()
+            return (
+                "file is not a database" in msg
+                or "database disk image is malformed" in msg
+            )
 
         # Initial delay so the gateway can finish wiring adapters.
         await asyncio.sleep(5)
@@ -4694,10 +4721,8 @@ class GatewayRunner:
                     for board_meta in boards:
                         slug = board_meta.get("slug") or _kb.DEFAULT_BOARD
                         db_path = board_meta.get("db_path")
-                        try:
-                            resolved_db_path = str(Path(db_path).expanduser().resolve()) if db_path else str(_kb.kanban_db_path(slug).resolve())
-                        except Exception:
-                            resolved_db_path = f"slug:{slug}"
+                        fingerprint = _board_db_fingerprint(slug, db_path)
+                        resolved_db_path = fingerprint[0]
                         if resolved_db_path in seen_db_paths:
                             logger.debug(
                                 "kanban notifier: skipping duplicate board slug %s for DB %s",
@@ -4705,10 +4730,29 @@ class GatewayRunner:
                             )
                             continue
                         seen_db_paths.add(resolved_db_path)
+                        disabled_fingerprint = disabled_corrupt_boards.get(slug)
+                        if disabled_fingerprint == fingerprint:
+                            continue
+                        if disabled_fingerprint is not None:
+                            logger.info(
+                                "kanban notifier: board %s database changed; retrying poll",
+                                slug,
+                            )
+                            disabled_corrupt_boards.pop(slug, None)
                         try:
                             conn = _kb.connect(board=slug)
                         except Exception as exc:
-                            logger.debug("kanban notifier: cannot open board %s: %s", slug, exc)
+                            if _is_corrupt_board_db_error(exc):
+                                disabled_corrupt_boards[slug] = fingerprint
+                                backup = getattr(exc, "backup_path", None)
+                                logger.warning(
+                                    "kanban notifier: board %s database %s is corrupt; "
+                                    "skipping this board until the file changes or the "
+                                    "gateway restarts (backup=%s): %s",
+                                    slug, fingerprint[0], backup or "<none>", exc,
+                                )
+                            else:
+                                logger.debug("kanban notifier: cannot open board %s: %s", slug, exc)
                             continue
                         try:
                             # `connect()` runs the schema + idempotent migration
@@ -5256,6 +5300,8 @@ class GatewayRunner:
             return (resolved, stat.st_mtime_ns, stat.st_size)
 
         def _is_corrupt_board_db_error(exc: Exception) -> bool:
+            if isinstance(exc, getattr(_kb, "KanbanDbCorruptError", ())):
+                return True
             if not isinstance(exc, sqlite3.DatabaseError):
                 return False
             msg = str(exc).lower()
@@ -5315,7 +5361,20 @@ class GatewayRunner:
                     return None
                 logger.exception("kanban dispatcher: tick failed on board %s", slug)
                 return None
-            except Exception:
+            except Exception as exc:
+                if _is_corrupt_board_db_error(exc):
+                    disabled_corrupt_boards[slug] = fingerprint
+                    backup = getattr(exc, "backup_path", None)
+                    logger.error(
+                        "kanban dispatcher: board %s database %s is corrupt; "
+                        "disabling dispatch for this board until the file "
+                        "changes or the gateway restarts (backup=%s): %s",
+                        slug,
+                        fingerprint[0],
+                        backup or "<none>",
+                        exc,
+                    )
+                    return None
                 logger.exception("kanban dispatcher: tick failed on board %s", slug)
                 return None
             finally:
@@ -5360,6 +5419,10 @@ class GatewayRunner:
                 boards = [_kb.read_board_metadata(_kb.DEFAULT_BOARD)]
             for b in boards:
                 slug = b.get("slug") or _kb.DEFAULT_BOARD
+                fingerprint = _board_db_fingerprint(slug)
+                disabled_fingerprint = disabled_corrupt_boards.get(slug)
+                if disabled_fingerprint == fingerprint:
+                    continue
                 conn = None
                 try:
                     conn = _kb.connect(board=slug)
@@ -5367,7 +5430,9 @@ class GatewayRunner:
                         return True
                     if _kb.has_spawnable_review(conn):
                         return True
-                except Exception:
+                except Exception as exc:
+                    if _is_corrupt_board_db_error(exc):
+                        disabled_corrupt_boards[slug] = fingerprint
                     continue
                 finally:
                     if conn is not None:
@@ -5415,6 +5480,10 @@ class GatewayRunner:
                 slug = b.get("slug") or _kb.DEFAULT_BOARD
                 if attempted >= auto_decompose_per_tick:
                     break
+                fingerprint = _board_db_fingerprint(slug)
+                disabled_fingerprint = disabled_corrupt_boards.get(slug)
+                if disabled_fingerprint == fingerprint:
+                    continue
                 # Pin this board for the duration of the call — same
                 # pattern as the dashboard specify endpoint. The
                 # decomposer module connects with no board kwarg and
@@ -5425,10 +5494,20 @@ class GatewayRunner:
                     try:
                         triage_ids = _decomp.list_triage_ids()
                     except Exception as exc:
-                        logger.debug(
-                            "kanban auto-decompose: list_triage_ids failed on board %s (%s)",
-                            slug, exc,
-                        )
+                        if _is_corrupt_board_db_error(exc):
+                            disabled_corrupt_boards[slug] = fingerprint
+                            backup = getattr(exc, "backup_path", None)
+                            logger.warning(
+                                "kanban auto-decompose: board %s database %s is corrupt; "
+                                "skipping this board until the file changes or the "
+                                "gateway restarts (backup=%s): %s",
+                                slug, fingerprint[0], backup or "<none>", exc,
+                            )
+                        else:
+                            logger.debug(
+                                "kanban auto-decompose: list_triage_ids failed on board %s (%s)",
+                                slug, exc,
+                            )
                         triage_ids = []
                     for tid in triage_ids:
                         if attempted >= auto_decompose_per_tick:

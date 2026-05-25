@@ -36,6 +36,23 @@ async def _run_one_notifier_tick(monkeypatch, runner):
     await runner._kanban_notifier_watcher(interval=1)
 
 
+async def _run_two_notifier_ticks(monkeypatch, runner):
+    real_sleep = asyncio.sleep
+    interval_sleeps = 0
+
+    async def fake_sleep(delay):
+        nonlocal interval_sleeps
+        if delay == 5:
+            return None
+        interval_sleeps += 1
+        if interval_sleeps >= 2:
+            runner._running = False
+        await real_sleep(0)
+
+    monkeypatch.setattr(asyncio, "sleep", fake_sleep)
+    await runner._kanban_notifier_watcher(interval=1)
+
+
 def _make_runner(adapter):
     runner = GatewayRunner.__new__(GatewayRunner)
     runner._running = True
@@ -87,6 +104,33 @@ def test_kanban_notifier_dedupes_board_slugs_pointing_to_same_db(tmp_path, monke
     assert len(adapter.sent) == 1
     assert "Kanban" in adapter.sent[0]["text"]
     assert tid in adapter.sent[0]["text"]
+
+
+def test_kanban_notifier_skips_unchanged_corrupt_board_after_first_failure(tmp_path, monkeypatch):
+    """A corrupt board should be backed off inside a long-lived notifier watcher."""
+    db_path = tmp_path / "kanban.db"
+    db_path.write_bytes(kb._SQLITE_HEADER + b"broken btree")
+    backup_path = tmp_path / "kanban.db.corrupt.0.bak"
+    connect_calls: list[str | None] = []
+
+    monkeypatch.setattr(
+        kb,
+        "list_boards",
+        lambda include_archived=False: [{"slug": "sandbox", "db_path": str(db_path)}],
+    )
+
+    def fake_connect(*_args, board=None, **_kwargs):
+        connect_calls.append(board)
+        raise kb.KanbanDbCorruptError(
+            db_path, backup_path, "integrity_check returned 'bad btree'"
+        )
+
+    monkeypatch.setattr(kb, "connect", fake_connect)
+
+    runner = _make_runner(RecordingAdapter())
+    asyncio.run(_run_two_notifier_ticks(monkeypatch, runner))
+
+    assert connect_calls == ["sandbox"]
 
 
 def test_kanban_notifier_claim_prevents_second_watcher_send(tmp_path, monkeypatch):

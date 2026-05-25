@@ -71,6 +71,7 @@ new locking.
 from __future__ import annotations
 
 import contextlib
+import hashlib
 import json
 import os
 import re
@@ -952,6 +953,11 @@ CREATE INDEX IF NOT EXISTS idx_notify_task           ON kanban_notify_subs(task_
 # ---------------------------------------------------------------------------
 
 _INITIALIZED_PATHS: set[str] = set()
+# Per-process cache of unchanged DB files that already failed integrity checks.
+# Value: (mtime_ns, size, sha256, backup_path, reason). This preserves the
+# first representative backup while preventing callers that poll the same
+# corrupt board from creating a fresh duplicate backup on every retry.
+_CORRUPT_DB_BACKUPS: dict[str, tuple[int, int, str, Optional[Path], str]] = {}
 _INIT_LOCK = threading.RLock()
 _SQLITE_HEADER = b"SQLite format 3\x00"
 
@@ -1025,12 +1031,26 @@ class KanbanDbCorruptError(RuntimeError):
             f"Original preserved; backup at {backup_str}."
         )
 
+def _file_sha256(path: Path) -> str:
+    """Return a content digest for corrupt-backup deduplication."""
+    h = hashlib.sha256()
+    try:
+        with path.open("rb") as handle:
+            for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+                h.update(chunk)
+    except OSError:
+        return ""
+    return h.hexdigest()
+
 
 def _backup_corrupt_db(path: Path) -> Optional[Path]:
-    """Copy a corrupt DB (and its WAL/SHM sidecars) to a timestamped backup.
+    """Preserve a corrupt DB (and its WAL/SHM sidecars) as a backup.
 
     Returns the backup path of the main DB file, or ``None`` if the copy
-    itself failed (the caller still raises loudly in that case).
+    itself failed (the caller still raises loudly in that case). If an
+    existing ``.corrupt.*.bak`` file in the same directory already has the
+    same size and SHA-256 digest as ``path``, returns that representative
+    backup instead of writing a duplicate.
 
     Writes are confined to the original DB's parent directory. The
     backup basename is derived purely from ``path.name``, never from
@@ -1042,6 +1062,26 @@ def _backup_corrupt_db(path: Path) -> Optional[Path]:
     resolved = path.resolve()
     parent = resolved.parent
     base_name = resolved.name  # basename only
+    try:
+        source_size = resolved.stat().st_size
+    except OSError:
+        source_size = -1
+    source_digest = _file_sha256(resolved)
+    if source_digest:
+        try:
+            existing_backups = sorted(parent.glob(f"{base_name}.corrupt.*.bak"))
+        except OSError:
+            existing_backups = []
+        for existing in existing_backups:
+            try:
+                if existing.parent != parent or not existing.is_file():
+                    continue
+                if source_size >= 0 and existing.stat().st_size != source_size:
+                    continue
+            except OSError:
+                continue
+            if _file_sha256(existing) == source_digest:
+                return existing
     stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     candidate = parent / f"{base_name}.corrupt.{stamp}.bak"
     # Defensive: candidate must still be inside parent after construction.
@@ -1106,30 +1146,55 @@ def _guard_existing_db_is_healthy(path: Path) -> None:
     except OSError:
         return
     try:
-        if not resolved.exists() or resolved.stat().st_size == 0:
-            return
+        stat = resolved.stat()
+    except FileNotFoundError:
+        return
     except OSError:
         return
-    if str(resolved) in _INITIALIZED_PATHS:
+    if stat.st_size == 0:
         return
-    reason: Optional[str] = None
-    try:
-        probe = sqlite3.connect(str(resolved), timeout=5, isolation_level=None)
+    resolved_str = str(resolved)
+    if resolved_str in _INITIALIZED_PATHS:
+        return
+
+    # The integrity guard intentionally fails closed, but callers such as
+    # gateway notifiers can poll every few seconds. Cache unchanged corrupt
+    # fingerprints per process so we keep one representative backup instead
+    # of copying the same broken DB forever.
+    stat_fingerprint = (stat.st_mtime_ns, stat.st_size)
+    with _INIT_LOCK:
+        if resolved_str in _INITIALIZED_PATHS:
+            return
+        cached = _CORRUPT_DB_BACKUPS.get(resolved_str)
+        if cached is not None and cached[:2] == stat_fingerprint:
+            _, _, cached_digest, cached_backup, cached_reason = cached
+            current_digest = _file_sha256(resolved)
+            if current_digest == cached_digest:
+                raise KanbanDbCorruptError(resolved, cached_backup, cached_reason)
+
+        reason: Optional[str] = None
         try:
-            row = probe.execute("PRAGMA integrity_check").fetchone()
-        finally:
-            probe.close()
-        if not row or (row[0] or "").lower() != "ok":
-            reason = f"integrity_check returned {row[0] if row else '<no row>'!r}"
-    except sqlite3.OperationalError:
-        # Lock contention, busy, transient IO — not corruption. Let it propagate.
-        raise
-    except sqlite3.DatabaseError as exc:
-        reason = f"sqlite refused to open file: {exc}"
-    if reason is None:
-        return
-    backup = _backup_corrupt_db(resolved)
-    raise KanbanDbCorruptError(resolved, backup, reason)
+            probe = sqlite3.connect(str(resolved), timeout=5, isolation_level=None)
+            try:
+                row = probe.execute("PRAGMA integrity_check").fetchone()
+            finally:
+                probe.close()
+            if not row or (row[0] or "").lower() != "ok":
+                reason = f"integrity_check returned {row[0] if row else '<no row>'!r}"
+        except sqlite3.OperationalError:
+            # Lock contention, busy, transient IO — not corruption. Let it propagate.
+            raise
+        except sqlite3.DatabaseError as exc:
+            reason = f"sqlite refused to open file: {exc}"
+        if reason is None:
+            _CORRUPT_DB_BACKUPS.pop(resolved_str, None)
+            return
+        backup = _backup_corrupt_db(resolved)
+        digest = _file_sha256(resolved)
+        _CORRUPT_DB_BACKUPS[resolved_str] = (
+            stat_fingerprint[0], stat_fingerprint[1], digest, backup, reason,
+        )
+        raise KanbanDbCorruptError(resolved, backup, reason)
 
 
 def connect(

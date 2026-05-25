@@ -135,6 +135,69 @@ def test_connect_rejects_tls_record_in_sqlite_header(tmp_path, monkeypatch):
     assert "53 51 4c 69 74 17 03 03 00 13" in msg
 
 
+def test_integrity_guard_reuses_backup_for_unchanged_corrupt_db(tmp_path, monkeypatch):
+    """Repeated opens of one unchanged corrupt DB should not create backups forever."""
+    db_path = tmp_path / "kanban.db"
+    db_path.write_bytes(kb._SQLITE_HEADER + b"x" * 128)
+    resolved = str(db_path.resolve())
+    kb._INITIALIZED_PATHS.discard(resolved)
+    kb._CORRUPT_DB_BACKUPS.pop(resolved, None)
+
+    class FakeProbe:
+        def execute(self, _sql):
+            class FakeCursor:
+                def fetchone(self):
+                    return ("bad btree",)
+            return FakeCursor()
+
+        def close(self):
+            pass
+
+    backups: list[Path] = []
+
+    def fake_connect(*_args, **_kwargs):
+        return FakeProbe()
+
+    def fake_backup(path: Path) -> Path:
+        backup = path.with_name(f"{path.name}.corrupt.{len(backups)}.bak")
+        backups.append(backup)
+        return backup
+
+    monkeypatch.setattr(kb.sqlite3, "connect", fake_connect)
+    monkeypatch.setattr(kb, "_backup_corrupt_db", fake_backup)
+
+    with pytest.raises(kb.KanbanDbCorruptError) as first:
+        kb._guard_existing_db_is_healthy(db_path)
+    with pytest.raises(kb.KanbanDbCorruptError) as second:
+        kb._guard_existing_db_is_healthy(db_path)
+
+    assert backups == [first.value.backup_path]
+    assert second.value.backup_path == first.value.backup_path
+
+    db_path.write_bytes(kb._SQLITE_HEADER + b"y" * 256)
+    with pytest.raises(kb.KanbanDbCorruptError) as third:
+        kb._guard_existing_db_is_healthy(db_path)
+
+    assert len(backups) == 2
+    assert third.value.backup_path != first.value.backup_path
+    kb._CORRUPT_DB_BACKUPS.pop(resolved, None)
+
+
+def test_backup_corrupt_db_reuses_existing_identical_backup(tmp_path):
+    db_path = tmp_path / "kanban.db"
+    db_bytes = kb._SQLITE_HEADER + b"same corrupt bytes"
+    db_path.write_bytes(db_bytes)
+    representative = tmp_path / "kanban.db.corrupt.20260524_120000.bak"
+    representative.write_bytes(db_bytes)
+
+    backup = kb._backup_corrupt_db(db_path)
+
+    assert backup == representative
+    assert sorted(p.name for p in tmp_path.glob("kanban.db.corrupt.*.bak")) == [
+        representative.name
+    ]
+
+
 def test_connect_migrates_legacy_db_before_optional_column_indexes(tmp_path):
     """Legacy DBs missing additive indexed columns must migrate cleanly.
 
