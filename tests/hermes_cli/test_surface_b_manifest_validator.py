@@ -439,6 +439,32 @@ class TestSurfaceBArtifactHashVerification:
         report = json.loads((tmp_path / "out" / "validation_report.json").read_text())
         assert report["valid"] is True
 
+    def test_matching_hash_with_sha256_prefix_passes(self, tmp_path, hermes_main):
+        """Regression for B1: accepted sha256:<hex> artifact refs must not false-fail as stale."""
+        f = tmp_path / "test.txt"
+        content = b"actual content"
+        f.write_bytes(content)
+        raw_hash = hashlib.sha256(content).hexdigest()
+        m = _make_manifest()
+        m["artifact_refs"] = [
+            {
+                "artifact_id": "a1",
+                "artifact_type": "raw_snapshot",
+                "authority_class": "diagnostic",
+                "path": str(f),
+                "sha256": f"sha256:{raw_hash}",
+                "size": len(content),
+                "redaction_state": "raw_only",
+            }
+        ]
+        m["bundle_id"] = _canonical_bundle_id(m)
+        manifest = tmp_path / "manifest.json"
+        manifest.write_text(json.dumps(m, indent=2))
+        result = _run_validate_manifest(tmp_path, hermes_main, manifest)
+        assert result.returncode == 0
+        report = json.loads((tmp_path / "out" / "validation_report.json").read_text())
+        assert report["valid"] is True
+
 
 # ---------------------------------------------------------------------------
 # Requirement 12: consumer-safe report (raw paths not exposed in report)

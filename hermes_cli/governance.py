@@ -811,7 +811,8 @@ def cmd_validate_manifest(args: argparse.Namespace) -> int:
         if not _toctou_check(ref_path, ref.get("size"), errors):
             continue
         computed_hash = _compute_sha256(ref_path)
-        expected_hash = ref.get("sha256")
+        expected_hash = ref.get("sha256", "")
+        expected_hash = expected_hash[7:] if expected_hash.startswith("sha256:") else expected_hash
         if computed_hash is None:
             errors.append(f"artifact_hash_unreadable:{path_str}")
         elif expected_hash and computed_hash != expected_hash:
