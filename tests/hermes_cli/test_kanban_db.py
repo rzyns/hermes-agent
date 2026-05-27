@@ -183,6 +183,49 @@ def test_integrity_guard_reuses_backup_for_unchanged_corrupt_db(tmp_path, monkey
     kb._CORRUPT_DB_BACKUPS.pop(resolved, None)
 
 
+def test_integrity_guard_rechecks_initialized_path_when_file_changes(
+    tmp_path, monkeypatch
+):
+    """A path cached healthy must be re-probed if the on-disk DB changes later."""
+    db_path = tmp_path / "kanban.db"
+    db_path.write_bytes(kb._SQLITE_HEADER + b"initial healthy fingerprint")
+    resolved = str(db_path.resolve())
+    initial = db_path.stat()
+    kb._INITIALIZED_PATHS.add(resolved)
+    kb._INITIALIZED_PATH_FINGERPRINTS[resolved] = (initial.st_mtime_ns, initial.st_size)
+    kb._CORRUPT_DB_BACKUPS.pop(resolved, None)
+
+    db_path.write_bytes(kb._SQLITE_HEADER + b"changed bytes now require a fresh probe")
+
+    class FakeProbe:
+        def execute(self, _sql):
+            class FakeCursor:
+                def fetchone(self):
+                    return ("bad btree",)
+            return FakeCursor()
+
+        def close(self):
+            pass
+
+    probes = []
+
+    def fake_connect(*_args, **_kwargs):
+        probes.append(True)
+        return FakeProbe()
+
+    monkeypatch.setattr(kb.sqlite3, "connect", fake_connect)
+    monkeypatch.setattr(kb, "_backup_corrupt_db", lambda path: path.with_suffix(".bak"))
+
+    with pytest.raises(kb.KanbanDbCorruptError) as exc_info:
+        kb._guard_existing_db_is_healthy(db_path)
+
+    assert probes == [True]
+    assert "integrity_check returned 'bad btree'" in str(exc_info.value)
+    assert resolved not in kb._INITIALIZED_PATHS
+    kb._INITIALIZED_PATH_FINGERPRINTS.pop(resolved, None)
+    kb._CORRUPT_DB_BACKUPS.pop(resolved, None)
+
+
 def test_backup_corrupt_db_reuses_existing_identical_backup(tmp_path):
     db_path = tmp_path / "kanban.db"
     db_bytes = kb._SQLITE_HEADER + b"same corrupt bytes"

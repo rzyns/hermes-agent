@@ -110,13 +110,40 @@ class TestApplyWalWithFallback:
         assert mode == "delete"
         conn.close()
 
-    def test_falls_back_on_disk_io_error(self, tmp_path):
-        """Flaky network FS → disk I/O error → still fall back."""
+    def test_reraises_disk_io_error_without_fallback(self, tmp_path):
+        """Generic disk I/O errors are corruption/device signals, not WAL incompat."""
         conn, _ = _open_blocking(
             tmp_path / "flaky.db", reason="disk I/O error", isolation_level=None
         )
-        mode = apply_wal_with_fallback(conn)
-        assert mode == "delete"
+        with pytest.raises(sqlite3.OperationalError, match="disk I/O error"):
+            apply_wal_with_fallback(conn)
+        conn.close()
+
+    def test_reports_both_errors_when_delete_fallback_fails(self, tmp_path):
+        """If WAL fallback is warranted but DELETE also fails, preserve both causes."""
+
+        class _BothJournalModesFailConnection(sqlite3.Connection):
+            def execute(self, sql, *args, **kwargs):  # type: ignore[override]
+                normalized = sql.lower().replace(" ", "")
+                if "journal_mode=wal" in normalized:
+                    raise sqlite3.OperationalError("locking protocol")
+                if "journal_mode=delete" in normalized:
+                    raise sqlite3.OperationalError("disk I/O error")
+                return super().execute(sql, *args, **kwargs)
+
+        conn = sqlite3.connect(
+            str(tmp_path / "broken.db"),
+            factory=_BothJournalModesFailConnection,
+            isolation_level=None,
+        )
+        with pytest.raises(sqlite3.OperationalError) as exc_info:
+            apply_wal_with_fallback(conn, db_label="kanban.db")
+        msg = str(exc_info.value)
+        assert "kanban.db" in msg
+        assert "journal_mode=WAL failed" in msg
+        assert "locking protocol" in msg
+        assert "journal_mode=DELETE also failed" in msg
+        assert "disk I/O error" in msg
         conn.close()
 
     def test_reraises_unrelated_operational_error(self, tmp_path):

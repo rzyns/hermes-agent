@@ -576,7 +576,9 @@ def remove_board(slug: str, *, archive: bool = True) -> dict:
     # A concurrent connect(board=normed) after the rename/delete recreates
     # an empty sqlite file via mkdir(exist_ok=True); the cache entry must be
     # dropped first so the schema init pass re-runs on that fresh file.
-    _INITIALIZED_PATHS.discard(str((d / "kanban.db").resolve()))
+    resolved_db = str((d / "kanban.db").resolve())
+    _INITIALIZED_PATHS.discard(resolved_db)
+    _INITIALIZED_PATH_FINGERPRINTS.pop(resolved_db, None)
 
     if archive:
         archive_root = boards_root() / "_archived"
@@ -953,6 +955,13 @@ CREATE INDEX IF NOT EXISTS idx_notify_task           ON kanban_notify_subs(task_
 # ---------------------------------------------------------------------------
 
 _INITIALIZED_PATHS: set[str] = set()
+# Fingerprint for DB files whose integrity guard succeeded in this process.
+# ``_INITIALIZED_PATHS`` alone is intentionally path-only for backwards
+# compatibility with tests and callers that clear/discard it directly, but a
+# path-only healthy cache can hide a DB that is replaced or corrupted after the
+# first successful open. Track the file fingerprint separately so changed DB
+# bytes force a fresh integrity probe.
+_INITIALIZED_PATH_FINGERPRINTS: dict[str, tuple[int, int]] = {}
 # Per-process cache of unchanged DB files that already failed integrity checks.
 # Value: (mtime_ns, size, sha256, backup_path, reason). This preserves the
 # first representative backup while preventing callers that poll the same
@@ -1129,7 +1138,7 @@ def _guard_existing_db_is_healthy(path: Path) -> None:
     normal lock failure and no spurious ``.corrupt`` backup is made.
 
     No-op for missing files, zero-byte files (treated as fresh), and
-    paths already proven healthy this process (cache hit).
+    unchanged paths already proven healthy this process (cache hit).
 
     Path-trust note: ``path`` arrives via :func:`connect`, which itself
     resolves it from an explicit ``db_path`` argument, the
@@ -1154,17 +1163,25 @@ def _guard_existing_db_is_healthy(path: Path) -> None:
     if stat.st_size == 0:
         return
     resolved_str = str(resolved)
-    if resolved_str in _INITIALIZED_PATHS:
+    stat_fingerprint = (stat.st_mtime_ns, stat.st_size)
+    if (
+        resolved_str in _INITIALIZED_PATHS
+        and _INITIALIZED_PATH_FINGERPRINTS.get(resolved_str) == stat_fingerprint
+    ):
         return
 
     # The integrity guard intentionally fails closed, but callers such as
     # gateway notifiers can poll every few seconds. Cache unchanged corrupt
     # fingerprints per process so we keep one representative backup instead
     # of copying the same broken DB forever.
-    stat_fingerprint = (stat.st_mtime_ns, stat.st_size)
     with _INIT_LOCK:
-        if resolved_str in _INITIALIZED_PATHS:
+        if (
+            resolved_str in _INITIALIZED_PATHS
+            and _INITIALIZED_PATH_FINGERPRINTS.get(resolved_str) == stat_fingerprint
+        ):
             return
+        if _INITIALIZED_PATH_FINGERPRINTS.get(resolved_str) != stat_fingerprint:
+            _INITIALIZED_PATHS.discard(resolved_str)
         cached = _CORRUPT_DB_BACKUPS.get(resolved_str)
         if cached is not None and cached[:2] == stat_fingerprint:
             _, _, cached_digest, cached_backup, cached_reason = cached
@@ -1188,6 +1205,7 @@ def _guard_existing_db_is_healthy(path: Path) -> None:
             reason = f"sqlite refused to open file: {exc}"
         if reason is None:
             _CORRUPT_DB_BACKUPS.pop(resolved_str, None)
+            _INITIALIZED_PATH_FINGERPRINTS[resolved_str] = stat_fingerprint
             return
         backup = _backup_corrupt_db(resolved)
         digest = _file_sha256(resolved)
@@ -1258,6 +1276,14 @@ def connect(
                 conn.executescript(SCHEMA_SQL)
                 _migrate_add_optional_columns(conn)
                 _INITIALIZED_PATHS.add(resolved)
+                try:
+                    post_init_stat = path.resolve().stat()
+                    _INITIALIZED_PATH_FINGERPRINTS[resolved] = (
+                        post_init_stat.st_mtime_ns,
+                        post_init_stat.st_size,
+                    )
+                except OSError:
+                    _INITIALIZED_PATH_FINGERPRINTS.pop(resolved, None)
     except Exception:
         conn.close()
         raise
@@ -1289,6 +1315,7 @@ def init_db(
     # schema + migration pass unconditionally.
     with _INIT_LOCK:
         _INITIALIZED_PATHS.discard(resolved)
+        _INITIALIZED_PATH_FINGERPRINTS.pop(resolved, None)
     with contextlib.closing(connect(path)):
         pass
     return path
