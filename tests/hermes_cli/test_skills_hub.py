@@ -1,12 +1,13 @@
 import json
 from io import StringIO
+from pathlib import Path
 from unittest.mock import patch
 
 import pytest
 from rich.console import Console
 
 from cli import ChatConsole
-from hermes_cli.skills_hub import do_check, do_install, do_list, do_update, handle_skills_slash
+from hermes_cli.skills_hub import do_check, do_install, do_inspect, do_list, do_update, handle_skills_slash, inspect_skill
 
 
 class _DummyLockFile:
@@ -849,3 +850,229 @@ def test_browse_skills_dedup_uses_identifier_not_name(monkeypatch):
         "browse_skills() must not deduplicate browse-sh skills with the same name "
         "but different identifiers"
     )
+
+# ---------------------------------------------------------------------------
+# Local-filesystem inspect fallback -- Phase 1 Direction E
+# ---------------------------------------------------------------------------
+
+
+def _make_local_skill_dir(skills_dir: Path, name: str, description: str = "") -> Path:
+    """Create a minimal local skill directory with SKILL.md and frontmatter."""
+    skill_dir = skills_dir / name
+    skill_dir.mkdir(parents=True, exist_ok=True)
+    frontmatter = f"""---
+name: {name}
+description: {description or "A local test skill"}
+---
+
+# {name}
+
+Full content for {name}.
+"""
+    (skill_dir / "SKILL.md").write_text(frontmatter, encoding="utf-8")
+    return skill_dir
+
+
+def test_do_inspect_falls_back_to_local_skill_when_hub_miss(monkeypatch, tmp_path, hub_env):
+    """RED: `do_inspect` cannot inspect a local-only skill that `do_list` shows.
+
+    This test proves the missing fallback: when hub/tap sources have no record
+    of a skill name, `do_inspect` should scan the same local filesystem that
+    `do_list` uses and render the skill's metadata + SKILL.md preview.
+    """
+    import tools.skills_hub as hub
+    import tools.skills_sync as skills_sync
+    import tools.skills_tool as skills_tool
+
+    # Stage a local-only skill in the (monkeypatched) skills directory.
+    local_skill_dir = _make_local_skill_dir(
+        hub.SKILLS_DIR, "local-only-inspect-skill",
+        description="A purely local skill for inspect fallback"
+    )
+
+    # No hub-installed skills, no builtins.
+    monkeypatch.setattr(hub, "HubLockFile", lambda: _DummyLockFile([]))
+    monkeypatch.setattr(skills_sync, "_read_manifest", lambda: {})
+
+    # Prevent do_inspect from trying real network sources (which time out).
+    monkeypatch.setattr(hub, "create_source_router", lambda auth: [])
+
+    # _find_all_skills must use the real scanner so the local skill is visible.
+    # hub_env patches tools.skills_hub.SKILLS_DIR but _find_all_skills lives in
+    # tools.skills_tool and imports its own SKILLS_DIR -- patch that too.
+    monkeypatch.setattr(skills_tool, "SKILLS_DIR", hub.SKILLS_DIR)
+    monkeypatch.setattr(skills_tool, "_get_disabled_skill_names", lambda: set())
+
+    # Run do_list first to confirm the skill is visible locally.
+    list_output = _capture(source_filter="local")
+    assert "local-only-inspect-skill" in list_output, (
+        "Setup error: local skill must be visible to do_list before inspect fallback works"
+    )
+
+    # Now run do_inspect on the local-only skill.
+    sink = StringIO()
+    console = Console(file=sink, force_terminal=False, color_system=None)
+    do_inspect("local-only-inspect-skill", console=console)
+
+    output = sink.getvalue()
+    assert "local-only-inspect-skill" in output, (
+        "Expected do_inspect to find and render the local-only skill"
+    )
+    assert "Full content for local-only-inspect-skill" in output, (
+        "Expected SKILL.md preview to be rendered from local filesystem"
+    )
+
+
+def test_do_inspect_prefers_hub_when_both_exist(monkeypatch, tmp_path, hub_env):
+    """GREEN-slice: when a skill exists both locally and in hub, hub resolution wins."""
+    import tools.skills_hub as hub
+    import tools.skills_sync as skills_sync
+    import tools.skills_tool as skills_tool
+
+    # Stage a local skill with the same name as a hub skill.
+    _make_local_skill_dir(
+        hub.SKILLS_DIR, "hub-and-local-skill",
+        description="Local copy"
+    )
+    monkeypatch.setattr(skills_tool, "SKILLS_DIR", hub.SKILLS_DIR)
+    monkeypatch.setattr(skills_tool, "_get_disabled_skill_names", lambda: set())
+
+    # Hub source resolves successfully.
+    canonical = "github/example/hub-and-local-skill"
+
+    class _HubSource:
+        def inspect(self, identifier):
+            return hub.SkillMeta(
+                name="hub-and-local-skill",
+                description="Hub canonical description",
+                source="github",
+                identifier=canonical,
+                trust_level="trusted",
+            )
+
+        def fetch(self, identifier):
+            return hub.SkillBundle(
+                name="hub-and-local-skill",
+                files={"SKILL.md": "Hub SKILL.md content"},
+                source="github",
+                identifier=canonical,
+                trust_level="trusted",
+            )
+
+    monkeypatch.setattr(hub, "HubLockFile", lambda: _DummyLockFile([]))
+    monkeypatch.setattr(skills_sync, "_read_manifest", lambda: {})
+    monkeypatch.setattr(hub, "create_source_router", lambda auth: [_HubSource()])
+
+    sink = StringIO()
+    console = Console(file=sink, force_terminal=False, color_system=None)
+    do_inspect(canonical, console=console)
+
+    output = sink.getvalue()
+    assert "Hub canonical description" in output
+    assert "Hub SKILL.md content" in output
+    assert "github" in output
+
+
+def test_do_inspect_errors_cleanly_for_truly_missing_skill(monkeypatch, tmp_path, hub_env):
+    """GREEN-slice: a skill that exists neither locally nor in hub emits a clear error."""
+    import tools.skills_hub as hub
+    import tools.skills_sync as skills_sync
+    import tools.skills_tool as skills_tool
+
+    monkeypatch.setattr(hub, "HubLockFile", lambda: _DummyLockFile([]))
+    monkeypatch.setattr(skills_sync, "_read_manifest", lambda: {})
+    monkeypatch.setattr(skills_tool, "SKILLS_DIR", hub.SKILLS_DIR)
+    monkeypatch.setattr(skills_tool, "_get_disabled_skill_names", lambda: set())
+    monkeypatch.setattr(hub, "create_source_router", lambda auth: [])
+
+    sink = StringIO()
+    console = Console(file=sink, force_terminal=False, color_system=None)
+    do_inspect("completely-missing-skill", console=console)
+
+    output = sink.getvalue()
+    assert "Error" in output
+    assert "completely-missing-skill" in output
+
+
+def test_inspect_skill_returns_local_fallback_dict(monkeypatch, tmp_path, hub_env):
+    """GREEN-slice: programmatic `inspect_skill` also falls back to local filesystem."""
+    import tools.skills_hub as hub
+    import tools.skills_sync as skills_sync
+    import tools.skills_tool as skills_tool
+
+    _make_local_skill_dir(
+        hub.SKILLS_DIR, "prog-local-skill",
+        description="Programmatic local fallback"
+    )
+    monkeypatch.setattr(skills_tool, "SKILLS_DIR", hub.SKILLS_DIR)
+    monkeypatch.setattr(skills_tool, "_get_disabled_skill_names", lambda: set())
+    monkeypatch.setattr(hub, "HubLockFile", lambda: _DummyLockFile([]))
+    monkeypatch.setattr(skills_sync, "_read_manifest", lambda: {})
+    monkeypatch.setattr(hub, "create_source_router", lambda auth: [])
+
+    result = inspect_skill("prog-local-skill")
+    assert result is not None
+    assert result["name"] == "prog-local-skill"
+    assert result["source"] == "local"
+    assert "Programmatic local fallback" in result["description"]
+    assert "skill_md_preview" in result
+
+
+def test_inspect_skill_returns_none_for_truly_missing(monkeypatch, tmp_path, hub_env):
+    """GREEN-slice: programmatic `inspect_skill` returns None when skill is absent everywhere."""
+    import tools.skills_hub as hub
+    import tools.skills_sync as skills_sync
+    import tools.skills_tool as skills_tool
+
+    monkeypatch.setattr(skills_tool, "SKILLS_DIR", hub.SKILLS_DIR)
+    monkeypatch.setattr(skills_tool, "_get_disabled_skill_names", lambda: set())
+    monkeypatch.setattr(hub, "HubLockFile", lambda: _DummyLockFile([]))
+    monkeypatch.setattr(skills_sync, "_read_manifest", lambda: {})
+    monkeypatch.setattr(hub, "create_source_router", lambda auth: [])
+
+    result = inspect_skill("no-such-skill-anywhere")
+    assert result is None
+
+
+# ---------------------------------------------------------------------------
+# Local-filesystem inspect fallback -- FALSE-ERROR REPAIR
+# ---------------------------------------------------------------------------
+
+
+def test_do_inspect_local_fallback_does_not_print_false_error(monkeypatch, tmp_path, hub_env):
+    """RED: `do_inspect` on a local-only short name must NOT print a false
+    `Error: No skill named ... found in any source` before successfully
+    rendering the local skill.
+
+    This is the blocker from review t_b1408cf0.
+    """
+    import tools.skills_hub as hub
+    import tools.skills_sync as skills_sync
+    import tools.skills_tool as skills_tool
+
+    # Stage a local-only skill.
+    _make_local_skill_dir(
+        hub.SKILLS_DIR, "false-error-local-skill",
+        description="A local skill that should not trigger a false error"
+    )
+    monkeypatch.setattr(skills_tool, "SKILLS_DIR", hub.SKILLS_DIR)
+    monkeypatch.setattr(skills_tool, "_get_disabled_skill_names", lambda: set())
+    monkeypatch.setattr(hub, "HubLockFile", lambda: _DummyLockFile([]))
+    monkeypatch.setattr(skills_sync, "_read_manifest", lambda: {})
+    monkeypatch.setattr(hub, "create_source_router", lambda auth: [])
+
+    sink = StringIO()
+    console = Console(file=sink, force_terminal=False, color_system=None)
+    do_inspect("false-error-local-skill", console=console)
+
+    output = sink.getvalue()
+    # The fix: no false "Error:" and no "No skill named ... found" noise.
+    assert "Error:" not in output, (
+        "do_inspect must not print a false error when local fallback succeeds"
+    )
+    assert "No skill named" not in output, (
+        "do_inspect must not print the not-found message when local fallback succeeds"
+    )
+    # But the skill must still be rendered.
+    assert "false-error-local-skill" in output
+    assert "A local skill that should not trigger a false error" in output
