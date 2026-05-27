@@ -332,6 +332,30 @@ word word
             result = _patch_skill("nonexistent", "old", "new")
         assert result["success"] is False
 
+    def test_patch_rejects_direct_lookup_path_traversal(self, tmp_path):
+        outside = tmp_path / "outside-skill"
+        outside.mkdir()
+        (outside / "SKILL.md").write_text(VALID_SKILL_CONTENT)
+
+        skills_dir = tmp_path / "skills"
+        skills_dir.mkdir()
+        with _skill_dir(skills_dir):
+            result = _patch_skill("../outside-skill", "Do the thing.", "Do the new thing.")
+
+        assert result["success"] is False
+        assert "Do the thing." in (outside / "SKILL.md").read_text()
+
+    def test_patch_rejects_direct_lookup_excluded_dirs(self, tmp_path):
+        archive_skill = tmp_path / ".archive" / "archived-skill"
+        archive_skill.mkdir(parents=True)
+        (archive_skill / "SKILL.md").write_text(VALID_SKILL_CONTENT)
+
+        with _skill_dir(tmp_path):
+            result = _patch_skill(".archive/archived-skill", "Do the thing.", "Do the new thing.")
+
+        assert result["success"] is False
+        assert "Do the thing." in (archive_skill / "SKILL.md").read_text()
+
     def test_patch_supporting_file_symlink_escape_blocked(self, tmp_path):
         outside_file = tmp_path / "outside.txt"
         outside_file.write_text("old text here")
@@ -724,6 +748,76 @@ class TestExternalSkillMutations:
     workaround.
     """
 
+    def test_patch_skill_garden_symlinked_category_skill_by_bare_name(self, tmp_path):
+        """Skill Garden dev-links visible to skill_view must be editable too.
+
+        Runtime skill loading follows symlinked category directories such as
+        ~/.hermes/skills/devops/foo -> ~/dev/hermes-stuff/skills/foo. The
+        write resolver must not miss the same active skill and suggest creating
+        a duplicate or switching profiles.
+        """
+        local = tmp_path / "local"
+        garden = tmp_path / "hermes-stuff" / "skills"
+        local.mkdir()
+        garden.mkdir(parents=True)
+        skill_dir = _write_external_skill(garden, name="garden-skill")
+        category = local / "devops"
+        category.mkdir()
+        link = category / "garden-skill"
+        try:
+            link.symlink_to(skill_dir, target_is_directory=True)
+        except OSError:
+            pytest.skip("Symlinks not supported")
+
+        with _two_roots(local, tmp_path / "unused-external"):
+            result = _patch_skill("garden-skill", "OLD_MARKER", "NEW_MARKER")
+
+        assert result["success"] is True, result
+        assert "NEW_MARKER" in (skill_dir / "SKILL.md").read_text()
+        assert not (local / "garden-skill").exists()
+
+    def test_patch_skill_garden_symlinked_category_skill_by_namespace_fallback(self, tmp_path):
+        """skill_view accepts category:skill as local category fallback; writes should too."""
+        local = tmp_path / "local"
+        garden = tmp_path / "hermes-stuff" / "skills"
+        local.mkdir()
+        garden.mkdir(parents=True)
+        skill_dir = _write_external_skill(garden, name="garden-skill")
+        category = local / "devops"
+        category.mkdir()
+        link = category / "garden-skill"
+        try:
+            link.symlink_to(skill_dir, target_is_directory=True)
+        except OSError:
+            pytest.skip("Symlinks not supported")
+
+        with _two_roots(local, tmp_path / "unused-external"):
+            result = _patch_skill("devops:garden-skill", "OLD_MARKER", "NEW_MARKER")
+
+        assert result["success"] is True, result
+        assert "NEW_MARKER" in (skill_dir / "SKILL.md").read_text()
+
+    def test_patch_skill_garden_symlinked_category_skill_by_slash_path(self, tmp_path):
+        """Direct category/path names that skill_view accepts should be writable."""
+        local = tmp_path / "local"
+        garden = tmp_path / "hermes-stuff" / "skills"
+        local.mkdir()
+        garden.mkdir(parents=True)
+        skill_dir = _write_external_skill(garden, name="garden-skill")
+        category = local / "devops"
+        category.mkdir()
+        link = category / "garden-skill"
+        try:
+            link.symlink_to(skill_dir, target_is_directory=True)
+        except OSError:
+            pytest.skip("Symlinks not supported")
+
+        with _two_roots(local, tmp_path / "unused-external"):
+            result = _patch_skill("devops/garden-skill", "OLD_MARKER", "NEW_MARKER")
+
+        assert result["success"] is True, result
+        assert "NEW_MARKER" in (skill_dir / "SKILL.md").read_text()
+
     def test_patch_external_skill_writes_in_place(self, tmp_path):
         local = tmp_path / "local"
         external = tmp_path / "vault"
@@ -819,6 +913,29 @@ class TestExternalSkillMutations:
         assert not skill_dir.exists()
         assert not cat_dir.exists()  # empty category cleaned up
         assert external.exists()     # but never the external root
+
+    def test_delete_symlinked_skill_garden_skill_is_refused(self, tmp_path):
+        """Resolver parity must not turn delete into accidental dev-link removal."""
+        local = tmp_path / "local"
+        garden = tmp_path / "hermes-stuff" / "skills"
+        local.mkdir()
+        garden.mkdir(parents=True)
+        skill_dir = _write_external_skill(garden, name="garden-skill")
+        category = local / "devops"
+        category.mkdir()
+        link = category / "garden-skill"
+        try:
+            link.symlink_to(skill_dir, target_is_directory=True)
+        except OSError:
+            pytest.skip("Symlinks not supported")
+
+        with _two_roots(local, tmp_path / "unused-external"):
+            result = _delete_skill("garden-skill")
+
+        assert result["success"] is False
+        assert "symlink" in result["error"].lower()
+        assert link.is_symlink()
+        assert (skill_dir / "SKILL.md").exists()
 
     def test_create_still_writes_to_local_root(self, tmp_path):
         """Creating a new skill always lands in local SKILLS_DIR, never
