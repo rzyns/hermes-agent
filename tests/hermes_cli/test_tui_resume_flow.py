@@ -358,6 +358,7 @@ def test_termux_fast_cli_launch_oneshot_uses_light_parser(monkeypatch, main_mod)
     monkeypatch.setattr(
         main_mod, "_prepare_agent_startup", lambda args: prepared.append(args.command)
     )
+    monkeypatch.setattr(main_mod, "_exit_oneshot", lambda code: (_ for _ in ()).throw(SystemExit(code)))
     monkeypatch.setitem(
         sys.modules,
         "hermes_cli.oneshot",
@@ -590,6 +591,7 @@ def test_main_top_level_oneshot_accepts_toolsets(monkeypatch, main_mod):
     )
     monkeypatch.setattr(config_mod, "load_config", lambda: {})
     monkeypatch.setattr(config_mod, "get_container_exec_info", lambda: None)
+    monkeypatch.setattr(main_mod, "_exit_oneshot", lambda code: (_ for _ in ()).throw(SystemExit(code)))
     monkeypatch.setitem(
         sys.modules,
         "agent.shell_hooks",
@@ -1001,3 +1003,4 @@ def test_print_tui_exit_summary_prefers_actual_active_session_file(
     assert seen == ["actual_session"]
     assert "hermes --tui --resume actual_session" in out
     assert "startup_resume" not in out
+

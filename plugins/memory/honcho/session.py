@@ -545,9 +545,11 @@ class HonchoSessionManager:
     def shutdown(self) -> None:
         """Gracefully shut down the async writer thread."""
         if self._async_queue is not None and self._async_thread is not None:
-            self.flush_all()
-            self._async_queue.put(_ASYNC_SHUTDOWN)
-            self._async_thread.join(timeout=10)
+            try:
+                self.flush_all()
+            finally:
+                self._async_queue.put(_ASYNC_SHUTDOWN)
+                self._async_thread.join(timeout=10)
 
     def delete(self, key: str) -> bool:
         """Delete a session from local cache."""

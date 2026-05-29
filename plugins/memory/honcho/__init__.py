@@ -199,6 +199,7 @@ class HonchoMemoryProvider(MemoryProvider):
         self._prefetch_lock = threading.Lock()
         self._prefetch_thread: Optional[threading.Thread] = None
         self._sync_thread: Optional[threading.Thread] = None
+        self._shutdown_event = threading.Event()
 
         # B1: recall_mode — set during initialize from config
         self._recall_mode = "hybrid"  # "context", "tools", or "hybrid"
@@ -705,7 +706,7 @@ class HonchoMemoryProvider(MemoryProvider):
         Context refresh updates the base layer (representation + card).
         Dialectic fires the LLM reasoning supplement.
         """
-        if self._cron_skipped:
+        if self._cron_skipped or self._shutdown_event.is_set():
             return
         if not self._manager or not self._session_key or not query:
             return
@@ -751,6 +752,8 @@ class HonchoMemoryProvider(MemoryProvider):
         _fired_at = self._turn_count
 
         def _run():
+            if self._shutdown_event.is_set():
+                return
             try:
                 result = self._run_dialectic_depth(query)
             except Exception as e:
@@ -758,6 +761,8 @@ class HonchoMemoryProvider(MemoryProvider):
                 self._dialectic_empty_streak += 1
                 return
             if result and result.strip():
+                if self._shutdown_event.is_set():
+                    return
                 with self._prefetch_lock:
                     self._prefetch_result = result
                     self._prefetch_result_fired_at = _fired_at
@@ -960,6 +965,8 @@ class HonchoMemoryProvider(MemoryProvider):
         results: list[str] = []
 
         for i in range(self._dialectic_depth):
+            if self._shutdown_event.is_set():
+                return ""
             if i == 0:
                 prompt = self._build_dialectic_prompt(0, results, is_cold)
             else:
@@ -1122,7 +1129,7 @@ class HonchoMemoryProvider(MemoryProvider):
         Messages exceeding the Honcho API limit (default 25k chars) are
         split into multiple messages with continuation markers.
         """
-        if self._cron_skipped:
+        if self._cron_skipped or self._shutdown_event.is_set():
             return
         if not self._manager or not self._session_key:
             return
@@ -1132,6 +1139,8 @@ class HonchoMemoryProvider(MemoryProvider):
         clean_assistant_content = sanitize_context(assistant_content or "").strip()
 
         def _sync():
+            if self._shutdown_event.is_set():
+                return
             try:
                 session = self._manager.get_or_create(self._session_key)
                 for chunk in self._chunk_message(clean_user_content, msg_limit):
@@ -1165,7 +1174,7 @@ class HonchoMemoryProvider(MemoryProvider):
         """
         if action != "add" or target != "user" or not content:
             return
-        if self._cron_skipped:
+        if self._cron_skipped or self._shutdown_event.is_set():
             return
         if not self._manager or not self._session_key:
             return
@@ -1307,15 +1316,47 @@ class HonchoMemoryProvider(MemoryProvider):
             return tool_error(f"Honcho {tool_name} failed: {e}")
 
     def shutdown(self) -> None:
+        self._shutdown_event.set()
+        self._close_honcho_client()
         for t in (self._prefetch_thread, self._sync_thread):
             if t and t.is_alive():
                 t.join(timeout=5.0)
-        # Flush any remaining messages
+        # Flush any remaining messages and stop the manager-owned async writer.
+        # Calling only flush_all() leaves the daemon writer thread alive until
+        # interpreter shutdown, which can abort CPython when the thread is still
+        # inside Honcho/httpx response validation during oneshot CLI exit.
         if self._manager:
             try:
-                self._manager.flush_all()
+                self._manager.shutdown()
             except Exception:
                 pass
+
+    def _close_honcho_client(self) -> None:
+        """Best-effort close of Honcho/httpx clients to interrupt shutdown reads."""
+        try:
+            client = getattr(self._manager, "_honcho", None) if self._manager else None
+            if client is None:
+                return
+            try:
+                http_client = client._get_http_client()
+            except Exception:
+                http_client = None
+            if http_client is not None and hasattr(http_client, "close"):
+                try:
+                    http_client.close()
+                except Exception:
+                    pass
+            async_http_client = getattr(client, "_async_http_client", None)
+            raw_async = getattr(async_http_client, "_client", None)
+            if raw_async is not None and getattr(raw_async, "is_closed", True) is False:
+                try:
+                    import asyncio
+
+                    asyncio.run(raw_async.aclose())
+                except Exception:
+                    pass
+        except Exception:
+            pass
 
 
 # ---------------------------------------------------------------------------

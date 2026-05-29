@@ -65,6 +65,22 @@ import os
 import sys
 
 
+def _exit_oneshot(code: int) -> None:
+    """Exit after top-level oneshot without running CPython finalizers.
+
+    ``hermes -z`` performs explicit agent/global cleanup before returning from
+    ``run_oneshot``.  Some optional provider stacks can still leave native
+    finalizers in a racy state during interpreter shutdown, so the process
+    boundary exits directly after flushing stdio.
+    """
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.flush()
+        except Exception:
+            pass
+    os._exit(code)
+
+
 # Mouse-tracking residue suppression — runs BEFORE every other import on the
 # TUI hot path so the terminal stops emitting SGR/X10 mouse reports while the
 # Python launcher is still doing imports (≈100–300ms in cooked + echo mode,
@@ -11291,7 +11307,7 @@ def _try_termux_fast_cli_launch() -> bool:
         _prepare_agent_startup(args)
         from hermes_cli.oneshot import run_oneshot
 
-        sys.exit(
+        _exit_oneshot(
             run_oneshot(
                 args.oneshot,
                 model=getattr(args, "model", None),
@@ -14398,7 +14414,7 @@ Examples:
     if getattr(args, "oneshot", None):
         from hermes_cli.oneshot import run_oneshot
 
-        sys.exit(
+        _exit_oneshot(
             run_oneshot(
                 args.oneshot,
                 model=getattr(args, "model", None),
