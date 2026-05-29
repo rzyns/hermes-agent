@@ -5603,7 +5603,6 @@ def _model_flow_bedrock(config, current_model=""):
 def _model_flow_api_key_provider(config, provider_id, current_model=""):
     """Generic flow for API-key providers (z.ai, MiniMax, OpenCode, etc.)."""
     from hermes_cli.auth import (
-        LMSTUDIO_NOAUTH_PLACEHOLDER,
         PROVIDER_REGISTRY,
         _prompt_model_selection,
         _save_model_choice,
@@ -13001,7 +13000,34 @@ Examples:
     )
     plugins_remove.add_argument("name", help="Plugin directory name to remove")
 
-    plugins_subparsers.add_parser("list", aliases=["ls"], help="List installed plugins")
+    plugins_list = plugins_subparsers.add_parser(
+        "list", aliases=["ls"], help="List installed plugins"
+    )
+    plugins_list.add_argument(
+        "--enabled",
+        action="store_true",
+        help="Show only enabled plugins",
+    )
+    plugins_list.add_argument(
+        "--user",
+        action="store_true",
+        help="Show only user-installed plugins (including git plugins)",
+    )
+    plugins_list.add_argument(
+        "--no-bundled",
+        action="store_true",
+        help="Hide bundled plugins",
+    )
+    plugins_list.add_argument(
+        "--plain",
+        action="store_true",
+        help="Print compact plain-text output instead of a Rich table",
+    )
+    plugins_list.add_argument(
+        "--json",
+        action="store_true",
+        help="Print machine-readable JSON",
+    )
 
     plugins_enable = plugins_subparsers.add_parser(
         "enable", help="Enable a disabled plugin"
