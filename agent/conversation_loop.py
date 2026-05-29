@@ -75,7 +75,20 @@ logger = logging.getLogger(__name__)
 
 def _ollama_context_limit_error(agent: Any, request_tokens: int) -> Optional[str]:
     """Return a user-facing error when Ollama is loaded with too little context."""
-    if not getattr(agent, "tools", None):
+    return _ollama_context_limit_error_for_tools(
+        agent,
+        request_tokens,
+        getattr(agent, "tools", None),
+    )
+
+
+def _ollama_context_limit_error_for_tools(
+    agent: Any,
+    request_tokens: int,
+    tools_for_request: Optional[List[dict]],
+) -> Optional[str]:
+    """Return the Ollama context error for the request-local tool set."""
+    if not tools_for_request:
         return None
 
     runtime_ctx = getattr(agent, "_ollama_num_ctx", None)
@@ -87,7 +100,7 @@ def _ollama_context_limit_error(agent: Any, request_tokens: int) -> Optional[str
     model = getattr(agent, "model", "") or "the selected model"
     base_url = getattr(agent, "base_url", "") or "unknown base URL"
     provider = getattr(agent, "provider", "") or "unknown"
-    tool_count = len(getattr(agent, "tools", None) or [])
+    tool_count = len(tools_for_request or [])
 
     logger.warning(
         "Ollama runtime context too small for Hermes tool use: "
@@ -115,6 +128,55 @@ def _ollama_context_limit_error(agent: Any, request_tokens: int) -> Optional[str
         "model context). If you manage the model through an Ollama Modelfile, "
         "set `PARAMETER num_ctx 65536` there instead."
     )
+
+
+def _select_tool_schemas_for_request(
+    agent: Any,
+    original_user_message: Any,
+    messages: List[dict],
+) -> Optional[List[dict]]:
+    """Return request-local tool schemas after plugin selection hooks.
+
+    The canonical ``agent.tools`` catalog is intentionally not mutated here.
+    Selectors receive a shallow copy of the enabled schema list. The first
+    hook result that is a list wins; malformed/no results fail open to the
+    original request-local copy. An empty list is a valid selector result and
+    means "send no tools for this request".
+    """
+    canonical_tools = getattr(agent, "tools", None)
+    if not canonical_tools:
+        return canonical_tools
+
+    tools_for_request = list(canonical_tools)
+    try:
+        from hermes_cli.plugins import invoke_hook as _invoke_hook
+
+        results = _invoke_hook(
+            "select_tool_schemas",
+            session_id=getattr(agent, "session_id", None) or "",
+            user_message=original_user_message,
+            conversation_history=list(messages),
+            schemas=tools_for_request,
+            model=getattr(agent, "model", "") or "",
+            platform=getattr(agent, "platform", None) or "",
+            provider=(
+                getattr(agent, "provider", None)
+                or getattr(agent, "model_provider", None)
+            ),
+        )
+    except Exception as exc:
+        logger.warning("select_tool_schemas hook failed; using original tools: %s", exc)
+        return tools_for_request
+
+    schema_lists = [result for result in results if isinstance(result, list)]
+    if not schema_lists:
+        return tools_for_request
+
+    if len(schema_lists) > 1:
+        logger.warning(
+            "Multiple select_tool_schemas hooks returned schemas; using the first result"
+        )
+    return schema_lists[0]
 
 
 def _ra():
@@ -1056,15 +1118,27 @@ def run_conversation(
         # the OpenAI SDK. Sanitizing here prevents the 3-retry cycle.
         _sanitize_messages_surrogates(api_messages)
 
+        # Apply request-local tool schema selection after the final API-message
+        # copy is built, but before request sizing/provider kwargs construction.
+        # The canonical ``agent.tools`` catalog remains untouched so selection
+        # never becomes sticky across retries, iterations, or turns.
+        tools_for_request = _select_tool_schemas_for_request(
+            agent,
+            original_user_message,
+            messages,
+        )
+
         # Calculate approximate request size for logging
         total_chars = sum(len(str(msg)) for msg in api_messages)
         approx_tokens = estimate_messages_tokens_rough(api_messages)
         approx_request_tokens = estimate_request_tokens_rough(
-            api_messages, tools=agent.tools or None
+            api_messages, tools=tools_for_request or None
         )
 
-        _runtime_context_error = _ollama_context_limit_error(
-            agent, approx_request_tokens
+        _runtime_context_error = _ollama_context_limit_error_for_tools(
+            agent,
+            approx_request_tokens,
+            tools_for_request,
         )
         if _runtime_context_error:
             final_response = _runtime_context_error
@@ -1086,7 +1160,7 @@ def run_conversation(
         if not agent.quiet_mode:
             agent._vprint(f"\n{agent.log_prefix}🔄 Making API call #{api_call_count}/{agent.max_iterations}...")
             agent._vprint(f"{agent.log_prefix}   📊 Request size: {len(api_messages)} messages, ~{approx_tokens:,} tokens (~{total_chars:,} chars)")
-            agent._vprint(f"{agent.log_prefix}   🔧 Available tools: {len(agent.tools) if agent.tools else 0}")
+            agent._vprint(f"{agent.log_prefix}   🔧 Available tools: {len(tools_for_request) if tools_for_request is not None else 0}")
         else:
             # Animated thinking spinner in quiet mode
             face = random.choice(KawaiiSpinner.get_thinking_faces())
@@ -1104,7 +1178,7 @@ def run_conversation(
         
         # Log request details if verbose
         if agent.verbose_logging:
-            logging.debug(f"API Request - Model: {agent.model}, Messages: {len(messages)}, Tools: {len(agent.tools) if agent.tools else 0}")
+            logging.debug(f"API Request - Model: {agent.model}, Messages: {len(messages)}, Tools: {len(tools_for_request) if tools_for_request is not None else 0}")
             logging.debug(f"Last message role: {messages[-1]['role'] if messages else 'none'}")
             logging.debug(f"Total message size: ~{approx_tokens:,} tokens")
         
@@ -1191,7 +1265,12 @@ def run_conversation(
                 # unless the active provider needs it) so the fallback request
                 # isn't sent with stale, primary-shaped reasoning fields.
                 agent._reapply_reasoning_echo_for_provider(api_messages)
-                api_kwargs = agent._build_api_kwargs(api_messages)
+                original_tools = agent.tools
+                agent.tools = tools_for_request
+                try:
+                    api_kwargs = agent._build_api_kwargs(api_messages)
+                finally:
+                    agent.tools = original_tools
                 if agent._force_ascii_payload:
                     _sanitize_structure_non_ascii(api_kwargs)
                 if agent.api_mode == "codex_responses":
@@ -1224,7 +1303,7 @@ def run_conversation(
                         api_call_count=api_call_count,
                         request_messages=list(request_messages) if isinstance(request_messages, list) else [],
                         message_count=len(api_messages),
-                        tool_count=len(agent.tools or []),
+                        tool_count=len(tools_for_request) if tools_for_request is not None else 0,
                         approx_input_tokens=approx_tokens,
                         request_char_count=total_chars,
                         max_tokens=agent.max_tokens,
