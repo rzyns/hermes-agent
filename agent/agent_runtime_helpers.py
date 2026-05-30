@@ -1612,33 +1612,82 @@ def invoke_tool(agent, function_name: str, function_args: dict, effective_task_i
     tools. Used by the concurrent execution path; the sequential path retains
     its own inline invocation for backward-compatible display handling.
     """
+    turn_id = getattr(agent, "_current_turn_id", "") or ""
+
     # Check plugin hooks for a block directive before executing anything.
     block_message: Optional[str] = None
     if not pre_tool_block_checked:
         try:
             from hermes_cli.plugins import get_pre_tool_call_block_message
             block_message = get_pre_tool_call_block_message(
-                function_name, function_args, task_id=effective_task_id or "",
+                function_name,
+                function_args,
+                task_id=effective_task_id or "",
+                session_id=agent.session_id or "",
+                tool_call_id=tool_call_id or "",
+                turn_id=turn_id,
             )
         except Exception:
             pass
     if block_message is not None:
         return json.dumps({"error": block_message}, ensure_ascii=False)
 
+    direct_dispatch_started = time.monotonic()
+
+    def _finish_direct_tool(result: str) -> str:
+        """Emit the normal post/transform hook seam for agent-level tools."""
+        duration_ms = int((time.monotonic() - direct_dispatch_started) * 1000)
+        try:
+            from hermes_cli.plugins import invoke_hook
+            invoke_hook(
+                "post_tool_call",
+                tool_name=function_name,
+                args=function_args,
+                result=result,
+                task_id=effective_task_id or "",
+                session_id=agent.session_id or "",
+                tool_call_id=tool_call_id or "",
+                duration_ms=duration_ms,
+                turn_id=turn_id,
+            )
+        except Exception as _hook_err:
+            logger.debug("post_tool_call hook error: %s", _hook_err)
+
+        try:
+            from hermes_cli.plugins import invoke_hook
+            hook_results = invoke_hook(
+                "transform_tool_result",
+                tool_name=function_name,
+                args=function_args,
+                result=result,
+                task_id=effective_task_id or "",
+                session_id=agent.session_id or "",
+                tool_call_id=tool_call_id or "",
+                duration_ms=duration_ms,
+                turn_id=turn_id,
+            )
+            for hook_result in hook_results:
+                if isinstance(hook_result, str):
+                    return hook_result
+        except Exception as _hook_err:
+            logger.debug("transform_tool_result hook error: %s", _hook_err)
+        return result
+
     if function_name == "todo":
         from tools.todo_tool import todo_tool as _todo_tool
-        return _todo_tool(
+        result = _todo_tool(
             todos=function_args.get("todos"),
             merge=function_args.get("merge", False),
             store=agent._todo_store,
         )
+        return _finish_direct_tool(result)
     elif function_name == "session_search":
         session_db = agent._get_session_db_for_recall()
         if not session_db:
             from hermes_state import format_session_db_unavailable
-            return json.dumps({"success": False, "error": format_session_db_unavailable()})
+            return _finish_direct_tool(json.dumps({"success": False, "error": format_session_db_unavailable()}))
         from tools.session_search_tool import session_search as _session_search
-        return _session_search(
+        result = _session_search(
             query=function_args.get("query", ""),
             role_filter=function_args.get("role_filter"),
             limit=function_args.get("limit", 3),
@@ -1649,6 +1698,7 @@ def invoke_tool(agent, function_name: str, function_args: dict, effective_task_i
             db=session_db,
             current_session_id=agent.session_id,
         )
+        return _finish_direct_tool(result)
     elif function_name == "memory":
         target = function_args.get("target", "memory")
         from tools.memory_tool import memory_tool as _memory_tool
@@ -1673,18 +1723,21 @@ def invoke_tool(agent, function_name: str, function_args: dict, effective_task_i
                 )
             except Exception:
                 pass
-        return result
+        return _finish_direct_tool(result)
     elif agent._memory_manager and agent._memory_manager.has_tool(function_name):
-        return agent._memory_manager.handle_tool_call(function_name, function_args)
+        result = agent._memory_manager.handle_tool_call(function_name, function_args)
+        return _finish_direct_tool(result)
     elif function_name == "clarify":
         from tools.clarify_tool import clarify_tool as _clarify_tool
-        return _clarify_tool(
+        result = _clarify_tool(
             question=function_args.get("question", ""),
             choices=function_args.get("choices"),
             callback=agent.clarify_callback,
         )
+        return _finish_direct_tool(result)
     elif function_name == "delegate_task":
-        return agent._dispatch_delegate_task(function_args)
+        result = agent._dispatch_delegate_task(function_args)
+        return _finish_direct_tool(result)
     else:
         return _ra().handle_function_call(
             function_name, function_args, effective_task_id,
@@ -1692,6 +1745,9 @@ def invoke_tool(agent, function_name: str, function_args: dict, effective_task_i
             session_id=agent.session_id or "",
             enabled_tools=list(agent.valid_tool_names) if agent.valid_tool_names else None,
             skip_pre_tool_call_hook=True,
+            turn_id=turn_id,
+            enabled_toolsets=getattr(agent, "enabled_toolsets", None),
+            disabled_toolsets=getattr(agent, "disabled_toolsets", None),
         )
 
 

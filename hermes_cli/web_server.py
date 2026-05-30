@@ -320,9 +320,7 @@ _SCHEMA_OVERRIDES: Dict[str, Dict[str, Any]] = {
     "stt.provider": {
         "type": "select",
         "description": "Speech-to-text provider",
-        # "mistral" temporarily removed — mistralai PyPI package quarantined
-        # (malicious 2.4.6 release on 2026-05-12). Restore once available.
-        "options": ["local", "openai"],
+        "options": ["local", "openai", "mistral"],
     },
     "display.skin": {
         "type": "select",
@@ -1898,8 +1896,7 @@ async def _start_device_code_flow(provider_id: str) -> Dict[str, Any]:
     """
     if provider_id == "nous":
         from hermes_cli.auth import (
-            _nous_device_scope_with_env_override,
-            _request_nous_device_code_with_scope_fallback,
+            _request_device_code,
             PROVIDER_REGISTRY,
         )
         import httpx
@@ -1910,22 +1907,21 @@ async def _start_device_code_flow(provider_id: str) -> Dict[str, Any]:
             or pconfig.portal_base_url
         ).rstrip("/")
         client_id = pconfig.client_id
-        scope, explicit_scope = _nous_device_scope_with_env_override(
-            None,
-            default_scope=pconfig.scope,
-        )
+        scope = pconfig.scope
 
         def _do_nous_device_request():
             with httpx.Client(
                 timeout=httpx.Timeout(15.0),
                 headers={"Accept": "application/json"},
             ) as client:
-                return _request_nous_device_code_with_scope_fallback(
-                    client=client,
-                    portal_base_url=portal_base_url,
-                    client_id=client_id,
-                    scope=scope,
-                    allow_legacy_fallback=not explicit_scope,
+                return (
+                    _request_device_code(
+                        client=client,
+                        portal_base_url=portal_base_url,
+                        client_id=client_id,
+                        scope=scope,
+                    ),
+                    scope,
                 )
 
         device_data, effective_scope = await asyncio.get_running_loop().run_in_executor(
@@ -2067,7 +2063,6 @@ async def _start_device_code_flow(provider_id: str) -> Dict[str, Any]:
 def _nous_poller(session_id: str) -> None:
     """Background poller that drives a Nous device-code flow to completion."""
     from hermes_cli.auth import (
-        NOUS_INFERENCE_AUTH_MODE_FRESH,
         _poll_for_token,
         refresh_nous_oauth_from_state,
     )
@@ -2093,7 +2088,7 @@ def _nous_poller(session_id: str) -> None:
                 expires_in=expires_in,
                 poll_interval=interval,
             )
-        # Same post-processing as _nous_device_code_login (mint agent key)
+        # Same post-processing as _nous_device_code_login (validate/refresh JWT)
         now = datetime.now(timezone.utc)
         token_ttl = int(token_data.get("expires_in") or 0)
         auth_state = {
@@ -2113,10 +2108,8 @@ def _nous_poller(session_id: str) -> None:
         }
         full_state = refresh_nous_oauth_from_state(
             auth_state,
-            min_key_ttl_seconds=300,
             timeout_seconds=15.0,
             force_refresh=False,
-            inference_auth_mode=NOUS_INFERENCE_AUTH_MODE_FRESH,
         )
         from hermes_cli.auth import persist_nous_credentials
         persist_nous_credentials(full_state)
@@ -3378,9 +3371,14 @@ _LOOPBACK_HOSTS = frozenset({"127.0.0.1", "::1", "localhost", "testclient"})
 def _ws_client_is_allowed(ws: "WebSocket") -> bool:
     """Check if the WebSocket client IP is acceptable.
 
-    Loopback mode: only loopback clients allowed — the legacy
+    Loopback bind: only loopback clients allowed — the legacy
     ``?token=<_SESSION_TOKEN>`` path is the only auth we have, so we
     don't want LAN hosts guessing tokens.
+
+    All-interfaces insecure bind (``--host 0.0.0.0 --insecure`` or
+    ``--host :: --insecure``): allow any peer. The operator explicitly
+    opted into LAN/public exposure in this mode, so the loopback-only peer
+    restriction should not apply.
 
     Gated mode: any peer is allowed — uvicorn's ``proxy_headers=True``
     (enabled when the OAuth gate is active so cookies can pick up
@@ -3391,6 +3389,9 @@ def _ws_client_is_allowed(ws: "WebSocket") -> bool:
     blocks DNS-rebinding here, not the peer IP.
     """
     if getattr(app.state, "auth_required", False):
+        return True
+    bound_host = getattr(app.state, "bound_host", "")
+    if bound_host in {"0.0.0.0", "::"}:
         return True
     client_host = ws.client.host if ws.client else ""
     if not client_host:
