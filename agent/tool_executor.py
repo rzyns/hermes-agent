@@ -192,7 +192,12 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
             try:
                 from hermes_cli.plugins import get_pre_tool_call_block_message
                 block_message = get_pre_tool_call_block_message(
-                    function_name, function_args, task_id=effective_task_id or "",
+                    function_name,
+                    function_args,
+                    task_id=effective_task_id or "",
+                    session_id=agent.session_id or "",
+                    tool_call_id=tool_call.id or "",
+                    turn_id=getattr(agent, "_current_turn_id", ""),
                 )
             except Exception:
                 block_message = None
@@ -598,7 +603,12 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
             try:
                 from hermes_cli.plugins import get_pre_tool_call_block_message
                 _block_msg = get_pre_tool_call_block_message(
-                    function_name, function_args, task_id=effective_task_id or "",
+                    function_name,
+                    function_args,
+                    task_id=effective_task_id or "",
+                    session_id=agent.session_id or "",
+                    tool_call_id=tool_call.id or "",
+                    turn_id=getattr(agent, "_current_turn_id", ""),
                 )
             except Exception:
                 pass
@@ -682,6 +692,7 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
                 pass  # never block tool execution
 
         tool_start_time = time.time()
+        _direct_tool_hooks_needed = False
 
         if _block_msg is not None:
             # Tool blocked by plugin policy — return error without executing.
@@ -693,6 +704,7 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
             function_result = agent._guardrail_block_result(_guardrail_block_decision)
             tool_duration = 0.0
         elif function_name == "todo":
+            _direct_tool_hooks_needed = True
             from tools.todo_tool import todo_tool as _todo_tool
             function_result = _todo_tool(
                 todos=function_args.get("todos"),
@@ -703,6 +715,7 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
             if agent._should_emit_quiet_tool_messages():
                 agent._vprint(f"  {_get_cute_tool_message_impl('todo', function_args, tool_duration, result=function_result)}")
         elif function_name == "session_search":
+            _direct_tool_hooks_needed = True
             session_db = agent._get_session_db_for_recall()
             if not session_db:
                 from hermes_state import format_session_db_unavailable
@@ -724,6 +737,7 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
             if agent._should_emit_quiet_tool_messages():
                 agent._vprint(f"  {_get_cute_tool_message_impl('session_search', function_args, tool_duration, result=function_result)}")
         elif function_name == "memory":
+            _direct_tool_hooks_needed = True
             target = function_args.get("target", "memory")
             from tools.memory_tool import memory_tool as _memory_tool
             function_result = _memory_tool(
@@ -751,6 +765,7 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
             if agent._should_emit_quiet_tool_messages():
                 agent._vprint(f"  {_get_cute_tool_message_impl('memory', function_args, tool_duration, result=function_result)}")
         elif function_name == "clarify":
+            _direct_tool_hooks_needed = True
             from tools.clarify_tool import clarify_tool as _clarify_tool
             function_result = _clarify_tool(
                 question=function_args.get("question", ""),
@@ -761,6 +776,7 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
             if agent._should_emit_quiet_tool_messages():
                 agent._vprint(f"  {_get_cute_tool_message_impl('clarify', function_args, tool_duration, result=function_result)}")
         elif function_name == "delegate_task":
+            _direct_tool_hooks_needed = True
             tasks_arg = function_args.get("tasks")
             if tasks_arg and isinstance(tasks_arg, list):
                 spinner_label = f"🔀 delegating {len(tasks_arg)} tasks · (/agents to monitor)"
@@ -790,6 +806,7 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
                 elif agent._should_emit_quiet_tool_messages():
                     agent._vprint(f"  {cute_msg}")
         elif agent._context_engine_tool_names and function_name in agent._context_engine_tool_names:
+            _direct_tool_hooks_needed = True
             # Context engine tools (lcm_grep, lcm_describe, lcm_expand, etc.)
             spinner = None
             if agent._should_emit_quiet_tool_messages():
@@ -813,6 +830,7 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
                 elif agent._should_emit_quiet_tool_messages():
                     agent._vprint(f"  {cute_msg}")
         elif agent._memory_manager and agent._memory_manager.has_tool(function_name):
+            _direct_tool_hooks_needed = True
             # Memory provider tools (hindsight_retain, honcho_search, etc.)
             # These are not in the tool registry — route through MemoryManager.
             spinner = None
@@ -883,6 +901,44 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
                 function_result = f"Error executing tool '{function_name}': {tool_error}"
                 logger.error("handle_function_call raised for %s: %s", function_name, tool_error, exc_info=True)
             tool_duration = time.time() - tool_start_time
+
+        if not _execution_blocked and _direct_tool_hooks_needed:
+            duration_ms = int(tool_duration * 1000)
+            try:
+                from hermes_cli.plugins import invoke_hook
+                invoke_hook(
+                    "post_tool_call",
+                    tool_name=function_name,
+                    args=function_args,
+                    result=function_result,
+                    task_id=effective_task_id or "",
+                    session_id=agent.session_id or "",
+                    tool_call_id=tool_call.id or "",
+                    duration_ms=duration_ms,
+                    turn_id=getattr(agent, "_current_turn_id", ""),
+                )
+            except Exception as _hook_err:
+                logger.debug("post_tool_call hook error: %s", _hook_err)
+
+            try:
+                from hermes_cli.plugins import invoke_hook
+                hook_results = invoke_hook(
+                    "transform_tool_result",
+                    tool_name=function_name,
+                    args=function_args,
+                    result=function_result,
+                    task_id=effective_task_id or "",
+                    session_id=agent.session_id or "",
+                    tool_call_id=tool_call.id or "",
+                    duration_ms=duration_ms,
+                    turn_id=getattr(agent, "_current_turn_id", ""),
+                )
+                for hook_result in hook_results:
+                    if isinstance(hook_result, str):
+                        function_result = hook_result
+                        break
+            except Exception as _hook_err:
+                logger.debug("transform_tool_result hook error: %s", _hook_err)
 
         if isinstance(function_result, str):
             result_preview = function_result if agent.verbose_logging else (
