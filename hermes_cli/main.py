@@ -4601,6 +4601,7 @@ def _model_flow_named_custom(config, provider_info):
                 menu_items,
                 selected=default_idx,
                 cancel_returns=-1,
+                searchable=True,
             )
             print()
             if idx < 0 or idx >= len(models):
@@ -6925,6 +6926,43 @@ def _desktop_packaged_executable(desktop_dir: Path) -> Optional[Path]:
     return max(existing, key=lambda p: p.stat().st_mtime)
 
 
+def _desktop_macos_relaunchable_fixup(desktop_dir: Path) -> None:
+    """Make a locally-built (unsigned) macOS desktop app survive in-place self-update.
+
+    An ad-hoc-signed .app has no stable Designated Requirement (no Team ID), so
+    when the self-updater rebuilds the bundle in place with a fresh build (a new,
+    different cdhash) Gatekeeper/LaunchServices treats the changed code as
+    tampering and macOS reports "Hermes is damaged and can't be opened." The
+    bundle also inherits the com.apple.quarantine flag from the downloaded
+    installer process chain. Both make the relaunch fail.
+
+    Clearing the quarantine xattrs and re-applying a clean deep ad-hoc signature
+    (omitting the hardened-runtime flag, which is meaningless without a real
+    Developer ID) lets the rebuilt app relaunch. No-op when a real signing
+    identity is configured (CSC_LINK / APPLE_SIGNING_IDENTITY) so a properly
+    signed/notarized build is never clobbered. Best-effort: never raises.
+    """
+    if sys.platform != "darwin":
+        return
+    if os.environ.get("CSC_LINK") or os.environ.get("APPLE_SIGNING_IDENTITY"):
+        return
+    exe = _desktop_packaged_executable(desktop_dir)
+    if exe is None:
+        return
+    # exe = .../Hermes.app/Contents/MacOS/Hermes  ->  app bundle = .../Hermes.app
+    app = exe.parents[2]
+    if not str(app).endswith(".app") or not app.is_dir():
+        return
+    codesign = shutil.which("codesign")
+    if not codesign:
+        return
+    try:
+        subprocess.run(["xattr", "-cr", str(app)], check=False)
+        subprocess.run([codesign, "--force", "--deep", "--sign", "-", str(app)], check=False)
+    except Exception as exc:
+        print(f"  (warning: macOS relaunch fixup skipped: {exc})")
+
+
 def cmd_gui(args):
     """Build and launch the native Electron desktop GUI."""
     desktop_dir = PROJECT_ROOT / "apps" / "desktop"
@@ -6998,6 +7036,11 @@ def cmd_gui(args):
             print(f"  Run manually:  cd apps/desktop && npm run {build_script}")
             sys.exit(build_result.returncode or 1)
         packaged_executable = _desktop_packaged_executable(desktop_dir)
+        if not source_mode:
+            # Locally-built apps are ad-hoc signed; make them relaunchable after
+            # an in-place self-update (otherwise macOS reports "Hermes is
+            # damaged"). No-op on non-macOS and on real-identity builds.
+            _desktop_macos_relaunchable_fixup(desktop_dir)
 
     # --build-only: produce the artifact but do NOT launch. The installer's
     # --update flow drives the rebuild headlessly and then launches the desktop
@@ -13346,6 +13389,43 @@ Examples:
         "-y",
         action="store_true",
         help="Skip confirmation prompt when using --restore",
+    )
+
+    skills_opt_out = skills_subparsers.add_parser(
+        "opt-out",
+        help="Stop bundled skills from being seeded into this profile",
+        description=(
+            "Write the .no-bundled-skills marker so the installer, "
+            "`hermes update`, and any direct sync stop seeding bundled skills "
+            "into the active profile. By default nothing already on disk is "
+            "touched. Pass --remove to ALSO delete bundled skills that are "
+            "unmodified (user-edited and hub/local skills are never removed)."
+        ),
+    )
+    skills_opt_out.add_argument(
+        "--remove",
+        action="store_true",
+        help="Also delete already-present unmodified bundled skills",
+    )
+    skills_opt_out.add_argument(
+        "--yes",
+        "-y",
+        action="store_true",
+        help="Skip confirmation prompt when using --remove",
+    )
+
+    skills_opt_in = skills_subparsers.add_parser(
+        "opt-in",
+        help="Re-enable bundled-skill seeding (undo opt-out)",
+        description=(
+            "Remove the .no-bundled-skills marker so bundled skills are seeded "
+            "again on the next `hermes update`. Pass --sync to re-seed now."
+        ),
+    )
+    skills_opt_in.add_argument(
+        "--sync",
+        action="store_true",
+        help="Re-seed bundled skills immediately instead of waiting for update",
     )
 
     skills_repair_official = skills_subparsers.add_parser(
