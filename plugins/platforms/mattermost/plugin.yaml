@@ -35,6 +35,10 @@ optional_env:
     description: "How replies are sent: 'thread' (nested) or 'off' (flat). Default: off."
     prompt: "Reply mode (thread|off)"
     password: false
+  - name: MATTERMOST_REACTIONS
+    description: "Add 👀/✅/❌ reactions while processing messages. Default: true."
+    prompt: "Enable processing reactions? (true/false)"
+    password: false
   - name: MATTERMOST_REQUIRE_MENTION
     description: "Require @bot mention in channels (default true). Set false for free-response everywhere."
     prompt: "Require @mention? (true/false)"

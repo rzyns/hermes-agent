@@ -9,6 +9,7 @@ Environment variables:
     MATTERMOST_TOKEN            Bot token or personal-access token
     MATTERMOST_ALLOWED_USERS    Comma-separated user IDs
     MATTERMOST_HOME_CHANNEL     Channel ID for cron/notification delivery
+    MATTERMOST_REACTIONS        Enable 👀/✅/❌ processing reactions (default true)
 """
 
 from __future__ import annotations
@@ -27,6 +28,7 @@ from gateway.platforms.base import (
     BasePlatformAdapter,
     MessageEvent,
     MessageType,
+    ProcessingOutcome,
     SendResult,
 )
 
@@ -162,6 +164,23 @@ class MattermostAdapter(BasePlatformAdapter):
         except aiohttp.ClientError as exc:
             logger.error("MM API PUT %s network error: %s", path, exc)
             return {}
+
+    async def _api_delete(self, path: str) -> bool:
+        """DELETE /api/v4/{path}."""
+        import aiohttp
+        url = f"{self._base_url}/api/v4/{path.lstrip('/')}"
+        try:
+            async with self._session.delete(
+                url, headers=self._headers(), timeout=aiohttp.ClientTimeout(total=30)
+            ) as resp:
+                if resp.status >= 400:
+                    body = await resp.text()
+                    logger.debug("MM API DELETE %s → %s: %s", path, resp.status, body[:200])
+                    return False
+                return True
+        except aiohttp.ClientError as exc:
+            logger.debug("MM API DELETE %s network error: %s", path, exc)
+            return False
 
     async def _upload_file(
         self, channel_id: str, file_data: bytes, filename: str, content_type: str = "application/octet-stream"
@@ -318,10 +337,56 @@ class MattermostAdapter(BasePlatformAdapter):
         self, chat_id: str, metadata: Optional[Dict[str, Any]] = None
     ) -> None:
         """Send a typing indicator."""
+        payload: Dict[str, Any] = {"channel_id": chat_id}
+        thread_id = (metadata or {}).get("thread_id")
+        if thread_id:
+            payload["parent_id"] = thread_id
         await self._api_post(
             f"users/{self._bot_user_id}/typing",
-            {"channel_id": chat_id},
+            payload,
         )
+
+    def _reactions_enabled(self) -> bool:
+        """Check if processing reactions are enabled via config/env."""
+        return os.getenv("MATTERMOST_REACTIONS", "true").strip().lower() not in {"false", "0", "no"}
+
+    async def _add_reaction(self, post_id: str, emoji_name: str) -> bool:
+        """Add the bot's reaction to a Mattermost post."""
+        if not post_id or not emoji_name:
+            return False
+        data = await self._api_post(
+            "reactions",
+            {
+                "user_id": self._bot_user_id,
+                "post_id": post_id,
+                "emoji_name": emoji_name,
+            },
+        )
+        return bool(data and data.get("post_id") == post_id)
+
+    async def _remove_reaction(self, post_id: str, emoji_name: str) -> bool:
+        """Remove the bot's own reaction from a Mattermost post."""
+        if not post_id or not emoji_name:
+            return False
+        return await self._api_delete(
+            f"users/{self._bot_user_id}/posts/{post_id}/reactions/{emoji_name}"
+        )
+
+    async def on_processing_start(self, event: MessageEvent) -> None:
+        """Add an in-progress reaction while Hermes processes a Mattermost post."""
+        if not self._reactions_enabled() or not event.message_id:
+            return
+        await self._add_reaction(event.message_id, "eyes")
+
+    async def on_processing_complete(self, event: MessageEvent, outcome: ProcessingOutcome) -> None:
+        """Swap the in-progress reaction for a final success/failure reaction."""
+        if not self._reactions_enabled() or not event.message_id:
+            return
+        await self._remove_reaction(event.message_id, "eyes")
+        if outcome == ProcessingOutcome.SUCCESS:
+            await self._add_reaction(event.message_id, "white_check_mark")
+        elif outcome == ProcessingOutcome.FAILURE:
+            await self._add_reaction(event.message_id, "x")
 
     async def edit_message(
         self, chat_id: str, message_id: str, content: str, *, finalize: bool = False
@@ -1107,6 +1172,8 @@ def _apply_yaml_config(yaml_cfg: dict, mattermost_cfg: dict) -> dict | None:
     """
     if "require_mention" in mattermost_cfg and not os.getenv("MATTERMOST_REQUIRE_MENTION"):
         os.environ["MATTERMOST_REQUIRE_MENTION"] = str(mattermost_cfg["require_mention"]).lower()
+    if "reactions" in mattermost_cfg and not os.getenv("MATTERMOST_REACTIONS"):
+        os.environ["MATTERMOST_REACTIONS"] = str(mattermost_cfg["reactions"]).lower()
     frc = mattermost_cfg.get("free_response_channels")
     if frc is not None and not os.getenv("MATTERMOST_FREE_RESPONSE_CHANNELS"):
         if isinstance(frc, list):
