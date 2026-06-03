@@ -44,6 +44,11 @@ _E164_TARGET_RE = re.compile(r"^\s*\+(\d{7,15})\s*$")
 # an explicit target for the email platform, not fall through to channel-name
 # resolution which has no way to resolve a raw address.
 _EMAIL_TARGET_RE = re.compile(r"^\s*[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}\s*$")
+# Mattermost channel, DM, group, and post IDs are 26-character lowercase
+# alphanumeric IDs. Treat them as explicit targets so resolved directory aliases
+# like "mattermost:janusz" do not get reparsed as unresolved names and fall
+# through to the configured home channel.
+_MATTERMOST_TARGET_RE = re.compile(r"^\s*([a-z0-9]{26})(?::([a-z0-9]{26}))?\s*$")
 # Most platforms read their home channel from "<PLATFORM>_HOME_CHANNEL", but a
 # few diverge. Email reads EMAIL_HOME_ADDRESS (see gateway/config.py), so the
 # generic "<PLATFORM>_HOME_CHANNEL" hint would point users at a variable that is
@@ -399,6 +404,10 @@ def _parse_target_ref(platform_name: str, target_ref: str):
         match = _EMAIL_TARGET_RE.fullmatch(target_ref)
         if match:
             return target_ref.strip(), None, True
+    if platform_name == "mattermost":
+        match = _MATTERMOST_TARGET_RE.fullmatch(target_ref)
+        if match:
+            return match.group(1), match.group(2), True
     if platform_name in _PHONE_PLATFORMS:
         match = _E164_TARGET_RE.fullmatch(target_ref)
         if match:
