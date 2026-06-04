@@ -68,6 +68,7 @@ def _install_example_plugin(_isolate_hermes_home):
     #      and start serving requests against a torn-down HERMES_HOME.
     app = web_server.app
     original_routes = list(app.router.routes)
+    original_mounted_plugin_apis = set(web_server._mounted_dashboard_plugin_apis)
 
     # Bust the module-level cache and re-discover so the example plugin
     # shows up in `_get_dashboard_plugins()`. `_mount_plugin_api_routes`
@@ -103,6 +104,8 @@ def _install_example_plugin(_isolate_hermes_home):
         # routes so the next test sees a clean app — and clear the
         # cache for the same reason.
         app.router.routes[:] = original_routes
+        web_server._mounted_dashboard_plugin_apis.clear()
+        web_server._mounted_dashboard_plugin_apis.update(original_mounted_plugin_apis)
         web_server._dashboard_plugins_cache = None
 
 
@@ -3580,7 +3583,7 @@ class TestPtyWebSocket:
         with pytest.raises(WebSocketDisconnect) as exc:
             with self.client.websocket_connect(self._url()):
                 pass
-        assert exc.value.code == 4403
+        assert exc.value.code == 4404
 
     def test_rejects_missing_token(self, monkeypatch):
         monkeypatch.setattr(
