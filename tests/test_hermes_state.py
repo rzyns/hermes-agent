@@ -1847,6 +1847,77 @@ class TestSessionTitle:
         assert session["title"] == "Before End"
         assert session["ended_at"] is not None
 
+    def test_manual_title_records_provenance(self, db):
+        db.create_session(session_id="s1", source="cli")
+
+        assert db.set_session_title("s1", "Manual Title", title_source="manual") is True
+
+        session = db.get_session("s1")
+        assert session["title"] == "Manual Title"
+        assert session["title_source"] == "manual"
+        assert isinstance(session["title_updated_at"], float)
+        assert session["title_revision_count"] == 1
+
+    def test_auto_title_records_provenance_and_revisions(self, db):
+        db.create_session(session_id="s1", source="cli")
+
+        db.set_session_title("s1", "Initial Auto Title", title_source="auto")
+        db.set_session_title("s1", "Better Auto Title", title_source="auto")
+
+        session = db.get_session("s1")
+        assert session["title"] == "Better Auto Title"
+        assert session["title_source"] == "auto"
+        assert session["title_revision_count"] == 2
+
+    def test_set_auto_session_title_does_not_overwrite_manual_title(self, db):
+        db.create_session(session_id="s1", source="cli")
+        db.set_session_title("s1", "Manual While LLM Runs", title_source="manual")
+
+        assert db.set_auto_session_title("s1", "Generated Title") is False
+
+        session = db.get_session("s1")
+        assert session["title"] == "Manual While LLM Runs"
+        assert session["title_source"] == "manual"
+        assert session["title_revision_count"] == 1
+
+    def test_set_auto_session_title_allows_single_auto_improvement(self, db):
+        db.create_session(session_id="s1", source="cli")
+
+        assert db.set_auto_session_title("s1", "Initial Auto") is True
+        assert db.set_auto_session_title("s1", "Better Auto", allow_retitle=True) is True
+        assert db.set_auto_session_title("s1", "Too Late Auto", allow_retitle=True) is False
+
+        session = db.get_session("s1")
+        assert session["title"] == "Better Auto"
+        assert session["title_source"] == "auto"
+        assert session["title_revision_count"] == 2
+
+    def test_set_backfill_session_title_only_updates_still_untitled(self, db):
+        db.create_session(session_id="empty", source="cli")
+        db.create_session(session_id="manual", source="cli")
+        db.set_session_title("manual", "Manual Title", title_source="manual")
+
+        assert db.set_backfill_session_title("empty", "Backfilled Title") is True
+        assert db.set_backfill_session_title("manual", "Generated Title") is False
+
+        assert db.get_session("empty")["title_source"] == "backfill"
+        assert db.get_session("manual")["title"] == "Manual Title"
+        assert db.get_session("manual")["title_source"] == "manual"
+
+    def test_set_auto_generated_session_title_only_updates_auto_titles(self, db):
+        db.create_session(session_id="auto", source="cli")
+        db.create_session(session_id="manual", source="cli")
+        db.set_session_title("auto", "Old Auto", title_source="auto")
+        db.set_session_title("manual", "Manual Title", title_source="manual")
+
+        assert db.set_auto_generated_session_title("auto", "Regenerated Auto") is True
+        assert db.set_auto_generated_session_title("manual", "Generated Title") is False
+
+        assert db.get_session("auto")["title"] == "Regenerated Auto"
+        assert db.get_session("auto")["title_source"] == "auto"
+        assert db.get_session("manual")["title"] == "Manual Title"
+        assert db.get_session("manual")["title_source"] == "manual"
+
 
 class TestSanitizeTitle:
     """Tests for SessionDB.sanitize_title() validation and cleaning."""

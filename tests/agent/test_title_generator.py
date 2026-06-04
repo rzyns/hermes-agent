@@ -4,6 +4,7 @@ from unittest.mock import MagicMock, patch
 
 
 from agent.title_generator import (
+    build_title_context,
     generate_title,
     auto_title_session,
     maybe_auto_title,
@@ -111,6 +112,53 @@ class TestGenerateTitle:
         user_content = captured_kwargs["messages"][1]["content"]
         assert len(user_content) < 1100  # 500 + 500 + formatting
 
+    def test_uses_rich_title_context_when_provided(self):
+        """A structured title context should replace the old first-exchange-only prompt body."""
+        captured_kwargs = {}
+
+        def mock_call_llm(**kwargs):
+            captured_kwargs.update(kwargs)
+            resp = MagicMock()
+            resp.choices = [MagicMock()]
+            resp.choices[0].message.content = "Hermes Session Titles"
+            return resp
+
+        rich_context = "Source: webui\nWorkspace: /repo\nLatest user request: improve session titles"
+        with patch("agent.title_generator.call_llm", side_effect=mock_call_llm):
+            title = generate_title("first", "reply", title_context=rich_context)
+
+        assert title == "Hermes Session Titles"
+        user_content = captured_kwargs["messages"][1]["content"]
+        assert user_content == rich_context
+        assert "User: first" not in user_content
+
+
+class TestBuildTitleContext:
+    """Unit tests for rich title-context construction."""
+
+    def test_includes_first_latest_assistant_tools_and_session_metadata(self):
+        history = [
+            {"role": "user", "content": "initial broad request about Hermes"},
+            {"role": "assistant", "content": "I'll inspect the title generator."},
+            {"role": "tool", "tool_name": "search_files", "content": "..."},
+            {"role": "user", "content": "Now implement the retitle command"},
+            {"role": "assistant", "content": "Implemented tests and CLI wiring."},
+        ]
+        context = build_title_context(
+            history,
+            current_user_message="Now implement the retitle command",
+            current_assistant_response="Implemented tests and CLI wiring.",
+            session={"source": "webui", "cwd": "/home/openclaw/.hermes/hermes-agent", "model": "gpt-test"},
+        )
+
+        assert "Source: webui" in context
+        assert "Workspace: /home/openclaw/.hermes/hermes-agent" in context
+        assert "Model: gpt-test" in context
+        assert "First user request: initial broad request about Hermes" in context
+        assert "Latest user request: Now implement the retitle command" in context
+        assert "Recent assistant answer: Implemented tests and CLI wiring." in context
+        assert "Tools used: search_files" in context
+
 
 class TestAutoTitleSession:
     """Tests for auto_title_session() — the sync worker function."""
@@ -129,14 +177,19 @@ class TestAutoTitleSession:
     def test_generates_and_sets_title(self):
         db = MagicMock()
         db.get_session_title.return_value = None
+        db.set_auto_session_title.return_value = True
 
         with patch("agent.title_generator.generate_title", return_value="New Title"):
             auto_title_session(db, "sess-1", "hi", "hello")
-            db.set_session_title.assert_called_once_with("sess-1", "New Title")
+            db.set_auto_session_title.assert_called_once_with(
+                "sess-1", "New Title", allow_retitle=False
+            )
+            db.set_session_title.assert_not_called()
 
     def test_invokes_title_callback_after_setting_title(self):
         db = MagicMock()
         db.get_session_title.return_value = None
+        db.set_auto_session_title.return_value = True
         seen = []
         with patch("agent.title_generator.generate_title", return_value="Readable Session"):
             auto_title_session(
@@ -146,8 +199,49 @@ class TestAutoTitleSession:
                 "hi there",
                 title_callback=seen.append,
             )
-        db.set_session_title.assert_called_once_with("sess-1", "Readable Session")
+        db.set_auto_session_title.assert_called_once_with(
+            "sess-1", "Readable Session", allow_retitle=False
+        )
         assert seen == ["Readable Session"]
+
+    def test_no_callback_when_conditional_auto_title_update_loses_race(self):
+        db = MagicMock()
+        db.get_session_title.return_value = None
+        db.set_auto_session_title.return_value = False
+        seen = []
+
+        with patch("agent.title_generator.generate_title", return_value="Readable Session"):
+            auto_title_session(
+                db,
+                "sess-1",
+                "hello",
+                "hi there",
+                title_callback=seen.append,
+            )
+
+        db.set_auto_session_title.assert_called_once_with(
+            "sess-1", "Readable Session", allow_retitle=False
+        )
+        assert seen == []
+
+    def test_allows_retitle_when_existing_title_is_auto_generated(self):
+        db = MagicMock()
+        db.get_session_title.return_value = "Vague Old Title"
+        db.get_session.return_value = {"title_source": "auto"}
+        db.set_auto_session_title.return_value = True
+
+        with patch("agent.title_generator.generate_title", return_value="Better Specific Title"):
+            auto_title_session(
+                db,
+                "sess-1",
+                "user",
+                "assistant",
+                allow_retitle=True,
+            )
+
+        db.set_auto_session_title.assert_called_once_with(
+            "sess-1", "Better Specific Title", allow_retitle=True
+        )
 
     def test_skips_if_generation_fails(self):
         db = MagicMock()
@@ -199,9 +293,11 @@ class TestMaybeAutoTitle:
                 "sess-1",
                 "hello",
                 "hi there",
+                title_context=build_title_context(history, current_user_message="hello", current_assistant_response="hi there"),
                 failure_callback=None,
                 main_runtime=None,
                 title_callback=None,
+                allow_retitle=False,
             )
 
     def test_forwards_failure_callback_to_worker(self):
@@ -225,10 +321,32 @@ class TestMaybeAutoTitle:
                 "sess-1",
                 "hello",
                 "hi there",
+                title_context=build_title_context(history, current_user_message="hello", current_assistant_response="hi there"),
                 failure_callback=_cb,
                 main_runtime=None,
                 title_callback=None,
+                allow_retitle=False,
             )
+
+    def test_fires_one_improvement_for_existing_auto_title_on_third_exchange(self):
+        db = MagicMock()
+        db.get_session_title.return_value = "Initial Generic Title"
+        db.get_session.return_value = {"title_source": "auto", "title_revision_count": 1}
+        history = [
+            {"role": "user", "content": "first"},
+            {"role": "assistant", "content": "response 1"},
+            {"role": "user", "content": "second"},
+            {"role": "assistant", "content": "response 2"},
+            {"role": "user", "content": "third"},
+            {"role": "assistant", "content": "response 3"},
+        ]
+
+        with patch("agent.title_generator.auto_title_session") as mock_auto:
+            maybe_auto_title(db, "sess-1", "third", "response 3", history)
+            import time
+            time.sleep(0.3)
+
+        assert mock_auto.call_args.kwargs["allow_retitle"] is True
 
     def test_skips_if_no_response(self):
         db = MagicMock()

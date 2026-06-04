@@ -269,6 +269,28 @@ class TestWebServerEndpoints:
         row = next(s for s in rows if s["id"] == "session-no-cwd")
         assert row["cwd"] is None
 
+    def test_get_sessions_exposes_title_provenance(self):
+        """Session rows include provenance needed for safe auto-retitle UX."""
+        from hermes_state import SessionDB
+
+        db = SessionDB()
+        try:
+            db.create_session(session_id="title-provenance", source="cli")
+            db.set_session_title(
+                "title-provenance", "Specific Auto Title", title_source="auto"
+            )
+        finally:
+            db.close()
+
+        resp = self.client.get("/api/sessions?limit=20&offset=0")
+        assert resp.status_code == 200
+        rows = resp.json()["sessions"]
+        row = next(s for s in rows if s["id"] == "title-provenance")
+        assert row["title"] == "Specific Auto Title"
+        assert row["title_source"] == "auto"
+        assert row["title_updated_at"] is not None
+        assert row["title_revision_count"] == 1
+
     def test_get_sessions_forwards_min_messages(self, monkeypatch):
         """The ?min_messages= filter must reach SessionDB.
 

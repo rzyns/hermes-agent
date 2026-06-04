@@ -14722,6 +14722,40 @@ Examples:
     sessions_rename.add_argument("session_id", help="Session ID to rename")
     sessions_rename.add_argument("title", nargs="+", help="New title for the session")
 
+    sessions_retitle = sessions_subparsers.add_parser(
+        "retitle",
+        help="Preview or apply generated title backfills/regeneration",
+        description=(
+            "Regenerate titles for a conservative session set. Defaults to a "
+            "dry run; pass --apply to write. Existing manual titles are never "
+            "selected by this command."
+        ),
+    )
+    sessions_retitle.add_argument(
+        "--mode",
+        choices=["untitled", "auto-generated"],
+        default="untitled",
+        help="Candidate set to retitle (default: untitled)",
+    )
+    sessions_retitle.add_argument("--source", help="Filter by source")
+    sessions_retitle.add_argument(
+        "--limit", type=int, default=50, help="Max sessions to inspect (default: 50)"
+    )
+    sessions_retitle.add_argument(
+        "--id",
+        dest="ids",
+        action="append",
+        help="Restrict to a specific session ID (repeatable)",
+    )
+    sessions_retitle.add_argument(
+        "--apply",
+        action="store_true",
+        help="Write generated titles. Omit for dry-run preview.",
+    )
+    sessions_retitle.add_argument(
+        "--json", action="store_true", help="Print machine-readable JSON output"
+    )
+
     sessions_browse = sessions_subparsers.add_parser(
         "browse",
         help="Interactive session picker — browse, search, and resume sessions",
@@ -14861,6 +14895,39 @@ Examples:
                     print(f"Session '{args.session_id}' not found.")
             except ValueError as e:
                 print(f"Error: {e}")
+
+        elif action == "retitle":
+            from hermes_cli.session_retitle import retitle_sessions
+
+            try:
+                result = retitle_sessions(
+                    db,
+                    mode=args.mode,
+                    apply=bool(args.apply),
+                    source=args.source,
+                    limit=args.limit,
+                    ids=args.ids,
+                )
+            except Exception as e:
+                print(f"Error: retitle failed: {e}")
+                return
+            if args.json:
+                print(_json.dumps(result, ensure_ascii=False, indent=2))
+            else:
+                effect = "Applied" if result["effect"] == "applied" else "Dry run"
+                print(
+                    f"{effect}: {len(result['candidates'])} candidate(s), "
+                    f"{result['applied_count']} applied."
+                )
+                if result["effect"] == "dry_run":
+                    print("Pass --apply to write these generated titles.")
+                for item in result["candidates"]:
+                    marker = "✓" if item["applied"] else "•"
+                    old = item.get("old_title") or "(untitled)"
+                    new = item.get("new_title") or "(generation failed)"
+                    if item.get("error"):
+                        new = f"(error: {item['error']})"
+                    print(f"{marker} {item['session_id']}: {old} -> {new}")
 
         elif action == "browse":
             limit = getattr(args, "limit", 500) or 500

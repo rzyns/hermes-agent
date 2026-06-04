@@ -33,7 +33,7 @@ T = TypeVar("T")
 
 DEFAULT_DB_PATH = get_hermes_home() / "state.db"
 
-SCHEMA_VERSION = 14
+SCHEMA_VERSION = 15
 
 # ---------------------------------------------------------------------------
 # WAL-compatibility fallback
@@ -265,6 +265,9 @@ CREATE TABLE IF NOT EXISTS sessions (
     cost_source TEXT,
     pricing_version TEXT,
     title TEXT,
+    title_source TEXT,
+    title_updated_at REAL,
+    title_revision_count INTEGER NOT NULL DEFAULT 0,
     api_call_count INTEGER DEFAULT 0,
     handoff_state TEXT,
     handoff_platform TEXT,
@@ -1396,32 +1399,159 @@ class SessionDB:
 
         return cleaned
 
-    def set_session_title(self, session_id: str, title: str) -> bool:
-        """Set or update a session's title.
+    def _validate_title_unique(self, conn, session_id: str, title: str) -> None:
+        if not title:
+            return
+        cursor = conn.execute(
+            "SELECT id FROM sessions WHERE title = ? AND id != ?",
+            (title, session_id),
+        )
+        conflict = cursor.fetchone()
+        if conflict:
+            raise ValueError(
+                f"Title '{title}' is already in use by session {conflict['id']}"
+            )
+
+    def set_session_title(
+        self,
+        session_id: str,
+        title: str,
+        *,
+        title_source: str = "manual",
+    ) -> bool:
+        """Set or update a session's title and provenance.
 
         Returns True if session was found and title was set.
         Raises ValueError if title is already in use by another session,
         or if the title fails validation (too long, invalid characters).
         Empty/whitespace-only strings are normalized to None (clearing the title).
+
+        ``title_source`` records whether the title was manually supplied,
+        generated automatically, imported, or backfilled.  This lets the UI and
+        maintenance commands improve auto titles without overwriting manual
+        user labels.
         """
+        allowed_sources = {"manual", "auto", "backfill", "imported"}
+        if title_source not in allowed_sources:
+            raise ValueError(
+                f"Invalid title_source '{title_source}' (expected one of {sorted(allowed_sources)})"
+            )
         title = self.sanitize_title(title)
+        now = time.time()
+
         def _do(conn):
-            if title:
-                # Check uniqueness (allow the same session to keep its own title)
-                cursor = conn.execute(
-                    "SELECT id FROM sessions WHERE title = ? AND id != ?",
-                    (title, session_id),
-                )
-                conflict = cursor.fetchone()
-                if conflict:
-                    raise ValueError(
-                        f"Title '{title}' is already in use by session {conflict['id']}"
-                    )
+            self._validate_title_unique(conn, session_id, title)
             cursor = conn.execute(
-                "UPDATE sessions SET title = ? WHERE id = ?",
-                (title, session_id),
+                """UPDATE sessions
+                   SET title = ?,
+                       title_source = ?,
+                       title_updated_at = ?,
+                       title_revision_count = COALESCE(title_revision_count, 0) + 1
+                   WHERE id = ?""",
+                (title, title_source if title else None, now, session_id),
             )
             return cursor.rowcount
+        rowcount = self._execute_write(_do)
+        return rowcount > 0
+
+    def set_backfill_session_title(self, session_id: str, title: str) -> bool:
+        """Set a backfilled title only if the session is still untitled."""
+        title = self.sanitize_title(title)
+        if not title:
+            return False
+        now = time.time()
+
+        def _do(conn):
+            self._validate_title_unique(conn, session_id, title)
+            cursor = conn.execute(
+                """UPDATE sessions
+                   SET title = ?,
+                       title_source = 'backfill',
+                       title_updated_at = ?,
+                       title_revision_count = COALESCE(title_revision_count, 0) + 1
+                   WHERE id = ?
+                     AND (title IS NULL OR title = '')""",
+                (title, now, session_id),
+            )
+            return cursor.rowcount
+
+        rowcount = self._execute_write(_do)
+        return rowcount > 0
+
+    def set_auto_generated_session_title(self, session_id: str, title: str) -> bool:
+        """Regenerate a title only if it is still auto-generated."""
+        title = self.sanitize_title(title)
+        if not title:
+            return False
+        now = time.time()
+
+        def _do(conn):
+            self._validate_title_unique(conn, session_id, title)
+            cursor = conn.execute(
+                """UPDATE sessions
+                   SET title = ?,
+                       title_source = 'auto',
+                       title_updated_at = ?,
+                       title_revision_count = COALESCE(title_revision_count, 0) + 1
+                   WHERE id = ?
+                     AND title_source = 'auto'""",
+                (title, now, session_id),
+            )
+            return cursor.rowcount
+
+        rowcount = self._execute_write(_do)
+        return rowcount > 0
+
+    def set_auto_session_title(
+        self,
+        session_id: str,
+        title: str,
+        *,
+        allow_retitle: bool = False,
+    ) -> bool:
+        """Set an auto-generated title only when provenance makes it safe.
+
+        This is the race-safe path for background title generation.  It updates
+        untitled sessions, and when ``allow_retitle`` is true, performs one
+        early improvement only if the current title is still auto-generated and
+        has at most one prior title revision.  Manual/imported/backfilled titles
+        are never overwritten, even if they are set while the LLM call is in
+        flight.
+        """
+        title = self.sanitize_title(title)
+        if not title:
+            return False
+        now = time.time()
+
+        def _do(conn):
+            self._validate_title_unique(conn, session_id, title)
+            if allow_retitle:
+                cursor = conn.execute(
+                    """UPDATE sessions
+                       SET title = ?,
+                           title_source = 'auto',
+                           title_updated_at = ?,
+                           title_revision_count = COALESCE(title_revision_count, 0) + 1
+                       WHERE id = ?
+                         AND (
+                           title IS NULL OR title = '' OR
+                           (title_source = 'auto' AND COALESCE(title_revision_count, 0) <= 1)
+                         )""",
+                    (title, now, session_id),
+                )
+            else:
+                cursor = conn.execute(
+                    """UPDATE sessions
+                       SET title = ?,
+                           title_source = 'auto',
+                           title_updated_at = ?,
+                           title_revision_count = COALESCE(title_revision_count, 0) + 1
+                       WHERE id = ?
+                         AND (title IS NULL OR title = '')""",
+                    (title, now, session_id),
+                )
+            return cursor.rowcount
+
         rowcount = self._execute_write(_do)
         return rowcount > 0
 
@@ -1748,7 +1878,9 @@ class SessionDB:
                 merged = dict(s)
                 for key in (
                     "id", "ended_at", "end_reason", "message_count",
-                    "tool_call_count", "title", "last_active", "preview",
+                    "tool_call_count", "title", "title_source",
+                    "title_updated_at", "title_revision_count",
+                    "last_active", "preview",
                     "model", "system_prompt", "cwd",
                 ):
                     if key in tip_row:
