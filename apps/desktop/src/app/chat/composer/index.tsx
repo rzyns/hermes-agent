@@ -34,7 +34,7 @@ import {
   shouldAutoDrainOnSettle,
   updateQueuedPrompt
 } from '@/store/composer-queue'
-import { $messages } from '@/store/session'
+import { $gatewayState, $messages } from '@/store/session'
 import { $threadScrolledUp } from '@/store/thread-scroll'
 
 import { extractDroppedFiles, HERMES_PATHS_MIME } from '../hooks/use-composer-actions'
@@ -142,6 +142,7 @@ export function ChatBar({
   const [queueEdit, setQueueEdit] = useState<QueueEditState | null>(null)
   const [focusRequestId, setFocusRequestId] = useState(0)
   const dragDepthRef = useRef(0)
+  const composingRef = useRef(false)  // true during IME composition (CJK input)
   const lastSpokenIdRef = useRef<string | null>(null)
 
   const narrow = useMediaQuery('(max-width: 30rem)')
@@ -156,7 +157,15 @@ export function ChatBar({
   const busyAction = busy && hasComposerPayload ? 'queue' : 'stop'
   const showHelpHint = draft === '?'
 
-  const placeholder = disabled ? 'Starting Hermes...' : 'Send follow-up'
+  const gatewayState = useStore($gatewayState)
+  // When the bar is disabled it's because the gateway isn't open. Distinguish a
+  // cold start ("Starting Hermes...") from a dropped connection we're trying to
+  // restore (e.g. after the Mac slept) so the stuck state reads as recoverable.
+  const placeholder = disabled
+    ? gatewayState === 'closed' || gatewayState === 'error'
+      ? 'Reconnecting to Hermes…'
+      : 'Starting Hermes...'
+    : 'Send follow-up'
 
   const focusInput = useCallback(() => {
     focusComposerInput(editorRef.current)
@@ -468,6 +477,13 @@ export function ChatBar({
   }, [trigger])
 
   const handleEditorInput = (event: FormEvent<HTMLDivElement>) => {
+    // During IME composition the DOM contains uncommitted preedit text
+    // mixed with real content.  Skip state writes — compositionend will
+    // deliver the finalized text via a clean input event.
+    if (composingRef.current) {
+      return
+    }
+
     const editor = event.currentTarget
 
     if (editor.childNodes.length === 1 && editor.firstChild?.nodeName === 'BR') {
@@ -567,6 +583,15 @@ export function ChatBar({
   }
 
   const handleEditorKeyDown = (event: KeyboardEvent<HTMLDivElement>) => {
+    // IME composition: Enter confirms composed text, not a message submission.
+    // We check both composingRef (set by compositionstart/compositionend, robust
+    // across browsers) and nativeEvent.isComposing (Chromium fallback).  Without
+    // this guard, pressing Enter to finalise a Korean/Japanese/Chinese IME
+    // preedit fires submitDraft() and splits the message mid-word.
+    if (composingRef.current || event.nativeEvent.isComposing) {
+      return
+    }
+
     if ((event.metaKey || event.ctrlKey) && !event.altKey && !event.shiftKey && event.key.toLowerCase() === 'k') {
       event.preventDefault()
 
@@ -956,7 +981,8 @@ export function ChatBar({
       const submitted = draft
       triggerHaptic('submit')
       clearDraft()
-      void onSubmit(submitted)
+      clearComposerAttachments()
+      void onSubmit(submitted, { attachments })
     }
 
     focusInput()
@@ -1082,8 +1108,8 @@ export function ChatBar({
     <div className={cn('relative', stacked ? 'w-full' : 'min-w-(--composer-input-inline-min-width) flex-1')}>
       <div
         aria-label="Message"
-        autoCorrect="off"
         autoCapitalize="off"
+        autoCorrect="off"
         className={cn(
           'min-h-(--composer-input-min-height) max-h-(--composer-input-max-height) overflow-y-auto bg-transparent pb-1 pr-1 pt-1 leading-normal text-foreground outline-none disabled:cursor-not-allowed',
           'empty:before:content-[attr(data-placeholder)] empty:before:text-muted-foreground/60',
@@ -1095,6 +1121,12 @@ export function ChatBar({
         data-placeholder={placeholder}
         data-slot={RICH_INPUT_SLOT}
         onBlur={() => window.setTimeout(closeTrigger, 80)}
+        onCompositionEnd={() => {
+          composingRef.current = false
+        }}
+        onCompositionStart={() => {
+          composingRef.current = true
+        }}
         onDragOver={handleInputDragOver}
         onDrop={handleInputDrop}
         onFocus={() => markActiveComposer('main')}
@@ -1123,7 +1155,7 @@ export function ChatBar({
 
         `asChild` swaps TextareaAutosize for a Radix Slot wrapping our
         plain <textarea>, which carries the binding but skips autosize. */}
-      <ComposerPrimitive.Input asChild tabIndex={-1} unstable_focusOnScrollToBottom={false}>
+      <ComposerPrimitive.Input asChild submitMode="ctrlEnter" tabIndex={-1} unstable_focusOnScrollToBottom={false}>
         <textarea aria-hidden className="sr-only" tabIndex={-1} />
       </ComposerPrimitive.Input>
     </div>
@@ -1143,6 +1175,9 @@ export function ChatBar({
           onDrop={handleDrop}
           onSubmit={e => {
             e.preventDefault()
+            if (composingRef.current) {
+              return
+            }
             submitDraft()
           }}
           ref={composerRef}
