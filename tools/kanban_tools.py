@@ -31,6 +31,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import subprocess
 from typing import Any, Optional
 
 from tools.registry import registry, tool_error
@@ -158,6 +159,81 @@ def _enforce_worker_task_ownership(tid: str) -> Optional[str]:
             f"{tid}. Use kanban_comment to hand off information to other "
             f"tasks, or kanban_create to spawn follow-up work."
         )
+    return None
+
+
+def _git_status_porcelain_for_worker(task_id: str) -> Optional[str]:
+    """Return git porcelain status for this worker's workspace, if any.
+
+    The guard is intentionally worker-only. Orchestrator profiles may close
+    bookkeeping tasks from outside a repo, while dispatcher-spawned workers have
+    a concrete ``$HERMES_KANBAN_WORKSPACE`` that represents their handoff scope.
+    """
+    if os.environ.get("HERMES_KANBAN_TASK") != task_id:
+        return None
+    workspace = os.environ.get("HERMES_KANBAN_WORKSPACE")
+    if not workspace or not os.path.isdir(workspace):
+        return None
+    try:
+        inside = subprocess.run(
+            ["git", "-C", workspace, "rev-parse", "--is-inside-work-tree"],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=2,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    if inside.returncode != 0 or inside.stdout.strip() != "true":
+        return None
+    try:
+        status = subprocess.run(
+            ["git", "-C", workspace, "status", "--porcelain"],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    if status.returncode != 0:
+        return None
+    return status.stdout.strip()
+
+
+def _guard_git_handoff(
+    task_id: str,
+    *,
+    metadata: Optional[dict] = None,
+    reason: Optional[str] = None,
+    action: str,
+) -> Optional[str]:
+    """Fail closed when a worker hands off a dirty git workspace silently."""
+    dirty = _git_status_porcelain_for_worker(task_id)
+    if not dirty:
+        return None
+
+    if action == "complete":
+        if isinstance(metadata, dict) and metadata.get("no_commit_reason"):
+            return None
+        return tool_error(
+            "git workspace still has uncommitted changes. Commit intended "
+            "repo changes before kanban_complete, or retry with "
+            "metadata.no_commit_reason explaining why the dirty state must be "
+            "left uncommitted."
+        )
+
+    if action == "block":
+        text = str(reason or "").lower()
+        if "no_commit_reason" in text:
+            return None
+        return tool_error(
+            "git workspace still has uncommitted changes. Commit intended "
+            "repo changes before kanban_block, or include "
+            "`no_commit_reason: ...` in the block reason after leaving a "
+            "comment with the dirty-state context."
+        )
+
     return None
 
 
@@ -548,6 +624,11 @@ def _handle_complete(args: dict, **kw) -> str:
         return tool_error(
             f"metadata must be an object/dict, got {type(metadata).__name__}"
         )
+    git_guard = _guard_git_handoff(
+        tid, metadata=metadata, action="complete"
+    )
+    if git_guard:
+        return git_guard
     metadata = _stamp_worker_session_metadata(tid, metadata)
     board = args.get("board")
     try:
@@ -608,6 +689,11 @@ def _handle_block(args: dict, **kw) -> str:
     reason = args.get("reason")
     if not reason or not str(reason).strip():
         return tool_error("reason is required — explain what input you need")
+    git_guard = _guard_git_handoff(
+        tid, reason=reason, action="block"
+    )
+    if git_guard:
+        return git_guard
     board = args.get("board")
     try:
         kb, conn = _connect(board=board)

@@ -42,10 +42,15 @@ kanban_complete(
         "changed_files": ["rate_limiter.py", "tests/test_rate_limiter.py"],
         "tests_run": 14,
         "tests_passed": 14,
+        "commit": "<sha>",
         "decisions": ["user_id primary, IP fallback for unauthenticated requests"],
     },
 )
 ```
+
+**Git repo/worktree changes:**
+
+If the workspace is a git repo or worktree and you changed code, tests, docs, or review artifacts, create a local commit by default before review handoff or completion. Commit only your intended files after verification (`git status`, targeted tests or an explicit reason tests were not run). Do **not** commit secrets, bulky generated junk, mixed/unowned dirt, failed or uncertain work, or tasks that explicitly say not to commit; include `no_commit_reason` in metadata/comment instead. Local commit is allowed; push/merge/deploy still require explicit approval.
 
 **Coding task that needs human review (review-required):**
 

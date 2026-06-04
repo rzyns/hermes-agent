@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import json
 import os
+import subprocess
 
 import pytest
 
@@ -1219,6 +1220,10 @@ def test_kanban_guidance_in_worker_prompt(monkeypatch, tmp_path):
     assert "kanban_complete" in prompt
     assert "kanban_block" in prompt
     assert "kanban_create" in prompt
+    # Git handoff guidance
+    assert "commit by default" in prompt
+    assert "no_commit_reason" in prompt
+    assert "Never push/merge/deploy" in prompt
     # Anti-shell guidance
     assert "Do not shell out" in prompt or "tools — they work" in prompt
 
@@ -1237,6 +1242,81 @@ def test_kanban_guidance_prompt_size_bounded(monkeypatch, tmp_path):
     assert 1_500 < len(KANBAN_GUIDANCE) < 4_096, (
         f"KANBAN_GUIDANCE is {len(KANBAN_GUIDANCE)} chars — too short (missing?) or too long"
     )
+
+
+# ---------------------------------------------------------------------------
+# Git handoff guard
+# ---------------------------------------------------------------------------
+
+def _make_dirty_git_repo(tmp_path):
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    subprocess.run(
+        ["git", "init"],
+        cwd=repo,
+        check=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    (repo / "changed.txt").write_text("dirty\n", encoding="utf-8")
+    return repo
+
+
+def test_git_handoff_guard_ignores_non_worker_dirty_repo(monkeypatch, tmp_path):
+    from tools.kanban_tools import _guard_git_handoff
+
+    repo = _make_dirty_git_repo(tmp_path)
+    monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
+    monkeypatch.setenv("HERMES_KANBAN_WORKSPACE", str(repo))
+
+    assert _guard_git_handoff("t_fake", metadata={}, action="complete") is None
+
+
+def test_git_handoff_guard_blocks_dirty_complete_without_reason(monkeypatch, tmp_path):
+    from tools.kanban_tools import _guard_git_handoff
+
+    repo = _make_dirty_git_repo(tmp_path)
+    monkeypatch.setenv("HERMES_KANBAN_TASK", "t_fake")
+    monkeypatch.setenv("HERMES_KANBAN_WORKSPACE", str(repo))
+
+    out = _guard_git_handoff("t_fake", metadata={}, action="complete")
+
+    assert out is not None
+    assert "metadata.no_commit_reason" in json.loads(out)["error"]
+
+
+def test_git_handoff_guard_allows_dirty_complete_with_reason(monkeypatch, tmp_path):
+    from tools.kanban_tools import _guard_git_handoff
+
+    repo = _make_dirty_git_repo(tmp_path)
+    monkeypatch.setenv("HERMES_KANBAN_TASK", "t_fake")
+    monkeypatch.setenv("HERMES_KANBAN_WORKSPACE", str(repo))
+
+    out = _guard_git_handoff(
+        "t_fake",
+        metadata={"no_commit_reason": "generated fixture is intentionally left dirty"},
+        action="complete",
+    )
+
+    assert out is None
+
+
+def test_git_handoff_guard_blocks_dirty_block_without_reason(monkeypatch, tmp_path):
+    from tools.kanban_tools import _guard_git_handoff
+
+    repo = _make_dirty_git_repo(tmp_path)
+    monkeypatch.setenv("HERMES_KANBAN_TASK", "t_fake")
+    monkeypatch.setenv("HERMES_KANBAN_WORKSPACE", str(repo))
+
+    out = _guard_git_handoff(
+        "t_fake",
+        reason="review-required: implementation ready for review",
+        action="block",
+    )
+
+    assert out is not None
+    assert "no_commit_reason" in json.loads(out)["error"]
 
 
 # ---------------------------------------------------------------------------
