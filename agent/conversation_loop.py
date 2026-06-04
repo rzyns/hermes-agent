@@ -358,6 +358,7 @@ def _restore_or_build_system_prompt(agent, system_message, conversation_history)
             "on_session_start",
             session_id=agent.session_id,
             model=agent.model,
+            provider=agent.provider,
             platform=getattr(agent, "platform", None) or "",
         )
     except Exception as exc:
@@ -773,6 +774,7 @@ def run_conversation(
             conversation_history=list(messages),
             is_first_turn=(not bool(conversation_history)),
             model=agent.model,
+            provider=agent.provider,
             platform=getattr(agent, "platform", None) or "",
             sender_id=getattr(agent, "_user_id", None) or "",
         )
@@ -4783,6 +4785,7 @@ def run_conversation(
                 assistant_response=final_response,
                 conversation_history=list(messages),
                 model=agent.model,
+                provider=agent.provider,
                 platform=getattr(agent, "platform", None) or "",
             )
         except Exception as exc:
