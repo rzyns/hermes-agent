@@ -137,6 +137,72 @@ def _conn(board: Optional[str] = None):
     return kanban_db.connect(board=board)
 
 
+def _effective_board(board: Optional[str]) -> str:
+    """Return the concrete board slug a request is mutating."""
+    return board or kanban_db.get_current_board()
+
+
+def _materialize_only_route_guard(board: Optional[str], task_id: str) -> Optional[dict[str, Any]]:
+    """Return route metadata when ``task_id`` is a guarded materialize-only target.
+
+    Attention Intake route repairs intentionally create Agent Research follow-up
+    cards as blocked ``materialize_only`` targets unless a separate human gate
+    authorizes dispatch. The normal dashboard ``blocked -> ready`` path calls
+    ``unblock_task`` directly, which is correct for ordinary cards but bypasses
+    the route register's authority boundary. Keep this guard narrow and
+    data-driven: it only applies to rows in the durable Attention register whose
+    active ``route_materialization.mode`` is exactly ``materialize_only``.
+    """
+    if _effective_board(board) != "agent-research-intake":
+        return None
+    register = get_default_hermes_root() / "artifacts" / "attention-intake" / "register.jsonl"
+    if not register.exists():
+        return None
+    try:
+        lines = register.read_text(encoding="utf-8").splitlines()
+    except OSError:
+        log.warning("could not read attention-intake register for route guard", exc_info=True)
+        return None
+    for line in lines:
+        if not line.strip() or task_id not in line:
+            continue
+        try:
+            row = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        routed = str(row.get("routed_to_task") or "")
+        target_board = str(row.get("routed_to_board") or row.get("routed_to_board_requested") or "")
+        target_task = routed
+        if "/" in routed:
+            target_board, target_task = routed.split("/", 1)
+        if target_board != "agent-research-intake" or target_task != task_id:
+            continue
+        materialization = row.get("route_materialization")
+        if isinstance(materialization, dict) and materialization.get("mode") == "materialize_only":
+            return {
+                "source_task": row.get("source_task") or row.get("task_id"),
+                "url": row.get("url") or row.get("source_url"),
+                "mode": materialization.get("mode"),
+            }
+    return None
+
+
+def _raise_materialize_only_route_guard(board: Optional[str], task_id: str) -> None:
+    guarded = _materialize_only_route_guard(board, task_id)
+    if not guarded:
+        return
+    raise HTTPException(
+        status_code=409,
+        detail=(
+            "Cannot move materialize_only routed target to ready from the dashboard. "
+            f"Target {task_id} is still registered as a blocked Attention Intake route "
+            f"from {guarded.get('source_task') or 'unknown source'} "
+            f"({guarded.get('url') or 'unknown URL'}). Record explicit route authorization "
+            "and update route_materialization.mode before dispatching this follow-up."
+        ),
+    )
+
+
 # ---------------------------------------------------------------------------
 # Serialization helpers
 # ---------------------------------------------------------------------------
@@ -959,6 +1025,7 @@ def update_task(task_id: str, payload: UpdateTaskBody, board: Optional[str] = Qu
                 # Re-open a blocked/scheduled task, or just an explicit status set.
                 current = kanban_db.get_task(conn, task_id)
                 if current and current.status in ("blocked", "scheduled"):
+                    _raise_materialize_only_route_guard(board, task_id)
                     ok = kanban_db.unblock_task(conn, task_id)
                 else:
                     # Direct status write for drag-drop (todo -> ready etc).
@@ -1299,6 +1366,7 @@ def bulk_update(payload: BulkTaskBody, board: Optional[str] = Query(None)):
                     elif s == "ready":
                         cur = kanban_db.get_task(conn, tid)
                         if cur and cur.status in ("blocked", "scheduled"):
+                            _raise_materialize_only_route_guard(board, tid)
                             ok = kanban_db.unblock_task(conn, tid)
                         else:
                             ok = _set_status_direct(conn, tid, "ready")
