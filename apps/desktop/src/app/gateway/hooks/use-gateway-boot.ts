@@ -99,6 +99,15 @@ export function useGatewayBoot({
     // tick — a stale OAuth ticket fails every attempt and would otherwise stack
     // identical error toasts (and their haptics). Reset on the next clean open.
     let reauthNotified = false
+    // After a healthy boot, a dropped gateway socket is usually transient
+    // (sleep/wake, remote restart, network flap). Keep retrying briefly, but if
+    // the retry loop is still failing after the exponential backoff has walked
+    // through roughly the same 45s window as the initial backend readiness
+    // timeout, raise the boot recovery overlay. Without this, the fullscreen
+    // CONNECTING overlay owns the UI forever and blocks Settings / Use local
+    // gateway — exactly when the user needs those controls.
+    let reconnectRecoveryRaised = false
+    const reconnectRecoveryAttemptThreshold = 6
 
     // Wrap the live getter in a call so TS control-flow analysis doesn't narrow
     // `connectionState` to a constant across the early-return guards (the state
@@ -142,6 +151,13 @@ export function useGatewayBoot({
         }
 
         reconnectAttempt = 0
+        reauthNotified = false
+        reconnectRecoveryRaised = false
+
+        if (bootCompleted) {
+          completeDesktopBoot()
+        }
+
         // Resync state that may have moved on the backend while we were asleep.
         await callbacksRef.current.refreshHermesConfig().catch(() => undefined)
         await callbacksRef.current.refreshSessions().catch(() => undefined)
@@ -153,6 +169,18 @@ export function useGatewayBoot({
         if (!cancelled && isGatewayReauthRequired(err) && !reauthNotified) {
           reauthNotified = true
           notifyError(err, translateNow('boot.errors.gatewaySignInRequired'))
+        }
+
+        if (
+          !cancelled &&
+          bootCompleted &&
+          !reconnectRecoveryRaised &&
+          reconnectAttempt >= reconnectRecoveryAttemptThreshold
+        ) {
+          reconnectRecoveryRaised = true
+          failDesktopBoot(
+            'Lost connection to the Hermes gateway. The desktop is still retrying; use the recovery buttons below if it does not recover.'
+          )
         }
       } finally {
         reconnecting = false
@@ -217,7 +245,12 @@ export function useGatewayBoot({
       if (st === 'open') {
         reconnectAttempt = 0
         reauthNotified = false
+        reconnectRecoveryRaised = false
         clearReconnectTimer()
+
+        if (bootCompleted && $desktopBoot.get().error) {
+          completeDesktopBoot()
+        }
       } else if (bootCompleted && (st === 'closed' || st === 'error')) {
         // The socket dropped after a healthy boot (typically sleep/wake). Try
         // to bring it back instead of leaving the composer stuck disabled.
