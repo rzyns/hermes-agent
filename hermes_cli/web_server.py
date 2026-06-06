@@ -69,6 +69,7 @@ try:
     from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, Response
     from fastapi.staticfiles import StaticFiles
     from pydantic import BaseModel
+    from starlette.concurrency import run_in_threadpool
 except ImportError:
     # First try lazy-installing the dashboard extras. Only the user actually
     # running `hermes dashboard` needs fastapi+uvicorn; lazy install keeps
@@ -81,6 +82,7 @@ except ImportError:
         from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, Response
         from fastapi.staticfiles import StaticFiles
         from pydantic import BaseModel
+        from starlette.concurrency import run_in_threadpool
     except Exception:
         raise SystemExit(
             "Web UI requires fastapi and uvicorn.\n"
@@ -5542,6 +5544,10 @@ def _find_cron_job_profile(job_id: str) -> Optional[str]:
 
 @app.get("/api/cron/jobs")
 async def list_cron_jobs(profile: str = "all"):
+    return await run_in_threadpool(_list_cron_jobs_sync, profile)
+
+
+def _list_cron_jobs_sync(profile: str = "all"):
     requested = (profile or "all").strip()
     if requested.lower() != "all":
         return _call_cron_for_profile(requested, "list_jobs", True)
@@ -7193,6 +7199,10 @@ def _write_profile_model(profile_dir: Path, provider: str, model: str) -> None:
 
 @app.get("/api/profiles")
 async def list_profiles_endpoint():
+    return await run_in_threadpool(_list_profiles_endpoint_sync)
+
+
+def _list_profiles_endpoint_sync():
     from hermes_cli import profiles as profiles_mod
     try:
         return {"profiles": [_profile_to_dict(p) for p in profiles_mod.list_profiles()]}

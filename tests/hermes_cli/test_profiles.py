@@ -765,6 +765,26 @@ class TestFindAliasForProfile:
         assert info.alias_path is not None
         assert info.alias_path.name == "qiaobusi"
 
+    def test_list_profiles_builds_alias_map_once(self, profile_env, monkeypatch):
+        """Profile listing must not rescan ~/.local/bin once per profile."""
+        import hermes_cli.profiles as profiles_mod
+
+        create_profile("alpha", no_alias=True)
+        create_profile("beta", no_alias=True)
+        calls = 0
+
+        def fake_alias_map():
+            nonlocal calls
+            calls += 1
+            return {"alpha": "alpha", "beta": "beta-alias"}
+
+        monkeypatch.setattr(profiles_mod, "_profile_alias_map", fake_alias_map)
+        listed = {p.name: p.alias_name for p in profiles_mod.list_profiles()}
+
+        assert listed["alpha"] == "alpha"
+        assert listed["beta"] == "beta-alias"
+        assert calls == 1
+
 
 # ===================================================================
 # TestRenameProfile

@@ -187,6 +187,33 @@ async def test_cron_delete_with_profile_deletes_only_target_profile(isolated_pro
 
 
 @pytest.mark.asyncio
+async def test_profile_heavy_dashboard_routes_use_threadpool(monkeypatch):
+    """Expensive synchronous dashboard discovery must not block the event loop."""
+    from hermes_cli import web_server
+
+    calls = []
+
+    async def fake_threadpool(func, *args, **kwargs):
+        calls.append((func, args, kwargs))
+        return {"sentinel": func.__name__, "args": args}
+
+    monkeypatch.setattr(web_server, "run_in_threadpool", fake_threadpool)
+
+    assert await web_server.list_cron_jobs(profile="all") == {
+        "sentinel": "_list_cron_jobs_sync",
+        "args": ("all",),
+    }
+    assert await web_server.list_profiles_endpoint() == {
+        "sentinel": "_list_profiles_endpoint_sync",
+        "args": (),
+    }
+    assert calls == [
+        (web_server._list_cron_jobs_sync, ("all",), {}),
+        (web_server._list_profiles_endpoint_sync, (), {}),
+    ]
+
+
+@pytest.mark.asyncio
 async def test_cron_profile_validation_errors(isolated_profiles):
     from hermes_cli import web_server
 
