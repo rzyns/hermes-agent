@@ -771,9 +771,23 @@ def _collect_auto_append_media_tags(
 # Must run BEFORE any HTTP library (discord, aiohttp, etc.) is imported.
 # ---------------------------------------------------------------------------
 def _ensure_ssl_certs() -> None:
-    """Set SSL_CERT_FILE if the system doesn't expose CA certs to Python."""
-    if "SSL_CERT_FILE" in os.environ:
-        return  # user already configured it
+    """Set SSL_CERT_FILE if the system doesn't expose CA certs to Python.
+
+    Windows startup paths (Desktop, Scheduled Tasks, installer children) can
+    occasionally inherit a stale SSL_CERT_FILE. Returning just because the
+    variable is present makes every later httpx/OpenAI client construction fail
+    with FileNotFoundError from ssl.load_verify_locations(). Treat a missing
+    path as unset and fall back to certifi instead.
+    """
+    configured_cert = os.environ.get("SSL_CERT_FILE")
+    if configured_cert:
+        if os.path.exists(configured_cert):
+            return  # user already configured it to a real file
+        logging.getLogger(__name__).warning(
+            "Ignoring stale SSL_CERT_FILE=%r because the path does not exist",
+            configured_cert,
+        )
+        os.environ.pop("SSL_CERT_FILE", None)
 
     import ssl
 
@@ -7405,6 +7419,21 @@ class GatewayRunner:
             if normalized_user_id:
                 check_ids.add(normalized_user_id)
 
+        # SimpleX: SIMPLEX_ALLOWED_USERS accepts either the numeric contactId
+        # or the contact's display name. The adapter sets user_id=contactId for
+        # stability across renames, but the SimpleX UI never surfaces the
+        # numeric id — operators only see display names, so that's what they
+        # naturally put in the env var. Match both so the allowlist works
+        # regardless of which form was chosen.
+        # Plugin platform: compare by value since Platform.SIMPLEX is not a
+        # hardcoded enum member (it's a dynamic plugin platform).
+        if (
+            source.platform is not None
+            and source.platform.value == "simplex"
+            and source.user_name
+        ):
+            check_ids.add(source.user_name)
+
         return bool(check_ids & allowed_ids)
 
     def _get_unauthorized_dm_behavior(self, platform: Optional[Platform]) -> str:
@@ -10001,6 +10030,37 @@ class GatewayRunner:
             except Exception:
                 pass
             logger.exception("Agent error in session %s", session_key)
+            # Crash-resilience for failures that happen before AIAgent enters
+            # run_conversation() (for example: provider/httpx client init
+            # failures). In that path the agent cannot persist the current
+            # inbound turn itself, so append the user message here once. If the
+            # agent already reached its early turn-start persistence, the latest
+            # transcript user row will match and we skip the duplicate.
+            try:
+                if 'message_text' in locals() and message_text is not None and session_entry is not None:
+                    _already_persisted = False
+                    try:
+                        _recent_transcript = self.session_store.load_transcript(session_entry.session_id)
+                    except Exception:
+                        _recent_transcript = []
+                    for _msg in reversed(_recent_transcript[-10:]):
+                        if _msg.get("role") == "user":
+                            _already_persisted = (_msg.get("content") == message_text)
+                            break
+                    if not _already_persisted:
+                        _user_entry = {
+                            "role": "user",
+                            "content": message_text,
+                            "timestamp": datetime.now().isoformat(),
+                        }
+                        if getattr(event, "message_id", None):
+                            _user_entry["message_id"] = str(event.message_id)
+                        self.session_store.append_to_transcript(
+                            session_entry.session_id,
+                            _user_entry,
+                        )
+            except Exception:
+                logger.debug("Failed to persist inbound user message after agent exception", exc_info=True)
             error_type = type(e).__name__
             error_detail = str(e)[:300] if str(e) else "no details available"
             status_hint = ""
@@ -15229,7 +15289,7 @@ class GatewayRunner:
                     env["PYTHONUNBUFFERED"] = "1"
                     with open(output_path, "wb") as f:
                         proc = subprocess.Popen(cmd, stdout=f, stderr=subprocess.STDOUT, env=env)
-                        rc = proc.wait()
+                        rc = proc.wait(timeout=3600)
                     with open(exit_code_path, "w") as f:
                         f.write(str(rc))
                     """
