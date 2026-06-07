@@ -447,3 +447,49 @@ class TestTickProfilePartition:
             assert seq_thread.startswith("cron-seq"), seq_thread
         par_thread = next(t for job_id, t in calls if job_id == "c")
         assert par_thread.startswith("cron-parallel"), par_thread
+
+    def test_parallel_jobs_wait_for_active_profile_context(
+        self, isolated_cron_profile_home, monkeypatch
+    ):
+        """No-profile jobs must not run while a profile job owns _hermes_home."""
+        import threading
+        import time
+        import cron.scheduler as sched
+
+        root, profile_home = isolated_cron_profile_home
+        profile_job = {"id": "profile", "name": "profile", "profile": "support"}
+        parallel_job = {"id": "parallel", "name": "parallel", "profile": None}
+
+        monkeypatch.setattr(sched, "get_due_jobs", lambda: [profile_job, parallel_job])
+        monkeypatch.setattr(sched, "advance_next_run", lambda *_a, **_kw: None)
+        monkeypatch.setattr(sched, "save_job_output", lambda _jid, _o: None)
+        monkeypatch.setattr(sched, "mark_job_run", lambda *_a, **_kw: None)
+        monkeypatch.setattr(sched, "_deliver_result", lambda *_a, **_kw: None)
+
+        profile_started = threading.Event()
+        release_profile = threading.Event()
+        parallel_started = threading.Event()
+        observed: dict[str, str] = {}
+
+        def fake_run_job(job):
+            if job["id"] == "profile":
+                sched._hermes_home = profile_home.resolve()
+                profile_started.set()
+                assert release_profile.wait(timeout=2), "test timed out releasing profile job"
+                sched._hermes_home = None
+            else:
+                parallel_started.set()
+                observed["parallel_home"] = str(sched._get_hermes_home())
+            return True, "output", "response", None
+
+        monkeypatch.setattr(sched, "run_job", fake_run_job)
+
+        assert sched.tick(verbose=False, sync=False) == 2
+        assert profile_started.wait(timeout=2), "profile job did not start"
+        time.sleep(0.1)
+        assert not parallel_started.is_set()
+
+        release_profile.set()
+        assert parallel_started.wait(timeout=2), "parallel job did not resume"
+        assert observed["parallel_home"] == str(root)
+        assert sched._get_hermes_home() == root

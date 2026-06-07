@@ -166,6 +166,60 @@ _parallel_pool_max_workers: Optional[int] = None
 _running_job_ids: set = set()
 _running_lock = threading.Lock()
 
+
+class _RuntimeContextIsolation:
+    """Reader/writer gate for cron jobs that mutate process-global state.
+
+    Profile/workdir jobs temporarily change scheduler-wide runtime state
+    (_hermes_home, os.environ, and sometimes cwd). They must not overlap with
+    ordinary jobs, because ordinary jobs resolve HERMES_HOME/script paths via
+    the same globals. Ordinary jobs may still run in parallel with each other.
+    """
+
+    def __init__(self):
+        self._condition = threading.Condition(threading.Lock())
+        self._readers = 0
+        self._writer_active = False
+        self._writers_waiting = 0
+
+    @contextmanager
+    def read(self):
+        with self._condition:
+            while self._writer_active or self._writers_waiting:
+                self._condition.wait()
+            self._readers += 1
+        try:
+            yield
+        finally:
+            with self._condition:
+                self._readers -= 1
+                if self._readers == 0:
+                    self._condition.notify_all()
+
+    @contextmanager
+    def write(self):
+        with self._condition:
+            self._writers_waiting += 1
+            try:
+                while self._writer_active or self._readers:
+                    self._condition.wait()
+                self._writer_active = True
+            finally:
+                self._writers_waiting -= 1
+        try:
+            yield
+        finally:
+            with self._condition:
+                self._writer_active = False
+                self._condition.notify_all()
+
+
+_runtime_context_isolation = _RuntimeContextIsolation()
+
+
+def _job_mutates_runtime_context(job: dict) -> bool:
+    return bool((job.get("workdir") or "").strip() or (job.get("profile") or "").strip())
+
 # Sequential (env/context-mutating) cron jobs — workdir/profile jobs that touch
 # process-global runtime state — must run one at a time, but must NOT block the
 # ticker thread.  A persistent single-thread executor preserves ordering across
@@ -2081,7 +2135,13 @@ def tick(verbose: bool = True, adapters=None, loop=None, sync: bool = True) -> i
         def _process_job(job: dict) -> bool:
             """Run one due job end-to-end: execute, save, deliver, mark."""
             try:
-                success, output, final_response, error = run_job(job)
+                runtime_gate = (
+                    _runtime_context_isolation.write()
+                    if _job_mutates_runtime_context(job)
+                    else _runtime_context_isolation.read()
+                )
+                with runtime_gate:
+                    success, output, final_response, error = run_job(job)
 
                 output_file = save_job_output(job["id"], output)
                 if verbose:
