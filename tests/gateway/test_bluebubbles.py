@@ -565,19 +565,26 @@ class TestBlueBubblesAttachmentDownload:
 
 
 class TestBlueBubblesWebhookUrl:
-    """_webhook_url property normalises local hosts to 'localhost'."""
+    """_webhook_url preserves explicit loopback hosts for registration."""
 
     def test_default_host(self, monkeypatch):
         adapter = _make_adapter(monkeypatch)
-        # Default webhook_host is 0.0.0.0 → normalized to localhost
-        assert "localhost" in adapter._webhook_url
+        # Default webhook_host is 127.0.0.1; preserve it instead of using
+        # localhost, which may resolve to IPv6 ::1 on macOS while a reverse
+        # SSH tunnel is bound only to IPv4 127.0.0.1.
+        assert adapter._webhook_url.startswith("http://127.0.0.1:")
         assert str(adapter.webhook_port) in adapter._webhook_url
         assert adapter.webhook_path in adapter._webhook_url
 
-    @pytest.mark.parametrize("host", ["0.0.0.0", "127.0.0.1", "localhost", "::"])
-    def test_local_hosts_normalized(self, monkeypatch, host):
+    @pytest.mark.parametrize("host", ["0.0.0.0", "::"])
+    def test_wildcard_hosts_normalized(self, monkeypatch, host):
         adapter = _make_adapter(monkeypatch, webhook_host=host)
         assert adapter._webhook_url.startswith("http://localhost:")
+
+    @pytest.mark.parametrize("host", ["127.0.0.1", "localhost"])
+    def test_explicit_loopback_hosts_preserved(self, monkeypatch, host):
+        adapter = _make_adapter(monkeypatch, webhook_host=host)
+        assert adapter._webhook_url.startswith(f"http://{host}:")
 
     def test_custom_host_preserved(self, monkeypatch):
         adapter = _make_adapter(monkeypatch, webhook_host="192.168.1.50")

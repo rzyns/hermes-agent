@@ -96,6 +96,8 @@ async def build_channel_directory(adapters: Dict[Any, Any]) -> Dict[str, Any]:
     except Exception:
         pass
 
+    _merge_configured_home_channels(platforms, adapters)
+
     directory = {
         "updated_at": datetime.now().isoformat(),
         "platforms": platforms,
@@ -238,6 +240,52 @@ def _build_from_sessions(platform_name: str) -> List[Dict[str, str]]:
         logger.debug("Channel directory: failed to read sessions for %s: %s", platform_name, e)
 
     return entries
+
+
+def _merge_configured_home_channels(
+    platforms: Dict[str, List[Dict[str, Any]]],
+    adapters: Dict[Any, Any],
+) -> None:
+    """Add configured home channels for currently connected platforms.
+
+    Address-based platforms such as BlueBubbles and Signal cannot always
+    enumerate contacts up front. If the operator configured a home channel,
+    include it in the directory so ``send_message(action="list")`` is not
+    empty immediately after gateway startup.
+    """
+    if not adapters:
+        return
+    try:
+        from gateway.config import load_gateway_config
+
+        config = load_gateway_config()
+    except Exception as exc:
+        logger.debug("Channel directory: failed to load home channels: %s", exc)
+        return
+
+    for platform in adapters:
+        platform_name = getattr(platform, "value", str(platform))
+        try:
+            home = config.get_home_channel(platform)
+        except Exception:
+            continue
+        if not home or not home.chat_id:
+            continue
+
+        entry_id = str(home.chat_id)
+        if getattr(home, "thread_id", None):
+            entry_id = f"{entry_id}:{home.thread_id}"
+        entries = platforms.setdefault(platform_name, [])
+        if any(ch.get("id") == entry_id for ch in entries):
+            continue
+        entry: Dict[str, Any] = {
+            "id": entry_id,
+            "name": getattr(home, "name", None) or "Home",
+            "type": "home",
+        }
+        if getattr(home, "thread_id", None):
+            entry["thread_id"] = home.thread_id
+        entries.append(entry)
 
 
 # ---------------------------------------------------------------------------
