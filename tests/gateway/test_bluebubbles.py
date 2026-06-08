@@ -115,6 +115,51 @@ class TestBlueBubblesHelpers:
         assert result.success is True
         assert sent == ["first thought", "second thought"]
 
+    @pytest.mark.asyncio
+    async def test_send_uses_private_api_when_helper_connected(self, monkeypatch):
+        adapter = _make_adapter(monkeypatch)
+        adapter._private_api_enabled = True
+        adapter._helper_connected = True
+        payloads = []
+
+        async def fake_resolve_chat_guid(chat_id):
+            return "iMessage;-;user@example.com"
+
+        async def fake_api_post(path, payload):
+            payloads.append(payload)
+            return {"data": {"guid": "msg-1"}}
+
+        monkeypatch.setattr(adapter, "_resolve_chat_guid", fake_resolve_chat_guid)
+        monkeypatch.setattr(adapter, "_api_post", fake_api_post)
+
+        result = await adapter.send("user@example.com", "hello")
+
+        assert result.success is True
+        assert payloads[0]["method"] == "private-api"
+        assert "selectedMessageGuid" not in payloads[0]
+
+    @pytest.mark.asyncio
+    async def test_send_uses_applescript_default_when_helper_unavailable(self, monkeypatch):
+        adapter = _make_adapter(monkeypatch)
+        adapter._private_api_enabled = True
+        adapter._helper_connected = False
+        payloads = []
+
+        async def fake_resolve_chat_guid(chat_id):
+            return "iMessage;-;user@example.com"
+
+        async def fake_api_post(path, payload):
+            payloads.append(payload)
+            return {"data": {"guid": "msg-1"}}
+
+        monkeypatch.setattr(adapter, "_resolve_chat_guid", fake_resolve_chat_guid)
+        monkeypatch.setattr(adapter, "_api_post", fake_api_post)
+
+        result = await adapter.send("user@example.com", "hello")
+
+        assert result.success is True
+        assert "method" not in payloads[0]
+
     def test_format_message_strips_markdown(self, monkeypatch):
         adapter = _make_adapter(monkeypatch)
         assert adapter.format_message("**Hello** `world`") == "Hello world"

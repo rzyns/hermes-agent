@@ -534,8 +534,14 @@ class BlueBubblesAdapter(BasePlatformAdapter):
                 "tempGuid": f"temp-{datetime.utcnow().timestamp()}",
                 "message": chunk,
             }
-            if reply_to and self._private_api_enabled and self._helper_connected:
+            if self._private_api_enabled and self._helper_connected:
+                # BlueBubbles defaults text sends to the AppleScript path. When
+                # the Private API helper is connected, prefer it for ordinary
+                # sends too; AppleScript is prone to Messages.app timeouts and
+                # "Message Send Error" 500s even when a local message record is
+                # created.
                 payload["method"] = "private-api"
+            if reply_to and self._private_api_enabled and self._helper_connected:
                 payload["selectedMessageGuid"] = reply_to
                 payload["partIndex"] = 0
             try:
