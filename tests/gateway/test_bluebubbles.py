@@ -65,6 +65,17 @@ class TestBlueBubblesConfigLoading:
         assert Platform.BLUEBUBBLES not in config.get_connected_platforms()
 
 
+class TestBlueBubblesSendMessageTargetParsing:
+    def test_e164_phone_target_is_explicit(self):
+        from tools.send_message_tool import _parse_target_ref
+
+        assert _parse_target_ref("bluebubbles", "+15551234567") == (
+            "+15551234567",
+            None,
+            True,
+        )
+
+
 class TestBlueBubblesHelpers:
     def test_check_requirements(self, monkeypatch):
         monkeypatch.setenv("BLUEBUBBLES_SERVER_URL", "http://localhost:1234")
