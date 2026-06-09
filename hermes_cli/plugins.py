@@ -506,6 +506,24 @@ class PluginContext:
 
         return registry.dispatch(tool_name, args, **kwargs)
 
+    # -- Kanban dependency provider registration -----------------------------
+    def register_kanban_dependency_provider(self, provider) -> None:
+        """Register a Kanban external dependency provider.
+
+        Providers participate in Kanban scheduler dependency checks for
+        board-external blockers. The core scheduler remains the enforcement
+        point; plugins supply local, deterministic blocker facts.
+        """
+        from hermes_cli import kanban_dependencies as kd
+
+        token = kd.register_dependency_provider(provider)
+        self._manager._kanban_dependency_providers.append(token)
+        logger.info(
+            "Plugin '%s' registered Kanban dependency provider: %s",
+            self.manifest.name,
+            getattr(provider, "name", provider.__class__.__name__),
+        )
+
     # -- context engine registration -----------------------------------------
 
     def register_context_engine(self, engine) -> None:
@@ -1054,6 +1072,9 @@ class PluginManager:
         # Plugin-registered auxiliary tasks: key → {key, display_name,
         # description, defaults, plugin}. See PluginContext.register_auxiliary_task.
         self._aux_tasks: Dict[str, Dict[str, Any]] = {}
+        # Kanban dependency-provider registrations returned by
+        # kanban_dependencies.register_dependency_provider().
+        self._kanban_dependency_providers: List[Any] = []
 
     # -----------------------------------------------------------------------
     # Public
@@ -1069,6 +1090,15 @@ class PluginManager:
         if self._discovered and not force:
             return
         if force:
+            try:
+                from hermes_cli import kanban_dependencies as kd
+                for provider in list(self._kanban_dependency_providers):
+                    kd.unregister_dependency_provider(provider)
+            except Exception:
+                logger.warning(
+                    "Failed to unregister plugin Kanban dependency providers during rediscovery",
+                    exc_info=True,
+                )
             self._plugins.clear()
             self._hooks.clear()
             self._middleware.clear()
@@ -1077,6 +1107,7 @@ class PluginManager:
             self._plugin_commands.clear()
             self._plugin_skills.clear()
             self._aux_tasks.clear()
+            self._kanban_dependency_providers.clear()
             self._context_engine = None
         self._discovered = True
 

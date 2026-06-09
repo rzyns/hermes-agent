@@ -90,6 +90,87 @@ def test_no_idempotency_key_never_collides(kanban_home):
 
 
 # ---------------------------------------------------------------------------
+# Cross-board dependency provider seam
+# ---------------------------------------------------------------------------
+
+def test_claim_task_rejects_unsatisfied_external_blocker(kanban_home):
+    """External dependency providers participate in the hard claim gate.
+
+    Even if a child task is already marked ``ready``, a provider-reported
+    unsatisfied external blocker must prevent ``ready -> running`` and demote
+    the child back to ``todo`` so the dispatcher cannot spawn it accidentally.
+    """
+    from hermes_cli import kanban_dependencies as kd
+
+    class BlockingProvider:
+        def blockers_for(self, *, board, task_id):
+            return [
+                kd.ExternalBlocker(
+                    parent_board="research-decision-queue",
+                    parent_id="t_parent",
+                    status="todo",
+                    kind="depends_on_decision",
+                    reason="waiting on research decision",
+                    satisfied=False,
+                    provenance={"source": "test"},
+                )
+            ]
+
+    conn = kb.connect(board="default")
+    try:
+        tid = kb.create_task(conn, title="downstream", assignee="worker")
+
+        with kd.scoped_dependency_provider(BlockingProvider()):
+            claimed = kb.claim_task(conn, tid, board="default")
+
+        assert claimed is None
+        task = kb.get_task(conn, tid)
+        assert task.status == "todo"
+        events = kb.list_events(conn, tid)
+        rejected = [e for e in events if e.kind == "claim_rejected"]
+        assert rejected
+        assert rejected[-1].payload["reason"] == "external_blockers"
+        assert rejected[-1].payload["blockers"][0]["parent_board"] == "research-decision-queue"
+        assert rejected[-1].payload["blockers"][0]["parent_id"] == "t_parent"
+    finally:
+        conn.close()
+
+
+def test_recompute_ready_does_not_promote_unsatisfied_external_blocker(kanban_home):
+    """External blockers participate in the normal todo -> ready promotion gate."""
+    from hermes_cli import kanban_dependencies as kd
+
+    class BlockingProvider:
+        def blockers_for(self, *, board, task_id):
+            return [
+                kd.ExternalBlocker(
+                    parent_board="research-decision-queue",
+                    parent_id="t_parent",
+                    status="running",
+                    kind="depends_on_decision",
+                    reason="waiting on research decision",
+                    satisfied=False,
+                    provenance={"source": "test"},
+                )
+            ]
+
+    conn = kb.connect(board="default")
+    try:
+        tid = kb.create_task(conn, title="downstream", assignee="worker")
+        with kb.write_txn(conn):
+            conn.execute("UPDATE tasks SET status = 'todo' WHERE id = ?", (tid,))
+
+        with kd.scoped_dependency_provider(BlockingProvider()):
+            promoted = kb.recompute_ready(conn, board="default")
+
+        assert promoted == 0
+        task = kb.get_task(conn, tid)
+        assert task.status == "todo"
+    finally:
+        conn.close()
+
+
+# ---------------------------------------------------------------------------
 # Spawn-failure circuit breaker
 # ---------------------------------------------------------------------------
 

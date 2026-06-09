@@ -103,6 +103,35 @@ class TestPluginDiscovery:
         assert "hello_plugin" in mgr._plugins
         assert mgr._plugins["hello_plugin"].enabled
 
+    def test_plugin_context_registers_kanban_dependency_provider(self):
+        from hermes_cli import kanban_dependencies as kd
+
+        manager = PluginManager()
+        manifest = PluginManifest(name="xdep-plugin")
+        ctx = PluginContext(manifest, manager)
+
+        class Provider:
+            def blockers_for(self, *, board, task_id):
+                return [
+                    kd.ExternalBlocker(
+                        parent_board="research-decision-queue",
+                        parent_id="t_parent",
+                        satisfied=False,
+                    )
+                ]
+
+        provider = Provider()
+        try:
+            ctx.register_kanban_dependency_provider(provider)
+            blockers = kd.unsatisfied_blockers_for(board="child-board", task_id="t_child")
+        finally:
+            kd.unregister_dependency_provider(provider)
+
+        assert blockers
+        assert blockers[0].parent_board == "research-decision-queue"
+        assert blockers[0].parent_id == "t_parent"
+        assert provider in manager._kanban_dependency_providers
+
     def test_plugin_can_register_and_invoke_middleware(self, tmp_path, monkeypatch):
         plugins_dir = tmp_path / "hermes_test" / "plugins"
         _make_plugin_dir(

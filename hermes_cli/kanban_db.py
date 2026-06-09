@@ -93,6 +93,18 @@ from toolsets import get_toolset_names
 _log = logging.getLogger(__name__)
 
 
+def _kanban_dependencies():
+    """Return the current dependency-provider module.
+
+    Some tests deliberately purge and re-import ``hermes_cli`` modules to
+    simulate fresh HERMES_HOME state. Resolving this lazily keeps long-lived
+    ``kanban_db`` module references pointed at the current provider registry.
+    """
+    from hermes_cli import kanban_dependencies as _kd
+
+    return _kd
+
+
 # ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------
@@ -2972,7 +2984,9 @@ def _has_sticky_block(conn: sqlite3.Connection, task_id: str) -> bool:
 
 
 def recompute_ready(
-    conn: sqlite3.Connection, failure_limit: int = None,
+    conn: sqlite3.Connection,
+    failure_limit: int = None,
+    board: Optional[str] = None,
 ) -> int:
     """Promote ``todo`` tasks to ``ready`` when all parents are ``done`` or ``archived``.
 
@@ -3004,6 +3018,7 @@ def recompute_ready(
     """
     if failure_limit is None:
         failure_limit = DEFAULT_FAILURE_LIMIT
+    effective_board = board or get_current_board()
     promoted = 0
     with write_txn(conn):
         todo_rows = conn.execute(
@@ -3026,6 +3041,12 @@ def recompute_ready(
                 (task_id,),
             ).fetchall()
             if all(p["status"] in ("done", "archived") for p in parents):
+                external_blockers = _kanban_dependencies().unsatisfied_blockers_for(
+                    board=effective_board,
+                    task_id=task_id,
+                )
+                if external_blockers:
+                    continue
                 if cur_status == "blocked":
                     # Don't auto-recover tasks that have hit the
                     # circuit-breaker failure limit.  Without this
@@ -3068,6 +3089,7 @@ def claim_task(
     *,
     ttl_seconds: Optional[int] = None,
     claimer: Optional[str] = None,
+    board: Optional[str] = None,
 ) -> Optional[Task]:
     """Atomically transition ``ready -> running``.
 
@@ -3101,6 +3123,26 @@ def claim_task(
             _append_event(
                 conn, task_id, "claim_rejected",
                 {"reason": "parents_not_done"},
+            )
+            return None
+        effective_board = board or get_current_board()
+        external_blockers = _kanban_dependencies().unsatisfied_blockers_for(
+            board=effective_board,
+            task_id=task_id,
+        )
+        if external_blockers:
+            conn.execute(
+                "UPDATE tasks SET status = 'todo' "
+                "WHERE id = ? AND status = 'ready'",
+                (task_id,),
+            )
+            _append_event(
+                conn, task_id, "claim_rejected",
+                {
+                    "reason": "external_blockers",
+                    "board": effective_board,
+                    "blockers": [b.to_dict() for b in external_blockers],
+                },
             )
             return None
         # Defensive: if a prior run somehow leaked (invariant violation from
@@ -6195,7 +6237,11 @@ def dispatch_once(
     if _crash_rate_limited:
         result.rate_limited.extend(_crash_rate_limited)
     result.timed_out = enforce_max_runtime(conn)
-    result.promoted = recompute_ready(conn, failure_limit=failure_limit)
+    result.promoted = recompute_ready(
+        conn,
+        failure_limit=failure_limit,
+        board=board,
+    )
 
     # Count tasks already running so max_spawn enforces concurrency rather
     # than a per-tick spawn budget. See the docstring above for the full
@@ -6383,7 +6429,7 @@ def dispatch_once(
                     _per_profile_running.get(row_assignee, 0) + 1
                 )
             continue
-        claimed = claim_task(conn, row["id"], ttl_seconds=ttl_seconds)
+        claimed = claim_task(conn, row["id"], ttl_seconds=ttl_seconds, board=board)
         if claimed is None:
             continue
         try:
