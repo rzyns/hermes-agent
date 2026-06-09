@@ -17,6 +17,7 @@ import sys
 from typing import Any
 
 from plugins.kanban_cross_deps.diagnostics import CrossBoardDiagnostics
+from plugins.kanban_cross_deps.discovery import CandidateDiscovery
 from plugins.kanban_cross_deps.models import VALID_EDGE_KINDS
 from plugins.kanban_cross_deps.store import CrossBoardRegistry
 
@@ -177,6 +178,62 @@ def register_cli(subparser: argparse.ArgumentParser) -> None:
         help="Print machine-readable JSON",
     )
 
+    # discover
+    disc_p = subs.add_parser(
+        "discover",
+        help="Read-only scan for cross-board dependency candidates",
+    )
+    disc_p.add_argument("--child-board", required=True)
+    disc_p.add_argument("--child-id", default=None, help="Optional: scan a single task")
+    disc_p.add_argument(
+        "--json",
+        action="store_true",
+        help="Print machine-readable JSON",
+    )
+
+    # promote-candidate
+    prom_p = subs.add_parser(
+        "promote-candidate",
+        aliases=["promote"],
+        help="Promote a discovered candidate into a canonical edge",
+    )
+    prom_p.add_argument("--child-board", required=True)
+    prom_p.add_argument("--child-id", required=True)
+    prom_p.add_argument("--parent-board", required=True)
+    prom_p.add_argument("--parent-id", required=True)
+    prom_p.add_argument(
+        "--kind",
+        required=True,
+        choices=sorted(VALID_EDGE_KINDS),
+        help="Edge kind",
+    )
+    prom_p.add_argument(
+        "--blocking",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Whether the edge blocks scheduler promotion (default: true)",
+    )
+    prom_p.add_argument(
+        "--required-statuses",
+        default=None,
+        help='JSON list of parent statuses that satisfy the edge',
+    )
+    prom_p.add_argument(
+        "--source",
+        default="promoted",
+        help="Provenance source label (default: promoted)",
+    )
+    prom_p.add_argument(
+        "--created-by",
+        default=None,
+        help="Actor who created the edge",
+    )
+    prom_p.add_argument(
+        "--json",
+        action="store_true",
+        help="Print machine-readable JSON",
+    )
+
     subparser.set_defaults(func=kanban_cross_deps_command)
 
 
@@ -187,10 +244,10 @@ def register_cli(subparser: argparse.ArgumentParser) -> None:
 def kanban_cross_deps_command(args: argparse.Namespace) -> int:
     sub = getattr(args, "kcd_command", None)
     if not sub:
-        print("usage: hermes kanban-cross-deps {add,remove,list,status,diagnostics}")
+        print("usage: hermes kanban-cross-deps {add,remove,list,status,diagnostics,discover,promote-candidate}")
         return 2
 
-    if sub in {"add", "remove", "list", "ls", "status", "diagnostics", "diag"}:
+    if sub in {"add", "remove", "list", "ls", "status", "diagnostics", "diag", "discover", "promote-candidate", "promote"}:
         return _dispatch_registry_command(args)
 
     print(f"Unknown kanban-cross-deps subcommand: {sub}", file=sys.stderr)
@@ -212,6 +269,10 @@ def _dispatch_registry_command(args: argparse.Namespace) -> int:
         return _cmd_status(args, reg)
     if sub in {"diagnostics", "diag"}:
         return _cmd_diagnostics(args)
+    if sub == "discover":
+        return _cmd_discover(args)
+    if sub in {"promote-candidate", "promote"}:
+        return _cmd_promote(args, reg)
 
     return 2
 
@@ -416,4 +477,82 @@ def _cmd_diagnostics(args: argparse.Namespace) -> int:
             for cycle in report["cycles"]["blocking"]:
                 path = " -> ".join(cycle.get("path", []))
                 print(f"    {path}")
+    return 0
+
+
+def _cmd_discover(args: argparse.Namespace) -> int:
+    discovery = CandidateDiscovery()
+    candidates = discovery.discover(
+        child_board=args.child_board,
+        child_id=args.child_id,
+    )
+    result = {
+        "child_board": args.child_board,
+        "child_id": args.child_id,
+        "candidates": [c.to_dict() for c in candidates],
+        "count": len(candidates),
+    }
+    if args.json:
+        _json_out(result)
+    else:
+        print(f"Discovery for {args.child_board}/{args.child_id or '*'}")
+        print(f"  Candidates found: {len(candidates)}")
+        for c in candidates:
+            status_flag = f"[{c.status}]"
+            print(f"  {status_flag} {c.child_board}/{c.child_id} -> {c.referenced_board}/{c.referenced_id} ({c.inferred_kind}, conf={c.confidence:.2f})")
+            print(f"    source={c.source_location} snippet={c.context_snippet[:60]}...")
+            if c.canonical_edge_id:
+                print(f"    canonical_edge_id={c.canonical_edge_id}")
+    return 0
+
+
+def _cmd_promote(args: argparse.Namespace, reg: CrossBoardRegistry) -> int:
+    required_statuses = None
+    if getattr(args, "required_statuses", None):
+        try:
+            required_statuses = json.loads(args.required_statuses)
+            if not isinstance(required_statuses, list):
+                raise ValueError("required_statuses must be a JSON list")
+        except Exception as exc:
+            _err(args, f"Invalid --required-statuses: {exc}")
+            return 2
+
+    # Cycle guard: reject new blocking edges that would close a cycle
+    if args.blocking:
+        diag = CrossBoardDiagnostics(registry=reg)
+        if diag.would_create_cycle(
+            parent_board=args.parent_board,
+            parent_id=args.parent_id,
+            child_board=args.child_board,
+            child_id=args.child_id,
+            blocking=True,
+        ):
+            msg = (
+                "Promoting this edge would create a blocking cycle. "
+                "Resolve the cycle first or promote as non-blocking."
+            )
+            _err(args, msg)
+            return 1
+
+    try:
+        edge = reg.add(
+            parent_board=args.parent_board,
+            parent_id=args.parent_id,
+            child_board=args.child_board,
+            child_id=args.child_id,
+            kind=args.kind,
+            blocking=args.blocking,
+            required_parent_statuses=required_statuses,
+            source=getattr(args, "source", "promoted"),
+            created_by=getattr(args, "created_by", None),
+        )
+    except ValueError as exc:
+        _err(args, str(exc))
+        return 1
+
+    if args.json:
+        _json_out({"ok": True, "edge": _edge_as_dict(edge)})
+    else:
+        print(f"Promoted candidate to edge {edge.id}")
+        print(f"  {edge.parent_board}/{edge.parent_id} --[{edge.kind}]{' (blocking)' if edge.blocking else ''}--> {edge.child_board}/{edge.child_id}")
     return 0
