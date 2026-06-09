@@ -7,6 +7,7 @@ The dependency provider and CLI surfaces will be added in downstream cards.
 from __future__ import annotations
 
 from plugins.kanban_cross_deps.cli import kanban_cross_deps_command, register_cli
+from plugins.kanban_cross_deps.diagnostics import CrossBoardDiagnostics
 from plugins.kanban_cross_deps.models import CrossBoardEdge, VALID_EDGE_KINDS
 from plugins.kanban_cross_deps.provider import CrossBoardDependencyProvider
 from plugins.kanban_cross_deps.store import CrossBoardRegistry
@@ -15,6 +16,7 @@ __all__ = [
     "CrossBoardEdge",
     "CrossBoardRegistry",
     "CrossBoardDependencyProvider",
+    "CrossBoardDiagnostics",
     "VALID_EDGE_KINDS",
     "kanban_cross_deps_command",
     "register_cli",

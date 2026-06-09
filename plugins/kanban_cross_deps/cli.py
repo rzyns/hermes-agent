@@ -16,6 +16,7 @@ import json
 import sys
 from typing import Any
 
+from plugins.kanban_cross_deps.diagnostics import CrossBoardDiagnostics
 from plugins.kanban_cross_deps.models import VALID_EDGE_KINDS
 from plugins.kanban_cross_deps.store import CrossBoardRegistry
 
@@ -164,6 +165,18 @@ def register_cli(subparser: argparse.ArgumentParser) -> None:
         help="Print machine-readable JSON",
     )
 
+    # diagnostics
+    diag_p = subs.add_parser(
+        "diagnostics",
+        aliases=["diag"],
+        help="Run cross-board dependency diagnostics",
+    )
+    diag_p.add_argument(
+        "--json",
+        action="store_true",
+        help="Print machine-readable JSON",
+    )
+
     subparser.set_defaults(func=kanban_cross_deps_command)
 
 
@@ -174,10 +187,10 @@ def register_cli(subparser: argparse.ArgumentParser) -> None:
 def kanban_cross_deps_command(args: argparse.Namespace) -> int:
     sub = getattr(args, "kcd_command", None)
     if not sub:
-        print("usage: hermes kanban-cross-deps {add,remove,list,status}")
+        print("usage: hermes kanban-cross-deps {add,remove,list,status,diagnostics}")
         return 2
 
-    if sub in {"add", "remove", "list", "ls", "status"}:
+    if sub in {"add", "remove", "list", "ls", "status", "diagnostics", "diag"}:
         return _dispatch_registry_command(args)
 
     print(f"Unknown kanban-cross-deps subcommand: {sub}", file=sys.stderr)
@@ -197,6 +210,8 @@ def _dispatch_registry_command(args: argparse.Namespace) -> int:
         return _cmd_list(args, reg)
     if sub == "status":
         return _cmd_status(args, reg)
+    if sub in {"diagnostics", "diag"}:
+        return _cmd_diagnostics(args)
 
     return 2
 
@@ -221,6 +236,23 @@ def _cmd_add(args: argparse.Namespace, reg: CrossBoardRegistry) -> int:
         except Exception as exc:
             _err(args, f"Invalid --metadata: {exc}")
             return 2
+
+    # Cycle guard: reject new blocking edges that would close a cycle
+    if args.blocking:
+        diag = CrossBoardDiagnostics(registry=reg)
+        if diag.would_create_cycle(
+            parent_board=args.parent_board,
+            parent_id=args.parent_id,
+            child_board=args.child_board,
+            child_id=args.child_id,
+            blocking=True,
+        ):
+            msg = (
+                "Adding this edge would create a blocking cycle. "
+                "Remove an existing edge, change to --no-blocking, or resolve the cycle first."
+            )
+            _err(args, msg)
+            return 1
 
     try:
         edge = reg.add(
@@ -356,3 +388,32 @@ def _err(args: argparse.Namespace, message: str) -> None:
         _json_out({"ok": False, "error": message})
     else:
         print(message, file=sys.stderr)
+
+
+def _cmd_diagnostics(args: argparse.Namespace) -> int:
+    diag = CrossBoardDiagnostics()
+    report = diag.run()
+    if args.json:
+        _json_out(report)
+    else:
+        summary = report.get("summary", {})
+        print("Cross-Board Dependency Diagnostics")
+        print(f"  Blocking cycles: {summary.get('blocking_cycles', 0)}")
+        print(f"  Informational cycles: {summary.get('informational_cycles', 0)}")
+        print(f"  Dangling edges: {summary.get('dangling', 0)}")
+        print(f"  Contradictions: {summary.get('contradictions', 0)}")
+        print(f"  Provider failures: {summary.get('provider_failures', 0)}")
+        if report.get("dangling"):
+            print("  Dangling:")
+            for d in report["dangling"]:
+                print(f"    {d['edge_id']} → {d['missing_side']}: {d['reason']}")
+        if report.get("contradictions"):
+            print("  Contradictions:")
+            for c in report["contradictions"]:
+                print(f"    {c['edge_id']} {c['kind']}: {c['reason']}")
+        if report.get("cycles", {}).get("blocking"):
+            print("  Blocking cycles:")
+            for cycle in report["cycles"]["blocking"]:
+                path = " -> ".join(cycle.get("path", []))
+                print(f"    {path}")
+    return 0
