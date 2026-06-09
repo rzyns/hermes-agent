@@ -428,18 +428,58 @@ class CrossBoardDiagnostics:
     def _find_contradictions(self, edges: list[CrossBoardEdge]) -> list[Contradiction]:
         contradictions: list[Contradiction] = []
 
+        # Group edges by child so we can evaluate spawnability across all parents
+        child_edges: dict[tuple[str, str], list[CrossBoardEdge]] = {}
         for edge in edges:
-            parent_status = _task_status(edge.parent_board, edge.parent_id)
-            child_status = _task_status(edge.child_board, edge.child_id)
+            child_edges.setdefault((edge.child_board, edge.child_id), []).append(edge)
 
-            if parent_status is None or child_status is None:
+        for (child_board, child_id), child_edges_list in child_edges.items():
+            child_status = _task_status(child_board, child_id)
+            if child_status is None:
                 continue  # dangling handled separately
 
-            required = edge.required_parent_statuses or DEFAULT_REQUIRED_PARENT_STATUSES
-            satisfied = parent_status in required
+            # Separate blocking and non-blocking edges for this child
+            blocking_edges = [e for e in child_edges_list if e.blocking]
 
-            if satisfied and child_status not in ("ready", "running", "done", "archived"):
-                if edge.blocking:
+            # Determine if child is spawnable (all blocking parents satisfied)
+            all_blocking_satisfied = True
+            unsatisfied_blocking: list[CrossBoardEdge] = []
+            for edge in blocking_edges:
+                parent_status = _task_status(edge.parent_board, edge.parent_id)
+                if parent_status is None:
+                    all_blocking_satisfied = False
+                    continue
+                required = edge.required_parent_statuses or DEFAULT_REQUIRED_PARENT_STATUSES
+                if parent_status not in required:
+                    all_blocking_satisfied = False
+                    unsatisfied_blocking.append(edge)
+
+            # Contradiction 1: child is ready/running but some blocking parent is unsatisfied
+            if child_status in ("ready", "running") and unsatisfied_blocking:
+                for edge in unsatisfied_blocking:
+                    parent_status = _task_status(edge.parent_board, edge.parent_id)
+                    required = edge.required_parent_statuses or DEFAULT_REQUIRED_PARENT_STATUSES
+                    contradictions.append(
+                        Contradiction(
+                            edge=edge,
+                            kind="unsatisfied_parent_child_ready_running",
+                            parent_status=parent_status,
+                            child_status=child_status,
+                            reason=(
+                                f"parent is '{parent_status}' (requires {required}) "
+                                f"but child is '{child_status}'"
+                            ),
+                        )
+                    )
+
+            # Contradiction 2: all blocking parents satisfied but child is still stuck (todo/blocked)
+            if all_blocking_satisfied and child_status not in ("ready", "running", "done", "archived"):
+                # Only report if there is at least one blocking edge; otherwise the child may just have no deps
+                if blocking_edges:
+                    # Pick the first blocking edge for the report (all are satisfied)
+                    edge = blocking_edges[0]
+                    parent_status = _task_status(edge.parent_board, edge.parent_id)
+                    required = edge.required_parent_statuses or DEFAULT_REQUIRED_PARENT_STATUSES
                     contradictions.append(
                         Contradiction(
                             edge=edge,
@@ -452,20 +492,6 @@ class CrossBoardDiagnostics:
                             ),
                         )
                     )
-
-            if not satisfied and child_status in ("ready", "running"):
-                contradictions.append(
-                    Contradiction(
-                        edge=edge,
-                        kind="unsatisfied_parent_child_ready_running",
-                        parent_status=parent_status,
-                        child_status=child_status,
-                        reason=(
-                            f"parent is '{parent_status}' (requires {required}) "
-                            f"but child is '{child_status}'"
-                        ),
-                    )
-                )
 
         return contradictions
 

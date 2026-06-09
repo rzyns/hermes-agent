@@ -324,6 +324,7 @@ def _cmd_add(args: argparse.Namespace, reg: CrossBoardRegistry) -> int:
             kind=args.kind,
             blocking=args.blocking,
             required_parent_statuses=required_statuses,
+            reject_cycle=False,  # cycle guard already enforced above
             source=args.source,
             created_by=args.created_by,
             metadata=metadata,

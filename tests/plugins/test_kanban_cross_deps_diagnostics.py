@@ -32,7 +32,13 @@ def kcd_home(tmp_path, monkeypatch):
     home.mkdir()
     monkeypatch.setenv("HERMES_HOME", str(home))
     monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    # Prevent leaked kanban overrides from affecting board/registry resolution
+    monkeypatch.delenv("HERMES_KANBAN_HOME", raising=False)
+    monkeypatch.delenv("HERMES_KANBAN_DB", raising=False)
+    monkeypatch.delenv("HERMES_KANBAN_BOARD", raising=False)
     kb.init_db()
+    # Assert that the board DB resolved under the temp home
+    assert kb.kanban_db_path().resolve().is_relative_to(home.resolve())
     return home
 
 
@@ -149,7 +155,7 @@ class TestDiagnosticsCycles:
             p2.close()
 
         reg.add(parent_board="board1", parent_id=a, child_board="board2", child_id=b, kind="blocks")
-        reg.add(parent_board="board2", parent_id=b, child_board="board1", child_id=a, kind="blocks")
+        reg.add(parent_board="board2", parent_id=b, child_board="board1", child_id=a, kind="blocks", reject_cycle=False)
 
         diag = CrossBoardDiagnostics(registry=reg)
         report = diag.run()
@@ -228,7 +234,7 @@ class TestDiagnosticsCycles:
             p2.close()
 
         reg.add(parent_board="b1", parent_id=a, child_board="b2", child_id=c, kind="blocks")
-        reg.add(parent_board="b2", parent_id=c, child_board="b1", child_id=a, kind="blocks")
+        reg.add(parent_board="b2", parent_id=c, child_board="b1", child_id=a, kind="blocks", reject_cycle=False)
         # Also add local cycle manually to test dedup if possible; since only two nodes it's fine
         diag = CrossBoardDiagnostics(registry=reg)
         report = diag.run()

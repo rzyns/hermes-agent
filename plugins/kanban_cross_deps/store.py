@@ -1,6 +1,6 @@
 """SQLite-backed registry store for canonical cross-board edges.
 
-Location: ``<HERMES_HOME>/kanban/cross_board_dependencies.db``
+Location: ``<KANBAN_HOME>/kanban/cross_board_dependencies.db``
 
 Idempotent init with versioned migrations so repeated runs are safe.
 Thread-safe via RLock around write paths; reads are direct SQLite which
@@ -70,7 +70,13 @@ class CrossBoardRegistry:
     """Canonical cross-board edge registry backed by SQLite."""
 
     def __init__(self, db_path: str | Path | None = None):
-        self.path = Path(db_path) if db_path else (get_hermes_home() / DEFAULT_REGISTRY_FILENAME)
+        if db_path:
+            self.path = Path(db_path)
+        else:
+            # Anchor to the shared kanban root (same as board DBs) so the
+            # registry is visible across profiles that share boards.
+            from hermes_cli.kanban_db import kanban_home
+            self.path = kanban_home() / DEFAULT_REGISTRY_FILENAME
         self._init_lock = threading.Lock()
         self._write_lock = threading.RLock()
         self._inited: bool = False
@@ -84,6 +90,23 @@ class CrossBoardRegistry:
     def _conn(self):
         """Yield a short-lived SQLite connection with row factory."""
         self._ensure_dir()
+        conn = sqlite3.connect(str(self.path))
+        conn.row_factory = sqlite3.Row
+        try:
+            yield conn
+        finally:
+            conn.close()
+
+    @contextmanager
+    def _read_conn(self):
+        """Yield a read-only connection that does NOT create dirs or schema.
+
+        If the DB file does not exist, yields None so callers can treat it
+        as an empty registry.
+        """
+        if not self.path.exists():
+            yield None
+            return
         conn = sqlite3.connect(str(self.path))
         conn.row_factory = sqlite3.Row
         try:
@@ -138,6 +161,52 @@ class CrossBoardRegistry:
             "metadata": json.dumps(edge.metadata) if edge.metadata else None,
         }
 
+    # -- cycle guard ----------------------------------------------------------
+
+    def _would_create_cycle(
+        self,
+        parent_board: str,
+        parent_id: str,
+        child_board: str,
+        child_id: str,
+    ) -> bool:
+        """Return True if adding a blocking edge would create a cycle.
+
+        Walks only existing cross-board edges; local task_links are already
+        guarded by kanban_db.link_tasks.  This prevents pure cross-board
+        cycles from being created via direct store writes.
+        """
+        start: tuple[str, str] = (child_board, child_id)
+        target: tuple[str, str] = (parent_board, parent_id)
+        if start == target:
+            return True
+
+        seen: set[tuple[str, str]] = set()
+        stack = [start]
+
+        while stack:
+            node = stack.pop()
+            if node == target:
+                return True
+            if node in seen:
+                continue
+            seen.add(node)
+
+            board, task_id = node
+            if self.path.exists():
+                with self._read_conn() as conn:
+                    if conn is not None:
+                        cur = conn.execute(
+                            "SELECT child_board, child_id FROM cross_board_edges "
+                            "WHERE parent_board = ? AND parent_id = ? AND blocking = 1",
+                            (board, task_id),
+                        )
+                        for r in cur.fetchall():
+                            dst = (r["child_board"], r["child_id"])
+                            if dst not in seen:
+                                stack.append(dst)
+        return False
+
     # -- public primitives ----------------------------------------------------
 
     def add(
@@ -154,10 +223,18 @@ class CrossBoardRegistry:
         created_by: str | None = None,
         metadata: dict[str, Any] | None = None,
         edge_id: str | None = None,
+        reject_cycle: bool = True,
     ) -> CrossBoardEdge:
-        """Add a canonical edge.  Raises ValueError on invalid kind.
+        """Add a canonical edge.  Raises ValueError on invalid kind or cycle.
         Returns the persisted edge (with generated id and timestamps).
         """
+        if blocking and reject_cycle:
+            if self._would_create_cycle(parent_board, parent_id, child_board, child_id):
+                raise ValueError(
+                    f"Adding edge ({parent_board}/{parent_id}) -> ({child_board}/{child_id}) "
+                    f"kind={kind} would create a blocking cycle"
+                )
+
         self._ensure_init()
         now = _utc_now()
         edge = CrossBoardEdge(
@@ -235,9 +312,10 @@ class CrossBoardRegistry:
                 return cur.rowcount > 0
 
     def get(self, edge_id: str) -> CrossBoardEdge | None:
-        """Fetch a single edge by id."""
-        self._ensure_init()
-        with self._conn() as conn:
+        """Fetch a single edge by id.  Does not create the registry DB."""
+        with self._read_conn() as conn:
+            if conn is None:
+                return None
             cur = conn.execute("SELECT * FROM cross_board_edges WHERE id = ?", (edge_id,))
             row = cur.fetchone()
             return self._row_to_edge(row) if row else None
@@ -255,8 +333,7 @@ class CrossBoardRegistry:
         limit: int = 500,
         offset: int = 0,
     ) -> list[CrossBoardEdge]:
-        """List/filter edges.  All filters are ANDed."""
-        self._ensure_init()
+        """List/filter edges.  All filters are ANDed.  Does not create the DB."""
         clauses: list[str] = []
         params: list[Any] = []
         if child_board is not None:
@@ -288,7 +365,9 @@ class CrossBoardRegistry:
             LIMIT ? OFFSET ?
         """
         params.extend([limit, offset])
-        with self._conn() as conn:
+        with self._read_conn() as conn:
+            if conn is None:
+                return []
             cur = conn.execute(sql, params)
             return [self._row_to_edge(row) for row in cur.fetchall()]
 
@@ -303,8 +382,7 @@ class CrossBoardRegistry:
         blocking: bool | None = None,
         source: str | None = None,
     ) -> int:
-        """Return matching edge count."""
-        self._ensure_init()
+        """Return matching edge count.  Does not create the DB."""
         clauses: list[str] = []
         params: list[Any] = []
         if child_board is not None:
@@ -330,7 +408,9 @@ class CrossBoardRegistry:
             params.append(source)
         where = " AND ".join(clauses) if clauses else "1=1"
         sql = f"SELECT COUNT(*) FROM cross_board_edges WHERE {where}"
-        with self._conn() as conn:
+        with self._read_conn() as conn:
+            if conn is None:
+                return 0
             cur = conn.execute(sql, params)
             return int(cur.fetchone()[0])
 
@@ -386,9 +466,12 @@ class CrossBoardRegistry:
         return self.get(edge_id)
 
     def schema_version(self) -> int:
-        """Return the current schema version from _registry_meta."""
-        self._ensure_init()
-        with self._conn() as conn:
+        """Return the current schema version from _registry_meta.
+        Does not create the DB.
+        """
+        with self._read_conn() as conn:
+            if conn is None:
+                return 0
             cur = conn.execute(
                 "SELECT value FROM _registry_meta WHERE key = 'schema_version'"
             )

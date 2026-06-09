@@ -51,6 +51,7 @@ def _make_args(**kwargs) -> argparse.Namespace:
 
 @pytest.fixture
 def reg():
+    """Registry backed by an explicit temp DB path."""
     with tempfile.TemporaryDirectory() as tmp:
         db = Path(tmp) / "kanban" / "cross_board_dependencies.db"
         yield CrossBoardRegistry(db)

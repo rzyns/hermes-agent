@@ -19,6 +19,10 @@ from plugins.kanban_cross_deps.store import CrossBoardRegistry
 @pytest.fixture
 def reg(monkeypatch):
     """Registry backed by a temp DB."""
+    # Prevent leaked kanban overrides from affecting board/registry resolution
+    monkeypatch.delenv("HERMES_KANBAN_HOME", raising=False)
+    monkeypatch.delenv("HERMES_KANBAN_DB", raising=False)
+    monkeypatch.delenv("HERMES_KANBAN_BOARD", raising=False)
     with tempfile.TemporaryDirectory() as tmp:
         db = Path(tmp) / "kanban" / "cross_board_dependencies.db"
         registry = CrossBoardRegistry(db)
@@ -28,6 +32,9 @@ def reg(monkeypatch):
 @pytest.fixture
 def reg2(monkeypatch):
     """Second registry pointing at the same temp DB for multi-instance tests."""
+    monkeypatch.delenv("HERMES_KANBAN_HOME", raising=False)
+    monkeypatch.delenv("HERMES_KANBAN_DB", raising=False)
+    monkeypatch.delenv("HERMES_KANBAN_BOARD", raising=False)
     with tempfile.TemporaryDirectory() as tmp:
         db = Path(tmp) / "kanban" / "cross_board_dependencies.db"
         r1 = CrossBoardRegistry(db)
@@ -136,6 +143,7 @@ class TestRegistryInit:
         assert "_registry_meta" in tables
 
     def test_schema_version_set(self, reg):
+        reg._ensure_init()
         assert reg.schema_version() == 1
 
     def test_init_is_idempotent(self, reg):
@@ -349,3 +357,102 @@ class TestRegistryConcurrency:
         reg.reset()
         assert reg.count() == 0
         assert reg.schema_version() == 0
+
+
+# ---------------------------------------------------------------------------
+# Cycle guard
+# ---------------------------------------------------------------------------
+
+class TestRegistryCycleGuard:
+    def test_self_loop_rejected(self, reg):
+        with pytest.raises(ValueError, match="blocking cycle"):
+            reg.add(
+                parent_board="a", parent_id="x",
+                child_board="a", child_id="x",
+                kind="blocks", blocking=True,
+            )
+
+    def test_blocking_cycle_rejected(self, reg):
+        reg.add(parent_board="a", parent_id="p1", child_board="b", child_id="c1", kind="blocks")
+        with pytest.raises(ValueError, match="blocking cycle"):
+            reg.add(
+                parent_board="b", parent_id="c1",
+                child_board="a", child_id="p1",
+                kind="blocks", blocking=True,
+            )
+
+    def test_non_blocking_cycle_allowed(self, reg):
+        reg.add(parent_board="a", parent_id="p1", child_board="b", child_id="c1", kind="related", blocking=False)
+        reg.add(
+            parent_board="b", parent_id="c1",
+            child_board="a", child_id="p1",
+            kind="related", blocking=False,
+        )
+        assert reg.count() == 2
+
+    def test_reject_cycle_false_allows_cycle(self, reg):
+        reg.add(parent_board="a", parent_id="p1", child_board="b", child_id="c1", kind="blocks")
+        reg.add(
+            parent_board="b", parent_id="c1",
+            child_board="a", child_id="p1",
+            kind="blocks", reject_cycle=False,
+        )
+        assert reg.count() == 2
+
+    def test_cycle_via_transitive_blocking_rejected(self, reg):
+        reg.add(parent_board="a", parent_id="p1", child_board="b", child_id="c1", kind="blocks")
+        reg.add(parent_board="b", parent_id="c1", child_board="c", child_id="d1", kind="blocks")
+        with pytest.raises(ValueError, match="blocking cycle"):
+            reg.add(
+                parent_board="c", parent_id="d1",
+                child_board="a", child_id="p1",
+                kind="blocks", blocking=True,
+            )
+
+    def test_read_only_no_db_creation(self, reg):
+        """Read-only ops on a registry that was never written must not create the DB."""
+        assert not reg.path.exists()
+        assert reg.get("missing") is None
+        assert reg.list_edges() == []
+        assert reg.count() == 0
+        assert reg.schema_version() == 0
+        assert not reg.path.exists()
+
+
+# ---------------------------------------------------------------------------
+# Profile-mode regression: shared kanban root anchoring
+# ---------------------------------------------------------------------------
+
+class TestRegistryRootAnchoring:
+    def test_registry_defaults_to_kanban_home(self, monkeypatch, tmp_path):
+        """When no explicit db_path is given, CrossBoardRegistry anchors to
+        kanban_home(), not get_hermes_home(), so it stays visible across
+        profiles that share boards.
+        """
+        shared = tmp_path / "shared_kanban"
+        shared.mkdir()
+        monkeypatch.setenv("HERMES_KANBAN_HOME", str(shared))
+        monkeypatch.delenv("HERMES_KANBAN_DB", raising=False)
+        monkeypatch.delenv("HERMES_KANBAN_BOARD", raising=False)
+        # Set an isolated profile home
+        profile_home = tmp_path / "profiles" / "some_profile"
+        profile_home.mkdir(parents=True)
+        monkeypatch.setenv("HERMES_HOME", str(profile_home))
+        monkeypatch.setattr(Path, "home", lambda: profile_home)
+
+        reg = CrossBoardRegistry()
+        expected = shared / "kanban" / "cross_board_dependencies.db"
+        assert reg.path == expected
+        edge = reg.add(parent_board="a", parent_id="p1", child_board="b", child_id="c1", kind="blocks")
+        assert reg.path.exists()
+
+        # Simulate another profile reading the same shared root
+        profile_home2 = tmp_path / "profiles" / "other_profile"
+        profile_home2.mkdir(parents=True)
+        monkeypatch.setenv("HERMES_HOME", str(profile_home2))
+        monkeypatch.setattr(Path, "home", lambda: profile_home2)
+        reg2 = CrossBoardRegistry()
+        assert reg2.path == expected
+        fetched = reg2.get(edge.id)
+        assert fetched is not None
+        assert fetched.parent_board == "a"

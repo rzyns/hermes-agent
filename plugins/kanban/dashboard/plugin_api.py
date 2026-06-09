@@ -67,6 +67,13 @@ except Exception:
 
 log = logging.getLogger(__name__)
 
+# Lazily resolve the kanban dependency-provider module so tests that
+# re-import hermes_cli modules still see the current provider registry.
+# Same pattern as hermes_cli/kanban_db.py.
+def _kanban_dependencies():
+    from hermes_cli import kanban_dependencies as _kd
+    return _kd
+
 router = APIRouter()
 
 
@@ -1230,6 +1237,18 @@ def _set_status_direct(
             if parent_statuses and not all(
                 p["status"] == "done" for p in parent_statuses
             ):
+                return False
+
+            # Cross-board external blocker guard (mirrors recompute_ready seam)
+            try:
+                _board = kanban_db.get_current_board()
+            except Exception:
+                _board = None
+            external_blockers = _kanban_dependencies().unsatisfied_blockers_for(
+                board=(_board or "default"),
+                task_id=task_id,
+            )
+            if external_blockers:
                 return False
 
         was_running = prev["status"] == "running"

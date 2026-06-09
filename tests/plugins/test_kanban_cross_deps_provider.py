@@ -30,8 +30,13 @@ def kcd_home(tmp_path, monkeypatch):
     home.mkdir()
     monkeypatch.setenv("HERMES_HOME", str(home))
     monkeypatch.setattr(Path, "home", lambda: tmp_path)
-    # Initialize both the default board and any additional boards on demand
+    # Prevent leaked kanban overrides from affecting board/registry resolution
+    monkeypatch.delenv("HERMES_KANBAN_HOME", raising=False)
+    monkeypatch.delenv("HERMES_KANBAN_DB", raising=False)
+    monkeypatch.delenv("HERMES_KANBAN_BOARD", raising=False)
     kb.init_db()
+    # Assert that the board DB resolved under the temp home
+    assert kb.kanban_db_path().resolve().is_relative_to(home.resolve())
     return home
 
 
