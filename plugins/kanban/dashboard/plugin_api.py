@@ -1082,7 +1082,13 @@ def update_task(task_id: str, payload: UpdateTaskBody, board: Optional[str] = Qu
                 current = kanban_db.get_task(conn, task_id)
                 if current and current.status in ("blocked", "scheduled"):
                     _raise_materialize_only_route_guard(board, task_id)
-                    ok = kanban_db.unblock_task(conn, task_id)
+                    # Guard: unblock must not promote an externally blocked task
+                    # to ready.  Mirror the guard in _set_status_direct.
+                    external = _external_blockers_for_ready(task_id)
+                    if external:
+                        ok = False
+                    else:
+                        ok = kanban_db.unblock_task(conn, task_id)
                 else:
                     # Direct status write for drag-drop (todo -> ready etc).
                     ok = _set_status_direct(conn, task_id, "ready")
@@ -1103,16 +1109,27 @@ def update_task(task_id: str, payload: UpdateTaskBody, board: Optional[str] = Qu
                 # See #26744.
                 if s == "ready":
                     blockers = _parents_blocking_ready(conn, task_id)
-                    if blockers:
-                        names = ", ".join(
-                            f"{p['title']!r} ({p['id']}, status={p['status']})"
-                            for p in blockers
-                        )
+                    external = _external_blockers_for_ready(task_id)
+                    if blockers or external:
+                        msgs: list[str] = []
+                        if blockers:
+                            names = ", ".join(
+                                f"{p['title']!r} ({p['id']}, status={p['status']})"
+                                for p in blockers
+                            )
+                            msgs.append(f"local parent(s) not done — {names}")
+                        if external:
+                            ext_names = ", ".join(
+                                f"{e['parent_board']}/{e['parent_id']}"
+                                + (f" (status={e['status']})" if e.get("status") else "")
+                                for e in external
+                            )
+                            msgs.append(f"external blocker(s) — {ext_names}")
                         raise HTTPException(
                             status_code=409,
                             detail=(
-                                f"Cannot move to 'ready': blocked by parent(s) "
-                                f"not done — {names}"
+                                "Cannot move to 'ready': blocked by "
+                                + "; ".join(msgs)
                             ),
                         )
                 raise HTTPException(
@@ -1181,9 +1198,10 @@ def delete_task(task_id: str, board: Optional[str] = Query(None)):
 
 def _parents_blocking_ready(
     conn: sqlite3.Connection, task_id: str,
-) -> list:
-    """Return parent rows (``id``, ``title``, ``status``) that aren't ``done``
-    and therefore prevent ``task_id`` from being promoted to ``ready``.
+) -> list[dict[str, Any]]:
+    """Return board-local parent rows (``id``, ``title``, ``status``) that
+    aren't ``done`` and therefore prevent ``task_id`` from being promoted to
+    ``ready``.
 
     Used to enrich the 409 response from :func:`update_task` so the
     dashboard can show an actionable toast (#26744) instead of a silent
@@ -1200,6 +1218,23 @@ def _parents_blocking_ready(
         {"id": r["id"], "title": r["title"], "status": r["status"]}
         for r in rows
     ]
+
+
+def _external_blockers_for_ready(task_id: str) -> list[dict[str, Any]]:
+    """Return unsatisfied external blockers for *task_id* as plain dicts.
+
+    Mirrors the guard inside :func:`_set_status_direct` so that 409
+    responses can name cross-board blockers alongside local parents.
+    """
+    try:
+        _board = kanban_db.get_current_board()
+    except Exception:
+        _board = None
+    blockers = _kanban_dependencies().unsatisfied_blockers_for(
+        board=(_board or "default"),
+        task_id=task_id,
+    )
+    return [b.to_dict() for b in blockers]
 
 
 def _set_status_direct(
@@ -1435,9 +1470,40 @@ def bulk_update(payload: BulkTaskBody, board: Optional[str] = Query(None)):
                         cur = kanban_db.get_task(conn, tid)
                         if cur and cur.status in ("blocked", "scheduled"):
                             _raise_materialize_only_route_guard(board, tid)
+                            external = _external_blockers_for_ready(tid)
+                            if external:
+                                entry.update(ok=False, error="external blocker(s) — " + "; ".join(
+                                    f"{e['parent_board']}/{e['parent_id']}"
+                                    for e in external
+                                ))
+                                results.append(entry)
+                                continue
                             ok = kanban_db.unblock_task(conn, tid)
                         else:
                             ok = _set_status_direct(conn, tid, "ready")
+                            if not ok:
+                                # Enrich with blocker details so the UI can show
+                                # actionable toasts per id in a bulk operation.
+                                local_blockers = _parents_blocking_ready(conn, tid)
+                                external_blockers = _external_blockers_for_ready(tid)
+                                reasons: list[str] = []
+                                if local_blockers:
+                                    names = ", ".join(
+                                        f"{p['title']!r} ({p['id']}, status={p['status']})"
+                                        for p in local_blockers
+                                    )
+                                    reasons.append(f"local parent(s) not done — {names}")
+                                if external_blockers:
+                                    ext_names = ", ".join(
+                                        f"{e['parent_board']}/{e['parent_id']}"
+                                        + (f" (status={e['status']})" if e.get("status") else "")
+                                        for e in external_blockers
+                                    )
+                                    reasons.append(f"external blocker(s) — {ext_names}")
+                                if reasons:
+                                    entry.update(ok=False, error="; ".join(reasons))
+                                    results.append(entry)
+                                    continue
                     elif s == "running":
                         entry.update(
                             ok=False,
@@ -1605,36 +1671,39 @@ def list_cross_board_diagnostics(
 
     try:
         from plugins.kanban_cross_deps.store import CrossBoardRegistry
+        from hermes_cli import kanban_dependencies as kd
 
         registry = CrossBoardRegistry()  # type: ignore[reportOptionalCall]
-        if task_id:
-            upstream = registry.list_edges(child_board=board, child_id=task_id)
-            downstream = registry.list_edges(parent_board=board, parent_id=task_id)
-            all_edges = upstream + downstream
-        else:
-            all_edges = registry.list_edges(limit=5000)
-
         diag_engine = CrossBoardDiagnostics(registry=registry)
-        report = diag_engine.run()
 
-        # Optionally strip out edges not touching task_id when filtering
+        # Compute availability / provenance surface split so callers can
+        # distinguish importable/readable from enabled/registered/enforced.
+        plugin_enabled = False
+        provider_registered = False
+        try:
+            from hermes_cli.plugins import _get_enabled_plugins
+            enabled = _get_enabled_plugins()
+            plugin_enabled = enabled is not None and "kanban_cross_deps" in enabled
+        except Exception:
+            pass
+        try:
+            provider_registered = bool(kd._providers)
+        except Exception:
+            pass
+
         if task_id:
-            for section in ("cycles",):
-                sec = report.get(section) or {}
-                for key in list(sec.keys()):
-                    if key in ("total",):
-                        continue
-                    filtered = []
-                    for item in sec.get(key, []):
-                        path = item.get("path") or []
-                        if any(
-                            f"{board}/{task_id}" in p for p in path
-                        ):
-                            filtered.append(item)
-                    sec[key] = filtered
+            _task_board = board or "default"
+            report = diag_engine.run(task_filter=(_task_board, task_id))
+        else:
+            report = diag_engine.run()
 
         return {
             "available": True,
+            "registry_importable": True,
+            "registry_readable": True,
+            "plugin_enabled": plugin_enabled,
+            "provider_registered": provider_registered,
+            "enforcement_active": plugin_enabled and provider_registered,
             "diagnostics": report,
             "count": sum(
                 len(v) if isinstance(v, list) else 0

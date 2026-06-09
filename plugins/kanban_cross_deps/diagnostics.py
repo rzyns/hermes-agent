@@ -126,12 +126,25 @@ class CrossBoardDiagnostics:
     def run(
         self,
         _local_link_resolver: Callable[[str, str], list[str]] | None = None,
+        task_filter: tuple[str, str] | None = None,
     ) -> dict[str, Any]:
-        """Run the full diagnostics suite and return a machine-readable report."""
+        """Run the full diagnostics suite and return a machine-readable report.
+
+        If *task_filter* is provided as ``(board, task_id)``, only edges
+        where that task participates are evaluated, and summary/counts are
+        recomputed for the restricted scope.
+        """
         if _local_link_resolver is None:
             _local_link_resolver = _default_local_children_resolver
 
         all_edges = self.registry.list_edges(limit=10000)
+        if task_filter:
+            _board, _tid = task_filter
+            all_edges = [
+                e for e in all_edges
+                if (e.child_board == _board and e.child_id == _tid)
+                or (e.parent_board == _board and e.parent_id == _tid)
+            ]
 
         cycles = self._find_cycles(all_edges, _local_link_resolver)
         blocking_cycles = [c for c in cycles if c.blocking]

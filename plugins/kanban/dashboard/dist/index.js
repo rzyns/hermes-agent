@@ -3729,26 +3729,27 @@
 
     function edgeRow(e, direction) {
       var kind = e.kind || "depends";
-      var blocking = e.blocking ? "blocking" : "";
-      var source = e.source ? "(" + e.source + ")" : "";
+      var blocking = e.blocking ? true : false;
+      var source = e.source || "";
+      var provenanceLabel = (blocking ? "blocking, " : "non-blocking, ") + (source || "canonical");
       return h("div", { className: "hermes-kanban-cbd-row", key: e.id },
-        h("span", { className: "hermes-kanban-cbd-dot " + (blocking ? "hermes-kanban-dot--blocking" : "") }),
+        h("span", { className: "hermes-kanban-cbd-dot " + (blocking ? "hermes-kanban-cbd-dot--blocking" : "") }),
         h("span", { className: "hermes-kanban-cbd-dir" }, direction),
         h("span", { className: "hermes-kanban-cbd-board" }, e.parent_board || e.child_board || ""),
         h("span", { className: "hermes-kanban-cbd-id" }, e.parent_id || e.child_id || ""),
         h("span", { className: "hermes-kanban-cbd-kind" }, kind),
-        source ? h("span", { className: "hermes-kanban-cbd-source" }, source) : null,
+        source ? h("span", { className: "hermes-kanban-cbd-source" }, "(" + provenanceLabel + ")") : null,
       );
     }
 
     return h("div", { className: "hermes-kanban-section" },
       h("div", { className: "hermes-kanban-section-head" }, tx(t, "crossBoardDeps", "Cross-board dependencies")),
       upstream.length > 0 ? h("div", { className: "hermes-kanban-cbd-group" },
-        h("div", { className: "hermes-kanban-cbd-group-label" }, tx(t, "upstream", "Upstream (blockers)")),
+        h("div", { className: "hermes-kanban-cbd-group-label" }, tx(t, "upstream", "Upstream")),
         upstream.map(function (e) { return edgeRow(e, "←"); }),
       ) : null,
       downstream.length > 0 ? h("div", { className: "hermes-kanban-cbd-group" },
-        h("div", { className: "hermes-kanban-cbd-group-label" }, tx(t, "downstream", "Downstream (dependents)")),
+        h("div", { className: "hermes-kanban-cbd-group-label" }, tx(t, "downstream", "Downstream")),
         downstream.map(function (e) { return edgeRow(e, "→"); }),
       ) : null,
     );
