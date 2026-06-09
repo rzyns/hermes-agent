@@ -873,6 +873,13 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
         action="store_true",
         help="Emit one JSON object per task on stdout",
     )
+    p_decompose.add_argument(
+        "--dry-run",
+        dest="dry_run",
+        action="store_true",
+        help="Run the full prompt, LLM call, parse, and validation, "
+             "but do not write to the Kanban DB or create any tasks",
+    )
 
     # --- gc ---
     p_gc = sub.add_parser(
@@ -2750,6 +2757,7 @@ def _cmd_decompose(args: argparse.Namespace) -> int:
     tenant = getattr(args, "tenant", None)
     author = getattr(args, "author", None) or _profile_author()
     want_json = bool(getattr(args, "json", False))
+    dry_run = bool(getattr(args, "dry_run", False))
 
     if args.task_id and all_flag:
         print(
@@ -2767,7 +2775,7 @@ def _cmd_decompose(args: argparse.Namespace) -> int:
                 + "."
             )
             if want_json:
-                print(json.dumps({"decomposed": 0, "total": 0}))
+                print(json.dumps({"decomposed": 0, "total": 0, "dry_run": dry_run}))
             else:
                 print(msg)
             return 0
@@ -2782,20 +2790,30 @@ def _cmd_decompose(args: argparse.Namespace) -> int:
 
     ok_count = 0
     for tid in ids:
-        outcome = decomp.decompose_task(tid, author=author)
+        outcome = decomp.decompose_task(tid, author=author, dry_run=dry_run)
         if outcome.ok:
             ok_count += 1
         if want_json:
-            print(json.dumps({
+            payload = {
                 "task_id": outcome.task_id,
                 "ok": outcome.ok,
                 "reason": outcome.reason,
                 "fanout": outcome.fanout,
                 "child_ids": outcome.child_ids,
                 "new_title": outcome.new_title,
-            }))
+                "dry_run": outcome.dry_run,
+            }
+            if dry_run:
+                payload["dry_run_tasks"] = outcome.dry_run_tasks
+                payload["dry_run_parsed"] = outcome.dry_run_parsed
+            print(json.dumps(payload))
         elif outcome.ok:
-            if outcome.fanout and outcome.child_ids:
+            if outcome.fanout and outcome.dry_run:
+                print(
+                    f"[DRY RUN] Would decompose {outcome.task_id} → "
+                    f"{len(outcome.dry_run_tasks or [])} children"
+                )
+            elif outcome.fanout and outcome.child_ids:
                 child_summary = ", ".join(outcome.child_ids)
                 print(
                     f"Decomposed {outcome.task_id} → {len(outcome.child_ids)} "
@@ -2807,10 +2825,16 @@ def _cmd_decompose(args: argparse.Namespace) -> int:
                     if outcome.new_title
                     else ""
                 )
-                print(
-                    f"Specified {outcome.task_id} → todo "
-                    f"(no fanout){title_suffix}"
-                )
+                if outcome.dry_run:
+                    print(
+                        f"[DRY RUN] Would specify {outcome.task_id} → todo "
+                        f"(no fanout){title_suffix}"
+                    )
+                else:
+                    print(
+                        f"Specified {outcome.task_id} → todo "
+                        f"(no fanout){title_suffix}"
+                    )
         else:
             print(
                 f"kanban: decompose {outcome.task_id}: {outcome.reason}",
