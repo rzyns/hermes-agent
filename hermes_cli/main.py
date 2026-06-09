@@ -2208,10 +2208,16 @@ def cmd_chat(args):
     cli_path = Path(__file__).resolve().parents[1] / "cli.py"
     import importlib.util
 
-    spec = importlib.util.spec_from_file_location("hermes_agent_root_cli", cli_path)
+    spec = importlib.util.spec_from_file_location("cli", cli_path)
     if spec is None or spec.loader is None:
         raise RuntimeError(f"Unable to load Hermes CLI entrypoint from {cli_path}")
     cli_module = importlib.util.module_from_spec(spec)
+    # Register the file-loaded root CLI under the canonical module name before
+    # execution.  cli.py-decomposition mixins still perform lazy
+    # ``from cli import ...`` lookups at call time; if a profile/plugin directory
+    # is earlier on sys.path, those lookups can otherwise resolve to a plugin's
+    # cli.py instead of Hermes core.
+    sys.modules["cli"] = cli_module
     spec.loader.exec_module(cli_module)
     cli_main = cli_module.main
 
