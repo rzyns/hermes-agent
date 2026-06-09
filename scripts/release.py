@@ -45,6 +45,7 @@ ACP_REGISTRY_MANIFEST = REPO_ROOT / "acp_registry" / "agent.json"
 
 # Auto-extracted from noreply emails + manual overrides
 AUTHOR_MAP = {
+    "philipadsouza@gmail.com": "PhilipAD",
     "zhuhaoyu0909@icloud.com": "underthestars-zhy",
     "raysun12142006@gmail.com": "yanxue06",
     "alberto.regalado@ymail.com": "ARegalado1",
@@ -1476,6 +1477,7 @@ AUTHOR_MAP = {
     # v0.15.0 additions
     "glen@workmanfirearms.com": "sgtworkman",
     "jorge.fuenmayort@gmail.com": "jfuenmayor",
+    "josh.dow@prepad.io": "joshuadow",  # PR #43004 salvage (desktop WS session rebind)
     "mordred@inaugust.com": "emonty",
     "rodrigoeq@hotmail.com": "rodrigoeqnit",
     "soliva.johnpaul@icloud.com": "jonpol01",
