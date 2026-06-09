@@ -45,6 +45,9 @@ class TraceState:
     trace_id: str
     root_ctx: Any
     root_span: Any
+    task_id: str = ""
+    session_id: str = ""
+    turn_id: str = ""
     generations: Dict[str, Any] = field(default_factory=dict)
     tools: Dict[str, Any] = field(default_factory=dict)
     pending_tools_by_name: Dict[str, list] = field(default_factory=dict)
@@ -219,12 +222,36 @@ def _get_langfuse() -> Optional[Langfuse]:
     return _LANGFUSE_CLIENT
 
 
-def _trace_key(task_id: str, session_id: str) -> str:
+def _trace_key(task_id: str = "", session_id: str = "", turn_id: str = "") -> str:
+    if turn_id:
+        return f"turn:{turn_id}"
     if task_id:
-        return task_id
+        return f"task:{task_id}"
     if session_id:
         return f"session:{session_id}"
     return f"thread:{threading.get_ident()}"
+
+
+def _trace_key_candidates(*, task_id: str = "", session_id: str = "", turn_id: str = "") -> list[str]:
+    """Return possible trace-state keys for current and legacy hook payloads.
+
+    Newer Hermes hook payloads include ``turn_id`` so each Langfuse trace can
+    represent the scored/evaluated turn. Older branches and early hooks may
+    have opened state with only task/session keys; keep those candidates so
+    cleanup and tool observations remain best-effort rather than orphaned.
+    """
+    candidates = [
+        _trace_key(task_id=task_id, session_id=session_id, turn_id=turn_id),
+        _trace_key(task_id=task_id, session_id=session_id),
+        _trace_key(session_id=session_id),
+    ]
+    seen: set[str] = set()
+    return [key for key in candidates if key and not (key in seen or seen.add(key))]
+
+
+def _trace_name_for(*, platform: str = "") -> str:
+    platform = (platform or "").strip().lower()
+    return f"Hermes {platform} turn" if platform else "Hermes turn"
 
 
 def _truncate_text(value: str, max_chars: int) -> str:
@@ -539,13 +566,18 @@ def _usage_and_cost(response: Any, *, provider: str, api_mode: str, model: str, 
     return usage_details, cost_details
 
 
-def _start_root_trace(task_key: str, *, task_id: str, session_id: str, platform: str, provider: str, model: str,
+def _start_root_trace(task_key: str, *, task_id: str, session_id: str, turn_id: str = "",
+                      platform: str, provider: str, model: str,
                       api_mode: str, messages: Any, client: Langfuse) -> TraceState:
-    trace_id = client.create_trace_id(seed=f"{session_id or 'sessionless'}::{task_id or task_key}")
+    trace_seed = turn_id or f"{session_id or 'sessionless'}::{task_id or task_key}"
+    trace_id = client.create_trace_id(seed=trace_seed)
+    trace_name = _trace_name_for(platform=platform)
     trace_input = _extract_last_user_message(messages)
     metadata = {
         "source": "hermes",
         "task_id": task_id,
+        "session_id": session_id,
+        "turn_id": turn_id,
         "platform": platform,
         "provider": provider,
         "model": model,
@@ -561,12 +593,12 @@ def _start_root_trace(task_key: str, *, task_id: str, session_id: str, platform:
         try:
             with propagate_attributes(
                 session_id=session_id or task_key,
-                trace_name="Hermes turn",
+                trace_name=trace_name,
                 tags=["hermes", "langfuse"],
             ):
                 root_ctx = client.start_as_current_observation(
                     trace_context=trace_ctx,
-                    name="Hermes turn",
+                    name=trace_name,
                     as_type="chain",
                     input=trace_input,
                     metadata=metadata,
@@ -576,7 +608,7 @@ def _start_root_trace(task_key: str, *, task_id: str, session_id: str, platform:
         except Exception:
             root_ctx = client.start_as_current_observation(
                 trace_context=trace_ctx,
-                name="Hermes turn",
+                name=trace_name,
                 as_type="chain",
                 input=trace_input,
                 metadata=metadata,
@@ -586,7 +618,7 @@ def _start_root_trace(task_key: str, *, task_id: str, session_id: str, platform:
     else:
         root_ctx = client.start_as_current_observation(
             trace_context=trace_ctx,
-            name="Hermes turn",
+            name=trace_name,
             as_type="chain",
             input=trace_input,
             metadata=metadata,
@@ -600,7 +632,14 @@ def _start_root_trace(task_key: str, *, task_id: str, session_id: str, platform:
         pass
 
     _debug(f"started trace {trace_id} for {task_key}")
-    return TraceState(trace_id=trace_id, root_ctx=root_ctx, root_span=root_span)
+    return TraceState(
+        trace_id=trace_id,
+        root_ctx=root_ctx,
+        root_span=root_span,
+        task_id=task_id,
+        session_id=session_id,
+        turn_id=turn_id,
+    )
 
 
 def _start_child_observation(state: TraceState, *, client: Langfuse, name: str, as_type: str,
@@ -657,18 +696,30 @@ def _finish_trace(task_key: str, *, output: Any = None) -> None:
         return
 
     try:
+        seen_observations: set[int] = set()
         for observation in state.generations.values():
+            if id(observation) in seen_observations:
+                continue
+            seen_observations.add(id(observation))
             _end_observation(observation)
         for observation in state.tools.values():
+            if id(observation) in seen_observations:
+                continue
+            seen_observations.add(id(observation))
             _end_observation(observation)
         for queue in state.pending_tools_by_name.values():
             for observation in queue:
+                if id(observation) in seen_observations:
+                    continue
+                seen_observations.add(id(observation))
                 _end_observation(observation)
         final_output = _merge_trace_output(output, state)
         if final_output is not None:
             state.root_span.set_trace_io(output=final_output)
             state.root_span.update(output=final_output)
         state.root_span.end()
+        if state.root_ctx is not None:
+            state.root_ctx.__exit__(None, None, None)
     except Exception as exc:  # pragma: no cover - fail-open
         _debug(f"finish trace failed: {exc}")
     finally:
@@ -686,7 +737,8 @@ def _request_key(api_call_count: Any) -> str:
     return str(api_call_count or 0)
 
 
-def on_pre_llm_call(*, task_id: str = "", session_id: str = "", platform: str = "", model: str = "",
+def on_pre_llm_call(*, task_id: str = "", session_id: str = "", turn_id: str = "",
+                    platform: str = "", model: str = "",
                     provider: str = "", base_url: str = "", api_mode: str = "",
                     api_call_count: int = 0, messages: Any = None, turn_type: str = "user",
                     conversation_history: Any = None, user_message: Any = None, **_: Any) -> None:
@@ -706,7 +758,7 @@ def on_pre_llm_call(*, task_id: str = "", session_id: str = "", platform: str = 
     # pre_llm_call with API messages directly. Current Hermes fires
     # pre_llm_call for context injection (conversation_history/user_message,
     # no messages list) — tracing that would create orphan traces.
-    task_key = _trace_key(task_id, session_id)
+    task_key = _trace_key(task_id=task_id, session_id=session_id, turn_id=turn_id)
 
     with _STATE_LOCK:
         state = _TRACE_STATE.get(task_key)
@@ -715,6 +767,7 @@ def on_pre_llm_call(*, task_id: str = "", session_id: str = "", platform: str = 
                 task_key,
                 task_id=task_id,
                 session_id=session_id,
+                turn_id=turn_id,
                 platform=platform,
                 provider=provider,
                 model=model,
@@ -730,6 +783,7 @@ def on_pre_llm_request(
     *,
     task_id: str = "",
     session_id: str = "",
+    turn_id: str = "",
     platform: str = "",
     model: str = "",
     provider: str = "",
@@ -759,7 +813,7 @@ def on_pre_llm_request(
         user_message=user_message,
     )
 
-    task_key = _trace_key(task_id, session_id)
+    task_key = _trace_key(task_id=task_id, session_id=session_id, turn_id=turn_id)
     req_key = _request_key(api_call_count)
 
     with _STATE_LOCK:
@@ -769,6 +823,7 @@ def on_pre_llm_request(
                 task_key,
                 task_id=task_id,
                 session_id=session_id,
+                turn_id=turn_id,
                 platform=platform,
                 provider=provider,
                 model=model,
@@ -798,7 +853,8 @@ def on_pre_llm_request(
         )
 
 
-def on_post_llm_call(*, task_id: str = "", session_id: str = "", provider: str = "", base_url: str = "",
+def on_post_llm_call(*, task_id: str = "", session_id: str = "", turn_id: str = "",
+                     provider: str = "", base_url: str = "",
                      api_mode: str = "", model: str = "", api_call_count: int = 0,
                      assistant_message: Any = None, response: Any = None,
                      api_duration: float = 0.0, finish_reason: str = "",
@@ -809,11 +865,16 @@ def on_post_llm_call(*, task_id: str = "", session_id: str = "", provider: str =
     if client is None:
         return
 
-    task_key = _trace_key(task_id, session_id)
+    task_key = ""
     req_key = _request_key(api_call_count)
 
     with _STATE_LOCK:
-        state = _TRACE_STATE.get(task_key)
+        state = None
+        for candidate_key in _trace_key_candidates(task_id=task_id, session_id=session_id, turn_id=turn_id):
+            state = _TRACE_STATE.get(candidate_key)
+            if state is not None:
+                task_key = candidate_key
+                break
         generation = state.generations.pop(req_key, None) if state else None
     if state is None or generation is None:
         return
@@ -927,15 +988,17 @@ def on_post_llm_call(*, task_id: str = "", session_id: str = "", provider: str =
 
 
 def on_pre_tool_call(*, tool_name: str = "", args: Any = None, task_id: str = "",
-                     session_id: str = "", tool_call_id: str = "", **_: Any) -> None:
+                     session_id: str = "", turn_id: str = "", tool_call_id: str = "", **_: Any) -> None:
     client = _get_langfuse()
     if client is None:
         return
 
-    task_key = _trace_key(task_id, session_id)
-
     with _STATE_LOCK:
-        state = _TRACE_STATE.get(task_key)
+        state = None
+        for task_key in _trace_key_candidates(task_id=task_id, session_id=session_id, turn_id=turn_id):
+            state = _TRACE_STATE.get(task_key)
+            if state is not None:
+                break
         if state is None:
             return
         observation = _start_child_observation(
@@ -944,7 +1007,7 @@ def on_pre_tool_call(*, tool_name: str = "", args: Any = None, task_id: str = ""
             name=f"Tool: {tool_name}",
             as_type="tool",
             input_value=_safe_value(args),
-            metadata={"tool_name": tool_name, "tool_call_id": tool_call_id},
+            metadata={"tool_name": tool_name, "tool_call_id": tool_call_id, "turn_id": turn_id},
         )
         if tool_call_id:
             state.tools[tool_call_id] = observation
@@ -953,12 +1016,17 @@ def on_pre_tool_call(*, tool_name: str = "", args: Any = None, task_id: str = ""
 
 
 def on_post_tool_call(*, tool_name: str = "", args: Any = None, result: Any = None,
-                      task_id: str = "", session_id: str = "", tool_call_id: str = "", **_: Any) -> None:
-    task_key = _trace_key(task_id, session_id)
+                      task_id: str = "", session_id: str = "", turn_id: str = "", tool_call_id: str = "", **_: Any) -> None:
+    task_key = ""
     observation = None
 
     with _STATE_LOCK:
-        state = _TRACE_STATE.get(task_key)
+        state = None
+        for candidate_key in _trace_key_candidates(task_id=task_id, session_id=session_id, turn_id=turn_id):
+            state = _TRACE_STATE.get(candidate_key)
+            if state is not None:
+                task_key = candidate_key
+                break
         if state is None:
             return
         if tool_call_id:
@@ -1000,6 +1068,25 @@ def on_post_tool_call(*, tool_name: str = "", args: Any = None, result: Any = No
     )
 
 
+def on_session_end(*, session_id: str = "", **_: Any) -> None:
+    """Close unfinished Langfuse traces for a session at lifecycle shutdown.
+
+    Some one-shot, interrupted, or tool-ending runs can leave a root context
+    open until interpreter teardown.  Drain only matching session traces and
+    keep the plugin fail-open so observability cleanup never breaks Hermes.
+    """
+    if not session_id:
+        return
+    with _STATE_LOCK:
+        keys = [
+            key
+            for key, state in _TRACE_STATE.items()
+            if getattr(state, "session_id", "") == session_id
+        ]
+    for key in keys:
+        _finish_trace(key, output={"finalized_by": "on_session_end"})
+
+
 def register(ctx) -> None:
     # Register for both hook name variants so the plugin works across
     # Hermes versions.  pre_api_request / post_api_request fire per API
@@ -1010,3 +1097,4 @@ def register(ctx) -> None:
     ctx.register_hook("post_llm_call", on_post_llm_call)
     ctx.register_hook("pre_tool_call", on_pre_tool_call)
     ctx.register_hook("post_tool_call", on_post_tool_call)
+    ctx.register_hook("on_session_end", on_session_end)

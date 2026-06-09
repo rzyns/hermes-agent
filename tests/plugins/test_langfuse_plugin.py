@@ -29,11 +29,12 @@ class TestManifest:
         data = yaml.safe_load((PLUGIN_DIR / "plugin.yaml").read_text())
         assert data["name"] == "langfuse"
         assert data["version"]
-        # All six hooks the plugin implements.
+        # Request, tool, and session lifecycle hooks the plugin implements.
         assert set(data["hooks"]) == {
             "pre_api_request", "post_api_request",
             "pre_llm_call", "post_llm_call",
             "pre_tool_call", "post_tool_call",
+            "on_session_end",
         }
         # Required env vars are the user-facing HERMES_ prefixed keys.
         assert "HERMES_LANGFUSE_PUBLIC_KEY" in data["requires_env"]
@@ -703,6 +704,177 @@ class TestToolObservationKeying:
         assert ended["obs"] is obs
         assert ended["output"] == {"status": "done"}
         assert not state.tools
+
+
+class TestTurnScopedTraceLifecycle:
+    def _make_mod(self):
+        sys.modules.pop("plugins.observability.langfuse", None)
+        return importlib.import_module("plugins.observability.langfuse")
+
+    def test_trace_key_prefers_turn_id_without_breaking_legacy_task_key(self):
+        mod = self._make_mod()
+        assert mod._trace_key(task_id="task-1", session_id="sess-1", turn_id="turn-1") == "turn:turn-1"
+        assert mod._trace_key(task_id="task-1", session_id="sess-1") == "task:task-1"
+        assert mod._trace_key(session_id="sess-1") == "session:sess-1"
+        assert mod._trace_key_candidates(
+            task_id="task-1", session_id="sess-1", turn_id="turn-1"
+        ) == ["turn:turn-1", "task:task-1", "session:sess-1"]
+
+    def test_start_root_trace_uses_turn_seed_name_and_metadata(self):
+        mod = self._make_mod()
+
+        class _Ctx:
+            def __init__(self, span):
+                self.span = span
+                self.exited = False
+            def __enter__(self):
+                return self.span
+            def __exit__(self, exc_type, exc, tb):
+                self.exited = True
+
+        class _Span:
+            def __init__(self):
+                self.trace_input = None
+            def set_trace_io(self, *, input=None, output=None):
+                self.trace_input = input
+            def start_observation(self, **kwargs):
+                return object()
+            def update(self, **kwargs):
+                pass
+            def end(self):
+                pass
+
+        class _Client:
+            def __init__(self):
+                self.seed = None
+                self.kwargs = None
+                self.span = _Span()
+            def create_trace_id(self, *, seed):
+                self.seed = seed
+                return "trace-id"
+            def start_as_current_observation(self, **kwargs):
+                self.kwargs = kwargs
+                return _Ctx(self.span)
+
+        client = _Client()
+        state = mod._start_root_trace(
+            "turn:turn-1",
+            task_id="task-1",
+            session_id="sess-1",
+            turn_id="turn-1",
+            platform="discord",
+            provider="provider-x",
+            model="model-y",
+            api_mode="responses",
+            messages=[{"role": "user", "content": "hello"}],
+            client=client,
+        )
+
+        assert client.seed == "turn-1"
+        assert client.kwargs["name"] == "Hermes discord turn"
+        assert client.kwargs["trace_context"]["session_id"] == "sess-1"
+        assert client.kwargs["metadata"]["session_id"] == "sess-1"
+        assert client.kwargs["metadata"]["turn_id"] == "turn-1"
+        assert state.session_id == "sess-1"
+        assert state.turn_id == "turn-1"
+
+    def test_post_llm_can_close_legacy_task_key_when_turn_id_is_present(self, monkeypatch):
+        mod = self._make_mod()
+        monkeypatch.setattr(mod, "_get_langfuse", lambda: object())
+        generation = object()
+        state = mod.TraceState(trace_id="trace", root_ctx=None, root_span=None, session_id="sess-1")
+        state.generations[mod._request_key(1)] = generation
+        legacy_key = mod._trace_key(task_id="task-1", session_id="sess-1")
+        monkeypatch.setitem(mod._TRACE_STATE, legacy_key, state)
+
+        ended = {}
+        def fake_end(o, *, output=None, metadata=None, **kw):
+            ended["obs"] = o
+            ended["output"] = output
+        monkeypatch.setattr(mod, "_end_observation", fake_end)
+
+        mod.on_post_llm_call(
+            task_id="task-1",
+            session_id="sess-1",
+            turn_id="turn-1",
+            api_call_count=1,
+            assistant_content_chars=0,
+        )
+
+        assert ended["obs"] is generation
+        assert legacy_key in mod._TRACE_STATE
+
+    def test_tool_post_can_find_turn_scoped_state(self, monkeypatch):
+        mod = self._make_mod()
+        obs = object()
+        state = mod.TraceState(trace_id="trace", root_ctx=None, root_span=None, session_id="sess-1", turn_id="turn-1")
+        state.tools["call-1"] = obs
+        monkeypatch.setitem(mod._TRACE_STATE, mod._trace_key(task_id="task-1", session_id="sess-1", turn_id="turn-1"), state)
+
+        ended = {}
+        def fake_end(o, *, output=None, metadata=None, **kw):
+            ended["obs"] = o
+            ended["output"] = output
+        monkeypatch.setattr(mod, "_end_observation", fake_end)
+
+        mod.on_post_tool_call(
+            tool_name="my_tool",
+            args={},
+            result='{"ok": true}',
+            task_id="task-1",
+            session_id="sess-1",
+            turn_id="turn-1",
+            tool_call_id="call-1",
+        )
+
+        assert ended["obs"] is obs
+        assert ended["output"] == {"ok": True}
+        assert not state.tools
+
+    def test_session_end_closes_unfinished_trace_for_matching_session(self, monkeypatch):
+        mod = self._make_mod()
+        monkeypatch.setattr(mod, "_get_langfuse", lambda: object())
+
+        class _Span:
+            def __init__(self):
+                self.ended = False
+                self.output = None
+            def set_trace_io(self, *, input=None, output=None):
+                self.output = output
+            def update(self, **kwargs):
+                self.output = kwargs.get("output")
+            def end(self):
+                self.ended = True
+
+        class _Ctx:
+            def __init__(self):
+                self.exited = False
+            def __exit__(self, exc_type, exc, tb):
+                self.exited = True
+
+        span = _Span()
+        ctx = _Ctx()
+        state = mod.TraceState(trace_id="trace", root_ctx=ctx, root_span=span, session_id="sess-1", turn_id="turn-1")
+        key = mod._trace_key(task_id="task-1", session_id="sess-1", turn_id="turn-1")
+        monkeypatch.setitem(mod._TRACE_STATE, key, state)
+
+        mod.on_session_end(session_id="sess-1")
+
+        assert key not in mod._TRACE_STATE
+        assert span.ended is True
+        assert ctx.exited is True
+        assert span.output == {"finalized_by": "on_session_end"}
+
+    def test_session_end_does_not_close_other_active_sessions(self, monkeypatch):
+        mod = self._make_mod()
+        monkeypatch.setattr(mod, "_get_langfuse", lambda: object())
+        state = mod.TraceState(trace_id="trace", root_ctx=None, root_span=object(), session_id="other")
+        key = mod._trace_key(task_id="task-2", session_id="other")
+        monkeypatch.setitem(mod._TRACE_STATE, key, state)
+
+        mod.on_session_end(session_id="sess-1")
+
+        assert mod._TRACE_STATE[key] is state
 
 
 class TestUsageFromSanitizedResponse:
