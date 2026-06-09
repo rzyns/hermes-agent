@@ -157,6 +157,13 @@ class TestDryRunNoMutation:
         assert outcome.dry_run is True
         assert outcome.fanout is False
         assert outcome.new_title == "Tightened title"
+        assert outcome.dry_run_tasks == [{
+            "title": "Tightened title",
+            "body": "**Goal**\nDo the thing.",
+            "assignee": "engineer",
+            "assignee_update": "engineer",
+            "effective_assignee": "engineer",
+        }]
 
         with kb.connect() as conn:
             task = kb.get_task(conn, tid)
@@ -165,6 +172,55 @@ class TestDryRunNoMutation:
             assert not task.assignee
             comments = kb.list_comments(conn, tid)
             assert len(comments) == 0
+            events = kb.list_events(conn, tid)
+            assert not any(ev.kind == "decomposed" for ev in events)
+            assert not any(ev.kind == "promoted" for ev in events)
+
+
+    def test_dry_run_no_fanout_existing_assignee_reports_update_and_effective_assignee(self, kanban_home):
+        with kb.connect() as conn:
+            tid = kb.create_task(
+                conn,
+                title="already routed",
+                assignee="reviewer",
+                triage=True,
+            )
+
+        llm_payload = jsonlib.dumps({
+            "fanout": False,
+            "rationale": "single unit",
+            "title": "Tightened title",
+            "body": "Do the thing.",
+            "assignee": "engineer",
+        })
+
+        patches = _patch_list_profiles(["orchestrator", "reviewer", "engineer"])
+        for p in patches:
+            p.start()
+        try:
+            with _patch_aux_client(llm_payload), _patch_extra_body():
+                outcome = decomp.decompose_task(tid, author="me", dry_run=True)
+        finally:
+            for p in patches:
+                p.stop()
+
+        assert outcome.ok
+        assert outcome.dry_run is True
+        assert outcome.dry_run_tasks == [{
+            "title": "Tightened title",
+            "body": "Do the thing.",
+            "assignee": None,
+            "assignee_update": None,
+            "effective_assignee": "reviewer",
+        }]
+
+        with kb.connect() as conn:
+            task = kb.get_task(conn, tid)
+            assert task is not None
+            assert task.status == "triage"
+            assert task.title == "already routed"
+            assert task.assignee == "reviewer"
+            assert not kb.list_comments(conn, tid)
             events = kb.list_events(conn, tid)
             assert not any(ev.kind == "decomposed" for ev in events)
             assert not any(ev.kind == "promoted" for ev in events)

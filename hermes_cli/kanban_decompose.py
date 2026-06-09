@@ -375,6 +375,7 @@ def decompose_task(
                 default_assignee=default_assignee,
                 valid_names=valid_names,
             )
+        effective_assignee = task.assignee or assignee_val
         if title_val is None and body_val is None:
             return DecomposeOutcome(
                 task_id, False, "decomposer returned fanout=false with no title/body",
@@ -387,6 +388,8 @@ def decompose_task(
                     "title": title_val,
                     "body": body_val,
                     "assignee": assignee_val,
+                    "assignee_update": assignee_val,
+                    "effective_assignee": effective_assignee,
                 }],
                 dry_run_parsed=parsed,
             )
