@@ -2534,6 +2534,65 @@ def test_bulk_ready_includes_external_blocker_per_id(client, monkeypatch, tmp_pa
     assert "external blocker" in entry["error"]
 
 
+def test_ready_transition_409_uses_request_board_not_current(client, monkeypatch, tmp_path):
+    """PATCH ?board=alt must use alt board's external blockers, not current/default.
+
+    Creates a cross-board edge for alt/<child> only; default/<child> is free.
+    The request ?board=alt must 409 because the alt board edge blocks it.
+    """
+    from hermes_cli import kanban_db as kb
+
+    add_edge, reg, _cleanup = _make_cross_board_fixture(client, monkeypatch, tmp_path)
+
+    # Create parent on "other" board and child on "alt" board.
+    p_conn = kb.connect(board="other")
+    c_conn = kb.connect(board="alt")
+    try:
+        pid = kb.create_task(p_conn, title="parent", assignee="worker")
+        cid = kb.create_task(c_conn, title="child", assignee="worker")
+    finally:
+        p_conn.close()
+        c_conn.close()
+
+    add_edge("other", pid, "alt", cid, kind="blocks", blocking=True)
+
+    # Request board=alt; the edge lives on alt/<child>.
+    r = client.patch(f"/api/plugins/kanban/tasks/{cid}?board=alt", json={"status": "ready"})
+    assert r.status_code == 409
+    detail = r.json()["detail"]
+    assert "external blocker" in detail
+    assert "other" in detail
+
+
+def test_bulk_ready_uses_request_board_not_current(client, monkeypatch, tmp_path):
+    """Bulk POST ?board=alt must use alt board blockers per-id.
+
+    Creates a cross-board edge for alt/<child> only; default/<child> is free.
+    The bulk request ?board=alt must produce per-id errors.
+    """
+    from hermes_cli import kanban_db as kb
+
+    add_edge, reg, _cleanup = _make_cross_board_fixture(client, monkeypatch, tmp_path)
+
+    p_conn = kb.connect(board="other")
+    c_conn = kb.connect(board="alt")
+    try:
+        pid = kb.create_task(p_conn, title="parent", assignee="worker")
+        cid = kb.create_task(c_conn, title="child", assignee="worker")
+    finally:
+        p_conn.close()
+        c_conn.close()
+
+    add_edge("other", pid, "alt", cid, kind="blocks", blocking=True)
+
+    r = client.post("/api/plugins/kanban/tasks/bulk?board=alt", json={"ids": [cid], "status": "ready"})
+    assert r.status_code == 200
+    results = r.json()["results"]
+    assert len(results) == 1
+    assert results[0]["ok"] is False
+    assert "external blocker" in results[0]["error"]
+
+
 def test_cross_board_diagnostics_task_filter_scopes_all_sections(client, monkeypatch, tmp_path):
     """GET /cross-board-diagnostics?task_id=... must scope all sections and recompute counts."""
     from hermes_cli import kanban_db as kb

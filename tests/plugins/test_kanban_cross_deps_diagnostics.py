@@ -185,7 +185,13 @@ class TestDiagnosticsCycles:
             p2.close()
 
         reg.add(parent_board="board1", parent_id=b, child_board="board2", child_id=c, kind="blocks")
-        reg.add(parent_board="board2", parent_id=c, child_board="board1", child_id=a, kind="blocks")
+        # The store-level guard now rejects mixed local+cross cycles.
+        # Disable the guard so diagnostics can be tested on a post-hoc cycle.
+        reg.add(
+            parent_board="board2", parent_id=c,
+            child_board="board1", child_id=a, kind="blocks",
+            reject_cycle=False,
+        )
 
         diag = CrossBoardDiagnostics(registry=reg)
         report = diag.run()

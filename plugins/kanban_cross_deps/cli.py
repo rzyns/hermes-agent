@@ -415,9 +415,12 @@ def _cmd_status(args: argparse.Namespace, reg: CrossBoardRegistry) -> int:
     blocking_edges = [e for e in edges if e.blocking]
     non_blocking_edges = [e for e in edges if not e.blocking]
 
-    # Distinguish canonical from inferred (if any non-canonical edges appear)
-    canonical = [e for e in edges if e.source == "canonical"]
-    inferred = [e for e in edges if e.source != "canonical"]
+    # All edges returned by list_edges() are canonical registry facts.
+    # The `source` field records provenance (canonical, promoted, imported, …).
+    # Inferred discovery candidates are a separate concept handled by `discover`.
+    provenance_counts: dict[str, int] = {}
+    for e in edges:
+        provenance_counts[e.source] = provenance_counts.get(e.source, 0) + 1
 
     result = {
         "child_board": args.child_board,
@@ -425,8 +428,7 @@ def _cmd_status(args: argparse.Namespace, reg: CrossBoardRegistry) -> int:
         "total_edges": len(edges),
         "blocking_edges": len(blocking_edges),
         "non_blocking_edges": len(non_blocking_edges),
-        "canonical_edges": len(canonical),
-        "inferred_edges": len(inferred),
+        "provenance": provenance_counts,
         "edges": [_edge_as_dict(e) for e in edges],
     }
 
@@ -436,7 +438,8 @@ def _cmd_status(args: argparse.Namespace, reg: CrossBoardRegistry) -> int:
         print(f"Status for {args.child_board}/{args.child_id}")
         print(f"  Total edges: {len(edges)}")
         print(f"  Blocking: {len(blocking_edges)}  Non-blocking: {len(non_blocking_edges)}")
-        print(f"  Canonical: {len(canonical)}  Inferred/other: {len(inferred)}")
+        prov_str = "  ".join(f"{k}: {v}" for k, v in provenance_counts.items())
+        print(f"  Provenance — {prov_str or 'none'}")
         if edges:
             print("  Edges:")
             for e in edges:

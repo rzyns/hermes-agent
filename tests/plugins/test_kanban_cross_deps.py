@@ -409,6 +409,82 @@ class TestRegistryCycleGuard:
                 kind="blocks", blocking=True,
             )
 
+    def test_local_plus_cross_cycle_rejected(self, reg, monkeypatch):
+        """A new cross-board edge closing a cycle through existing local links must be rejected.
+
+        Graph: local A -> B (task_links), cross B -> C, then attempted cross C -> A.
+        The final edge must raise before writing.
+        """
+        from hermes_cli import kanban_db as _kb
+
+        # Use a real board DB so local task_links can be created.
+        monkeypatch.delenv("HERMES_KANBAN_HOME", raising=False)
+        monkeypatch.delenv("HERMES_KANBAN_DB", raising=False)
+        monkeypatch.delenv("HERMES_KANBAN_BOARD", raising=False)
+        # Re-init with fresh home so connect() resolves to our temp root.
+        _kb.init_db(board="local_cycle_board")
+        conn = _kb.connect(board="local_cycle_board")
+        try:
+            a = _kb.create_task(conn, title="A", assignee="w")
+            b = _kb.create_task(conn, title="B", assignee="w")
+            c = _kb.create_task(conn, title="C", assignee="w")
+            _kb.link_tasks(conn, a, b)  # local A -> B
+        finally:
+            conn.close()
+
+        # cross-board B -> C
+        reg.add(
+            parent_board="local_cycle_board", parent_id=b,
+            child_board="x", child_id=c,
+            kind="blocks", blocking=True,
+        )
+
+        # cross-board C -> A would close the cycle; must reject
+        with pytest.raises(ValueError, match="blocking cycle"):
+            reg.add(
+                parent_board="x", parent_id=c,
+                child_board="local_cycle_board", child_id=a,
+                kind="blocks", blocking=True,
+            )
+
+        # Only the first cross-board edge should have been written.
+        assert reg.count() == 1
+
+    def test_update_blocking_promotion_rejects_cycle(self, reg, monkeypatch):
+        """Turning an existing non-blocking edge into blocking must also guard cycles.
+
+        Graph: local A -> B, cross B -> C, cross C -> A (non-blocking).
+        Promoting C -> A to blocking must raise because it would create a cycle.
+        """
+        from hermes_cli import kanban_db as _kb
+
+        monkeypatch.delenv("HERMES_KANBAN_HOME", raising=False)
+        monkeypatch.delenv("HERMES_KANBAN_DB", raising=False)
+        monkeypatch.delenv("HERMES_KANBAN_BOARD", raising=False)
+        _kb.init_db(board="promote_cycle_board")
+        conn = _kb.connect(board="promote_cycle_board")
+        try:
+            a = _kb.create_task(conn, title="A", assignee="w")
+            b = _kb.create_task(conn, title="B", assignee="w")
+            c = _kb.create_task(conn, title="C", assignee="w")
+            _kb.link_tasks(conn, a, b)
+        finally:
+            conn.close()
+
+        reg.add(
+            parent_board="promote_cycle_board", parent_id=b,
+            child_board="x", child_id=c,
+            kind="blocks", blocking=True,
+        )
+        edge = reg.add(
+            parent_board="x", parent_id=c,
+            child_board="promote_cycle_board", child_id=a,
+            kind="blocks", blocking=False,
+        )
+
+        with pytest.raises(ValueError, match="Promoting edge .* to blocking would create a cycle"):
+            reg.update_blocking(edge.id, blocking=True)
+
     def test_read_only_no_db_creation(self, reg):
         """Read-only ops on a registry that was never written must not create the DB."""
         assert not reg.path.exists()

@@ -336,7 +336,7 @@ class TestCliStatus:
         data = json.loads(capsys.readouterr().out)
         assert data["total_edges"] == 0
         assert data["blocking_edges"] == 0
-        assert data["canonical_edges"] == 0
+        assert data["provenance"] == {}
 
     def test_status_with_mixed_edges(self, reg, capsys):
         reg.add(parent_board="a", parent_id="p1", child_board="b", child_id="c", kind="blocks", blocking=True, source="canonical")
@@ -348,8 +348,7 @@ class TestCliStatus:
         assert data["total_edges"] == 2
         assert data["blocking_edges"] == 1
         assert data["non_blocking_edges"] == 1
-        assert data["canonical_edges"] == 1
-        assert data["inferred_edges"] == 1
+        assert data["provenance"] == {"canonical": 1, "inferred": 1}
         assert len(data["edges"]) == 2
 
 

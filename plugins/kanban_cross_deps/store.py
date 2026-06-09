@@ -172,10 +172,14 @@ class CrossBoardRegistry:
     ) -> bool:
         """Return True if adding a blocking edge would create a cycle.
 
-        Walks only existing cross-board edges; local task_links are already
-        guarded by kanban_db.link_tasks.  This prevents pure cross-board
-        cycles from being created via direct store writes.
+        Walks both existing cross-board edges *and* local ``task_links`` so
+        that a new cross-board edge cannot close a cycle through already
+        existing board-local parent/child links.  This is the same graph
+        semantics used by diagnostics and is stricter than the old pure
+        cross-board guard.
         """
+        from hermes_cli import kanban_db as _kb
+
         start: tuple[str, str] = (child_board, child_id)
         target: tuple[str, str] = (parent_board, parent_id)
         if start == target:
@@ -193,6 +197,7 @@ class CrossBoardRegistry:
             seen.add(node)
 
             board, task_id = node
+            # 1) Cross-board outgoing edges
             if self.path.exists():
                 with self._read_conn() as conn:
                     if conn is not None:
@@ -205,6 +210,23 @@ class CrossBoardRegistry:
                             dst = (r["child_board"], r["child_id"])
                             if dst not in seen:
                                 stack.append(dst)
+
+            # 2) Local outgoing edges from the board-local task_links table
+            try:
+                conn = _kb.connect(board=board)
+                try:
+                    rows = conn.execute(
+                        "SELECT child_id FROM task_links WHERE parent_id = ?",
+                        (task_id,),
+                    ).fetchall()
+                    for r in rows:
+                        dst = (board, r["child_id"])
+                        if dst not in seen:
+                            stack.append(dst)
+                finally:
+                    conn.close()
+            except Exception:
+                pass
         return False
 
     # -- public primitives ----------------------------------------------------
@@ -451,8 +473,26 @@ class CrossBoardRegistry:
         edge_id: str,
         blocking: bool,
     ) -> CrossBoardEdge | None:
-        """Update the blocking flag for an edge.  Returns updated edge or None."""
+        """Update the blocking flag for an edge.  Returns updated edge or None.
+
+        Turning a non-blocking edge into a blocking edge is a semantic class
+        identical to adding a new blocking edge: it may create a cycle.  Guard
+        against that by running the same cycle check before committing.
+        """
         self._ensure_init()
+        # Guard: promoting to blocking must not introduce a cycle.
+        if blocking:
+            edge = self.get(edge_id)
+            if edge is not None and not edge.blocking:
+                if self._would_create_cycle(
+                    parent_board=edge.parent_board,
+                    parent_id=edge.parent_id,
+                    child_board=edge.child_board,
+                    child_id=edge.child_id,
+                ):
+                    raise ValueError(
+                        f"Promoting edge {edge_id} to blocking would create a cycle"
+                    )
         with self._write_lock:
             with self._conn() as conn:
                 now = int(_utc_now().timestamp())

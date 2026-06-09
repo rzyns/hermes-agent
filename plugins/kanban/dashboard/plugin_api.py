@@ -1084,14 +1084,14 @@ def update_task(task_id: str, payload: UpdateTaskBody, board: Optional[str] = Qu
                     _raise_materialize_only_route_guard(board, task_id)
                     # Guard: unblock must not promote an externally blocked task
                     # to ready.  Mirror the guard in _set_status_direct.
-                    external = _external_blockers_for_ready(task_id)
+                    external = _external_blockers_for_ready(task_id, board=board)
                     if external:
                         ok = False
                     else:
                         ok = kanban_db.unblock_task(conn, task_id)
                 else:
                     # Direct status write for drag-drop (todo -> ready etc).
-                    ok = _set_status_direct(conn, task_id, "ready")
+                    ok = _set_status_direct(conn, task_id, "ready", board=board)
             elif s == "archived":
                 ok = kanban_db.archive_task(conn, task_id)
             elif s == "running":
@@ -1109,7 +1109,7 @@ def update_task(task_id: str, payload: UpdateTaskBody, board: Optional[str] = Qu
                 # See #26744.
                 if s == "ready":
                     blockers = _parents_blocking_ready(conn, task_id)
-                    external = _external_blockers_for_ready(task_id)
+                    external = _external_blockers_for_ready(task_id, board=board)
                     if blockers or external:
                         msgs: list[str] = []
                         if blockers:
@@ -1220,18 +1220,18 @@ def _parents_blocking_ready(
     ]
 
 
-def _external_blockers_for_ready(task_id: str) -> list[dict[str, Any]]:
+def _external_blockers_for_ready(
+    task_id: str, board: Optional[str] = None,
+) -> list[dict[str, Any]]:
     """Return unsatisfied external blockers for *task_id* as plain dicts.
 
     Mirrors the guard inside :func:`_set_status_direct` so that 409
     responses can name cross-board blockers alongside local parents.
+    ``board`` is the resolved request board slug (not the process current
+    board) so that ``?board=alt`` queries query the correct registry.
     """
-    try:
-        _board = kanban_db.get_current_board()
-    except Exception:
-        _board = None
     blockers = _kanban_dependencies().unsatisfied_blockers_for(
-        board=(_board or "default"),
+        board=(board or "default"),
         task_id=task_id,
     )
     return [b.to_dict() for b in blockers]
@@ -1239,6 +1239,7 @@ def _external_blockers_for_ready(task_id: str) -> list[dict[str, Any]]:
 
 def _set_status_direct(
     conn: sqlite3.Connection, task_id: str, new_status: str,
+    board: Optional[str] = None,
 ) -> bool:
     """Direct status write for drag-drop moves that aren't covered by the
     structured complete/block/unblock/archive verbs (e.g. todo<->ready,
@@ -1274,13 +1275,11 @@ def _set_status_direct(
             ):
                 return False
 
-            # Cross-board external blocker guard (mirrors recompute_ready seam)
-            try:
-                _board = kanban_db.get_current_board()
-            except Exception:
-                _board = None
+            # Cross-board external blocker guard (mirrors recompute_ready seam).
+            # Use the resolved request board, not the process current board,
+            # so ?board=alt mutations query the correct registry.
             external_blockers = _kanban_dependencies().unsatisfied_blockers_for(
-                board=(_board or "default"),
+                board=(board or "default"),
                 task_id=task_id,
             )
             if external_blockers:
@@ -1470,7 +1469,7 @@ def bulk_update(payload: BulkTaskBody, board: Optional[str] = Query(None)):
                         cur = kanban_db.get_task(conn, tid)
                         if cur and cur.status in ("blocked", "scheduled"):
                             _raise_materialize_only_route_guard(board, tid)
-                            external = _external_blockers_for_ready(tid)
+                            external = _external_blockers_for_ready(tid, board=board)
                             if external:
                                 entry.update(ok=False, error="external blocker(s) — " + "; ".join(
                                     f"{e['parent_board']}/{e['parent_id']}"
@@ -1480,12 +1479,12 @@ def bulk_update(payload: BulkTaskBody, board: Optional[str] = Query(None)):
                                 continue
                             ok = kanban_db.unblock_task(conn, tid)
                         else:
-                            ok = _set_status_direct(conn, tid, "ready")
+                            ok = _set_status_direct(conn, tid, "ready", board=board)
                             if not ok:
                                 # Enrich with blocker details so the UI can show
                                 # actionable toasts per id in a bulk operation.
                                 local_blockers = _parents_blocking_ready(conn, tid)
-                                external_blockers = _external_blockers_for_ready(tid)
+                                external_blockers = _external_blockers_for_ready(tid, board=board)
                                 reasons: list[str] = []
                                 if local_blockers:
                                     names = ", ".join(
@@ -1687,7 +1686,10 @@ def list_cross_board_diagnostics(
         except Exception:
             pass
         try:
-            provider_registered = bool(kd._providers)
+            for p in kd._providers:
+                if kd._provider_name(p) == "kanban_cross_deps":
+                    provider_registered = True
+                    break
         except Exception:
             pass
 
