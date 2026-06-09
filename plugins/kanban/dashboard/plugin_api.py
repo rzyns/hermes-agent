@@ -52,6 +52,19 @@ from hermes_cli import kanban_db
 from hermes_cli import kanban_diagnostics as kd
 from hermes_constants import get_default_hermes_root
 
+# Soft import of the cross-board deps plugin so the kanban dashboard can
+# surface canonical edges even if the plugin is not enabled.  The import
+# is deferred to router-handler time so the plugin's optional status never
+# breaks dashboard startup.
+try:
+    from plugins.kanban_cross_deps.store import CrossBoardRegistry
+    from plugins.kanban_cross_deps.diagnostics import CrossBoardDiagnostics
+    _CROSS_BOARD_AVAILABLE = True
+except Exception:
+    _CROSS_BOARD_AVAILABLE = False
+    CrossBoardRegistry = None  # type: ignore[misc,assignment]
+    CrossBoardDiagnostics = None  # type: ignore[misc,assignment]
+
 log = logging.getLogger(__name__)
 
 router = APIRouter()
@@ -438,6 +451,42 @@ def _links_for(conn: sqlite3.Connection, task_id: str) -> dict[str, list[str]]:
     return {"parents": parents, "children": children}
 
 
+def _cross_board_edges_for(task_id: str, board: Optional[str]) -> dict[str, Any]:
+    """Return canonical cross-board edges where *task_id* participates.
+
+    The result is split by direction and provenance so the UI can render
+    canonical registry facts separately from inferred candidates:
+
+        {
+          "upstream":    [edge_dict, ...],   # task is child
+          "downstream":  [edge_dict, ...],   # task is parent
+          "diagnostics": {...} or None,
+        }
+
+    If the cross-board deps plugin is not available, returns empty lists
+    and ``None`` for diagnostics.
+    """
+    if not _CROSS_BOARD_AVAILABLE or CrossBoardRegistry is None:
+        return {"upstream": [], "downstream": [], "diagnostics": None}
+
+    board = board or kanban_db.get_current_board()
+
+    try:
+        registry = CrossBoardRegistry()  # type: ignore[reportOptionalCall]
+        upstream = registry.list_edges(child_board=board, child_id=task_id)
+        downstream = registry.list_edges(parent_board=board, parent_id=task_id)
+        diag_engine = CrossBoardDiagnostics(registry=registry)  # type: ignore[reportOptionalCall]
+        diagnostics = diag_engine.run()
+        return {
+            "upstream": [e.to_dict() for e in upstream],
+            "downstream": [e.to_dict() for e in downstream],
+            "diagnostics": diagnostics,
+        }
+    except Exception as exc:
+        log.warning("Cross-board edge lookup failed for %s: %s", task_id, exc)
+        return {"upstream": [], "downstream": [], "diagnostics": None}
+
+
 # ---------------------------------------------------------------------------
 # GET /board
 # ---------------------------------------------------------------------------
@@ -626,6 +675,7 @@ def get_task(
             "events": [_event_dict(e) for e in kanban_db.list_events(conn, task_id)],
             "attachments": [_attachment_dict(a) for a in kanban_db.list_attachments(conn, task_id)],
             "links": _links_for(conn, task_id),
+            "cross_board": _cross_board_edges_for(task_id, board),
             "runs": [
                 _run_dict(r)
                 for r in kanban_db.list_runs(
@@ -1506,6 +1556,76 @@ def list_diagnostics(
     finally:
         conn.close()
 
+
+# ---------------------------------------------------------------------------
+# Cross-board dependency diagnostics
+# ---------------------------------------------------------------------------
+
+@router.get("/cross-board-diagnostics")
+def list_cross_board_diagnostics(
+    board: Optional[str] = Query(None, description="Kanban board slug (omit for current)"),
+    task_id: Optional[str] = Query(None, description="Filter to a single task id"),
+):
+    """Return cross-board dependency diagnostics from the canonical registry.
+
+    If *task_id* is provided, only edges where that task participates are
+    included.  Otherwise diagnostics are computed for all boards.
+
+    The result surface is read-only and mirrors the CLI
+    ``kanban-cross-deps diagnostics`` output so the UI can render board-
+    level health rows and per-task blocker panels.
+    """
+    board = _resolve_board(board)
+
+    if not _CROSS_BOARD_AVAILABLE or CrossBoardDiagnostics is None:
+        return {
+            "available": False,
+            "diagnostics": {},
+            "count": 0,
+        }
+
+    try:
+        from plugins.kanban_cross_deps.store import CrossBoardRegistry
+
+        registry = CrossBoardRegistry()  # type: ignore[reportOptionalCall]
+        if task_id:
+            upstream = registry.list_edges(child_board=board, child_id=task_id)
+            downstream = registry.list_edges(parent_board=board, parent_id=task_id)
+            all_edges = upstream + downstream
+        else:
+            all_edges = registry.list_edges(limit=5000)
+
+        diag_engine = CrossBoardDiagnostics(registry=registry)
+        report = diag_engine.run()
+
+        # Optionally strip out edges not touching task_id when filtering
+        if task_id:
+            for section in ("cycles",):
+                sec = report.get(section) or {}
+                for key in list(sec.keys()):
+                    if key in ("total",):
+                        continue
+                    filtered = []
+                    for item in sec.get(key, []):
+                        path = item.get("path") or []
+                        if any(
+                            f"{board}/{task_id}" in p for p in path
+                        ):
+                            filtered.append(item)
+                    sec[key] = filtered
+
+        return {
+            "available": True,
+            "diagnostics": report,
+            "count": sum(
+                len(v) if isinstance(v, list) else 0
+                for sec in report.values()
+                for v in (sec.values() if isinstance(sec, dict) else [])
+            ),
+        }
+    except Exception as exc:
+        log.warning("Cross-board diagnostics failed: %s", exc)
+        raise HTTPException(status_code=500, detail=f"cross-board diagnostics error: {exc}")
 
 
 # ---------------------------------------------------------------------------

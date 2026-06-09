@@ -2362,3 +2362,54 @@ def test_dashboard_failed_card_highlight_class_exists():
     assert "hermes-kanban-card--failed" in js
     assert "hermes-kanban-card--failed" in css
     assert "failedIds" in js
+
+
+# ---------------------------------------------------------------------------
+# Cross-board dependency integration — soft-import graceful degradation
+# ---------------------------------------------------------------------------
+
+def test_get_task_includes_cross_board_field(client):
+    """GET /tasks/:id must always include a ``cross_board`` blob, even when
+    the cross-board deps plugin is unavailable.  This keeps the drawer
+    contract stable so the UI never has to guard the key's existence."""
+    r = client.post("/api/plugins/kanban/tasks", json={"title": "cross-board test"})
+    task = r.json()["task"]
+
+    r = client.get(f"/api/plugins/kanban/tasks/{task['id']}")
+    assert r.status_code == 200
+    data = r.json()
+    assert "cross_board" in data
+    assert isinstance(data["cross_board"]["upstream"], list)
+    assert isinstance(data["cross_board"]["downstream"], list)
+    # diagnostics is either None (plugin absent) or a dict (plugin present)
+    assert data["cross_board"]["diagnostics"] is None or isinstance(
+        data["cross_board"]["diagnostics"], dict
+    )
+
+
+def test_cross_board_diagnostics_shape(client):
+    """GET /cross-board-diagnostics must return 200 with a stable shape
+    whether the plugin is available or not."""
+    r = client.get("/api/plugins/kanban/cross-board-diagnostics")
+    assert r.status_code == 200
+    data = r.json()
+    assert "available" in data
+    assert "diagnostics" in data
+    assert "count" in data
+
+
+def test_cross_board_section_renders_in_dist():
+    """The built dashboard JS must contain the CrossBoardDepsSection component
+    and its associated CSS classes so the drawer surfaces canonical edges."""
+    repo_root = Path(__file__).resolve().parents[2]
+    js = (repo_root / "plugins" / "kanban" / "dashboard" / "dist" / "index.js").read_text()
+    css = (repo_root / "plugins" / "kanban" / "dashboard" / "dist" / "style.css").read_text()
+
+    assert "function CrossBoardDepsSection" in js
+    assert "hermes-kanban-cbd-row" in css
+    assert "hermes-kanban-cbd-dot" in css
+    assert "hermes-kanban-cbd-dot--blocking" in css
+    assert "hermes-kanban-cbd-board" in css
+    assert "hermes-kanban-cbd-id" in css
+    assert "hermes-kanban-cbd-kind" in css
+    assert "hermes-kanban-cbd-source" in css
