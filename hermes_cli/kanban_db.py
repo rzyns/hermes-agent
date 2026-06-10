@@ -4308,6 +4308,7 @@ def promote_task(
     reason: Optional[str] = None,
     force: bool = False,
     dry_run: bool = False,
+    board: Optional[str] = None,
 ) -> tuple[bool, Optional[str]]:
     """Manually promote a `todo` or `blocked` task to `ready`.
 
@@ -4347,6 +4348,22 @@ def promote_task(
             return False, (
                 f"unsatisfied parent dependencies: "
                 f"{', '.join(unsatisfied)} (use --force to override)"
+            )
+
+        # Cross-board blocker check (mirrors recompute_ready seam)
+        effective_board = board or get_current_board()
+        external_blockers = _kanban_dependencies().unsatisfied_blockers_for(
+            board=effective_board,
+            task_id=task_id,
+        )
+        if external_blockers:
+            blocker_names = ", ".join(
+                f"{b.parent_board}/{b.parent_id} ({b.reason})"
+                for b in external_blockers
+            )
+            return False, (
+                f"blocked by external dependencies: {blocker_names} "
+                f"(use --force to override)"
             )
 
     if dry_run:
@@ -5058,6 +5075,10 @@ class DispatchResult:
     (EX_TEMPFAIL sentinel exit) and were released back to ``ready`` WITHOUT
     counting a failure. These never trip the circuit breaker — a long quota
     window just makes the task bounce cheaply until the window clears."""
+    skipped_external: list[tuple[str, list[dict[str, Any]]]] = field(default_factory=list)
+    """Tasks deferred because unsatisfied external (cross-board) blockers exist.
+    Each entry is ``(task_id, blocker_dicts)``.  Separate bucket so dry-run
+    and telemetry can show scheduler-aware blocking."""
 
 
 # Bounded registry of recently-reaped worker child exits, populated by the
@@ -6419,6 +6440,15 @@ def dispatch_once(
                     )
             continue
         if dry_run:
+            # Dry-run should also surface external blockers so operators
+            # don't see a blocked task as spawnable.
+            _dry_board = board or get_current_board()
+            _dry_blockers = _kanban_dependencies().unsatisfied_blockers_for(
+                board=_dry_board, task_id=row["id"],
+            )
+            if _dry_blockers:
+                result.skipped_external.append((row["id"], [b.to_dict() for b in _dry_blockers]))
+                continue
             result.spawned.append((row["id"], row_assignee, ""))
             # Increment per-profile counter even in dry_run so the cap
             # check sees the would-be spawn on subsequent iterations.

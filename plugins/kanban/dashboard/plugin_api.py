@@ -52,7 +52,27 @@ from hermes_cli import kanban_db
 from hermes_cli import kanban_diagnostics as kd
 from hermes_constants import get_default_hermes_root
 
+# Soft import of the cross-board deps plugin so the kanban dashboard can
+# surface canonical edges even if the plugin is not enabled.  The import
+# is deferred to router-handler time so the plugin's optional status never
+# breaks dashboard startup.
+try:
+    from plugins.kanban_cross_deps.store import CrossBoardRegistry
+    from plugins.kanban_cross_deps.diagnostics import CrossBoardDiagnostics
+    _CROSS_BOARD_AVAILABLE = True
+except Exception:
+    _CROSS_BOARD_AVAILABLE = False
+    CrossBoardRegistry = None  # type: ignore[misc,assignment]
+    CrossBoardDiagnostics = None  # type: ignore[misc,assignment]
+
 log = logging.getLogger(__name__)
+
+# Lazily resolve the kanban dependency-provider module so tests that
+# re-import hermes_cli modules still see the current provider registry.
+# Same pattern as hermes_cli/kanban_db.py.
+def _kanban_dependencies():
+    from hermes_cli import kanban_dependencies as _kd
+    return _kd
 
 router = APIRouter()
 
@@ -438,6 +458,42 @@ def _links_for(conn: sqlite3.Connection, task_id: str) -> dict[str, list[str]]:
     return {"parents": parents, "children": children}
 
 
+def _cross_board_edges_for(task_id: str, board: Optional[str]) -> dict[str, Any]:
+    """Return canonical cross-board edges where *task_id* participates.
+
+    The result is split by direction and provenance so the UI can render
+    canonical registry facts separately from inferred candidates:
+
+        {
+          "upstream":    [edge_dict, ...],   # task is child
+          "downstream":  [edge_dict, ...],   # task is parent
+          "diagnostics": {...} or None,
+        }
+
+    If the cross-board deps plugin is not available, returns empty lists
+    and ``None`` for diagnostics.
+    """
+    if not _CROSS_BOARD_AVAILABLE or CrossBoardRegistry is None:
+        return {"upstream": [], "downstream": [], "diagnostics": None}
+
+    board = board or kanban_db.get_current_board()
+
+    try:
+        registry = CrossBoardRegistry()  # type: ignore[reportOptionalCall]
+        upstream = registry.list_edges(child_board=board, child_id=task_id)
+        downstream = registry.list_edges(parent_board=board, parent_id=task_id)
+        diag_engine = CrossBoardDiagnostics(registry=registry)  # type: ignore[reportOptionalCall]
+        diagnostics = diag_engine.run()
+        return {
+            "upstream": [e.to_dict() for e in upstream],
+            "downstream": [e.to_dict() for e in downstream],
+            "diagnostics": diagnostics,
+        }
+    except Exception as exc:
+        log.warning("Cross-board edge lookup failed for %s: %s", task_id, exc)
+        return {"upstream": [], "downstream": [], "diagnostics": None}
+
+
 # ---------------------------------------------------------------------------
 # GET /board
 # ---------------------------------------------------------------------------
@@ -626,6 +682,7 @@ def get_task(
             "events": [_event_dict(e) for e in kanban_db.list_events(conn, task_id)],
             "attachments": [_attachment_dict(a) for a in kanban_db.list_attachments(conn, task_id)],
             "links": _links_for(conn, task_id),
+            "cross_board": _cross_board_edges_for(task_id, board),
             "runs": [
                 _run_dict(r)
                 for r in kanban_db.list_runs(
@@ -1025,10 +1082,16 @@ def update_task(task_id: str, payload: UpdateTaskBody, board: Optional[str] = Qu
                 current = kanban_db.get_task(conn, task_id)
                 if current and current.status in ("blocked", "scheduled"):
                     _raise_materialize_only_route_guard(board, task_id)
-                    ok = kanban_db.unblock_task(conn, task_id)
+                    # Guard: unblock must not promote an externally blocked task
+                    # to ready.  Mirror the guard in _set_status_direct.
+                    external = _external_blockers_for_ready(task_id, board=board)
+                    if external:
+                        ok = False
+                    else:
+                        ok = kanban_db.unblock_task(conn, task_id)
                 else:
                     # Direct status write for drag-drop (todo -> ready etc).
-                    ok = _set_status_direct(conn, task_id, "ready")
+                    ok = _set_status_direct(conn, task_id, "ready", board=board)
             elif s == "archived":
                 ok = kanban_db.archive_task(conn, task_id)
             elif s == "running":
@@ -1046,16 +1109,27 @@ def update_task(task_id: str, payload: UpdateTaskBody, board: Optional[str] = Qu
                 # See #26744.
                 if s == "ready":
                     blockers = _parents_blocking_ready(conn, task_id)
-                    if blockers:
-                        names = ", ".join(
-                            f"{p['title']!r} ({p['id']}, status={p['status']})"
-                            for p in blockers
-                        )
+                    external = _external_blockers_for_ready(task_id, board=board)
+                    if blockers or external:
+                        msgs: list[str] = []
+                        if blockers:
+                            names = ", ".join(
+                                f"{p['title']!r} ({p['id']}, status={p['status']})"
+                                for p in blockers
+                            )
+                            msgs.append(f"local parent(s) not done — {names}")
+                        if external:
+                            ext_names = ", ".join(
+                                f"{e['parent_board']}/{e['parent_id']}"
+                                + (f" (status={e['status']})" if e.get("status") else "")
+                                for e in external
+                            )
+                            msgs.append(f"external blocker(s) — {ext_names}")
                         raise HTTPException(
                             status_code=409,
                             detail=(
-                                f"Cannot move to 'ready': blocked by parent(s) "
-                                f"not done — {names}"
+                                "Cannot move to 'ready': blocked by "
+                                + "; ".join(msgs)
                             ),
                         )
                 raise HTTPException(
@@ -1124,9 +1198,10 @@ def delete_task(task_id: str, board: Optional[str] = Query(None)):
 
 def _parents_blocking_ready(
     conn: sqlite3.Connection, task_id: str,
-) -> list:
-    """Return parent rows (``id``, ``title``, ``status``) that aren't ``done``
-    and therefore prevent ``task_id`` from being promoted to ``ready``.
+) -> list[dict[str, Any]]:
+    """Return board-local parent rows (``id``, ``title``, ``status``) that
+    aren't ``done`` and therefore prevent ``task_id`` from being promoted to
+    ``ready``.
 
     Used to enrich the 409 response from :func:`update_task` so the
     dashboard can show an actionable toast (#26744) instead of a silent
@@ -1145,8 +1220,26 @@ def _parents_blocking_ready(
     ]
 
 
+def _external_blockers_for_ready(
+    task_id: str, board: Optional[str] = None,
+) -> list[dict[str, Any]]:
+    """Return unsatisfied external blockers for *task_id* as plain dicts.
+
+    Mirrors the guard inside :func:`_set_status_direct` so that 409
+    responses can name cross-board blockers alongside local parents.
+    ``board`` is the resolved request board slug (not the process current
+    board) so that ``?board=alt`` queries query the correct registry.
+    """
+    blockers = _kanban_dependencies().unsatisfied_blockers_for(
+        board=(board or "default"),
+        task_id=task_id,
+    )
+    return [b.to_dict() for b in blockers]
+
+
 def _set_status_direct(
     conn: sqlite3.Connection, task_id: str, new_status: str,
+    board: Optional[str] = None,
 ) -> bool:
     """Direct status write for drag-drop moves that aren't covered by the
     structured complete/block/unblock/archive verbs (e.g. todo<->ready,
@@ -1180,6 +1273,16 @@ def _set_status_direct(
             if parent_statuses and not all(
                 p["status"] == "done" for p in parent_statuses
             ):
+                return False
+
+            # Cross-board external blocker guard (mirrors recompute_ready seam).
+            # Use the resolved request board, not the process current board,
+            # so ?board=alt mutations query the correct registry.
+            external_blockers = _kanban_dependencies().unsatisfied_blockers_for(
+                board=(board or "default"),
+                task_id=task_id,
+            )
+            if external_blockers:
                 return False
 
         was_running = prev["status"] == "running"
@@ -1366,9 +1469,40 @@ def bulk_update(payload: BulkTaskBody, board: Optional[str] = Query(None)):
                         cur = kanban_db.get_task(conn, tid)
                         if cur and cur.status in ("blocked", "scheduled"):
                             _raise_materialize_only_route_guard(board, tid)
+                            external = _external_blockers_for_ready(tid, board=board)
+                            if external:
+                                entry.update(ok=False, error="external blocker(s) — " + "; ".join(
+                                    f"{e['parent_board']}/{e['parent_id']}"
+                                    for e in external
+                                ))
+                                results.append(entry)
+                                continue
                             ok = kanban_db.unblock_task(conn, tid)
                         else:
-                            ok = _set_status_direct(conn, tid, "ready")
+                            ok = _set_status_direct(conn, tid, "ready", board=board)
+                            if not ok:
+                                # Enrich with blocker details so the UI can show
+                                # actionable toasts per id in a bulk operation.
+                                local_blockers = _parents_blocking_ready(conn, tid)
+                                external_blockers = _external_blockers_for_ready(tid, board=board)
+                                reasons: list[str] = []
+                                if local_blockers:
+                                    names = ", ".join(
+                                        f"{p['title']!r} ({p['id']}, status={p['status']})"
+                                        for p in local_blockers
+                                    )
+                                    reasons.append(f"local parent(s) not done — {names}")
+                                if external_blockers:
+                                    ext_names = ", ".join(
+                                        f"{e['parent_board']}/{e['parent_id']}"
+                                        + (f" (status={e['status']})" if e.get("status") else "")
+                                        for e in external_blockers
+                                    )
+                                    reasons.append(f"external blocker(s) — {ext_names}")
+                                if reasons:
+                                    entry.update(ok=False, error="; ".join(reasons))
+                                    results.append(entry)
+                                    continue
                     elif s == "running":
                         entry.update(
                             ok=False,
@@ -1506,6 +1640,82 @@ def list_diagnostics(
     finally:
         conn.close()
 
+
+# ---------------------------------------------------------------------------
+# Cross-board dependency diagnostics
+# ---------------------------------------------------------------------------
+
+@router.get("/cross-board-diagnostics")
+def list_cross_board_diagnostics(
+    board: Optional[str] = Query(None, description="Kanban board slug (omit for current)"),
+    task_id: Optional[str] = Query(None, description="Filter to a single task id"),
+):
+    """Return cross-board dependency diagnostics from the canonical registry.
+
+    If *task_id* is provided, only edges where that task participates are
+    included.  Otherwise diagnostics are computed for all boards.
+
+    The result surface is read-only and mirrors the CLI
+    ``kanban-cross-deps diagnostics`` output so the UI can render board-
+    level health rows and per-task blocker panels.
+    """
+    board = _resolve_board(board)
+
+    if not _CROSS_BOARD_AVAILABLE or CrossBoardDiagnostics is None:
+        return {
+            "available": False,
+            "diagnostics": {},
+            "count": 0,
+        }
+
+    try:
+        from plugins.kanban_cross_deps.store import CrossBoardRegistry
+        from hermes_cli import kanban_dependencies as kd
+
+        registry = CrossBoardRegistry()  # type: ignore[reportOptionalCall]
+        diag_engine = CrossBoardDiagnostics(registry=registry)
+
+        # Compute availability / provenance surface split so callers can
+        # distinguish importable/readable from enabled/registered/enforced.
+        plugin_enabled = False
+        provider_registered = False
+        try:
+            from hermes_cli.plugins import _get_enabled_plugins
+            enabled = _get_enabled_plugins()
+            plugin_enabled = enabled is not None and "kanban_cross_deps" in enabled
+        except Exception:
+            pass
+        try:
+            for p in kd._providers:
+                if kd._provider_name(p) == "kanban_cross_deps":
+                    provider_registered = True
+                    break
+        except Exception:
+            pass
+
+        if task_id:
+            _task_board = board or "default"
+            report = diag_engine.run(task_filter=(_task_board, task_id))
+        else:
+            report = diag_engine.run()
+
+        return {
+            "available": True,
+            "registry_importable": True,
+            "registry_readable": True,
+            "plugin_enabled": plugin_enabled,
+            "provider_registered": provider_registered,
+            "enforcement_active": plugin_enabled and provider_registered,
+            "diagnostics": report,
+            "count": sum(
+                len(v) if isinstance(v, list) else 0
+                for sec in report.values()
+                for v in (sec.values() if isinstance(sec, dict) else [])
+            ),
+        }
+    except Exception as exc:
+        log.warning("Cross-board diagnostics failed: %s", exc)
+        raise HTTPException(status_code=500, detail=f"cross-board diagnostics error: {exc}")
 
 
 # ---------------------------------------------------------------------------

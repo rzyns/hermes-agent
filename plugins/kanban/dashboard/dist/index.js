@@ -3294,6 +3294,7 @@
     const events = props.data.events || [];
     const attachments = props.data.attachments || [];
     const links = props.data.links || { parents: [], children: [] };
+    const crossBoard = props.data.cross_board || { upstream: [], downstream: [] };
 
     return h("div", { className: "hermes-kanban-drawer-body" },
       h("div", { className: "hermes-kanban-drawer-title" },
@@ -3363,6 +3364,10 @@
         onRemoveParent: props.onRemoveParent,
         onAddChild: props.onAddChild,
         onRemoveChild: props.onRemoveChild,
+      }),
+      h(CrossBoardDepsSection, {
+        upstream: crossBoard.upstream,
+        downstream: crossBoard.downstream,
       }),
       t.result ? h("div", { className: "hermes-kanban-section" },
         h("div", { className: "hermes-kanban-section-head" }, tx(i18n, "result", "Result")),
@@ -3708,6 +3713,45 @@
           ? h(MarkdownBlock, { source: props.task.body, enabled: props.renderMarkdown })
           : h("div", { className: "text-xs text-muted-foreground italic" },
               tx(t, "noDescription", "— no description —")),
+    );
+  }
+
+  // -------------------------------------------------------------------------
+  // Cross-board dependency section (read-only — only the registry CLI may
+  // create or remove edges, so the UI is purely informative)
+  // -------------------------------------------------------------------------
+
+  function CrossBoardDepsSection(props) {
+    const { t } = useI18n();
+    var upstream   = props.upstream   || [];
+    var downstream = props.downstream || [];
+    if (!upstream.length && !downstream.length) return null;
+
+    function edgeRow(e, direction) {
+      var kind = e.kind || "depends";
+      var blocking = e.blocking ? true : false;
+      var source = e.source || "";
+      var provenanceLabel = (blocking ? "blocking, " : "non-blocking, ") + (source || "canonical");
+      return h("div", { className: "hermes-kanban-cbd-row", key: e.id },
+        h("span", { className: "hermes-kanban-cbd-dot " + (blocking ? "hermes-kanban-cbd-dot--blocking" : "") }),
+        h("span", { className: "hermes-kanban-cbd-dir" }, direction),
+        h("span", { className: "hermes-kanban-cbd-board" }, e.parent_board || e.child_board || ""),
+        h("span", { className: "hermes-kanban-cbd-id" }, e.parent_id || e.child_id || ""),
+        h("span", { className: "hermes-kanban-cbd-kind" }, kind),
+        source ? h("span", { className: "hermes-kanban-cbd-source" }, "(" + provenanceLabel + ")") : null,
+      );
+    }
+
+    return h("div", { className: "hermes-kanban-section" },
+      h("div", { className: "hermes-kanban-section-head" }, tx(t, "crossBoardDeps", "Cross-board dependencies")),
+      upstream.length > 0 ? h("div", { className: "hermes-kanban-cbd-group" },
+        h("div", { className: "hermes-kanban-cbd-group-label" }, tx(t, "upstream", "Upstream")),
+        upstream.map(function (e) { return edgeRow(e, "←"); }),
+      ) : null,
+      downstream.length > 0 ? h("div", { className: "hermes-kanban-cbd-group" },
+        h("div", { className: "hermes-kanban-cbd-group-label" }, tx(t, "downstream", "Downstream")),
+        downstream.map(function (e) { return edgeRow(e, "→"); }),
+      ) : null,
     );
   }
 

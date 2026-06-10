@@ -49,6 +49,10 @@ def kanban_home(tmp_path, monkeypatch):
     home.mkdir()
     monkeypatch.setenv("HERMES_HOME", str(home))
     monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    # Prevent leaked kanban overrides from affecting board/registry resolution
+    monkeypatch.delenv("HERMES_KANBAN_HOME", raising=False)
+    monkeypatch.delenv("HERMES_KANBAN_DB", raising=False)
+    monkeypatch.delenv("HERMES_KANBAN_BOARD", raising=False)
     kb.init_db()
     return home
 
@@ -2362,3 +2366,282 @@ def test_dashboard_failed_card_highlight_class_exists():
     assert "hermes-kanban-card--failed" in js
     assert "hermes-kanban-card--failed" in css
     assert "failedIds" in js
+
+
+# ---------------------------------------------------------------------------
+# Cross-board dependency integration — soft-import graceful degradation
+# ---------------------------------------------------------------------------
+
+def test_get_task_includes_cross_board_field(client):
+    """GET /tasks/:id must always include a ``cross_board`` blob, even when
+    the cross-board deps plugin is unavailable.  This keeps the drawer
+    contract stable so the UI never has to guard the key's existence."""
+    r = client.post("/api/plugins/kanban/tasks", json={"title": "cross-board test"})
+    task = r.json()["task"]
+
+    r = client.get(f"/api/plugins/kanban/tasks/{task['id']}")
+    assert r.status_code == 200
+    data = r.json()
+    assert "cross_board" in data
+    assert isinstance(data["cross_board"]["upstream"], list)
+    assert isinstance(data["cross_board"]["downstream"], list)
+    # diagnostics is either None (plugin absent) or a dict (plugin present)
+    assert data["cross_board"]["diagnostics"] is None or isinstance(
+        data["cross_board"]["diagnostics"], dict
+    )
+
+
+def test_cross_board_diagnostics_shape(client):
+    """GET /cross-board-diagnostics must return 200 with a stable shape
+    whether the plugin is available or not."""
+    r = client.get("/api/plugins/kanban/cross-board-diagnostics")
+    assert r.status_code == 200
+    data = r.json()
+    assert "available" in data
+    assert "diagnostics" in data
+    assert "count" in data
+
+
+def test_cross_board_section_renders_in_dist():
+    """The built dashboard JS must contain the CrossBoardDepsSection component
+    and its associated CSS classes so the drawer surfaces canonical edges."""
+    repo_root = Path(__file__).resolve().parents[2]
+    js = (repo_root / "plugins" / "kanban" / "dashboard" / "dist" / "index.js").read_text()
+    css = (repo_root / "plugins" / "kanban" / "dashboard" / "dist" / "style.css").read_text()
+
+    assert "function CrossBoardDepsSection" in js
+    assert "hermes-kanban-cbd-row" in css
+    assert "hermes-kanban-cbd-dot" in css
+    assert "hermes-kanban-cbd-dot--blocking" in css
+    assert "hermes-kanban-cbd-board" in css
+    assert "hermes-kanban-cbd-id" in css
+    assert "hermes-kanban-cbd-kind" in css
+    assert "hermes-kanban-cbd-source" in css
+
+
+# ---------------------------------------------------------------------------
+# Fixture-backed cross-board edge + blocker tests
+# ---------------------------------------------------------------------------
+
+def _make_cross_board_fixture(client, monkeypatch, tmp_path):
+    """Return a helper that wires a temp CrossBoardRegistry under the test DB
+    and registers its provider with the global dependency seam."""
+    from hermes_cli import kanban_dependencies as kd
+    from plugins.kanban_cross_deps.store import CrossBoardRegistry
+    from plugins.kanban_cross_deps.provider import CrossBoardDependencyProvider
+    reg = CrossBoardRegistry()
+    # Ensure the registry DB is under the temp home
+    assert reg.path.resolve().is_relative_to(tmp_path.resolve())
+    provider = CrossBoardDependencyProvider(registry=reg)
+    token = kd.register_dependency_provider(provider)
+
+    def add_edge(parent_board, parent_id, child_board, child_id, kind="blocks", blocking=True, source="canonical"):
+        return reg.add(
+            parent_board=parent_board, parent_id=parent_id,
+            child_board=child_board, child_id=child_id,
+            kind=kind, blocking=blocking, source=source,
+        )
+
+    def cleanup():
+        kd.unregister_dependency_provider(token)
+    return add_edge, reg, cleanup
+
+
+def test_task_detail_shows_canonical_edge_provenance(client, monkeypatch, tmp_path):
+    """GET /tasks/:id cross_board blob must expose blocking and source fields."""
+    from hermes_cli import kanban_db as kb
+    from plugins.kanban_cross_deps.store import CrossBoardRegistry
+
+    add_edge, reg, _cleanup = _make_cross_board_fixture(client, monkeypatch, tmp_path)
+
+    # Create parent task on a sibling board and child task on default board
+    p_conn = kb.connect(board="other")
+    c_conn = kb.connect(board="default")
+    try:
+        pid = kb.create_task(p_conn, title="parent", assignee="worker")
+        cid = kb.create_task(c_conn, title="child", assignee="worker")
+    finally:
+        p_conn.close()
+        c_conn.close()
+
+    edge = add_edge("other", pid, "default", cid, kind="informed_by", blocking=False, source="promoted")
+
+    r = client.get(f"/api/plugins/kanban/tasks/{cid}")
+    assert r.status_code == 200
+    data = r.json()
+    assert "cross_board" in data
+    upstream = data["cross_board"]["upstream"]
+    assert len(upstream) == 1
+    u = upstream[0]
+    assert u["blocking"] is False
+    assert u["source"] == "promoted"
+    assert u["kind"] == "informed_by"
+
+
+def test_ready_transition_409_includes_external_blocker(client, monkeypatch, tmp_path):
+    """PATCH status ready must 409 and name the external blocker, not silently refuse."""
+    from hermes_cli import kanban_db as kb
+    from plugins.kanban_cross_deps.store import CrossBoardRegistry
+
+    add_edge, reg, _cleanup = _make_cross_board_fixture(client, monkeypatch, tmp_path)
+
+    p_conn = kb.connect(board="other")
+    c_conn = kb.connect(board="default")
+    try:
+        pid = kb.create_task(p_conn, title="parent", assignee="worker")
+        # Create child in todo (not ready) so the ready transition is real.
+        local_parent = kb.create_task(c_conn, title="local parent", assignee="worker")
+        cid = kb.create_task(c_conn, title="child", assignee="worker", parents=[local_parent])
+    finally:
+        p_conn.close()
+        c_conn.close()
+
+    add_edge("other", pid, "default", cid, kind="blocks", blocking=True)
+
+    r = client.patch(f"/api/plugins/kanban/tasks/{cid}", json={"status": "ready"})
+    assert r.status_code == 409
+    detail = r.json()["detail"]
+    assert "external blocker" in detail
+    assert "other" in detail
+    assert pid in detail
+
+
+def test_bulk_ready_includes_external_blocker_per_id(client, monkeypatch, tmp_path):
+    """Bulk POST ready must return per-id error strings naming external blockers."""
+    from hermes_cli import kanban_db as kb
+    from plugins.kanban_cross_deps.store import CrossBoardRegistry
+
+    add_edge, reg, _cleanup = _make_cross_board_fixture(client, monkeypatch, tmp_path)
+
+    p_conn = kb.connect(board="other")
+    c_conn = kb.connect(board="default")
+    try:
+        pid = kb.create_task(p_conn, title="parent", assignee="worker")
+        local_parent = kb.create_task(c_conn, title="local parent", assignee="worker")
+        cid = kb.create_task(c_conn, title="child", assignee="worker", parents=[local_parent])
+    finally:
+        p_conn.close()
+        c_conn.close()
+
+    add_edge("other", pid, "default", cid, kind="blocks", blocking=True)
+
+    r = client.post("/api/plugins/kanban/tasks/bulk", json={"ids": [cid], "status": "ready"})
+    assert r.status_code == 200
+    results = r.json()["results"]
+    assert len(results) == 1
+    entry = results[0]
+    assert entry["ok"] is False
+    assert "external blocker" in entry["error"]
+
+
+def test_ready_transition_409_uses_request_board_not_current(client, monkeypatch, tmp_path):
+    """PATCH ?board=alt must use alt board's external blockers, not current/default.
+
+    Creates a cross-board edge for alt/<child> only; default/<child> is free.
+    The request ?board=alt must 409 because the alt board edge blocks it.
+    """
+    from hermes_cli import kanban_db as kb
+
+    add_edge, reg, _cleanup = _make_cross_board_fixture(client, monkeypatch, tmp_path)
+
+    # Create parent on "other" board and child on "alt" board.
+    p_conn = kb.connect(board="other")
+    c_conn = kb.connect(board="alt")
+    try:
+        pid = kb.create_task(p_conn, title="parent", assignee="worker")
+        cid = kb.create_task(c_conn, title="child", assignee="worker")
+    finally:
+        p_conn.close()
+        c_conn.close()
+
+    add_edge("other", pid, "alt", cid, kind="blocks", blocking=True)
+
+    # Request board=alt; the edge lives on alt/<child>.
+    r = client.patch(f"/api/plugins/kanban/tasks/{cid}?board=alt", json={"status": "ready"})
+    assert r.status_code == 409
+    detail = r.json()["detail"]
+    assert "external blocker" in detail
+    assert "other" in detail
+
+
+def test_bulk_ready_uses_request_board_not_current(client, monkeypatch, tmp_path):
+    """Bulk POST ?board=alt must use alt board blockers per-id.
+
+    Creates a cross-board edge for alt/<child> only; default/<child> is free.
+    The bulk request ?board=alt must produce per-id errors.
+    """
+    from hermes_cli import kanban_db as kb
+
+    add_edge, reg, _cleanup = _make_cross_board_fixture(client, monkeypatch, tmp_path)
+
+    p_conn = kb.connect(board="other")
+    c_conn = kb.connect(board="alt")
+    try:
+        pid = kb.create_task(p_conn, title="parent", assignee="worker")
+        cid = kb.create_task(c_conn, title="child", assignee="worker")
+    finally:
+        p_conn.close()
+        c_conn.close()
+
+    add_edge("other", pid, "alt", cid, kind="blocks", blocking=True)
+
+    r = client.post("/api/plugins/kanban/tasks/bulk?board=alt", json={"ids": [cid], "status": "ready"})
+    assert r.status_code == 200
+    results = r.json()["results"]
+    assert len(results) == 1
+    assert results[0]["ok"] is False
+    assert "external blocker" in results[0]["error"]
+
+
+def test_cross_board_diagnostics_task_filter_scopes_all_sections(client, monkeypatch, tmp_path):
+    """GET /cross-board-diagnostics?task_id=... must scope all sections and recompute counts."""
+    from hermes_cli import kanban_db as kb
+    from plugins.kanban_cross_deps.store import CrossBoardRegistry
+
+    add_edge, reg, _cleanup = _make_cross_board_fixture(client, monkeypatch, tmp_path)
+
+    p_conn = kb.connect(board="other")
+    c_conn = kb.connect(board="default")
+    try:
+        pid = kb.create_task(p_conn, title="parent", assignee="worker")
+        cid = kb.create_task(c_conn, title="child", assignee="worker")
+    finally:
+        p_conn.close()
+        c_conn.close()
+
+    add_edge("other", pid, "default", cid, kind="blocks", blocking=True)
+
+    r = client.get(f"/api/plugins/kanban/cross-board-diagnostics?task_id={cid}")
+    assert r.status_code == 200
+    data = r.json()
+    assert data["available"] is True
+    # The scoped report should only contain edges touching t_child
+    report = data["diagnostics"]
+    # Cycles, dangling, contradictions, provider_failures are scoped
+    assert "summary" in report
+    summary = report["summary"]
+    # Counts should be <= 1 for each category because only one edge exists
+    assert summary["dangling"] <= 1
+    assert summary["contradictions"] <= 1
+    assert summary["provider_failures"] <= 1
+    # The overall count field must match recomputed sum
+    computed_count = sum(
+        len(v) if isinstance(v, list) else 0
+        for sec in report.values()
+        for v in (sec.values() if isinstance(sec, dict) else [])
+    )
+    assert data["count"] == computed_count
+
+
+def test_cross_board_diagnostics_provenance_surface(client, monkeypatch, tmp_path):
+    """Diagnostics endpoint must expose registry_importable / plugin_enabled / provider_registered / enforcement_active."""
+    r = client.get("/api/plugins/kanban/cross-board-diagnostics")
+    assert r.status_code == 200
+    data = r.json()
+    assert "registry_importable" in data
+    assert "registry_readable" in data
+    assert "plugin_enabled" in data
+    assert "provider_registered" in data
+    assert "enforcement_active" in data
+    # enforcement_active = plugin_enabled and provider_registered
+    assert data["enforcement_active"] == (data["plugin_enabled"] and data["provider_registered"])

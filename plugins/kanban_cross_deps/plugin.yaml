@@ -1,0 +1,4 @@
+name: kanban-cross-deps
+version: 0.1.0
+description: "Cross-board Kanban dependency registry, discovery, diagnostics, and scheduler provider."
+author: NousResearch

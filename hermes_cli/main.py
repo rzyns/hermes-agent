@@ -2217,7 +2217,7 @@ def cmd_chat(args):
     # ``from cli import ...`` lookups at call time; if a profile/plugin directory
     # is earlier on sys.path, those lookups can otherwise resolve to a plugin's
     # cli.py instead of Hermes core.
-    sys.modules["cli"] = cli_module
+    sys.modules[spec.name] = cli_module
     spec.loader.exec_module(cli_module)
     cli_main = cli_module.main
 
