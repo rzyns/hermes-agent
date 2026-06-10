@@ -2212,6 +2212,7 @@ def cmd_chat(args):
     if spec is None or spec.loader is None:
         raise RuntimeError(f"Unable to load Hermes CLI entrypoint from {cli_path}")
     cli_module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = cli_module
     spec.loader.exec_module(cli_module)
     cli_main = cli_module.main
 
