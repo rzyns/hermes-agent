@@ -2159,25 +2159,48 @@ def _cmd_promote(args: argparse.Namespace) -> int:
             ids.append(tid)
             seen.add(tid)
 
+    force = bool(getattr(args, "force", False))
+    dry_run = bool(getattr(args, "dry_run", False))
+    board = getattr(args, "board", None)
+
     results: list[dict[str, object]] = []
-    with kb.connect_closing() as conn:
-        for tid in ids:
-            ok, err = kb.promote_task(
-                conn,
-                tid,
-                actor=author,
-                reason=reason,
-                force=bool(args.force),
-                dry_run=bool(args.dry_run),
-            )
-            results.append({
-                "task_id": tid,
-                "promoted": ok,
-                "dry_run": bool(args.dry_run),
-                "forced": bool(args.force),
-                "reason": reason,
-                "error": err,
-            })
+    if not force:
+        try:
+            from hermes_cli.plugins import discover_plugins
+
+            discover_plugins()
+        except Exception as exc:
+            err = f"could not load enabled Kanban dependency providers: {exc}"
+            for tid in ids:
+                results.append({
+                    "task_id": tid,
+                    "promoted": False,
+                    "dry_run": dry_run,
+                    "forced": force,
+                    "reason": reason,
+                    "error": err,
+                })
+
+    if not results:
+        with kb.connect_closing() as conn:
+            for tid in ids:
+                ok, err = kb.promote_task(
+                    conn,
+                    tid,
+                    actor=author,
+                    reason=reason,
+                    force=force,
+                    dry_run=dry_run,
+                    board=board,
+                )
+                results.append({
+                    "task_id": tid,
+                    "promoted": ok,
+                    "dry_run": dry_run,
+                    "forced": force,
+                    "reason": reason,
+                    "error": err,
+                })
 
     failed = [r for r in results if not r["promoted"]]
     if as_json:
