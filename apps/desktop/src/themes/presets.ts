@@ -3,7 +3,7 @@
  * Add new themes here — no code changes needed elsewhere.
  */
 
-import type { DesktopTheme, DesktopThemeTypography } from './types'
+import type { DesktopTheme, DesktopThemeColors, DesktopThemeTypography } from './types'
 
 // Color-emoji fonts to append to every stack as a last resort. None of the UI
 // text/mono fonts carry emoji glyphs, so without this emoji render as tofu
@@ -278,13 +278,99 @@ export const slateTheme: DesktopTheme = {
   }
 }
 
+const GITHUB_DARK_COLORBLIND_COLORS: DesktopThemeColors = {
+  background: '#0d1117',
+  foreground: '#c9d1d9',
+  card: '#010409',
+  cardForeground: '#c9d1d9',
+  muted: '#161b22',
+  mutedForeground: '#8b949e',
+  popover: '#161b22',
+  popoverForeground: '#c9d1d9',
+  primary: '#58a6ff',
+  primaryForeground: '#0d1117',
+  secondary: '#1f6feb',
+  secondaryForeground: '#ffffff',
+  accent: '#18273e',
+  accentForeground: '#c9d1d9',
+  border: '#30363d',
+  input: '#0d1117',
+  ring: '#58a6ff',
+  midground: '#58a6ff',
+  midgroundForeground: '#0d1117',
+  composerRing: '#58a6ff',
+  destructive: '#d47616',
+  destructiveForeground: '#ffffff',
+  sidebarBackground: '#010409',
+  sidebarBorder: '#30363d',
+  userBubble: '#0e1c32',
+  userBubbleBorder: '#30363d'
+}
+
+/**
+ * GitHub Dark Colorblind — faithful desktop clone of the GitHub Theme VS Code
+ * extension's `GitHub Dark Colorblind (Beta)` palette. The source theme is MIT
+ * licensed in primer/github-vscode-theme (Copyright © 2020 Primer) and swaps
+ * red/green status colors for orange/blue cues for protanopia/deuteranopia
+ * accessibility.
+ */
+export const githubDarkColorblindTheme: DesktopTheme = {
+  name: 'github-dark-colorblind',
+  label: 'GitHub Dark Colorblind',
+  description: 'GitHub dark colorblind palette — blue/orange accessible contrast',
+  colors: GITHUB_DARK_COLORBLIND_COLORS,
+  darkColors: GITHUB_DARK_COLORBLIND_COLORS,
+  typography: {
+    fontMono: `"Cascadia Code", "JetBrains Mono", ${SYSTEM_MONO}`
+  },
+  terminal: {
+    foreground: '#c9d1d9',
+    black: '#484f58',
+    red: '#ec8e2c',
+    green: '#58a6ff',
+    yellow: '#d29922',
+    blue: '#58a6ff',
+    magenta: '#bc8cff',
+    cyan: '#39c5cf',
+    white: '#b1bac4',
+    brightBlack: '#6e7681',
+    brightRed: '#fdac54',
+    brightGreen: '#79c0ff',
+    brightYellow: '#e3b341',
+    brightBlue: '#79c0ff',
+    brightMagenta: '#d2a8ff',
+    brightCyan: '#56d4dd',
+    brightWhite: '#ffffff'
+  },
+  darkTerminal: {
+    foreground: '#c9d1d9',
+    black: '#484f58',
+    red: '#ec8e2c',
+    green: '#58a6ff',
+    yellow: '#d29922',
+    blue: '#58a6ff',
+    magenta: '#bc8cff',
+    cyan: '#39c5cf',
+    white: '#b1bac4',
+    brightBlack: '#6e7681',
+    brightRed: '#fdac54',
+    brightGreen: '#79c0ff',
+    brightYellow: '#e3b341',
+    brightBlue: '#79c0ff',
+    brightMagenta: '#d2a8ff',
+    brightCyan: '#56d4dd',
+    brightWhite: '#ffffff'
+  }
+}
+
 export const BUILTIN_THEMES: Record<string, DesktopTheme> = {
   nous: nousTheme,
   midnight: midnightTheme,
   ember: emberTheme,
   mono: monoTheme,
   cyberpunk: cyberpunkTheme,
-  slate: slateTheme
+  slate: slateTheme,
+  'github-dark-colorblind': githubDarkColorblindTheme
 }
 
 export const BUILTIN_THEME_LIST = Object.values(BUILTIN_THEMES)
