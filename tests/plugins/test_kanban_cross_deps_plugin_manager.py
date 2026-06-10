@@ -21,6 +21,27 @@ import yaml
 from hermes_cli.plugins import PluginManager
 
 
+def _clear_kanban_cross_deps_discovery_cache(monkeypatch):
+    """Reset plugin discovery without replacing ``hermes_cli.plugins``.
+
+    Other test modules import functions from ``hermes_cli.plugins`` at module
+    import time. Replacing the core module object leaves those functions bound
+    to old globals while later string-based monkeypatches target the new module.
+    Reset the singleton in-place and evict only plugin implementation modules.
+    """
+
+    import hermes_cli.plugins as plugins_mod
+
+    monkeypatch.setattr(plugins_mod, "_plugin_manager", None)
+    for key in list(sys.modules):
+        if (
+            key.startswith("hermes_plugins.")
+            or key == "plugins.kanban_cross_deps"
+            or key.startswith("plugins.kanban_cross_deps.")
+        ):
+            del sys.modules[key]
+
+
 @pytest.fixture
 def _isolate_env(tmp_path, monkeypatch):
     """Temp HERMES_HOME with minimal config.yaml scaffold."""
@@ -43,10 +64,7 @@ class TestPluginManagerLoads:
         config = {"plugins": {"enabled": ["kanban-cross-deps"]}}
         (_isolate_env / "config.yaml").write_text(yaml.safe_dump(config))
 
-        # Wipe any cached plugin state from earlier tests in this worker.
-        for k in list(sys.modules):
-            if k.startswith(("hermes_plugins", "hermes_cli.plugins")):
-                del sys.modules[k]
+        _clear_kanban_cross_deps_discovery_cache(monkeypatch)
 
         from hermes_cli.plugins import _ensure_plugins_discovered
 
@@ -64,9 +82,7 @@ class TestPluginManagerLoads:
         config = {"plugins": {"enabled": ["kanban-cross-deps"]}}
         (_isolate_env / "config.yaml").write_text(yaml.safe_dump(config))
 
-        for k in list(sys.modules):
-            if k.startswith(("hermes_plugins", "hermes_cli.plugins")):
-                del sys.modules[k]
+        _clear_kanban_cross_deps_discovery_cache(monkeypatch)
 
         from hermes_cli import kanban_dependencies as kd
         from hermes_cli.plugins import _ensure_plugins_discovered
@@ -85,9 +101,7 @@ class TestPluginManagerLoads:
         config = {"plugins": {"enabled": ["kanban-cross-deps"]}}
         (_isolate_env / "config.yaml").write_text(yaml.safe_dump(config))
 
-        for k in list(sys.modules):
-            if k.startswith(("hermes_plugins", "hermes_cli.plugins")):
-                del sys.modules[k]
+        _clear_kanban_cross_deps_discovery_cache(monkeypatch)
 
         from hermes_cli.plugins import _ensure_plugins_discovered
         _ensure_plugins_discovered(force=True)
@@ -107,9 +121,7 @@ class TestPluginManagerLoads:
         config = {"plugins": {"enabled": ["kanban-cross-deps"]}}
         (_isolate_env / "config.yaml").write_text(yaml.safe_dump(config))
 
-        for k in list(sys.modules):
-            if k.startswith(("hermes_plugins", "hermes_cli.plugins")):
-                del sys.modules[k]
+        _clear_kanban_cross_deps_discovery_cache(monkeypatch)
 
         from hermes_cli.plugins import _ensure_plugins_discovered
         _ensure_plugins_discovered(force=True)

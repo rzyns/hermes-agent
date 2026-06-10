@@ -309,6 +309,20 @@ class TestPreToolCallHook:
 # Bundled-plugin discovery
 # ---------------------------------------------------------------------------
 
+def _clear_security_guidance_discovery_cache(monkeypatch):
+    """Reset plugin discovery without replacing ``hermes_cli.plugins``."""
+
+    import hermes_cli.plugins as plugins_mod
+
+    monkeypatch.setattr(plugins_mod, "_plugin_manager", None)
+    for key in list(sys.modules):
+        if (
+            key.startswith("hermes_plugins.")
+            or key == "plugins.security_guidance"
+            or key.startswith("plugins.security_guidance.")
+        ):
+            del sys.modules[key]
+
 class TestPluginDiscovery:
     def test_loads_via_plugin_manager(self, _isolate_env, monkeypatch):
         """End-to-end: enable in config.yaml and verify the PluginManager
@@ -318,10 +332,7 @@ class TestPluginDiscovery:
         config = {"plugins": {"enabled": ["security-guidance"]}}
         (_isolate_env / "config.yaml").write_text(yaml.safe_dump(config))
 
-        # Wipe any cached plugin state from earlier tests in this worker.
-        for k in list(sys.modules):
-            if k.startswith(("hermes_plugins", "hermes_cli.plugins")):
-                del sys.modules[k]
+        _clear_security_guidance_discovery_cache(monkeypatch)
 
         from hermes_cli.plugins import _ensure_plugins_discovered
 
