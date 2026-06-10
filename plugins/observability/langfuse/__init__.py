@@ -243,6 +243,7 @@ def _trace_key_candidates(*, task_id: str = "", session_id: str = "", turn_id: s
     candidates = [
         _trace_key(task_id=task_id, session_id=session_id, turn_id=turn_id),
         _trace_key(task_id=task_id, session_id=session_id),
+        task_id,  # Pre-turn-key plugin versions used the raw task_id as the key.
         _trace_key(session_id=session_id),
     ]
     seen: set[str] = set()
@@ -714,12 +715,14 @@ def _finish_trace(task_key: str, *, output: Any = None) -> None:
                 seen_observations.add(id(observation))
                 _end_observation(observation)
         final_output = _merge_trace_output(output, state)
-        if final_output is not None:
-            state.root_span.set_trace_io(output=final_output)
-            state.root_span.update(output=final_output)
-        state.root_span.end()
-        if state.root_ctx is not None:
-            state.root_ctx.__exit__(None, None, None)
+        try:
+            if final_output is not None:
+                state.root_span.set_trace_io(output=final_output)
+                state.root_span.update(output=final_output)
+            state.root_span.end()
+        finally:
+            if state.root_ctx is not None:
+                state.root_ctx.__exit__(None, None, None)
     except Exception as exc:  # pragma: no cover - fail-open
         _debug(f"finish trace failed: {exc}")
     finally:
@@ -1068,21 +1071,31 @@ def on_post_tool_call(*, tool_name: str = "", args: Any = None, result: Any = No
     )
 
 
-def on_session_end(*, session_id: str = "", **_: Any) -> None:
-    """Close unfinished Langfuse traces for a session at lifecycle shutdown.
+def on_session_end(*, session_id: str = "", task_id: str = "", turn_id: str = "", **_: Any) -> None:
+    """Close unfinished Langfuse traces at the end of a Hermes turn/session.
 
-    Some one-shot, interrupted, or tool-ending runs can leave a root context
-    open until interpreter teardown.  Drain only matching session traces and
-    keep the plugin fail-open so observability cleanup never breaks Hermes.
+    ``run_conversation`` fires this hook per turn and includes ``turn_id``.
+    Prefer that narrow key so concurrent or queued turns in the same session do
+    not close each other's traces.  If older callers omit ``turn_id``, fall back
+    to draining all unfinished traces for the session.
     """
-    if not session_id:
+    if not (session_id or task_id or turn_id):
         return
-    with _STATE_LOCK:
-        keys = [
-            key
-            for key, state in _TRACE_STATE.items()
-            if getattr(state, "session_id", "") == session_id
-        ]
+    if turn_id:
+        with _STATE_LOCK:
+            keys = [
+                key
+                for key in _trace_key_candidates(task_id=task_id, session_id=session_id, turn_id=turn_id)
+                if key in _TRACE_STATE
+            ]
+    else:
+        with _STATE_LOCK:
+            keys = [
+                key
+                for key, state in _TRACE_STATE.items()
+                if (session_id and getattr(state, "session_id", "") == session_id)
+                or (task_id and getattr(state, "task_id", "") == task_id)
+            ]
     for key in keys:
         _finish_trace(key, output={"finalized_by": "on_session_end"})
 

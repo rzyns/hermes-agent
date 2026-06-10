@@ -718,7 +718,7 @@ class TestTurnScopedTraceLifecycle:
         assert mod._trace_key(session_id="sess-1") == "session:sess-1"
         assert mod._trace_key_candidates(
             task_id="task-1", session_id="sess-1", turn_id="turn-1"
-        ) == ["turn:turn-1", "task:task-1", "session:sess-1"]
+        ) == ["turn:turn-1", "task:task-1", "task-1", "session:sess-1"]
 
     def test_start_root_trace_uses_turn_seed_name_and_metadata(self):
         mod = self._make_mod()
@@ -784,7 +784,7 @@ class TestTurnScopedTraceLifecycle:
         generation = object()
         state = mod.TraceState(trace_id="trace", root_ctx=None, root_span=None, session_id="sess-1")
         state.generations[mod._request_key(1)] = generation
-        legacy_key = mod._trace_key(task_id="task-1", session_id="sess-1")
+        legacy_key = "task-1"
         monkeypatch.setitem(mod._TRACE_STATE, legacy_key, state)
 
         ended = {}
@@ -858,12 +858,89 @@ class TestTurnScopedTraceLifecycle:
         key = mod._trace_key(task_id="task-1", session_id="sess-1", turn_id="turn-1")
         monkeypatch.setitem(mod._TRACE_STATE, key, state)
 
-        mod.on_session_end(session_id="sess-1")
+        mod.on_session_end(session_id="sess-1", task_id="task-1", turn_id="turn-1")
 
         assert key not in mod._TRACE_STATE
         assert span.ended is True
         assert ctx.exited is True
         assert span.output == {"finalized_by": "on_session_end"}
+
+    def test_session_end_with_turn_id_does_not_close_other_turn_same_session(self, monkeypatch):
+        mod = self._make_mod()
+        monkeypatch.setattr(mod, "_get_langfuse", lambda: object())
+
+        class _Span:
+            def __init__(self):
+                self.ended = False
+            def set_trace_io(self, *, input=None, output=None):
+                pass
+            def update(self, **kwargs):
+                pass
+            def end(self):
+                self.ended = True
+
+        class _Ctx:
+            def __init__(self):
+                self.exited = False
+            def __exit__(self, exc_type, exc, tb):
+                self.exited = True
+
+        span_a, span_b = _Span(), _Span()
+        ctx_a, ctx_b = _Ctx(), _Ctx()
+        state_a = mod.TraceState(
+            trace_id="trace-a", root_ctx=ctx_a, root_span=span_a,
+            task_id="task-a", session_id="sess-1", turn_id="turn-a",
+        )
+        state_b = mod.TraceState(
+            trace_id="trace-b", root_ctx=ctx_b, root_span=span_b,
+            task_id="task-b", session_id="sess-1", turn_id="turn-b",
+        )
+        key_a = mod._trace_key(task_id="task-a", session_id="sess-1", turn_id="turn-a")
+        key_b = mod._trace_key(task_id="task-b", session_id="sess-1", turn_id="turn-b")
+        monkeypatch.setitem(mod._TRACE_STATE, key_a, state_a)
+        monkeypatch.setitem(mod._TRACE_STATE, key_b, state_b)
+
+        mod.on_session_end(session_id="sess-1", task_id="task-a", turn_id="turn-a")
+
+        assert key_a not in mod._TRACE_STATE
+        assert mod._TRACE_STATE[key_b] is state_b
+        assert span_a.ended is True
+        assert ctx_a.exited is True
+        assert span_b.ended is False
+        assert ctx_b.exited is False
+
+    def test_finish_trace_exits_root_context_even_when_root_span_end_raises(self, monkeypatch):
+        mod = self._make_mod()
+        monkeypatch.setattr(mod, "_get_langfuse", lambda: object())
+
+        class _Span:
+            def __init__(self):
+                self.ended = False
+            def set_trace_io(self, *, input=None, output=None):
+                pass
+            def update(self, **kwargs):
+                pass
+            def end(self):
+                self.ended = True
+                raise RuntimeError("boom")
+
+        class _Ctx:
+            def __init__(self):
+                self.exited = False
+            def __exit__(self, exc_type, exc, tb):
+                self.exited = True
+
+        span = _Span()
+        ctx = _Ctx()
+        state = mod.TraceState(trace_id="trace", root_ctx=ctx, root_span=span, session_id="sess-1", turn_id="turn-1")
+        key = mod._trace_key(task_id="task-1", session_id="sess-1", turn_id="turn-1")
+        monkeypatch.setitem(mod._TRACE_STATE, key, state)
+
+        mod._finish_trace(key, output={"ok": True})
+
+        assert key not in mod._TRACE_STATE
+        assert span.ended is True
+        assert ctx.exited is True
 
     def test_session_end_does_not_close_other_active_sessions(self, monkeypatch):
         mod = self._make_mod()
