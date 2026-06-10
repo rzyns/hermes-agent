@@ -1649,6 +1649,9 @@ def _make_tui_argv(tui_dir: Path, tui_dev: bool) -> tuple[list[str], Path]:
             [
                 npm,
                 "install",
+                # The TUI build needs devDependencies (esbuild, tsx); npm
+                # defaults to omit=dev when NODE_ENV=production is set.
+                "--include=dev",
                 *npm_workspace_args,
                 "--silent",
                 "--no-fund",
@@ -4595,7 +4598,14 @@ def _run_npm_install_deterministic(
     rewrites committed lockfiles (stripping ``"peer": true`` etc.), which leaves
     the working tree dirty and causes the next ``hermes update`` to stash the
     lockfile — repeatedly.
+
+    Every caller installs to *build* (web UI, TUI, desktop), and those builds
+    run from devDependencies (typescript, vite, @vitejs/plugin-react, @types/*).
+    ``--include=dev`` pins that, because npm defaults to ``omit=dev`` whenever
+    ``NODE_ENV=production`` is set in the host environment — which silently
+    strips the toolchain and fails the build later with confusing TS errors.
     """
+    extra_args = ("--include=dev", *extra_args)
     lockfile = cwd / "package-lock.json"
     if lockfile.exists():
         ci_cmd = [npm, "ci", *extra_args]
