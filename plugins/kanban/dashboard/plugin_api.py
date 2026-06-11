@@ -498,6 +498,27 @@ def _cross_board_edges_for(task_id: str, board: Optional[str]) -> dict[str, Any]
 # GET /board
 # ---------------------------------------------------------------------------
 
+def _degraded_board_payload(
+    board: Optional[str],
+    reason: str,
+    *,
+    backup_path: Optional[Path] = None,
+) -> dict[str, Any]:
+    """Return the safe dashboard payload for a board that cannot be opened."""
+    return {
+        "degraded": True,
+        "board_slug": board or kanban_db.get_current_board(),
+        "reason": reason,
+        "corrupt_backup_path": str(backup_path) if backup_path else None,
+        "repair_candidate_available": bool(backup_path),
+        "columns": [],
+        "tenants": [],
+        "assignees": [],
+        "latest_event_id": 0,
+        "now": int(time.time()),
+    }
+
+
 @router.get("/board")
 def get_board(
     tenant: Optional[str] = Query(None, description="Filter to a single tenant"),
@@ -520,7 +541,19 @@ def get_board(
     ``current`` pointer → ``default``).
     """
     board = _resolve_board(board)
-    conn = _conn(board=board)
+    try:
+        conn = _conn(board=board)
+    except kanban_db.KanbanDbCorruptError as exc:
+        log.warning("Kanban board degraded: %s", exc.reason)
+        return _degraded_board_payload(board, exc.reason, backup_path=exc.backup_path)
+    except sqlite3.DatabaseError as exc:
+        # Some guard paths (for example invalid SQLite headers) surface as a
+        # sqlite DatabaseError before kanban_db can attach backup metadata.
+        # Keep the dashboard fail-closed and actionable instead of returning a
+        # generic 500 or silently recreating an empty board.
+        reason = str(exc)
+        log.warning("Kanban board degraded: %s", reason)
+        return _degraded_board_payload(board, reason)
     try:
         tasks = kanban_db.list_tasks(
             conn,
@@ -2371,6 +2404,162 @@ class RenameBoardBody(BaseModel):
     color: Optional[str] = None
 
 
+# Simple in-memory health cache: {slug: (timestamp, health_dict)}
+_BOARD_HEALTH_CACHE: dict[str, tuple[float, dict[str, Any]]] = {}
+_BOARD_HEALTH_CACHE_TTL = 30.0  # seconds
+
+
+def _probe_board_health(slug: str) -> dict[str, Any]:
+    """Return health metadata for a single board without caching.
+
+    The probe opens a short-lived connection and runs:
+    - ``PRAGMA integrity_check`` (with a 5-second timeout guard).
+    - ``PRAGMA foreign_key_check`` on success.
+    - WAL presence/size and task count.
+
+    On corruption, extracts the backup path from the raised
+    :class:`KanbanDbCorruptError`.  On any other failure, returns
+    ``status: unreachable`` with the exception text.
+    """
+    path = kanban_db.kanban_db_path(board=slug)
+    if not path.exists():
+        return {
+            "status": "missing",
+            "integrity_check": "skipped",
+            "foreign_key_check": "skipped",
+            "wal_present": False,
+            "wal_size_bytes": None,
+            "last_modified": None,
+            "task_count": None,
+        }
+
+    # Try a lightweight integrity check first.
+    integrity_ok = False
+    integrity_detail: Optional[str] = None
+    corrupt_backup: Optional[str] = None
+    try:
+        # Use a raw sqlite3 connection with a short timeout so a badly
+        # corrupt file can't hang the /boards endpoint.
+        probe = sqlite3.connect(
+            f"file:{path.resolve()}?mode=ro",
+            uri=True,
+            timeout=5.0,
+            detect_types=0,
+            isolation_level=None,
+        )
+        probe.row_factory = sqlite3.Row
+        try:
+            row = probe.execute("PRAGMA integrity_check").fetchone()
+            if row and (row[0] or "").lower() == "ok":
+                integrity_ok = True
+            else:
+                integrity_detail = row[0] if row else "<no row>"
+        finally:
+            probe.close()
+    except kanban_db.KanbanDbCorruptError as exc:
+        integrity_detail = exc.reason
+        corrupt_backup = str(exc.backup_path) if exc.backup_path else None
+    except sqlite3.DatabaseError as exc:
+        integrity_detail = str(exc)
+    except Exception as exc:
+        return {
+            "status": "unreachable",
+            "integrity_check": "skipped",
+            "foreign_key_check": "skipped",
+            "wal_present": False,
+            "wal_size_bytes": None,
+            "last_modified": None,
+            "task_count": None,
+            "detail": str(exc),
+        }
+
+    if not integrity_ok:
+        return {
+            "status": "degraded",
+            "integrity_check": "failed",
+            "integrity_detail": integrity_detail,
+            "foreign_key_check": "skipped",
+            "wal_present": False,
+            "wal_size_bytes": None,
+            "last_modified": None,
+            "task_count": None,
+            "corrupt_backup_path": corrupt_backup,
+            "repair_candidate_available": bool(corrupt_backup),
+        }
+
+    # Healthy path: stay read-only.  Do not call kanban_db.connect() from the
+    # health probe; connect() may run WAL/schema/migration setup, while the
+    # dashboard board-list health badge must be safe to render during incident
+    # triage.
+    try:
+        conn = sqlite3.connect(
+            f"file:{path.resolve()}?mode=ro",
+            uri=True,
+            timeout=5.0,
+            detect_types=0,
+            isolation_level=None,
+        )
+        conn.row_factory = sqlite3.Row
+        try:
+            fk_rows = conn.execute("PRAGMA foreign_key_check").fetchall()
+            fk_ok = "ok" if not fk_rows else f"{len(fk_rows)} violations"
+            task_count = conn.execute(
+                "SELECT COUNT(*) AS n FROM tasks"
+            ).fetchone()["n"]
+        finally:
+            conn.close()
+    except Exception as exc:
+        return {
+            "status": "unreachable",
+            "integrity_check": "ok",
+            "foreign_key_check": "skipped",
+            "wal_present": False,
+            "wal_size_bytes": None,
+            "last_modified": None,
+            "task_count": None,
+            "detail": str(exc),
+        }
+
+    wal_present = False
+    wal_size = None
+    for suffix in ("-wal", "-shm"):
+        wal_path = path.parent / f"{path.name}{suffix}"
+        if wal_path.exists():
+            wal_present = True
+            if suffix == "-wal":
+                try:
+                    wal_size = wal_path.stat().st_size
+                except OSError:
+                    pass
+            break
+
+    try:
+        mtime = path.stat().st_mtime
+    except OSError:
+        mtime = None
+
+    return {
+        "status": "healthy",
+        "integrity_check": "ok",
+        "foreign_key_check": fk_ok,
+        "wal_present": wal_present,
+        "wal_size_bytes": wal_size,
+        "last_modified": int(mtime) if mtime is not None else None,
+        "task_count": task_count,
+    }
+
+
+def _board_health(slug: str) -> dict[str, Any]:
+    """Return cached or fresh health metadata for *slug*."""
+    now = time.time()
+    cached = _BOARD_HEALTH_CACHE.get(slug)
+    if cached and (now - cached[0]) < _BOARD_HEALTH_CACHE_TTL:
+        return cached[1]
+    health = _probe_board_health(slug)
+    _BOARD_HEALTH_CACHE[slug] = (now, health)
+    return health
+
+
 def _board_counts(slug: str) -> dict[str, int]:
     """Return ``{status: count}`` for a board. Safe on an empty DB."""
     try:
@@ -2391,12 +2580,20 @@ def _board_counts(slug: str) -> dict[str, int]:
 
 @router.get("/boards")
 def list_boards(include_archived: bool = Query(False)):
-    """Return every board on disk with task counts and the active slug."""
+    """Return every board on disk with task counts, health, and the active slug."""
     boards = kanban_db.list_boards(include_archived=include_archived)
     current = kanban_db.get_current_board()
     for b in boards:
         b["is_current"] = (b["slug"] == current)
-        b["counts"] = _board_counts(b["slug"])
+        health = _board_health(b["slug"])
+        b["health"] = health
+        if health.get("status") == "healthy":
+            b["counts"] = _board_counts(b["slug"])
+        else:
+            # Avoid opening corrupt/missing boards through the normal
+            # kanban_db.connect() path just to count tasks; the health payload is
+            # the actionable signal and keeps incident triage read-mostly.
+            b["counts"] = {}
         b["total"] = sum(b["counts"].values())
     return {"boards": boards, "current": current}
 
@@ -2782,6 +2979,33 @@ async def stream_events(ws: WebSocket):
             ws_board = kanban_db._normalize_board_slug(ws_board_raw) if ws_board_raw else None
         except ValueError:
             ws_board = None
+
+        # --- degraded-board handshake ----------------------------------------
+        # Detect corrupt boards before entering the tail loop so the browser
+        # doesn't spin a tight reconnect.
+        try:
+            # A lightweight probe: the connect() path raises
+            # KanbanDbCorruptError for integrity failures. Invalid-header guard
+            # failures can surface as sqlite3.DatabaseError before backup
+            # metadata exists; those are still surfaced as degraded to the UI.
+            probe_conn = kanban_db.connect(board=ws_board)
+            probe_conn.close()
+        except kanban_db.KanbanDbCorruptError as exc:
+            log.warning("Kanban WS degraded handshake: %s", exc.reason)
+            await ws.send_json(_degraded_board_payload(
+                ws_board,
+                exc.reason,
+                backup_path=exc.backup_path,
+            ))
+            await ws.close(code=http_status.WS_1011_INTERNAL_ERROR)
+            return
+        except sqlite3.DatabaseError as exc:
+            reason = str(exc)
+            log.warning("Kanban WS degraded handshake: %s", reason)
+            await ws.send_json(_degraded_board_payload(ws_board, reason))
+            await ws.close(code=http_status.WS_1011_INTERNAL_ERROR)
+            return
+        # ------------------------------------------------------------------
 
         def _fetch_new(cursor_val: int) -> tuple[int, list[dict]]:
             conn = kanban_db.connect(board=ws_board)

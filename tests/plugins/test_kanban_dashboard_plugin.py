@@ -50,9 +50,10 @@ def kanban_home(tmp_path, monkeypatch):
     monkeypatch.setenv("HERMES_HOME", str(home))
     monkeypatch.setattr(Path, "home", lambda: tmp_path)
     # Prevent leaked kanban overrides from affecting board/registry resolution
-    monkeypatch.delenv("HERMES_KANBAN_HOME", raising=False)
+    monkeypatch.setenv("HERMES_KANBAN_HOME", str(home / "kanban"))
     monkeypatch.delenv("HERMES_KANBAN_DB", raising=False)
     monkeypatch.delenv("HERMES_KANBAN_BOARD", raising=False)
+    monkeypatch.delenv("HERMES_KANBAN_WORKSPACES_ROOT", raising=False)
     kb.init_db()
     return home
 
@@ -2645,3 +2646,71 @@ def test_cross_board_diagnostics_provenance_surface(client, monkeypatch, tmp_pat
     assert "enforcement_active" in data
     # enforcement_active = plugin_enabled and provider_registered
     assert data["enforcement_active"] == (data["plugin_enabled"] and data["provider_registered"])
+
+# ---------------------------------------------------------------------------
+# Degraded-board safety / health surfacing (HP-KDB-08)
+# ---------------------------------------------------------------------------
+
+
+def _assert_test_kanban_path_is_sandboxed(path: Path, tmp_root: Path) -> None:
+    resolved = path.expanduser().resolve()
+    expected = tmp_root.expanduser().resolve()
+    live_root = Path("/home/openclaw/.hermes/kanban").resolve()
+    assert str(resolved).startswith(str(expected)), (resolved, expected)
+    assert not str(resolved).startswith(str(live_root)), resolved
+
+
+def test_board_endpoint_returns_degraded_payload_for_corrupt_guard(client, monkeypatch, tmp_path):
+    backup = tmp_path / "kanban.db.corrupt.test.bak"
+    err = kb.KanbanDbCorruptError(tmp_path / "kanban.db", backup, "integrity_check failed")
+
+    def _raise_connect(*_args, **_kwargs):
+        raise err
+
+    monkeypatch.setattr(kb, "connect", _raise_connect)
+    r = client.get("/api/plugins/kanban/board")
+    assert r.status_code == 200, r.text
+    payload = r.json()
+    assert payload["degraded"] is True
+    assert payload["reason"] == "integrity_check failed"
+    assert payload["corrupt_backup_path"] == str(backup)
+    assert payload["repair_candidate_available"] is True
+    assert payload["columns"] == []
+    assert payload["tenants"] == []
+    assert payload["assignees"] == []
+
+
+def test_boards_endpoint_health_marks_invalid_sqlite_header_degraded(client, kanban_home, monkeypatch):
+    kb.create_board("broken")
+    db_path = kb.kanban_db_path("broken")
+    _assert_test_kanban_path_is_sandboxed(db_path, kanban_home)
+    db_path.write_bytes(b"not a sqlite database")
+
+    plugin_mod = sys.modules["hermes_dashboard_plugin_kanban_test"]
+    original_counts = plugin_mod._board_counts
+
+    def _counts_guard(slug):
+        if slug == "broken":
+            raise AssertionError("degraded board counts must not open kanban.db")
+        return original_counts(slug)
+
+    monkeypatch.setattr(plugin_mod, "_board_counts", _counts_guard)
+
+    r = client.get("/api/plugins/kanban/boards")
+    assert r.status_code == 200, r.text
+    boards = {b["slug"]: b for b in r.json()["boards"]}
+    health = boards["broken"]["health"]
+    assert health["status"] == "degraded"
+    assert health["integrity_check"] == "failed"
+    assert health["foreign_key_check"] == "skipped"
+    assert health["repair_candidate_available"] is False
+
+
+def test_dashboard_bundle_contains_degraded_board_ui(repo_root=None):
+    root = Path(__file__).resolve().parents[2]
+    js = (root / "plugins" / "kanban" / "dashboard" / "dist" / "index.js").read_text()
+    css = (root / "plugins" / "kanban" / "dashboard" / "dist" / "style.css").read_text()
+    assert "DegradedBoardNotice" in js
+    assert "boardHealthStatus" in js
+    assert "hermes-kanban-degraded" in css
+    assert "hermes-kanban-board-health" in css
