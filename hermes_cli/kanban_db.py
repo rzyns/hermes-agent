@@ -2904,6 +2904,42 @@ def _append_event(
         "VALUES (?, ?, ?, ?, ?)",
         (task_id, run_id, kind, pl, now),
     )
+    # Sidecar durability amplifier — disabled by default; see
+    # kanban_sidecar.py for the full design.
+    _append_sidecar_event(conn, task_id, kind, payload, run_id=run_id)
+
+
+def _append_sidecar_event(
+    conn: sqlite3.Connection,
+    task_id: str,
+    kind: str,
+    payload: Optional[dict] = None,
+    *,
+    run_id: Optional[int] = None,
+) -> None:
+    """Append the same event to the append-only JSONL sidecar, if enabled.
+
+    Called from ``_append_event`` so it is inside the same SQLite
+    transaction.  The sidecar write uses POSIX advisory locking; because
+    SQLite already serializes writers, the lock is uncontended in the
+    single-writer model.
+    """
+    try:
+        from hermes_cli import kanban_sidecar as ks
+    except Exception:
+        # If the sidecar module is missing (e.g. old install), silently
+        # skip — this is a no-op durability amplifier, not a hard
+        # dependency.
+        return
+    if not ks._sidecar_enabled():
+        return
+    # Derive board_dir from the connection's DB path.
+    try:
+        db_path = Path(conn.execute("PRAGMA database_list").fetchone()[2])
+    except Exception:
+        return
+    board_dir = db_path.parent
+    ks.append_event(board_dir, task_id, kind, payload, run_id=run_id)
 
 
 def _end_run(
