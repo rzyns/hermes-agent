@@ -179,6 +179,136 @@ def test_append_event_from_kanban_db(tmp_path, monkeypatch):
     assert events[0]["payload"]["x"] == 1
 
 
+def test_real_create_and_complete_rebuilds_structural_task_without_summary_text(tmp_path, monkeypatch):
+    """Real kanban_db mutations must emit replayable sidecar events without free-form summaries."""
+    board_dir = _init_board(tmp_path, monkeypatch)
+    _enable_sidecar(monkeypatch)
+
+    conn = kb.connect(board="default")
+    try:
+        task_id = kb.create_task(
+            conn,
+            title="Recovered title",
+            body="body text should be summarized, not duplicated",
+            initial_status="running",
+            assignee="platform-eng",
+        )
+        assert kb.complete_task(
+            conn,
+            task_id,
+            result="short result",
+            summary="FREEFORM SUMMARY MUST NOT BE DUPLICATED",
+        )
+    finally:
+        conn.close()
+
+    events = _load_events(board_dir)
+    assert [event["kind"] for event in events] == ["task_created", "task_status_changed"]
+    created_payload = events[0]["payload"]
+    assert created_payload["title"] == "Recovered title"
+    assert created_payload["status"] == "ready"
+    assert "body" not in created_payload
+    assert created_payload["body_len"] == len("body text should be summarized, not duplicated")
+    completed_payload = events[1]["payload"]
+    assert completed_payload["new"] == "done"
+    assert "summary" not in completed_payload
+    assert completed_payload["summary_len"] == len("FREEFORM SUMMARY MUST NOT BE DUPLICATED")
+
+    target = tmp_path / "rebuilt-real.db"
+    report = ks.rebuild_board(board_dir, target)
+    assert report.events_replayed == 2
+    assert report.tasks_created == 1
+    assert report.tasks_updated == 1
+
+    rebuilt = sqlite3.connect(str(target))
+    try:
+        row = rebuilt.execute("SELECT title, status, assignee FROM tasks WHERE id = ?", (task_id,)).fetchone()
+        assert row == ("Recovered title", "done", "platform-eng")
+    finally:
+        rebuilt.close()
+
+
+def test_hallucination_rejection_sidecar_omits_summary_preview_text(tmp_path, monkeypatch):
+    board_dir = _init_board(tmp_path, monkeypatch)
+    _enable_sidecar(monkeypatch)
+
+    conn = kb.connect(board="default")
+    try:
+        task_id = kb.create_task(conn, title="Hallucination guard")
+        with pytest.raises(kb.HallucinatedCardsError):
+            kb.complete_task(
+                conn,
+                task_id,
+                result="result sentinel",
+                summary="LEAK_SENTINEL_SUMMARY_PREVIEW should not be duplicated",
+                created_cards=["t_deadbeef"],
+            )
+    finally:
+        conn.close()
+
+    events = _load_events(board_dir)
+    payload = events[-1]["payload"]
+    assert events[-1]["kind"] == "completion_blocked_hallucination"
+    assert "summary_preview" not in payload
+    assert payload["summary_preview_len"] == len("LEAK_SENTINEL_SUMMARY_PREVIEW should not be duplicated")
+    assert "LEAK_SENTINEL_SUMMARY_PREVIEW" not in json.dumps(events, sort_keys=True)
+
+
+def test_real_block_unblock_and_manual_promote_rebuild_final_status(tmp_path, monkeypatch):
+    board_dir = _init_board(tmp_path, monkeypatch)
+    _enable_sidecar(monkeypatch)
+
+    conn = kb.connect(board="default")
+    try:
+        blocked_then_unblocked = kb.create_task(conn, title="Block/unblock")
+        assert kb.block_task(conn, blocked_then_unblocked, reason="BLOCK_REASON_SENTINEL")
+        assert kb.unblock_task(conn, blocked_then_unblocked)
+
+        manually_promoted = kb.create_task(conn, title="Manual promote", initial_status="blocked")
+        promoted, reason = kb.promote_task(conn, manually_promoted, actor="reviewer", reason="PROMOTE_REASON_SENTINEL", force=True)
+        assert promoted, reason
+    finally:
+        conn.close()
+
+    events = _load_events(board_dir)
+    assert "BLOCK_REASON_SENTINEL" not in json.dumps(events, sort_keys=True)
+    assert "PROMOTE_REASON_SENTINEL" not in json.dumps(events, sort_keys=True)
+    status_changes = [event["payload"]["new"] for event in events if event["kind"] == "task_status_changed"]
+    assert status_changes == ["blocked", "ready", "ready"]
+
+    target = tmp_path / "rebuilt-status-transitions.db"
+    report = ks.rebuild_board(board_dir, target)
+    assert report.tasks_created == 2
+    assert report.tasks_updated == 3
+
+    rebuilt = sqlite3.connect(str(target))
+    try:
+        rows = dict(rebuilt.execute("SELECT title, status FROM tasks").fetchall())
+        assert rows == {"Block/unblock": "ready", "Manual promote": "ready"}
+    finally:
+        rebuilt.close()
+
+
+def test_rebuild_comment_placeholder_uses_integer_autoincrement_id(tmp_path, monkeypatch):
+    board_dir = _init_board(tmp_path, monkeypatch)
+    _enable_sidecar(monkeypatch)
+    ks.append_event(board_dir, "t_alpha", "task_created", {"title": "Alpha", "status": "todo"})
+    ks.append_event(board_dir, "t_alpha", "commented", {"author": "reviewer", "len": 17})
+
+    target = tmp_path / "rebuilt-comments.db"
+    report = ks.rebuild_board(board_dir, target)
+    assert report.comments_added == 1
+
+    rebuilt = sqlite3.connect(str(target))
+    try:
+        row = rebuilt.execute("SELECT id, author, body FROM task_comments").fetchone()
+        assert isinstance(row[0], int)
+        assert row[1] == "reviewer"
+        assert "original length 17" in row[2]
+    finally:
+        rebuilt.close()
+
+
 # ---------------------------------------------------------------------------
 # Rotation
 # ---------------------------------------------------------------------------

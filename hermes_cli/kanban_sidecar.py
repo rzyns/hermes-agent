@@ -452,47 +452,112 @@ def _apply_event_to_db(db_path: Path, event: Dict[str, Any], report: RebuildRepo
     conn = sqlite3.connect(str(db_path))
     conn.row_factory = sqlite3.Row
     try:
-        if kind == "task_created":
+        if kind in ("task_created", "created"):
             existing = conn.execute("SELECT 1 FROM tasks WHERE id = ?", (task_id,)).fetchone()
             if not existing:
-                title = payload.get("title", "")
+                title = payload.get("title") or f"[recovered task {task_id}]"
                 status = payload.get("status", "todo")
                 assignee = payload.get("assignee")
                 tenant = payload.get("tenant")
                 conn.execute(
-                    "INSERT INTO tasks (id, title, status, assignee, tenant, created_at) "
-                    "VALUES (?, ?, ?, ?, ?, ?)",
-                    (task_id, title, status, assignee, tenant, ts),
+                    """
+                    INSERT INTO tasks (
+                        id, title, status, assignee, tenant, priority,
+                        created_by, created_at, workspace_kind, workspace_path,
+                        branch_name, idempotency_key, max_runtime_seconds,
+                        skills, max_retries, goal_mode, goal_max_turns,
+                        session_id
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        task_id,
+                        title,
+                        status,
+                        assignee,
+                        tenant,
+                        int(payload.get("priority") or 0),
+                        payload.get("created_by"),
+                        int(payload.get("created_at") or ts),
+                        payload.get("workspace_kind") or "scratch",
+                        payload.get("workspace_path"),
+                        payload.get("branch_name"),
+                        payload.get("idempotency_key"),
+                        payload.get("max_runtime_seconds"),
+                        payload.get("skills"),
+                        payload.get("max_retries"),
+                        1 if payload.get("goal_mode") else 0,
+                        payload.get("goal_max_turns"),
+                        payload.get("session_id"),
+                    ),
                 )
                 report.tasks_created += 1
-        elif kind == "task_status_changed":
-            new_status = payload.get("new", "")
+            for parent in payload.get("parents") or []:
+                if parent:
+                    conn.execute(
+                        "INSERT OR IGNORE INTO task_links (parent_id, child_id) VALUES (?, ?)",
+                        (parent, task_id),
+                    )
+        elif kind in (
+            "task_status_changed",
+            "completed",
+            "blocked",
+            "promoted",
+            "promoted_manual",
+            "unblocked",
+            "specified",
+            "claimed",
+        ):
+            new_status = payload.get("new") or {
+                "completed": "done",
+                "blocked": "blocked",
+                "promoted": "ready",
+                "promoted_manual": "ready",
+                "unblocked": payload.get("status") or "ready",
+                "specified": "todo",
+                "claimed": "running",
+            }.get(kind, "")
             if new_status:
-                conn.execute(
+                cur = conn.execute(
                     "UPDATE tasks SET status = ? WHERE id = ?",
                     (new_status, task_id),
                 )
-                report.tasks_updated += 1
-        elif kind == "task_assigned":
+                if cur.rowcount:
+                    report.tasks_updated += 1
+        elif kind in ("task_assigned", "assigned"):
             assignee = payload.get("assignee")
-            if assignee:
-                conn.execute(
-                    "UPDATE tasks SET assignee = ? WHERE id = ?",
-                    (assignee, task_id),
-                )
+            cur = conn.execute(
+                "UPDATE tasks SET assignee = ? WHERE id = ?",
+                (assignee, task_id),
+            )
+            if cur.rowcount:
                 report.tasks_updated += 1
         elif kind == "commented":
             author = payload.get("author", "unknown")
             body_len = payload.get("len", 0)
             # Insert a placeholder — sidecar does not store full text.
             body = f"[recovered placeholder; original length {body_len}]"
-            comment_id = f"c_{ts}_{task_id}"
             conn.execute(
-                "INSERT INTO task_comments (id, task_id, author, body, created_at) "
-                "VALUES (?, ?, ?, ?, ?)",
-                (comment_id, task_id, author, body, ts),
+                "INSERT INTO task_comments (task_id, author, body, created_at) "
+                "VALUES (?, ?, ?, ?)",
+                (task_id, author, body, ts),
             )
             report.comments_added += 1
+        elif kind in ("link_added", "linked"):
+            parent = payload.get("parent")
+            child = payload.get("child") or task_id
+            if parent and child:
+                conn.execute(
+                    "INSERT OR IGNORE INTO task_links (parent_id, child_id) VALUES (?, ?)",
+                    (parent, child),
+                )
+        elif kind in ("link_removed", "unlinked"):
+            parent = payload.get("parent")
+            child = payload.get("child") or task_id
+            if parent and child:
+                conn.execute(
+                    "DELETE FROM task_links WHERE parent_id = ? AND child_id = ?",
+                    (parent, child),
+                )
         elif kind == "run_ended":
             outcome = payload.get("outcome", "")
             summary = payload.get("summary")
