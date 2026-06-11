@@ -611,6 +611,8 @@ def read_board_metadata(board: Optional[str] = None) -> dict:
                 # its directory — trust the filesystem.
                 raw["slug"] = slug
                 meta.update(raw)
+                if "maintenance" not in raw and "maintenance_mode" in raw:
+                    meta["maintenance"] = bool(raw.get("maintenance_mode"))
     except (OSError, json.JSONDecodeError):
         pass
     meta["db_path"] = str(kanban_db_path(slug))
@@ -618,7 +620,7 @@ def read_board_metadata(board: Optional[str] = None) -> dict:
 
 
 def write_board_metadata(
-    board: Optional[str],
+    board: Optional[str] = None,
     *,
     name: Optional[str] = None,
     description: Optional[str] = None,
@@ -626,6 +628,8 @@ def write_board_metadata(
     color: Optional[str] = None,
     archived: Optional[bool] = None,
     maintenance: Optional[bool] = None,
+    maintenance_reason: Optional[str] = None,
+    maintenance_since: Optional[int] = None,
     default_workdir: Optional[str] = None,
 ) -> dict:
     """Create / update ``board.json`` for ``board``.
@@ -650,6 +654,21 @@ def write_board_metadata(
         meta["archived"] = bool(archived)
     if maintenance is not None:
         meta["maintenance"] = bool(maintenance)
+        # ``maintenance`` is the canonical per-board maintenance flag.
+        # Older HP-KDB-09 repair builds wrote ``maintenance_mode``; once a
+        # canonical writer touches the flag, remove the legacy key so readers
+        # cannot observe split-brain metadata.
+        meta.pop("maintenance_mode", None)
+    if maintenance_reason is not None:
+        if maintenance_reason:
+            meta["maintenance_reason"] = str(maintenance_reason)
+        else:
+            meta.pop("maintenance_reason", None)
+    if maintenance_since is not None:
+        if maintenance_since:
+            meta["maintenance_since"] = int(maintenance_since)
+        else:
+            meta.pop("maintenance_since", None)
     if default_workdir is not None:
         meta["default_workdir"] = str(default_workdir) if default_workdir else None
     if not meta.get("created_at"):
@@ -664,7 +683,7 @@ def write_board_metadata(
     return meta
 
 
-def set_board_maintenance(board: Optional[str], enabled: bool) -> dict:
+def set_board_maintenance(board: Optional[str], enabled: bool, *, reason: str = "") -> dict:
     """Enable/disable per-board maintenance mode in ``board.json``.
 
     Maintenance mode is intentionally metadata-only: it does not open, vacuum,
@@ -673,7 +692,33 @@ def set_board_maintenance(board: Optional[str], enabled: bool) -> dict:
     operators perform manual maintenance/restore work.
     """
     slug = _normalize_board_slug(board) or DEFAULT_BOARD
-    return write_board_metadata(slug, maintenance=bool(enabled))
+    kwargs: dict[str, Any] = {"maintenance": bool(enabled)}
+    if enabled:
+        kwargs["maintenance_reason"] = str(reason)
+        kwargs["maintenance_since"] = int(time.time())
+    else:
+        kwargs["maintenance_reason"] = ""
+        kwargs["maintenance_since"] = 0
+    return write_board_metadata(slug, **kwargs)
+
+
+def clear_board_maintenance(board: Optional[str]) -> dict:
+    """Explicitly clear maintenance fields from board metadata."""
+    slug = _normalize_board_slug(board) or DEFAULT_BOARD
+    meta = read_board_metadata(slug)
+    meta.pop("maintenance", None)
+    meta.pop("maintenance_mode", None)
+    meta.pop("maintenance_reason", None)
+    meta.pop("maintenance_since", None)
+    meta.pop("db_path", None)
+    path = board_metadata_path(slug)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        json.dumps(meta, indent=2, ensure_ascii=False) + "\n",
+        encoding="utf-8",
+    )
+    meta["db_path"] = str(kanban_db_path(slug))
+    return meta
 
 
 def board_in_maintenance(board_or_meta: Optional[object] = None) -> bool:
@@ -684,9 +729,13 @@ def board_in_maintenance(board_or_meta: Optional[object] = None) -> bool:
     callers that already enumerated boards.
     """
     if isinstance(board_or_meta, dict):
-        return bool(board_or_meta.get("maintenance"))
+        if "maintenance" in board_or_meta:
+            return bool(board_or_meta.get("maintenance"))
+        # Backward-compatible read for metadata written by the short-lived
+        # split-key implementation. Canonical writes remove this legacy key.
+        return bool(board_or_meta.get("maintenance_mode"))
     board = str(board_or_meta) if board_or_meta is not None else get_current_board()
-    return bool(read_board_metadata(board).get("maintenance"))
+    return board_in_maintenance(read_board_metadata(board))
 
 
 def create_board(

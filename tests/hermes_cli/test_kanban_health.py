@@ -407,7 +407,7 @@ def test_set_maintenance_mode(multi_board_home):
     kh.set_maintenance_mode("testboard", True, reason="DB migration")
     assert kh.is_maintenance_mode("testboard") is True
     meta = kb.read_board_metadata("testboard")
-    assert meta["maintenance_mode"] is True
+    assert meta["maintenance"] is True
     assert meta["maintenance_reason"] == "DB migration"
     assert meta["maintenance_since"] > 0
 
@@ -494,3 +494,196 @@ def test_pragma_str_ok(multi_board_home):
     val = kh._pragma_str(conn, "PRAGMA journal_mode")
     assert val.lower() == "wal"
     conn.close()
+
+
+# ---------------------------------------------------------------------------
+# Cross-surface maintenance regression tests (HP-KDB-12R)
+# ---------------------------------------------------------------------------
+
+def test_kanban_maintenance_surfaces_agree(multi_board_home):
+    """Top-level maintenance, boards maintenance, health report, and dispatch
+    must all agree on the same canonical ``maintenance`` key.
+    """
+    board = "testboard"
+
+    # Initially off everywhere
+    assert kh.is_maintenance_mode(board) is False
+    assert kb.board_in_maintenance(board) is False
+    assert kb.read_board_metadata(board).get("maintenance") is not True
+    report = kh.board_health_report(board)
+    assert report["maintenance_mode"] is False
+
+    # Enable via kanban_health API
+    kh.set_maintenance_mode(board, True, reason="cross-surface test")
+    assert kh.is_maintenance_mode(board) is True
+    assert kb.board_in_maintenance(board) is True
+    meta = kb.read_board_metadata(board)
+    assert meta.get("maintenance") is True
+    assert "maintenance_mode" not in meta
+    assert meta.get("maintenance_reason") == "cross-surface test"
+    assert meta.get("maintenance_since") is not None
+    report = kh.board_health_report(board)
+    assert report["maintenance_mode"] is True
+
+    # Disable via kanban_health API
+    kh.set_maintenance_mode(board, False)
+    assert kh.is_maintenance_mode(board) is False
+    assert kb.board_in_maintenance(board) is False
+    meta = kb.read_board_metadata(board)
+    assert meta.get("maintenance") is not True
+    assert "maintenance_reason" not in meta
+    assert "maintenance_since" not in meta
+    report = kh.board_health_report(board)
+    assert report["maintenance_mode"] is False
+
+
+def test_boards_maintenance_on_makes_approve_swap_accept(multi_board_home):
+    """Using ``boards maintenance <board> on`` must satisfy the maintenance
+    gate in ``approve_swap_board(..., yes_flag=True)``.
+    """
+    board = "testboard"
+    db_path = kb.kanban_db_path(board=board)
+
+    # Enable via kanban_db primitive (the one boards maintenance calls)
+    kb.set_board_maintenance(board, True, reason="boards maintenance test")
+    assert kb.board_in_maintenance(board) is True
+    assert kh.is_maintenance_mode(board) is True
+
+    # Create a trivial repair candidate (copy current DB)
+    import shutil, time
+    candidate_dir = db_path.parent / "repair-candidates"
+    candidate_dir.mkdir(parents=True, exist_ok=True)
+    candidate_db = candidate_dir / "candidate.db"
+    shutil.copy2(str(db_path), str(candidate_db))
+    manifest = {
+        "board_slug": board,
+        "candidate_db_path": str(candidate_db),
+        "candidate_db_sha256": kh._file_sha256(candidate_db),
+        "created_at": int(time.time()),
+    }
+    manifest_path = candidate_dir / "manifest.json"
+    manifest_path.write_text(json.dumps(manifest, indent=2), encoding="utf-8")
+
+    # Swap should succeed because maintenance mode is active and no tasks running
+    receipt = kh.approve_swap_board(
+        board, candidate_manifest_path=manifest_path, yes_flag=True
+    )
+    assert receipt["swapped"] is True
+    assert receipt["maintenance_mode"] is True
+
+
+def test_top_level_maintenance_on_makes_dispatcher_skip_board(multi_board_home):
+    """Using top-level ``hermes kanban maintenance <board> on`` must set the
+    same key the dispatcher reads via ``board_in_maintenance()``.
+    """
+    board = "testboard"
+    kh.set_maintenance_mode(board, True, reason="dispatcher skip test")
+    assert kh.is_maintenance_mode(board) is True
+    assert kb.board_in_maintenance(board) is True
+
+    # Simulate the dispatcher check exactly as in gateway/kanban_watchers.py
+    meta = kb.read_board_metadata(board)
+    assert kb.board_in_maintenance(meta) is True
+
+
+def test_maintenance_mode_degraded_path_uses_canonical_key(multi_board_home):
+    """When the board DB is corrupt, the degraded health report must still
+    read the canonical ``maintenance`` key, not the old ``maintenance_mode``.
+    """
+    board = "testboard"
+    db_path = kb.kanban_db_path(board=board)
+
+    # Enable maintenance first, then corrupt the DB
+    kb.set_board_maintenance(board, True, reason="degraded path test")
+    kh.inject_corruption(db_path, offset=0, length=16)
+
+    report = kh.board_health_report(board)
+    assert report["healthy"] is False
+    assert report["maintenance_mode"] is True
+
+
+def test_maintenance_mode_fleet_report_uses_canonical_key(multi_board_home):
+    """Fleet-wide health report must read the canonical ``maintenance`` key."""
+    board = "testboard"
+    kb.set_board_maintenance(board, True, reason="fleet report test")
+    fleet = kh.fleet_health_report()
+    for r in fleet["boards"]:
+        if r["slug"] == board:
+            assert r["maintenance_mode"] is True
+            return
+    pytest.fail("board not found in fleet report")
+
+
+def test_legacy_maintenance_mode_without_canonical_key_is_supported(multi_board_home):
+    """Metadata written by the split-key implementation remains protective
+    until a canonical writer normalizes the board metadata.
+    """
+    board = "testboard"
+    meta_path = kb.board_metadata_path(board)
+    meta = json.loads(meta_path.read_text(encoding="utf-8"))
+    meta["maintenance_mode"] = True  # old key
+    meta.pop("maintenance", None)     # no canonical key yet
+    meta.pop("db_path", None)
+    meta_path.write_text(json.dumps(meta, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+
+    assert kh.is_maintenance_mode(board) is True
+    assert kb.board_in_maintenance(board) is True
+    report = kh.board_health_report(board)
+    assert report["maintenance_mode"] is True
+
+
+def test_legacy_maintenance_mode_degraded_path_is_supported(multi_board_home):
+    """Legacy-only maintenance metadata remains visible in degraded reports."""
+    board = "testboard"
+    meta_path = kb.board_metadata_path(board)
+    meta = json.loads(meta_path.read_text(encoding="utf-8"))
+    meta["maintenance_mode"] = True
+    meta.pop("maintenance", None)
+    meta.pop("db_path", None)
+    meta_path.write_text(json.dumps(meta, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+
+    kh.inject_corruption(kb.kanban_db_path(board=board), offset=0, length=16)
+    report = kh.board_health_report(board)
+    assert report["healthy"] is False
+    assert report["maintenance_mode"] is True
+
+
+def test_canonical_maintenance_key_overrides_legacy_maintenance_mode(multi_board_home):
+    """If both keys exist, the canonical ``maintenance`` key wins.
+
+    This prevents stale legacy metadata from overriding an explicit canonical
+    off state.
+    """
+    board = "testboard"
+    meta_path = kb.board_metadata_path(board)
+    meta = json.loads(meta_path.read_text(encoding="utf-8"))
+    meta["maintenance_mode"] = True  # old key
+    meta["maintenance"] = False      # canonical key
+    meta.pop("db_path", None)
+    meta_path.write_text(json.dumps(meta, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+
+    assert kh.is_maintenance_mode(board) is False
+    assert kb.board_in_maintenance(board) is False
+    report = kh.board_health_report(board)
+    assert report["maintenance_mode"] is False
+
+
+def test_canonical_maintenance_writer_removes_legacy_key(multi_board_home):
+    """Canonical writes normalize old split-key metadata."""
+    board = "testboard"
+    meta_path = kb.board_metadata_path(board)
+    meta = json.loads(meta_path.read_text(encoding="utf-8"))
+    meta["maintenance_mode"] = True
+    meta.pop("db_path", None)
+    meta_path.write_text(json.dumps(meta, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+
+    kb.set_board_maintenance(board, True, reason="normalize")
+    meta = kb.read_board_metadata(board)
+    assert meta["maintenance"] is True
+    assert "maintenance_mode" not in meta
+    assert meta["maintenance_reason"] == "normalize"
+
+    kb.set_board_maintenance(board, False)
+    meta = kb.read_board_metadata(board)
+    assert meta["maintenance"] is False
+    assert "maintenance_mode" not in meta

@@ -125,7 +125,7 @@ def board_health_report(
             try:
                 meta = kb.read_board_metadata(board)
                 slug = meta.get("slug", board or kb.DEFAULT_BOARD)
-                maintenance = bool(meta.get("maintenance_mode", False))
+                maintenance = kb.board_in_maintenance(meta)
             except Exception:
                 slug = board or kb.DEFAULT_BOARD
                 maintenance = False
@@ -146,7 +146,7 @@ def board_health_report(
             try:
                 meta = kb.read_board_metadata(board)
                 slug = meta.get("slug", board or kb.DEFAULT_BOARD)
-                maintenance = bool(meta.get("maintenance_mode", False))
+                maintenance = kb.board_in_maintenance(meta)
             except Exception:
                 slug = board or kb.DEFAULT_BOARD
                 maintenance = False
@@ -181,7 +181,7 @@ def board_health_report(
         running = by_status.get("running", 0)
 
         # Maintenance mode
-        maintenance = bool(meta.get("maintenance_mode", False))
+        maintenance = kb.board_in_maintenance(meta)
 
         report = {
             "slug": slug,
@@ -228,7 +228,7 @@ def fleet_health_report(
                 "wal": None,
                 "shm": None,
                 "task_counts": {"total": 0, "running": 0, "stale": 0},
-                "maintenance_mode": bool(meta.get("maintenance_mode", False)),
+                "maintenance_mode": kb.board_in_maintenance(meta),
             }
         if report["healthy"]:
             healthy_count += 1
@@ -718,34 +718,24 @@ def set_maintenance_mode(
     enabled: bool,
     *,
     reason: str = "",
-) -> None:
-    """Toggle maintenance mode in board metadata."""
-    import json
-    slug = kb._normalize_board_slug(board) or board
-    meta = kb.read_board_metadata(slug)
-    meta["maintenance_mode"] = bool(enabled)
-    if enabled:
-        meta["maintenance_reason"] = str(reason)
-        meta["maintenance_since"] = int(time.time())
-    else:
-        meta.pop("maintenance_mode", None)
-        meta.pop("maintenance_reason", None)
-        meta.pop("maintenance_since", None)
-    # Persist full metadata directly; write_board_metadata only accepts
-    # a fixed set of keyword arguments and would drop maintenance fields.
-    path = kb.board_metadata_path(slug)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    meta.pop("db_path", None)  # derived field
-    path.write_text(
-        json.dumps(meta, indent=2, ensure_ascii=False) + "\n",
-        encoding="utf-8",
-    )
+) -> dict:
+    """Toggle maintenance mode in board metadata.
+
+    Delegates to :func:`kanban_db.set_board_maintenance` so that the
+    dispatcher, health surface, and CLI all read/write the same canonical
+    ``maintenance`` key.
+    """
+    return kb.set_board_maintenance(board, enabled, reason=reason)
 
 
 def is_maintenance_mode(board: str) -> bool:
-    """Read maintenance mode from board metadata."""
-    meta = kb.read_board_metadata(board)
-    return bool(meta.get("maintenance_mode", False))
+    """Read maintenance mode from board metadata.
+
+    Delegates to :func:`kanban_db.board_in_maintenance` so that the
+    dispatcher, health surface, and CLI all agree on the same canonical
+    ``maintenance`` key.
+    """
+    return kb.board_in_maintenance(board)
 
 
 # ---------------------------------------------------------------------------
