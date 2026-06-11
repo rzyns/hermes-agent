@@ -26,6 +26,13 @@ from hermes_cli import kanban_db as kb
 # Internal helpers
 # ---------------------------------------------------------------------------
 
+def _quote_sqlite_identifier(identifier: str) -> str:
+    """Quote a SQLite identifier sourced from schema metadata."""
+    if "\x00" in identifier:
+        raise ValueError("SQLite identifiers cannot contain NUL bytes")
+    return '"' + identifier.replace('"', '""') + '"'
+
+
 def _file_sha256(path: Path) -> str:
     """Return a hex SHA-256 digest for a file."""
     h = hashlib.sha256()
@@ -501,8 +508,12 @@ def create_repair_candidate(
             dst_conn = sqlite3.connect(str(candidate_db))
             for table in tables:
                 try:
+                    quoted_table = _quote_sqlite_identifier(table)
+                except ValueError:
+                    continue
+                try:
                     # Get CREATE TABLE
-                    cursor.execute(f"SELECT sql FROM sqlite_master WHERE name=?", (table,))
+                    cursor.execute("SELECT sql FROM sqlite_master WHERE name=?", (table,))
                     create_row = cursor.fetchone()
                     if create_row and create_row[0]:
                         dst_conn.execute(create_row[0])
@@ -511,13 +522,14 @@ def create_repair_candidate(
                 # Copy rows
                 row_count = 0
                 try:
-                    cursor.execute(f"SELECT * FROM {table}")
+                    cursor.execute(f"SELECT * FROM {quoted_table}")
                     cols = [d[0] for d in cursor.description]
+                    quoted_cols = ",".join(_quote_sqlite_identifier(col) for col in cols)
                     placeholders = ",".join("?" for _ in cols)
                     for row in cursor:
                         try:
                             dst_conn.execute(
-                                f"INSERT INTO {table} ({','.join(cols)}) VALUES ({placeholders})",
+                                f"INSERT INTO {quoted_table} ({quoted_cols}) VALUES ({placeholders})",
                                 row,
                             )
                             row_count += 1

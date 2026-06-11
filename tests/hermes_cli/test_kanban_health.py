@@ -319,6 +319,19 @@ def test_create_repair_candidate_from_live(multi_board_home):
     assert candidate["candidate_integrity_check"] == "ok"
 
 
+def test_create_repair_candidate_quotes_schema_identifiers(multi_board_home):
+    db_path = kb.kanban_db_path("default")
+    with sqlite3.connect(str(db_path)) as conn:
+        conn.execute('CREATE TABLE "odd""table" ("odd""col" TEXT)')
+        conn.execute('INSERT INTO "odd""table" ("odd""col") VALUES (?)', ("survives",))
+
+    manifest_path = kh.create_repair_candidate("default")
+    candidate = json.loads(manifest_path.read_text(encoding="utf-8"))
+    with sqlite3.connect(candidate["candidate_db_path"]) as conn:
+        row = conn.execute('SELECT "odd""col" FROM "odd""table"').fetchone()
+    assert row == ("survives",)
+
+
 def test_create_repair_candidate_from_backup(multi_board_home):
     dest = multi_board_home / "backups"
     out = kh.backup_board("default", dest_dir=dest)
