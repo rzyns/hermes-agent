@@ -115,6 +115,20 @@ VALID_WORKSPACE_KINDS = {"scratch", "worktree", "dir"}
 KNOWN_TOOLSET_NAMES = frozenset(name.casefold() for name in get_toolset_names())
 _IS_WINDOWS = sys.platform == "win32"
 
+# Kanban SQLite durability is deliberately conservative by default.  FULL
+# narrows the crash window for both main-DB and WAL/checkpoint writes; users can
+# explicitly opt into NORMAL when their board is on redundant storage and they
+# prefer lower fsync pressure.  Unsafe modes such as OFF are not accepted via
+# config.yaml.
+KANBAN_DURABILITY_FULL = "full"
+KANBAN_DURABILITY_NORMAL = "normal"
+KANBAN_DURABILITY_DEFAULT = KANBAN_DURABILITY_FULL
+_KANBAN_DURABILITY_TO_SYNCHRONOUS = {
+    KANBAN_DURABILITY_FULL: "FULL",
+    KANBAN_DURABILITY_NORMAL: "NORMAL",
+}
+_CONFIG_UNSET = object()
+
 # A running task's claim is valid for 15 minutes by default; after that the
 # next dispatcher tick reclaims it. Workers that outlive this window should
 # call ``heartbeat_claim(task_id)`` periodically. In practice most kanban
@@ -132,6 +146,33 @@ DEFAULT_CLAIM_TTL_SECONDS = 15 * 60
 # so any genuinely active worker keeps its heartbeat fresh as a side
 # effect of normal API traffic.
 DEFAULT_CLAIM_HEARTBEAT_MAX_STALE_SECONDS = 60 * 60
+
+
+def _resolve_kanban_durability(raw_value: object = _CONFIG_UNSET) -> str:
+    """Return the configured SQLite synchronous level for kanban connections.
+
+    ``kanban.durability`` is a small, safe surface: ``full`` (default) maps to
+    ``PRAGMA synchronous=FULL``; ``normal`` maps to SQLite's WAL-friendly
+    ``NORMAL``.  Invalid or unsafe values fail closed to FULL.  When
+    ``raw_value`` is omitted, the value is read from ``config.yaml`` through
+    ``load_config()``; callers/tests may pass an explicit value to avoid any
+    profile config access.
+    """
+    if raw_value is _CONFIG_UNSET:
+        try:
+            from hermes_cli.config import load_config
+            cfg = load_config()
+            kanban_cfg = cfg.get("kanban", {}) if isinstance(cfg, dict) else {}
+            raw_value = kanban_cfg.get("durability", KANBAN_DURABILITY_DEFAULT)
+        except Exception:
+            raw_value = KANBAN_DURABILITY_DEFAULT
+
+    value = str(raw_value or KANBAN_DURABILITY_DEFAULT).strip().lower()
+    if value in {"full", "safe", "durable"}:
+        return _KANBAN_DURABILITY_TO_SYNCHRONOUS[KANBAN_DURABILITY_FULL]
+    if value in {"normal", "balanced"}:
+        return _KANBAN_DURABILITY_TO_SYNCHRONOUS[KANBAN_DURABILITY_NORMAL]
+    return _KANBAN_DURABILITY_TO_SYNCHRONOUS[KANBAN_DURABILITY_FULL]
 
 
 def _resolve_claim_ttl_seconds(ttl_seconds: Optional[int] = None) -> int:
@@ -555,6 +596,11 @@ def read_board_metadata(board: Optional[str] = None) -> dict:
         "default_workdir": None,
         "created_at": None,
         "archived": False,
+        # When true, background dispatch/auto-decompose skip this board. This
+        # lets operators run manual SQLite maintenance or restore work without
+        # workers claiming tasks mid-procedure. Task-level read/list operations
+        # remain available.
+        "maintenance": False,
     }
     try:
         p = board_metadata_path(slug)
@@ -579,6 +625,7 @@ def write_board_metadata(
     icon: Optional[str] = None,
     color: Optional[str] = None,
     archived: Optional[bool] = None,
+    maintenance: Optional[bool] = None,
     default_workdir: Optional[str] = None,
 ) -> dict:
     """Create / update ``board.json`` for ``board``.
@@ -601,6 +648,8 @@ def write_board_metadata(
         meta["color"] = str(color)
     if archived is not None:
         meta["archived"] = bool(archived)
+    if maintenance is not None:
+        meta["maintenance"] = bool(maintenance)
     if default_workdir is not None:
         meta["default_workdir"] = str(default_workdir) if default_workdir else None
     if not meta.get("created_at"):
@@ -613,6 +662,31 @@ def write_board_metadata(
     )
     meta["db_path"] = str(kanban_db_path(slug))
     return meta
+
+
+def set_board_maintenance(board: Optional[str], enabled: bool) -> dict:
+    """Enable/disable per-board maintenance mode in ``board.json``.
+
+    Maintenance mode is intentionally metadata-only: it does not open, vacuum,
+    checkpoint, or otherwise mutate the SQLite DB. Background dispatchers use
+    the flag to skip worker claims and auto-decomposition for the board while
+    operators perform manual maintenance/restore work.
+    """
+    slug = _normalize_board_slug(board) or DEFAULT_BOARD
+    return write_board_metadata(slug, maintenance=bool(enabled))
+
+
+def board_in_maintenance(board_or_meta: Optional[object] = None) -> bool:
+    """Return True when a board metadata dict or board slug is in maintenance.
+
+    ``None`` means the active/current board, matching the rest of the Kanban
+    command surface. Passing a metadata dict avoids any filesystem lookup for
+    callers that already enumerated boards.
+    """
+    if isinstance(board_or_meta, dict):
+        return bool(board_or_meta.get("maintenance"))
+    board = str(board_or_meta) if board_or_meta is not None else get_current_board()
+    return bool(read_board_metadata(board).get("maintenance"))
 
 
 def create_board(
@@ -1554,9 +1628,15 @@ def connect(
                 # See hermes_state._WAL_INCOMPAT_MARKERS for detection logic.
                 from hermes_state import apply_wal_with_fallback
                 apply_wal_with_fallback(conn, db_label=f"kanban.db ({path.name})")
-                # FULL (was NORMAL): fsync before each checkpoint to narrow the
-                # crash window that can leave a b-tree page header torn.
-                conn.execute("PRAGMA synchronous=FULL")
+                # Default FULL narrows the crash window that can leave a b-tree
+                # page header torn.  ``kanban.durability: normal`` is the only
+                # supported opt-down and still keeps WAL consistency guarantees;
+                # invalid/unsafe config values fail closed to FULL.
+                synchronous = _resolve_kanban_durability()
+                if synchronous == "NORMAL":
+                    conn.execute("PRAGMA synchronous=NORMAL")
+                else:
+                    conn.execute("PRAGMA synchronous=FULL")
                 conn.execute("PRAGMA wal_autocheckpoint=100")
                 conn.execute("PRAGMA foreign_keys=ON")
                 # Zero freed pages so a later torn write cannot expose stale

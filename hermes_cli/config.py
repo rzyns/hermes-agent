@@ -2067,6 +2067,15 @@ DEFAULT_CONFIG = {
         # Seconds between dispatcher ticks (idle or not). Lower = snappier
         # pickup of newly-ready tasks; higher = less SQL pressure.
         "dispatch_interval_seconds": 60,
+        # Emergency/maintenance brake. When true, gateway/CLI dispatchers skip
+        # claiming or spawning work while leaving read-only list/status commands
+        # available. Use per-board metadata (``hermes kanban boards maintenance``)
+        # to pause only one board.
+        "maintenance_mode": False,
+        # SQLite durability for kanban.db connections. Default ``full`` maps to
+        # PRAGMA synchronous=FULL. The only supported opt-down is ``normal``;
+        # invalid/unsafe values fail closed to FULL at runtime.
+        "durability": "full",
         # Auto-block after this many consecutive non-success attempts for the
         # same task/profile (spawn_failed, timed_out, or crashed). Reassignment
         # resets the streak for the new profile.

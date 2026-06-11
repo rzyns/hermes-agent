@@ -304,6 +304,19 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
     b_set_wd.add_argument("path", nargs="?", default=None,
                           help="Absolute path to use as default workdir. Omit to clear.")
 
+    b_maint = boards_sub.add_parser(
+        "maintenance",
+        help="Show or set per-board maintenance mode (dispatcher skip)",
+    )
+    b_maint.add_argument("slug")
+    b_maint.add_argument(
+        "state",
+        nargs="?",
+        choices=["on", "off", "status"],
+        default="status",
+        help="on/off to toggle, or status to show without writing",
+    )
+
     # --- create ---
     p_create = sub.add_parser("create", help="Create a new task")
     p_create.add_argument("title", help="Task title")
@@ -1077,11 +1090,13 @@ def kanban_command(args: argparse.Namespace) -> int:
     # schema creation; `create` / `list` / every other command would
     # error out on a fresh install.
     with board_scope:
-        try:
-            kb.init_db()
-        except Exception as exc:
-            print(f"kanban: could not initialize database: {exc}", file=sys.stderr)
-            return 1
+        init_before_handler = action not in {"dispatch", "daemon"}
+        if init_before_handler:
+            try:
+                kb.init_db()
+            except Exception as exc:
+                print(f"kanban: could not initialize database: {exc}", file=sys.stderr)
+                return 1
 
         handlers = {
             "init":     _cmd_init,
@@ -1185,6 +1200,8 @@ def _dispatch_boards(args: argparse.Namespace) -> int:
         return _cmd_boards_rename(args)
     if sub == "set-default-workdir":
         return _cmd_boards_set_default_workdir(args)
+    if sub == "maintenance":
+        return _cmd_boards_maintenance(args)
     print(f"kanban boards: unknown action {sub!r}", file=sys.stderr)
     return 2
 
@@ -1231,6 +1248,8 @@ def _cmd_boards_list(args: argparse.Namespace) -> int:
         name = b.get("name") or ""
         if b.get("archived"):
             name += " [archived]"
+        if b.get("maintenance"):
+            name += " [maintenance]"
         print(f"{marker:2s}  {b['slug']:24s}  {name:28s}  {counts_str}")
     print()
     print(f"Current board: {current}")
@@ -1320,6 +1339,8 @@ def _cmd_boards_show(args: argparse.Namespace) -> int:
     if meta.get("description"):
         print(f"  Description:  {meta['description']}")
     print(f"  DB path:      {meta['db_path']}")
+    if meta.get("maintenance"):
+        print("  Maintenance: ON (dispatchers skip this board)")
     print(f"  Tasks:        {total} total"
           + (f" ({', '.join(f'{k}={v}' for k, v in sorted(counts.items()))})"
              if counts else ""))
@@ -1357,6 +1378,28 @@ def _cmd_boards_set_default_workdir(args: argparse.Namespace) -> int:
         print(f"Board {normed!r} default workdir set to {new_val!r}.")
     else:
         print(f"Board {normed!r} default workdir cleared.")
+    return 0
+
+
+def _cmd_boards_maintenance(args: argparse.Namespace) -> int:
+    try:
+        normed = kb._normalize_board_slug(args.slug)
+    except ValueError as exc:
+        print(f"kanban boards maintenance: {exc}", file=sys.stderr)
+        return 2
+    if not normed or not kb.board_exists(normed):
+        print(f"kanban boards maintenance: board {args.slug!r} does not exist",
+              file=sys.stderr)
+        return 1
+    state = getattr(args, "state", "status") or "status"
+    if state == "status":
+        meta = kb.read_board_metadata(normed)
+    else:
+        meta = kb.set_board_maintenance(normed, state == "on")
+    label = "ON" if meta.get("maintenance") else "off"
+    print(f"Board {normed!r} maintenance mode: {label}.")
+    if meta.get("maintenance"):
+        print("  Dispatchers skip this board; task list/status commands still work.")
     return 0
 
 
@@ -2564,6 +2607,7 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
         _cfg = load_config()
         _kanban_cfg = _cfg.get("kanban", {}) if isinstance(_cfg, dict) else {}
         default_assignee = (_kanban_cfg.get("default_assignee") or "").strip() or None
+        maintenance_mode = bool(_kanban_cfg.get("maintenance_mode", False))
 
         def _coerce_positive_int(value):
             if value is None:
@@ -2586,9 +2630,31 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
         )
     except Exception:
         default_assignee = None
+        maintenance_mode = False
         max_in_progress_per_profile = None
         max_in_progress = None
         max_spawn = getattr(args, "max", None)
+    board = getattr(args, "board", None)
+    if maintenance_mode or kb.board_in_maintenance(board):
+        if getattr(args, "json", False):
+            print(json.dumps({
+                "maintenance_mode": True,
+                "board": board or kb.get_current_board(),
+                "reclaimed": 0,
+                "crashed": [],
+                "timed_out": [],
+                "stale": [],
+                "auto_blocked": [],
+                "promoted": 0,
+                "spawned": [],
+                "skipped_unassigned": [],
+                "skipped_nonspawnable": [],
+                "skipped_per_profile_capped": [],
+                "auto_assigned_default": [],
+            }, indent=2))
+        else:
+            print("Kanban dispatcher skipped: maintenance mode is enabled.")
+        return 0
     with kb.connect_closing() as conn:
         res = kb.dispatch_once(
             conn,
@@ -2696,6 +2762,27 @@ def _cmd_daemon(args: argparse.Namespace) -> int:
         return 2
 
     # Legacy path — same logic as before, kept behind --force.
+    try:
+        from hermes_cli.config import load_config as _load_config
+        _cfg = _load_config()
+        _kanban_cfg = _cfg.get("kanban", {}) if isinstance(_cfg, dict) else {}
+        if bool(_kanban_cfg.get("maintenance_mode", False)):
+            print(
+                "Kanban dispatcher not started: kanban.maintenance_mode=true.",
+                file=sys.stderr,
+            )
+            return 0
+    except Exception:
+        pass
+    try:
+        if kb.board_in_maintenance(None):
+            print(
+                "Kanban dispatcher not started: current board is in maintenance mode.",
+                file=sys.stderr,
+            )
+            return 0
+    except Exception:
+        pass
     # Make sure the DB exists before printing "started" so the user sees the
     # correct DB path and any init error surfaces immediately.
     kb.init_db()

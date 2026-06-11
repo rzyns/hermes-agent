@@ -644,6 +644,11 @@ class GatewayKanbanWatchersMixin:
                 "kanban dispatcher: disabled via config kanban.dispatch_in_gateway=false"
             )
             return
+        if bool(kanban_cfg.get("maintenance_mode", False)):
+            logger.info(
+                "kanban dispatcher: disabled via config kanban.maintenance_mode=true"
+            )
+            return
 
         try:
             from hermes_cli import kanban_db as _kb
@@ -820,6 +825,10 @@ class GatewayKanbanWatchersMixin:
             connection handle or accidentally claim across each other.
             """
             conn = None
+            meta = _kb.read_board_metadata(slug)
+            if _kb.board_in_maintenance(meta):
+                logger.info("kanban dispatcher: board %s in maintenance; skipping", slug)
+                return None
             fingerprint = _board_db_fingerprint(slug)
             disabled_entry = disabled_corrupt_boards.get(slug)
             if disabled_entry is not None:
@@ -963,6 +972,8 @@ class GatewayKanbanWatchersMixin:
                 boards = [_kb.read_board_metadata(_kb.DEFAULT_BOARD)]
             for b in boards:
                 slug = b.get("slug") or _kb.DEFAULT_BOARD
+                if _kb.board_in_maintenance(b):
+                    continue
                 fingerprint = _board_db_fingerprint(slug)
                 disabled_entry = disabled_corrupt_boards.get(slug)
                 if disabled_entry is not None:
@@ -1025,6 +1036,8 @@ class GatewayKanbanWatchersMixin:
             successes = 0
             for b in boards:
                 slug = b.get("slug") or _kb.DEFAULT_BOARD
+                if _kb.board_in_maintenance(b):
+                    continue
                 if attempted >= auto_decompose_per_tick:
                     break
                 fingerprint = _board_db_fingerprint(slug)
