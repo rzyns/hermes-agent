@@ -182,6 +182,25 @@ class _RuntimeContextIsolation:
         self._writer_active = False
         self._writers_waiting = 0
 
+    def reserve_write(self) -> None:
+        """Reserve writer priority before a context-mutating job is dispatched.
+
+        Sequential jobs are submitted to a single-worker pool and may not reach
+        ``write()`` before non-mutating jobs submitted to the parallel pool. The
+        reservation makes readers wait for already-queued writers instead of
+        racing ahead while the sequential worker is still starting.
+        """
+        with self._condition:
+            self._writers_waiting += 1
+            self._condition.notify_all()
+
+    def cancel_reserved_write(self) -> None:
+        """Release a writer reservation if dispatch fails before execution."""
+        with self._condition:
+            if self._writers_waiting > 0:
+                self._writers_waiting -= 1
+            self._condition.notify_all()
+
     @contextmanager
     def read(self):
         with self._condition:
@@ -197,9 +216,10 @@ class _RuntimeContextIsolation:
                     self._condition.notify_all()
 
     @contextmanager
-    def write(self):
+    def write(self, *, reserved: bool = False):
         with self._condition:
-            self._writers_waiting += 1
+            if not reserved:
+                self._writers_waiting += 1
             try:
                 while self._writer_active or self._readers:
                     self._condition.wait()
@@ -2183,11 +2203,11 @@ def tick(verbose: bool = True, adapters=None, loop=None, sync: bool = True) -> i
                 _max_workers if _max_workers else "unbounded",
             )
 
-        def _process_job(job: dict) -> bool:
+        def _process_job(job: dict, *, reserved_runtime_write: bool = False) -> bool:
             """Run one due job end-to-end: execute, save, deliver, mark."""
             try:
                 runtime_gate = (
-                    _runtime_context_isolation.write()
+                    _runtime_context_isolation.write(reserved=reserved_runtime_write)
                     if _job_mutates_runtime_context(job)
                     else _runtime_context_isolation.read()
                 )
@@ -2233,21 +2253,13 @@ def tick(verbose: bool = True, adapters=None, loop=None, sync: bool = True) -> i
                 mark_job_run(job["id"], False, str(e))
                 return False
 
-        # Partition due jobs: jobs with a per-job workdir and/or profile touch
-        # process-global runtime state inside run_job. Workdir jobs temporarily
-        # set os.environ["TERMINAL_CWD"]; profile jobs use a context-local
-        # Hermes home override, scheduler _hermes_home hook, and temporary
-        # profile .env load into os.environ with snapshot/restore. They MUST run
-        # sequentially to avoid corrupting each other. Jobs without either field
-        # stay parallel-safe.
-        sequential_jobs = [
-            j for j in due_jobs
-            if (j.get("workdir") or "").strip() or (j.get("profile") or "").strip()
-        ]
-        parallel_jobs = [
-            j for j in due_jobs
-            if not ((j.get("workdir") or "").strip() or (j.get("profile") or "").strip())
-        ]
+        # Partition due jobs: those with a per-job workdir or profile mutate
+        # process-global runtime context (TERMINAL_CWD, _hermes_home and/or
+        # profile-loaded env). They MUST run sequentially to avoid corrupting
+        # each other. Non-mutating jobs stay parallel-safe, but still enter a
+        # read gate so they cannot overlap an active context-mutating job.
+        sequential_jobs = [j for j in due_jobs if _job_mutates_runtime_context(j)]
+        parallel_jobs = [j for j in due_jobs if not _job_mutates_runtime_context(j)]
 
         _results: list = []
         _all_futures: list = []
@@ -2265,20 +2277,34 @@ def tick(verbose: bool = True, adapters=None, loop=None, sync: bool = True) -> i
                     logger.info("Job '%s' already running — skipping", job.get("name", job_id))
                     return None
                 _running_job_ids.add(job_id)
+            reserved_runtime_write = _job_mutates_runtime_context(job)
+            if reserved_runtime_write:
+                _runtime_context_isolation.reserve_write()
             _ctx = contextvars.copy_context()
 
             def _run_and_release(j=job, ctx=_ctx):
                 try:
-                    return ctx.run(_process_job, j)
+                    return ctx.run(
+                        _process_job,
+                        j,
+                        reserved_runtime_write=reserved_runtime_write,
+                    )
                 finally:
                     with _running_lock:
                         _running_job_ids.discard(j["id"])
 
-            return pool.submit(_run_and_release)
+            try:
+                return pool.submit(_run_and_release)
+            except Exception:
+                if reserved_runtime_write:
+                    _runtime_context_isolation.cancel_reserved_write()
+                with _running_lock:
+                    _running_job_ids.discard(job_id)
+                raise
 
-        # Sequential pass for env/context-mutating (workdir/profile) jobs.
+        # Sequential pass for context-mutating (workdir/profile) jobs.
         # Queued to a persistent single-thread pool so they run one at a time
-        # WITHOUT blocking the ticker thread — a long workdir/profile job no
+        # WITHOUT blocking the ticker thread — a long workdir job no
         # longer starves the rest of the schedule (same fix as the parallel
         # pass, just serialized).  The in-flight guard prevents a still-running
         # job from being re-queued on the next tick.
