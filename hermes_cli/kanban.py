@@ -619,7 +619,7 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
     )
     p_repair_swap.add_argument(
         "--force", action="store_true",
-        help="Proceed even if the board is actively in use",
+        help="Proceed without maintenance-mode/running-task guard after operator review",
     )
 
     p_repair_list = repair_sub.add_parser(

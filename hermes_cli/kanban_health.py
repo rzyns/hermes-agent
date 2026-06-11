@@ -12,6 +12,7 @@ import contextlib
 import hashlib
 import json
 import os
+import shutil
 import sqlite3
 import tempfile
 import time
@@ -301,19 +302,35 @@ def backup_board(
     wal_sha = _file_sha256(db_path.parent / (db_path.name + "-wal")) if sidecars["wal"] and sidecars["wal"].get("present") else ""
 
     with contextlib.ExitStack() as stack:
+        backup_method = "sqlite_backup_api"
+        consolidated_wal = True
+        backup_sidecars: dict[str, dict[str, Any]] = {}
         try:
             src_conn = stack.enter_context(kb.connect_closing(board=board))
         except (kb.KanbanDbCorruptError, sqlite3.DatabaseError) as exc:
             if not force:
                 raise
-            # Forensic fallback: raw file copy when SQLite cannot open the DB.
-            import shutil
+            # Forensic fallback: raw file + sidecar copy when SQLite cannot
+            # open the DB. This is not a clean standalone backup, so the
+            # manifest must not claim WAL consolidation.
             shutil.copy2(str(db_path), str(backup_db_path))
             backup_sha = _file_sha256(backup_db_path)
             backup_size = backup_db_path.stat().st_size
             fk_msg = f"unavailable — {exc}"
             journal_mode = "unknown"
             synchronous = "unknown"
+            backup_method = "raw_file_copy"
+            consolidated_wal = False
+            for suffix, key in (("-wal", "wal"), ("-shm", "shm")):
+                source_sidecar = db_path.parent / (db_path.name + suffix)
+                if source_sidecar.exists() and source_sidecar.is_file():
+                    dest_sidecar = backup_db_path.parent / (backup_db_path.name + suffix)
+                    shutil.copy2(str(source_sidecar), str(dest_sidecar))
+                    backup_sidecars[key] = {
+                        "path": str(dest_sidecar),
+                        "sha256": _file_sha256(dest_sidecar),
+                        "size_bytes": dest_sidecar.stat().st_size,
+                    }
         else:
             fk_ok, fk_msg = _foreign_key_check(src_conn)
             journal_mode = _pragma_str(src_conn, "PRAGMA journal_mode")
@@ -366,15 +383,16 @@ def backup_board(
         "backup": {
             "db_path": str(backup_db_path) if not manifest_only else "",
             "db_sha256": backup_sha,
-            "method": "sqlite_backup_api",
-            "consolidated_wal": True,
+            "method": backup_method,
+            "consolidated_wal": consolidated_wal,
             "sqlite_page_count": 0,  # populated below if file exists
+            "sidecars": backup_sidecars,
         },
         "label": label or "",
         "hermes_version": "2.x.x",
     }
 
-    if backup_db_path.exists():
+    if backup_method == "sqlite_backup_api" and backup_db_path.exists():
         try:
             probe = sqlite3.connect(str(backup_db_path))
             with probe:
@@ -445,8 +463,7 @@ def create_repair_candidate(
     slug = kb._normalize_board_slug(board) or board
     db_path = kb.kanban_db_path(board=slug)
     now_iso = time.strftime("%Y%m%dT%H%M%SZ", time.gmtime())
-    candidate_dir = Path(tempfile.gettempdir()) / f"hermes-repair-{slug}-{now_iso}"
-    candidate_dir.mkdir(parents=True, exist_ok=True)
+    candidate_dir = Path(tempfile.mkdtemp(prefix=f"hermes-repair-{slug}-{now_iso}-"))
     candidate_db = candidate_dir / "candidate.db"
     manifest_path = candidate_dir / "repair-candidate.json"
 
@@ -551,6 +568,35 @@ def create_repair_candidate(
     return manifest_path
 
 
+def _probe_db_integrity(db_path: Path) -> str:
+    """Return PRAGMA integrity_check text for a standalone DB file."""
+    try:
+        with sqlite3.connect(str(db_path)) as conn:
+            row = conn.execute("PRAGMA integrity_check").fetchone()
+        return str(row[0]) if row else "<no row>"
+    except sqlite3.DatabaseError as exc:
+        return f"sqlite refused: {exc}"
+
+
+def _running_task_count(board: str) -> int:
+    """Best-effort count of running tasks for active-use guardrails."""
+    try:
+        with kb.connect_closing(board=board) as conn:
+            stats = kb.board_stats(conn)
+        return int(stats.get("by_status", {}).get("running", 0))
+    except Exception:
+        # If the board is corrupt/unopenable, do not treat this probe as an
+        # active-use proof. Maintenance-mode confirmation still gates swaps.
+        return 0
+
+
+def _sidecar_paths(db_path: Path) -> tuple[Path, Path]:
+    return (
+        db_path.parent / f"{db_path.name}-wal",
+        db_path.parent / f"{db_path.name}-shm",
+    )
+
+
 def approve_swap_board(
     board: str,
     *,
@@ -560,17 +606,41 @@ def approve_swap_board(
 ) -> dict[str, Any]:
     """Approval-gated live swap of a board DB with a repair candidate.
 
-    Creates a pre-swap backup of the current DB, then atomically renames
-    the candidate into place using os.replace.
+    Creates a SQLite-aware pre-swap backup of the current DB, validates that
+    the candidate manifest belongs to the requested board, removes stale
+    WAL/SHM sidecars, then atomically replaces the board DB with a copied
+    candidate. The repair candidate itself is preserved as evidence.
 
     Returns a swap receipt dict.
     """
     slug = kb._normalize_board_slug(board) or board
     db_path = kb.kanban_db_path(board=slug)
     candidate_manifest = json.loads(candidate_manifest_path.read_text(encoding="utf-8"))
+
+    manifest_board = kb._normalize_board_slug(candidate_manifest.get("board_slug"))
+    if manifest_board != slug:
+        raise RuntimeError(
+            f"repair candidate board mismatch: manifest is {manifest_board!r}, requested {slug!r}"
+        )
+
     candidate_db = Path(candidate_manifest["candidate_db_path"])
     if not candidate_db.exists():
         raise FileNotFoundError(f"candidate DB not found: {candidate_db}")
+
+    expected_sha = str(candidate_manifest.get("candidate_db_sha256", ""))
+    if not expected_sha:
+        raise RuntimeError("repair candidate manifest missing candidate_db_sha256")
+    actual_sha = _file_sha256(candidate_db)
+    if actual_sha != expected_sha:
+        raise RuntimeError(
+            f"repair candidate hash mismatch: expected {expected_sha}, got {actual_sha}"
+        )
+
+    candidate_integrity = _probe_db_integrity(candidate_db)
+    if candidate_integrity.lower() != "ok":
+        raise RuntimeError(
+            f"repair candidate integrity_check is not ok: {candidate_integrity}"
+        )
 
     if not yes_flag and not force:
         # In CLI context the caller should have prompted interactively.
@@ -579,22 +649,63 @@ def approve_swap_board(
             "approve_swap_board requires explicit confirmation (yes_flag=True or force=True)"
         )
 
-    # Pre-swap backup
+    maintenance = is_maintenance_mode(slug)
+    running = _running_task_count(slug)
+    if not force:
+        if not maintenance:
+            raise RuntimeError(
+                "approve_swap_board requires maintenance mode unless force=True"
+            )
+        if running:
+            raise RuntimeError(
+                f"approve_swap_board refused: board has {running} running task(s); use force=True only after operator review"
+            )
+
+    # Pre-swap backup: use the same SQLite-aware backup primitive as the CLI,
+    # falling back to raw forensic copy only when forced and SQLite cannot open.
     pre_swap_dir = db_path.parent / "pre-swaps"
     pre_swap_dir.mkdir(parents=True, exist_ok=True)
-    pre_swap_path = pre_swap_dir / f"{db_path.name}.pre-swap.{int(time.time())}.db"
+    pre_swap_backup = None
     if db_path.exists():
-        shutil = __import__("shutil")
-        shutil.copy2(str(db_path), str(pre_swap_path))
+        pre_swap_backup = backup_board(
+            slug,
+            dest_dir=pre_swap_dir,
+            label="pre-swap",
+            force=True,
+        )
 
-    # Atomic rename candidate into place
-    os.replace(str(candidate_db), str(db_path))
+    # Copy candidate into the destination directory first so os.replace is an
+    # atomic same-filesystem rename, and preserve the candidate as evidence.
+    tmp_fd, tmp_path_str = tempfile.mkstemp(
+        dir=str(db_path.parent), prefix=f"{db_path.name}.swap.", suffix=".tmp"
+    )
+    os.close(tmp_fd)
+    tmp_path = Path(tmp_path_str)
+    try:
+        shutil.copy2(str(candidate_db), str(tmp_path))
+        # A candidate DB must not be paired with stale WAL/SHM sidecars from
+        # the prior live DB. Remove them immediately before and after replace.
+        for sidecar in _sidecar_paths(db_path):
+            sidecar.unlink(missing_ok=True)
+        os.replace(str(tmp_path), str(db_path))
+        for sidecar in _sidecar_paths(db_path):
+            sidecar.unlink(missing_ok=True)
+    finally:
+        tmp_path.unlink(missing_ok=True)
+
+    post_integrity = _probe_db_integrity(db_path)
+    if post_integrity.lower() != "ok":
+        raise RuntimeError(f"post-swap integrity_check is not ok: {post_integrity}")
 
     return {
         "board": slug,
         "swapped": True,
-        "pre_swap_backup": str(pre_swap_path),
+        "pre_swap_backup": str(pre_swap_backup) if pre_swap_backup else "",
         "candidate_db": str(candidate_db),
+        "candidate_db_sha256": actual_sha,
+        "post_swap_integrity_check": post_integrity,
+        "maintenance_mode": maintenance,
+        "running_tasks": running,
     }
 
 
@@ -651,7 +762,9 @@ def _is_relative_to(path: Path, root: Path) -> bool:
 
 def _live_kanban_roots() -> tuple[Path, ...]:
     candidates = [
+        Path.home().expanduser().resolve() / ".hermes",
         Path.home().expanduser().resolve() / ".hermes" / "kanban",
+        Path("/home/openclaw/.hermes"),
         Path("/home/openclaw/.hermes/kanban"),
     ]
     roots: list[Path] = []

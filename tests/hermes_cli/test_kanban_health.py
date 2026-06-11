@@ -15,6 +15,7 @@ import pytest
 
 from hermes_cli import kanban_db as kb
 from hermes_cli import kanban_health as kh
+from hermes_cli.kanban import run_slash
 
 # Live root used for fail-closed assertions (computed once per process).
 _LIVE_KANBAN_ROOT = (Path.home() / ".hermes" / "kanban").resolve()
@@ -143,6 +144,26 @@ def test_fleet_health_report_skips_archived_by_default(multi_board_home):
     assert slugs == {"default"}
 
 
+def test_run_slash_health_board_json(multi_board_home):
+    out = run_slash("health --board default --json")
+    data = json.loads(out)
+    assert data["summary"] == {"total": 1, "healthy": 1, "degraded": 0}
+    assert data["boards"][0]["slug"] == "default"
+    assert data["boards"][0]["integrity_check"] == "ok"
+
+
+def test_run_slash_backup_board_json(multi_board_home):
+    dest = multi_board_home / "slash-backups"
+    out = run_slash(f"backup --board default --dest {dest} --json")
+    data = json.loads(out)
+    assert data[0]["board"] == "default"
+    assert data[0]["error"] is None
+    backup_path = Path(data[0]["path"])
+    _assert_sandboxed(backup_path, multi_board_home)
+    assert backup_path.exists()
+    assert kh.verify_backup_manifest(dest / f"{backup_path.stem}.manifest.json") is True
+
+
 def test_board_health_report_corrupt_db(multi_board_home):
     db_path = kb.kanban_db_path("testboard")
     _assert_sandboxed(db_path, multi_board_home)
@@ -220,6 +241,28 @@ def test_backup_board_force_integrity_failure(multi_board_home):
     assert m["source"]["integrity_check"] != "ok"
 
 
+def test_backup_board_force_raw_copy_preserves_sidecars(multi_board_home, monkeypatch):
+    db_path = kb.kanban_db_path("testboard")
+    _assert_sandboxed(db_path, multi_board_home)
+    wal_path = db_path.parent / f"{db_path.name}-wal"
+    shm_path = db_path.parent / f"{db_path.name}-shm"
+    wal_path.write_bytes(b"forensic wal")
+    shm_path.write_bytes(b"forensic shm")
+
+    def _raise_corrupt(*args, **kwargs):
+        raise kb.KanbanDbCorruptError(db_path, None, "forced test corruption")
+
+    monkeypatch.setattr(kb, "connect", _raise_corrupt)
+    dest = multi_board_home / "forensic-backups"
+    out = kh.backup_board("testboard", dest_dir=dest, force=True)
+    manifest = dest / f"{out.stem}.manifest.json"
+    m = json.loads(manifest.read_text(encoding="utf-8"))
+    assert m["backup"]["method"] == "raw_file_copy"
+    assert m["backup"]["consolidated_wal"] is False
+    assert Path(m["backup"]["sidecars"]["wal"]["path"]).exists()
+    assert Path(m["backup"]["sidecars"]["shm"]["path"]).exists()
+
+
 def test_backup_consolidates_wal(multi_board_home):
     """Backup should produce a standalone DB with no WAL sidecars."""
     db_path = kb.kanban_db_path("default")
@@ -291,19 +334,69 @@ def test_approve_swap_board_requires_confirmation(multi_board_home):
         kh.approve_swap_board("default", candidate_manifest_path=manifest_path)
 
 
-def test_approve_swap_board_succeeds_with_yes_flag(multi_board_home):
+def test_approve_swap_board_requires_maintenance_without_force(multi_board_home):
+    manifest_path = kh.create_repair_candidate("default")
+    with pytest.raises(RuntimeError, match="requires maintenance mode"):
+        kh.approve_swap_board("default", candidate_manifest_path=manifest_path, yes_flag=True)
+
+
+def test_approve_swap_board_rejects_wrong_board_candidate(multi_board_home):
+    manifest_path = kh.create_repair_candidate("default")
+    with pytest.raises(RuntimeError, match="board mismatch"):
+        kh.approve_swap_board("testboard", candidate_manifest_path=manifest_path, yes_flag=True, force=True)
+
+
+def test_approve_swap_board_rejects_missing_candidate_hash(multi_board_home):
+    manifest_path = kh.create_repair_candidate("default")
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest.pop("candidate_db_sha256")
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+    with pytest.raises(RuntimeError, match="missing candidate_db_sha256"):
+        kh.approve_swap_board("default", candidate_manifest_path=manifest_path, yes_flag=True, force=True)
+
+
+def test_approve_swap_board_rejects_candidate_hash_mismatch(multi_board_home):
+    manifest_path = kh.create_repair_candidate("default")
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["candidate_db_sha256"] = "0" * 64
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+    with pytest.raises(RuntimeError, match="hash mismatch"):
+        kh.approve_swap_board("default", candidate_manifest_path=manifest_path, yes_flag=True, force=True)
+
+
+def test_approve_swap_board_rejects_running_tasks_without_force(multi_board_home):
+    with kb.connect(board="default") as conn:
+        tid = kb.create_task(conn, title="running-task")
+        conn.execute("UPDATE tasks SET status='running' WHERE id=?", (tid,))
+    manifest_path = kh.create_repair_candidate("default")
+    kh.set_maintenance_mode("default", True, reason="test running guard")
+    with pytest.raises(RuntimeError, match="running task"):
+        kh.approve_swap_board("default", candidate_manifest_path=manifest_path, yes_flag=True)
+
+
+def test_approve_swap_board_succeeds_with_maintenance_and_preserves_candidate(multi_board_home):
     with kb.connect(board="default") as conn:
         kb.create_task(conn, title="pre-swap-task")
+    db_path = kb.kanban_db_path("default")
     manifest_path = kh.create_repair_candidate("default")
+    candidate = json.loads(manifest_path.read_text(encoding="utf-8"))
+    candidate_db = Path(candidate["candidate_db_path"])
+    wal_path = db_path.parent / f"{db_path.name}-wal"
+    shm_path = db_path.parent / f"{db_path.name}-shm"
+    wal_path.write_bytes(b"stale wal")
+    shm_path.write_bytes(b"stale shm")
+    kh.set_maintenance_mode("default", True, reason="test swap")
     receipt = kh.approve_swap_board(
         "default", candidate_manifest_path=manifest_path, yes_flag=True
     )
     assert receipt["swapped"] is True
     assert receipt["board"] == "default"
-    # The swapped DB may or may not pass integrity_check depending on
-    # whether the best-effort dump reconstructed indexes perfectly.
-    # The swap itself succeeding is the invariant we care about.
-    db_path = kb.kanban_db_path("default")
+    assert receipt["post_swap_integrity_check"] == "ok"
+    assert receipt["pre_swap_backup"]
+    assert Path(receipt["pre_swap_backup"]).exists()
+    assert candidate_db.exists(), "candidate DB is evidence and should not be moved"
+    assert not wal_path.exists()
+    assert not shm_path.exists()
     assert db_path.exists()
 
 # ---------------------------------------------------------------------------
@@ -329,6 +422,16 @@ def test_clear_maintenance_mode(multi_board_home):
     assert "maintenance_since" not in meta
 
 
+def test_run_slash_maintenance_toggles_metadata(multi_board_home):
+    out = run_slash("maintenance testboard on --reason 'CLI proof'")
+    assert "Maintenance mode enabled" in out
+    assert kh.is_maintenance_mode("testboard") is True
+    assert kb.read_board_metadata("testboard")["maintenance_reason"] == "CLI proof"
+    out = run_slash("maintenance testboard off")
+    assert "Maintenance mode disabled" in out
+    assert kh.is_maintenance_mode("testboard") is False
+
+
 # ---------------------------------------------------------------------------
 # Corruption injection helper
 # ---------------------------------------------------------------------------
@@ -337,6 +440,19 @@ def test_inject_corruption_refuses_live_kanban_root():
     live_like_path = Path.home() / ".hermes" / "kanban" / "boards" / "real" / "kanban.db"
     with pytest.raises(RuntimeError, match="Refusing to inject corruption into live Kanban path"):
         kh.inject_corruption(live_like_path, offset=0, length=16)
+
+
+def test_inject_corruption_refuses_live_default_db_path():
+    live_default_path = Path.home() / ".hermes" / "kanban.db"
+    with pytest.raises(RuntimeError, match="Refusing to inject corruption into live Kanban path"):
+        kh.inject_corruption(live_default_path, offset=0, length=16)
+
+
+def test_inject_corruption_refuses_operator_default_db_even_if_home_is_monkeypatched(tmp_path, monkeypatch):
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    live_default_path = Path("/home/openclaw/.hermes/kanban.db")
+    with pytest.raises(RuntimeError, match="Refusing to inject corruption into live Kanban path"):
+        kh.inject_corruption(live_default_path, offset=0, length=16)
 
 
 def test_inject_corruption_refuses_operator_root_even_if_home_is_monkeypatched(tmp_path, monkeypatch):
