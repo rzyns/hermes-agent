@@ -530,6 +530,123 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
         help="Emit JSON (structured) instead of the default human table",
     )
 
+    # --- health ---
+    p_health = sub.add_parser(
+        "health",
+        aliases=["h"],
+        help="Fleet-wide or per-board DB integrity + operational health",
+    )
+    p_health.add_argument(
+        "--board", default=None,
+        help="Check one board (default: current board)",
+    )
+    p_health.add_argument(
+        "--all", action="store_true",
+        help="Check all boards",
+    )
+    p_health.add_argument(
+        "--json", action="store_true",
+        help="Emit structured JSON instead of human-readable summary",
+    )
+
+    # --- backup ---
+    p_backup = sub.add_parser(
+        "backup",
+        help="SQLite-aware backup of one or all boards with manifest generation",
+    )
+    p_backup.add_argument(
+        "--board", default=None,
+        help="Board slug to back up (default: current board)",
+    )
+    p_backup.add_argument(
+        "--all", action="store_true",
+        help="Back up every board",
+    )
+    p_backup.add_argument(
+        "--dest", default=None,
+        help="Destination directory (default: <kanban-home>/backups/)",
+    )
+    p_backup.add_argument(
+        "--label", default=None,
+        help="Optional label written into the manifest",
+    )
+    p_backup.add_argument(
+        "--manifest-only", action="store_true",
+        help="Only emit the manifest without copying the DB file",
+    )
+    p_backup.add_argument(
+        "--force", action="store_true",
+        help="Proceed even if integrity_check fails",
+    )
+    p_backup.add_argument(
+        "--json", action="store_true",
+        help="Emit structured JSON result",
+    )
+
+    # --- repair ---
+    p_repair = sub.add_parser(
+        "repair",
+        help="Repair-candidate creation and approval-gated board swap",
+    )
+    repair_sub = p_repair.add_subparsers(dest="repair_action")
+
+    p_repair_create = repair_sub.add_parser(
+        "create-candidate",
+        help="Create a repair candidate from a board (or from a backup)",
+    )
+    p_repair_create.add_argument("board")
+    p_repair_create.add_argument(
+        "--from-backup", default=None,
+        help="Use a clean backup as the source instead of the live board",
+    )
+    p_repair_create.add_argument(
+        "--reason", default="",
+        help="Human-readable reason for the repair",
+    )
+
+    p_repair_swap = repair_sub.add_parser(
+        "approve-swap",
+        help="Atomically swap a board DB with a repair candidate",
+    )
+    p_repair_swap.add_argument("board")
+    p_repair_swap.add_argument(
+        "--candidate", required=True,
+        help="Path to the repair-candidate manifest JSON",
+    )
+    p_repair_swap.add_argument(
+        "--yes-i-have-read-the-manifest", action="store_true", dest="yes_flag",
+        help="Skip the interactive confirmation prompt (foot-gun flag)",
+    )
+    p_repair_swap.add_argument(
+        "--force", action="store_true",
+        help="Proceed even if the board is actively in use",
+    )
+
+    p_repair_list = repair_sub.add_parser(
+        "list-candidates",
+        help="List repair candidates for a board",
+    )
+    p_repair_list.add_argument("board")
+    p_repair_list.add_argument(
+        "--json", action="store_true",
+        help="Emit structured JSON",
+    )
+
+    # --- maintenance ---
+    p_maint = sub.add_parser(
+        "maintenance",
+        help="Toggle maintenance mode on a board",
+    )
+    p_maint.add_argument("board")
+    p_maint.add_argument(
+        "state", choices=["on", "off"],
+        help="Enable or disable maintenance mode",
+    )
+    p_maint.add_argument(
+        "--reason", default="",
+        help="Reason recorded when enabling maintenance",
+    )
+
     # --- link / unlink ---
     p_link = sub.add_parser("link", help="Add a parent->child dependency")
     p_link.add_argument("parent_id")
@@ -1007,6 +1124,10 @@ def kanban_command(args: argparse.Namespace) -> int:
             "intake-link": _cmd_intake_link,
             "intake-link-health": _cmd_intake_link_health,
             "gc":       _cmd_gc,
+            "health":   _cmd_health,
+            "backup":   _cmd_backup,
+            "repair":   _cmd_repair,
+            "maintenance": _cmd_maintenance,
         }
         handler = handlers.get(action)
         if not handler:
@@ -1937,6 +2058,170 @@ def _cmd_diagnostics(args: argparse.Namespace) -> int:
                 if a.suggested:
                     print(f"       → {a.label}")
         print()
+    return 0
+
+
+def _cmd_health(args: argparse.Namespace) -> int:
+    """Fleet-wide or per-board DB integrity + operational health."""
+    from hermes_cli import kanban_health as kh
+
+    if getattr(args, "all", False):
+        report = kh.fleet_health_report()
+    else:
+        board = getattr(args, "board", None)
+        report = kh.board_health_report(board)
+        report = {"boards": [report], "summary": {"total": 1, "healthy": 1 if report["healthy"] else 0, "degraded": 0 if report["healthy"] else 1}}
+
+    if getattr(args, "json", False):
+        print(json.dumps(report, indent=2, ensure_ascii=False))
+        return 0 if report["summary"]["degraded"] == 0 else 1
+
+    for b in report["boards"]:
+        slug = b["slug"]
+        db = b["db_path"]
+        healthy = b["healthy"]
+        status = "HEALTHY" if healthy else "DEGRADED"
+        print(f"Board: {slug}")
+        print(f"  DB: {db}")
+        print(f"  integrity_check: {b['integrity_check']}")
+        print(f"  foreign_key_check: {b['foreign_key_check']}")
+        wal = b.get("wal") or {}
+        shm = b.get("shm") or {}
+        if wal.get("present"):
+            print(f"  WAL: present ({wal.get('size_bytes', 0)} bytes)")
+        else:
+            print(f"  WAL: none")
+        if shm.get("present"):
+            print(f"  SHM: present ({shm.get('size_bytes', 0)} bytes)")
+        else:
+            print(f"  SHM: none")
+        tc = b.get("task_counts", {})
+        print(f"  tasks: {tc.get('total', 0)} total, {tc.get('running', 0)} running")
+        if b.get("maintenance_mode"):
+            print(f"  maintenance: ON")
+        print(f"  status: {status}")
+        print()
+    summary = report["summary"]
+    print(f"Summary: {summary['total']} boards, {summary['healthy']} healthy, {summary['degraded']} degraded")
+    return 0 if summary["degraded"] == 0 else 1
+
+
+def _cmd_backup(args: argparse.Namespace) -> int:
+    """SQLite-aware backup of one or all boards with manifest generation."""
+    from hermes_cli import kanban_health as kh
+
+    dest = getattr(args, "dest", None)
+    if dest is None:
+        dest = str(kb.kanban_home() / "backups")
+    label = getattr(args, "label", None)
+    manifest_only = getattr(args, "manifest_only", False)
+    force = getattr(args, "force", False)
+    use_json = getattr(args, "json", False)
+
+    boards: list[str] = []
+    if getattr(args, "all", False):
+        boards = [m["slug"] for m in kb.list_boards()]
+    else:
+        board = getattr(args, "board", None)
+        if board:
+            boards = [board]
+        else:
+            boards = [kb.get_current_board()]
+
+    results: list[dict] = []
+    exit_code = 0
+    for slug in boards:
+        try:
+            out_path = kh.backup_board(
+                slug,
+                dest_dir=Path(dest),
+                label=label,
+                manifest_only=manifest_only,
+                force=force,
+            )
+            results.append({"board": slug, "path": str(out_path), "error": None})
+        except kb.KanbanDbCorruptError as exc:
+            results.append({"board": slug, "path": None, "error": str(exc)})
+            exit_code = 1
+        except Exception as exc:
+            results.append({"board": slug, "path": None, "error": str(exc)})
+            exit_code = 2
+
+    if use_json:
+        print(json.dumps(results, indent=2, ensure_ascii=False))
+    else:
+        for r in results:
+            slug = r["board"]
+            if r["error"]:
+                print(f"{slug}: FAILED — {r['error']}")
+            else:
+                print(f"{slug}: backed up to {r['path']}")
+    return exit_code
+
+
+def _cmd_repair(args: argparse.Namespace) -> int:
+    """Dispatch repair subcommands."""
+    from hermes_cli import kanban_health as kh
+
+    sub = getattr(args, "repair_action", None)
+    if not sub:
+        print("kanban repair: subcommand required (create-candidate, approve-swap, list-candidates)", file=sys.stderr)
+        return 2
+
+    if sub == "create-candidate":
+        board = args.board
+        from_backup = Path(args.from_backup) if getattr(args, "from_backup", None) else None
+        reason = getattr(args, "reason", "")
+        manifest_path = kh.create_repair_candidate(board, from_backup=from_backup, reason=reason)
+        print(manifest_path)
+        return 0
+
+    if sub == "approve-swap":
+        board = args.board
+        candidate = Path(args.candidate)
+        yes_flag = getattr(args, "yes_flag", False)
+        force = getattr(args, "force", False)
+        if not yes_flag and not force:
+            print("kanban repair approve-swap: requires --yes-i-have-read-the-manifest", file=sys.stderr)
+            return 2
+        receipt = kh.approve_swap_board(board, candidate_manifest_path=candidate, yes_flag=yes_flag, force=force)
+        print(json.dumps(receipt, indent=2, ensure_ascii=False))
+        return 0
+
+    if sub == "list-candidates":
+        # Simple glob under temp for candidates matching this board
+        import tempfile
+        board = args.board
+        candidates = []
+        tmp = Path(tempfile.gettempdir())
+        for d in tmp.glob(f"hermes-repair-{board}-*"):
+            manifest = d / "repair-candidate.json"
+            if manifest.exists():
+                candidates.append(str(manifest))
+        if getattr(args, "json", False):
+            print(json.dumps(candidates, indent=2, ensure_ascii=False))
+        else:
+            if candidates:
+                for c in candidates:
+                    print(c)
+            else:
+                print(f"No repair candidates found for board {board}.")
+        return 0
+
+    print(f"kanban repair: unknown subcommand {sub!r}", file=sys.stderr)
+    return 2
+
+
+def _cmd_maintenance(args: argparse.Namespace) -> int:
+    """Toggle maintenance mode on a board."""
+    from hermes_cli import kanban_health as kh
+
+    board = args.board
+    state = args.state
+    reason = getattr(args, "reason", "")
+    enabled = state == "on"
+    kh.set_maintenance_mode(board, enabled, reason=reason)
+    print(f"Maintenance mode {'enabled' if enabled else 'disabled'} for board {board}")
     return 0
 
 
