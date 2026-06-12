@@ -35,6 +35,8 @@ def _make_args(**kwargs):
         "deliver_chat_id": "",
         "secret": "",
         "payload": "",
+        "deliver_only": False,
+        "action": "",
     }
     defaults.update(kwargs)
     return Namespace(**defaults)
@@ -88,6 +90,42 @@ class TestSubscribe:
         webhook_command(_make_args(webhook_action="subscribe", name="bad name!"))
         out = capsys.readouterr().out
         assert "Error" in out or "Invalid" in out
+        assert _load_subscriptions() == {}
+
+    def test_deterministic_action_subscription(self, capsys):
+        webhook_command(_make_args(
+            webhook_action="subscribe",
+            name="attention-links",
+            action="kanban-intake-links",
+            description="Ingest links into Attention Intake",
+        ))
+        out = capsys.readouterr().out
+        assert "deterministic action" in out
+        subs = _load_subscriptions()
+        route = subs["attention-links"]
+        assert route["action"] == "kanban_intake_links"
+        assert route["deliver"] == "log"
+
+    def test_unknown_action_rejected(self, capsys):
+        webhook_command(_make_args(
+            webhook_action="subscribe",
+            name="bad-action",
+            action="does-not-exist",
+        ))
+        out = capsys.readouterr().out
+        assert "Unknown --action" in out
+        assert _load_subscriptions() == {}
+
+    def test_action_and_deliver_only_rejected(self, capsys):
+        webhook_command(_make_args(
+            webhook_action="subscribe",
+            name="conflict",
+            action="kanban_intake_links",
+            deliver="telegram",
+            deliver_only=True,
+        ))
+        out = capsys.readouterr().out
+        assert "mutually exclusive" in out
         assert _load_subscriptions() == {}
 
 
