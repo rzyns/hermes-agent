@@ -138,20 +138,22 @@ def _fill_missing_type(node: Dict[str, Any]) -> Dict[str, Any]:
 
     Standard JSON Schema allows ``type`` to be an array such as
     ``["string", "null"]``. Moonshot's flavored schema does not accept that
-    shape in tool parameters, and the previous membership check also crashed
-    because lists are unhashable. Collapse nullable/union types to the first
-    non-null scalar so the rest of the Moonshot repairs can continue.
+    shape in tool parameters, and a naive membership check also crashes because
+    lists are unhashable. Collapse nullable/union type arrays to the first
+    non-null concrete type. If the array contains no usable concrete type, fall
+    through to the existing heuristic inference rather than blindly preserving a
+    null-only/empty union.
     """
     if "type" in node:
         node_type = node["type"]
         if isinstance(node_type, list):
-            scalar_types = [
+            concrete_types = [
                 t for t in node_type
                 if isinstance(t, str) and t not in {"", "null"}
             ]
-            if scalar_types:
-                return {**node, "type": scalar_types[0]}
-            # No usable scalar type remains; fall through to heuristic inference.
+            if concrete_types:
+                return {**node, "type": concrete_types[0]}
+            # No usable concrete type remains; fall through to heuristic inference.
         elif node_type not in {None, ""}:
             return node
 

@@ -372,6 +372,7 @@ def _make_adapter():
         extra={
             "homeserver": "https://matrix.example.org",
             "user_id": "@bot:example.org",
+            "allowed_rooms": [],
         },
     )
     adapter = MatrixAdapter(config)
@@ -1089,6 +1090,24 @@ class TestMatrixMarkdownToHtml:
         assert "<pre>" in result
         assert "<code" in result
         assert "print" in result
+
+    def test_matrix_markdown_preserves_table_structure(self):
+        table = "\n".join(
+            [
+                "| Item | Quantity |",
+                "| --- | --- |",
+                "| Apples | 4 |",
+                "| Bread | 1 |",
+            ]
+        )
+
+        result = self.adapter._markdown_to_html(table)
+
+        assert "<table>" in result
+        assert "<thead>" in result
+        assert "<tbody>" in result
+        assert "<th>Item</th>" in result
+        assert "<td>Apples</td>" in result
 
 
 # ---------------------------------------------------------------------------
@@ -3940,6 +3959,7 @@ class TestMatrixRequireMention:
             extra={
                 "homeserver": "https://matrix.example.org",
                 "user_id": "@bot:example.org",
+                "allowed_rooms": [],
                 "require_mention": False,
             },
         )
