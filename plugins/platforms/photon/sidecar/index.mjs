@@ -170,7 +170,12 @@ function phoneTargetFromSpaceId(spaceId) {
 
 function rememberInboundSpace(space, message) {
   const msgSpace = message?.space || {};
-  const ids = [space?.id, msgSpace.id];
+  const sender = message?.sender || {};
+  // Photon/Spectrum can surface DM spaces with opaque ids while carrying the
+  // recipient/sender address separately as `space.phone` or `sender.id`. Cache
+  // under every stable id/address we see so post-inbound sends can reuse the
+  // warm space instead of falling back to a cold provider resolution.
+  const ids = [space?.id, msgSpace.id, space?.phone, msgSpace.phone, sender.id];
   for (const id of ids) {
     rememberKnownSpace(id, space);
     const phone = phoneTargetFromSpaceId(id);
@@ -445,27 +450,38 @@ async function resolveSpace(spaceId) {
   // A bare E.164 phone number addresses a DM, so callers can pass just
   // "+1..." (e.g. PHOTON_HOME_CHANNEL for cron delivery) instead of an opaque
   // inbound space id. Photon also represents DM chat ids as `any;-;+1...`;
-  // normalize those through the same path. `space.create` accepts the raw
-  // phone string directly.
+  // normalize those through the same path. spectrum-ts has shipped both
+  // `im.space.create(target)` and function-style `im.space(target)` APIs;
+  // support both so a pinned SDK/runtime mismatch does not turn cold outbound
+  // sends into generic HTTP 500s.
   if (phoneTarget) {
     try {
-      space = await im.space.create(phoneTarget);
+      if (typeof im.space?.create === "function") {
+        space = await im.space.create(phoneTarget);
+      } else if (typeof im.space === "function") {
+        space = await im.space(phoneTarget);
+      }
     } catch (e) {
       console.error(
-        "photon-sidecar: phone->DM space.create failed: " +
+        "photon-sidecar: phone->DM space resolution failed: " +
           (e && e.stack ? e.stack : String(e))
       );
     }
   }
   // Anything else — typically an opaque group GUID — is rehydrated from the
-  // persisted id via `space.get`, so group spaces stay reachable after a
-  // sidecar restart even before any fresh inbound message in that group.
+  // persisted id via `space.get` where the SDK exposes it. Current spectrum-ts
+  // also accepts function-style refs for already-shaped spaces; DMs are handled
+  // above because a raw phone target is unambiguous.
   if (!space) {
     try {
-      space = await im.space.get(spaceId);
+      if (typeof im.space?.get === "function") {
+        space = await im.space.get(spaceId);
+      } else if (typeof im.space === "function" && phoneTarget) {
+        space = await im.space(phoneTarget);
+      }
     } catch (e) {
       console.error(
-        "photon-sidecar: space.get failed: " +
+        "photon-sidecar: space rehydrate failed: " +
           (e && e.stack ? e.stack : String(e))
       );
     }
@@ -475,6 +491,7 @@ async function resolveSpace(spaceId) {
   rememberKnownSpace(spaceId, space);
   if (phoneTarget) rememberKnownSpace(phoneTarget, space);
   rememberKnownSpace(space?.id, space);
+  rememberKnownSpace(space?.phone, space);
   return space;
 }
 
