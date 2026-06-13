@@ -74,6 +74,7 @@ from acp_adapter.permissions import make_approval_callback
 from acp_adapter.provenance import session_provenance_meta
 from acp_adapter.session import SessionManager, SessionState, _expand_acp_enabled_toolsets
 from acp_adapter.tools import build_tool_complete, build_tool_start
+from acp_adapter import filesystem as acp_filesystem
 
 logger = logging.getLogger(__name__)
 
@@ -518,6 +519,7 @@ class HermesACPAgent(acp.Agent):
         super().__init__()
         self.session_manager = session_manager or SessionManager()
         self._conn: Optional[acp.Client] = None
+        self._client_capabilities: ClientCapabilities | None = None
 
     # ---- Connection lifecycle -----------------------------------------------
 
@@ -564,6 +566,16 @@ class HermesACPAgent(acp.Agent):
         mode = str(getattr(state, "mode", "") or self._MODE_DEFAULT)
         policy = self._MODE_TO_EDIT_APPROVAL_POLICY.get(mode, self._EDIT_APPROVAL_POLICY_DEFAULT)
         return policy, state.cwd
+
+    def client_supports_fs_read(self) -> bool:
+        """Return whether the connected ACP client advertised text-file reads."""
+
+        return acp_filesystem.supports_read(self._client_capabilities)
+
+    def client_supports_fs_write(self) -> bool:
+        """Return whether the connected ACP client advertised text-file writes."""
+
+        return acp_filesystem.supports_write(self._client_capabilities)
 
     @staticmethod
     def _encode_model_choice(provider: str | None, model: str | None) -> str:
@@ -876,6 +888,7 @@ class HermesACPAgent(acp.Agent):
             client_name,
             resolved_protocol_version,
         )
+        self._client_capabilities = client_capabilities
 
         return InitializeResponse(
             protocol_version=acp.PROTOCOL_VERSION,
@@ -1502,12 +1515,27 @@ class HermesACPAgent(acp.Agent):
             previous_session_id = os.environ.get("HERMES_SESSION_ID")
             os.environ["HERMES_SESSION_ID"] = session_id
             try:
-                result = agent.run_conversation(
-                    user_message=user_content,
-                    conversation_history=state.history,
-                    task_id=session_id,
-                    persist_user_message=user_text or "[Image attachment]",
-                )
+                if conn and self._client_capabilities:
+                    with acp_filesystem.use_acp_filesystem(
+                        client=conn,
+                        session_id=session_id,
+                        loop=loop,
+                        cwd=getattr(state, "cwd", None),
+                        capabilities=self._client_capabilities,
+                    ):
+                        result = agent.run_conversation(
+                            user_message=user_content,
+                            conversation_history=state.history,
+                            task_id=session_id,
+                            persist_user_message=user_text or "[Image attachment]",
+                        )
+                else:
+                    result = agent.run_conversation(
+                        user_message=user_content,
+                        conversation_history=state.history,
+                        task_id=session_id,
+                        persist_user_message=user_text or "[Image attachment]",
+                    )
                 return result
             except Exception as e:
                 logger.exception("Agent error in session %s", session_id)

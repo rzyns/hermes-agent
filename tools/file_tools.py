@@ -18,6 +18,11 @@ from tools.file_operations import (
 from tools import file_state
 from agent.redact import redact_sensitive_text
 
+try:
+    from acp_adapter import filesystem as acp_filesystem
+except Exception:  # pragma: no cover - ACP extra may be unavailable in non-ACP installs
+    acp_filesystem = None  # type: ignore[assignment]
+
 logger = logging.getLogger(__name__)
 
 
@@ -148,10 +153,14 @@ def _authoritative_workspace_root(task_id: str = "default") -> str | None:
     """Best-effort absolute workspace root for divergence checks.
 
     Prefers the live terminal cwd (the directory the agent is actually working
-    in). When no terminal command has run yet — so the live registry is empty —
-    falls back to a sentinel-free absolute ``$TERMINAL_CWD``. This is what lets
-    a worktree session warn about (and resolve into) the worktree from the very
-    first ``write_file``/``patch``, before any ``cd`` has populated the live cwd.
+    in). In ACP sessions, falls back to the editor/session cwd before the
+    process-level ``$TERMINAL_CWD`` so file tools, ACP dirty-buffer calls, and
+    staleness bookkeeping share one path identity even before any terminal
+    command has populated the live cwd registry. When no terminal command has
+    run yet — so the live registry is empty — falls back to a sentinel-free
+    absolute ``$TERMINAL_CWD``. This is what lets a worktree session warn about
+    (and resolve into) the worktree from the very first ``write_file``/``patch``,
+    before any ``cd`` has populated the live cwd.
 
     Returns ``None`` only when there is genuinely no reliable anchor, in which
     case callers fall back to the process cwd.
@@ -159,6 +168,16 @@ def _authoritative_workspace_root(task_id: str = "default") -> str | None:
     live = _get_live_tracking_cwd(task_id)
     if live:
         return live
+    if acp_filesystem:
+        try:
+            ctx = acp_filesystem.current_context()
+            acp_cwd = getattr(ctx, "cwd", None) if ctx else None
+            if acp_cwd:
+                acp_root = Path(str(acp_cwd)).expanduser()
+                if acp_root.is_absolute():
+                    return str(acp_root)
+        except Exception:
+            pass
     return _configured_terminal_cwd()
 
 
@@ -787,6 +806,7 @@ def read_file_tool(path: str, offset: int = 1, limit: int = 500, task_id: str = 
         # file hasn't been modified since, return a lightweight stub
         # instead of re-sending the same content.  Saves context tokens.
         resolved_str = str(_resolved)
+        acp_read_active = bool(acp_filesystem and acp_filesystem.acp_read_active())
         dedup_key = (resolved_str, offset, limit)
         with _read_tracker_lock:
             task_data = _read_tracker.setdefault(task_id, {
@@ -803,7 +823,7 @@ def read_file_tool(path: str, offset: int = 1, limit: int = 500, task_id: str = 
                 task_data["read_timestamps"] = {}
             cached_mtime = task_data.get("dedup", {}).get(dedup_key)
 
-        if cached_mtime is not None:
+        if cached_mtime is not None and not acp_read_active:
             try:
                 current_mtime = os.path.getmtime(resolved_str)
                 if current_mtime == cached_mtime:
@@ -843,8 +863,13 @@ def read_file_tool(path: str, offset: int = 1, limit: int = 500, task_id: str = 
                 pass  # stat failed — fall through to full read
 
         # ── Perform the read ──────────────────────────────────────────
-        file_ops = _get_file_ops(task_id)
-        result = file_ops.read_file(path, offset, limit)
+        # In ACP editor sessions, prefer the client's filesystem so reads see
+        # unsaved/dirty editor buffers. Non-ACP sessions and ACP clients that
+        # did not advertise fs/read_text_file fall back unchanged.
+        result = acp_filesystem.read_text_file(resolved_str, offset, limit) if acp_filesystem else None
+        if result is None:
+            file_ops = _get_file_ops(task_id)
+            result = file_ops.read_file(path, offset, limit)
         result_dict = result.to_dict()
 
         # ── Character-count guard ─────────────────────────────────────
@@ -1126,8 +1151,10 @@ def write_file_tool(path: str, content: str, task_id: str = "default",
 
         if _resolved is None:
             stale_warning = _check_file_staleness(path, task_id)
-            file_ops = _get_file_ops(task_id)
-            result = file_ops.write_file(path, content)
+            result = acp_filesystem.write_text_file(path, content) if acp_filesystem else None
+            if result is None:
+                file_ops = _get_file_ops(task_id)
+                result = file_ops.write_file(path, content)
             result_dict = result.to_dict()
             if stale_warning:
                 result_dict["_warning"] = stale_warning
@@ -1145,8 +1172,10 @@ def write_file_tool(path: str, content: str, task_id: str = "default",
             # Workspace-divergence warning: relative path resolving outside the
             # terminal's cwd (the worktree-cwd bug). Lowest priority of the three.
             cwd_warning = _path_resolution_warning(path, Path(_resolved), task_id)
-            file_ops = _get_file_ops(task_id)
-            result = file_ops.write_file(_resolved, content)
+            result = acp_filesystem.write_text_file(_resolved, content) if acp_filesystem else None
+            if result is None:
+                file_ops = _get_file_ops(task_id)
+                result = file_ops.write_file(_resolved, content)
             result_dict = result.to_dict()
             effective_warning = cross_warning or stale_warning or cwd_warning
             if effective_warning:
@@ -1169,6 +1198,39 @@ def write_file_tool(path: str, content: str, task_id: str = "default",
         else:
             logger.error("write_file error: %s: %s", type(e).__name__, e, exc_info=True)
         return tool_error(str(e))
+
+
+def _rewrite_v4a_patch_paths(
+    patch: str,
+    resolved_paths: dict[str, str | None],
+) -> str:
+    """Rewrite V4A file headers to the paths already resolved by file_tools.
+
+    ACP patch attempts and local fallback must target the same file identity as
+    the sensitive-path checks, staleness warnings, and file-state locks. When an
+    ACP resource miss makes us fall back to the local V4A patcher, feeding the
+    original relative headers back into the shell layer could route the fallback
+    through a different cwd. Rewrite known headers to their absolute resolved
+    paths first.
+    """
+    if not resolved_paths:
+        return patch
+
+    import re as _re
+
+    def replace_file_header(match: _re.Match[str]) -> str:
+        raw_path = match.group(2).strip()
+        resolved = resolved_paths.get(raw_path)
+        if not resolved:
+            return match.group(0)
+        return f"{match.group(1)}{resolved}"
+
+    return _re.sub(
+        r"^(\*\*\*\s+(?:Update|Add|Delete)\s+File:\s*)(.+)$",
+        replace_file_header,
+        patch,
+        flags=_re.MULTILINE,
+    )
 
 
 def patch_tool(mode: str = "replace", path: str = None, old_string: str = None,
@@ -1239,7 +1301,7 @@ def patch_tool(mode: str = "replace", path: str = None, old_string: str = None,
             # Collect warnings — cross-agent registry first (names sibling),
             # then per-task tracker as a fallback.
             stale_warnings: list[str] = []
-            _path_to_resolved: dict[str, str] = {}
+            _path_to_resolved: dict[str, str | None] = {}
             for _p in _paths_to_check:
                 try:
                     _r = str(_resolve_path_for_task(_p, task_id))
@@ -1266,13 +1328,26 @@ def patch_tool(mode: str = "replace", path: str = None, old_string: str = None,
                 # operates on the exact file the tool layer resolved — the
                 # shell's own cwd may differ (worktree-cwd bug), and a relative
                 # path would let the two layers disagree about which file is
-                # being edited.
+                # being edited. Use the same resolved path for ACP replace-mode
+                # patches so dirty-buffer edits and local fallback target the
+                # same file identity.
                 _replace_target = _path_to_resolved.get(path) or path
-                result = file_ops.patch_replace(_replace_target, old_string, new_string, replace_all)
+                result = acp_filesystem.patch_replace(
+                    _replace_target, old_string, new_string, replace_all
+                ) if acp_filesystem else None
+                if result is None:
+                    result = file_ops.patch_replace(
+                        _replace_target, old_string, new_string, replace_all
+                    )
             elif mode == "patch":
                 if not patch:
                     return tool_error("patch content required")
-                result = file_ops.patch_v4a(patch)
+                resolved_patch = _rewrite_v4a_patch_paths(patch, _path_to_resolved)
+                result = acp_filesystem.patch_v4a(
+                    patch, _path_to_resolved
+                ) if acp_filesystem else None
+                if result is None:
+                    result = file_ops.patch_v4a(resolved_patch)
             else:
                 return tool_error(f"Unknown mode: {mode}")
 
