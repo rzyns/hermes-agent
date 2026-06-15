@@ -101,6 +101,23 @@ def _resolve_path(filepath: str, task_id: str = "default") -> Path:
 _TERMINAL_CWD_SENTINELS = frozenset({"", ".", "./", "auto", "cwd"})
 
 
+def _sentinel_free_abs_cwd(raw: str | None) -> str | None:
+    """Normalize a cwd candidate to an absolute, sentinel-free anchor.
+
+    Returns the expanded path only when *raw* is non-empty, not a sentinel (see
+    ``_TERMINAL_CWD_SENTINELS``), and absolute. A relative anchor is meaningless
+    without knowing which cwd it is relative to — exactly the ambiguity that
+    misroutes worktree edits — so relative/sentinel/empty values yield ``None``.
+    """
+    raw = str(raw or "").strip()
+    if raw.lower() in _TERMINAL_CWD_SENTINELS:
+        return None
+    expanded = os.path.expanduser(raw)
+    if not os.path.isabs(expanded):
+        return None
+    return expanded
+
+
 def _configured_terminal_cwd() -> str | None:
     """Return ``$TERMINAL_CWD`` only when it names a real directory anchor.
 
@@ -109,13 +126,26 @@ def _configured_terminal_cwd() -> str | None:
     relative to, which is exactly the ambiguity that misroutes worktree edits.
     Only an absolute, sentinel-free value is honored.
     """
-    raw = (os.environ.get("TERMINAL_CWD") or "").strip()
-    if raw.lower() in _TERMINAL_CWD_SENTINELS:
+    return _sentinel_free_abs_cwd(os.environ.get("TERMINAL_CWD"))
+
+
+def _registered_task_cwd_override(task_id: str = "default") -> str | None:
+    """Return a registered cwd override for the raw task id, when available.
+
+    ``terminal_tool`` intentionally collapses CWD-only task overrides to the
+    shared ``"default"`` environment so TUI/dashboard/ACP sessions do not spin
+    up isolated sandboxes just because they have different workspaces. The cwd
+    value itself is still keyed by the raw session/task id, so file tools must
+    read that raw override before falling back to the collapsed container key.
+    """
+    try:
+        from tools.terminal_tool import resolve_task_overrides
+
+        overrides = resolve_task_overrides(task_id)
+    except Exception:
         return None
-    expanded = os.path.expanduser(raw)
-    if not os.path.isabs(expanded):
-        return None
-    return expanded
+
+    return _sentinel_free_abs_cwd(overrides.get("cwd"))
 
 
 def _get_live_tracking_cwd(task_id: str = "default") -> str | None:
@@ -153,14 +183,14 @@ def _authoritative_workspace_root(task_id: str = "default") -> str | None:
     """Best-effort absolute workspace root for divergence checks.
 
     Prefers the live terminal cwd (the directory the agent is actually working
-    in). In ACP sessions, falls back to the editor/session cwd before the
-    process-level ``$TERMINAL_CWD`` so file tools, ACP dirty-buffer calls, and
-    staleness bookkeeping share one path identity even before any terminal
-    command has populated the live cwd registry. When no terminal command has
-    run yet — so the live registry is empty — falls back to a sentinel-free
-    absolute ``$TERMINAL_CWD``. This is what lets a worktree session warn about
-    (and resolve into) the worktree from the very first ``write_file``/``patch``,
-    before any ``cd`` has populated the live cwd.
+    in). When no terminal command has run yet — so the live registry is empty —
+    falls back to a registered task/session cwd override (TUI/Desktop/ACP
+    sessions register a raw-keyed cwd before any tool runs), then to the active
+    ACP editor/session cwd if the filesystem bridge has context but no task
+    override, then to a sentinel-free absolute ``$TERMINAL_CWD``. This is what
+    lets a worktree, Desktop, or ACP session warn about (and resolve into) its
+    workspace from the very first ``write_file``/``patch``, before any ``cd`` has
+    populated the live cwd.
 
     Returns ``None`` only when there is genuinely no reliable anchor, in which
     case callers fall back to the process cwd.
@@ -168,6 +198,9 @@ def _authoritative_workspace_root(task_id: str = "default") -> str | None:
     live = _get_live_tracking_cwd(task_id)
     if live:
         return live
+    registered = _registered_task_cwd_override(task_id)
+    if registered:
+        return registered
     if acp_filesystem:
         try:
             ctx = acp_filesystem.current_context()
@@ -187,10 +220,12 @@ def _resolve_base_dir(task_id: str = "default") -> Path:
     Resolution order:
       1. The task's live terminal cwd (the directory the agent is actually
          working in — e.g. a git worktree). Authoritative when known.
-      2. A sentinel-free, absolute ``$TERMINAL_CWD`` (the worktree path set by
+      2. A registered task/session cwd override (TUI/Desktop/ACP sessions
+         register a raw-keyed workspace cwd before any terminal command runs).
+      3. A sentinel-free, absolute ``$TERMINAL_CWD`` (the worktree path set by
          ``cli.py``/``main.py`` for ``-w`` sessions). Used even before any
          terminal command has populated the live cwd registry.
-      3. The process cwd.
+      4. The process cwd.
 
     The returned base is ALWAYS absolute. This is the core invariant that
     prevents the worktree-cwd divergence bug: a relative or sentinel
@@ -237,9 +272,10 @@ def _path_resolution_warning(filepath: str, resolved: Path, task_id: str = "defa
     target. ``None`` when the path is absolute, the base is unknown, or the
     resolved path is correctly under the workspace root.
 
-    The workspace root is the live terminal cwd when known, else a sentinel-free
-    absolute ``$TERMINAL_CWD`` — so a worktree session whose terminal registry
-    is still empty (no ``cd`` run yet) is warned on the very first write.
+    The workspace root is the live terminal cwd when known, else a registered
+    task/session cwd override, else a sentinel-free absolute ``$TERMINAL_CWD``
+    — so a worktree or Desktop session whose terminal registry is still empty
+    (no ``cd`` run yet) is warned on the very first write.
     """
     try:
         if Path(filepath).expanduser().is_absolute():
@@ -644,7 +680,8 @@ def _get_file_ops(task_id: str = "default") -> ShellFileOperations:
     )
     import time
 
-    task_id = _resolve_container_task_id(task_id)
+    raw_task_id = task_id or "default"
+    task_id = _resolve_container_task_id(raw_task_id)
 
     # Fast path: check cache -- but also verify the underlying environment
     # is still alive (it may have been killed by the cleanup thread).
@@ -677,11 +714,11 @@ def _get_file_ops(task_id: str = "default") -> ShellFileOperations:
                 terminal_env = None
 
         if terminal_env is None:
-            from tools.terminal_tool import _task_env_overrides
+            from tools.terminal_tool import resolve_task_overrides
 
             config = _get_env_config()
             env_type = config["env_type"]
-            overrides = _task_env_overrides.get(task_id, {})
+            overrides = resolve_task_overrides(raw_task_id)
 
             if env_type == "docker":
                 image = overrides.get("docker_image") or config["docker_image"]
