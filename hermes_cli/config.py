@@ -377,7 +377,7 @@ def detect_install_method(project_root: Optional[Path] = None) -> str:
        backward compatibility, but a ``docker`` value is IGNORED when we are
        not actually running inside a container (see below).
     3. HERMES_MANAGED env / .managed marker (NixOS, Homebrew)
-    4. .git directory presence -> 'git'
+    4. .git path presence (directory or worktree file) -> 'git'
     5. Fallback -> 'pip'
 
     Why the stamp is code-scoped, not home-scoped (issue: shared ``~/.hermes``)
@@ -439,7 +439,7 @@ def detect_install_method(project_root: Optional[Path] = None) -> str:
     managed = get_managed_system()
     if managed:
         return managed.lower().replace(" ", "-")
-    if (root / ".git").is_dir():
+    if (root / ".git").exists():
         return "git"
     return "pip"
 
