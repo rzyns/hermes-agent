@@ -1084,6 +1084,13 @@ def update_task(task_id: str, payload: UpdateTaskBody, board: Optional[str] = Qu
         if task is None:
             raise HTTPException(status_code=404, detail=f"task {task_id} not found")
 
+        if payload.status == "ready" and task.status in ("blocked", "scheduled"):
+            # Validate authorization-bound unblock attempts before applying
+            # any other requested field changes. Dashboard PATCHes can bundle
+            # assignee + status; a refused unblock must not leave a partial
+            # assignment on materialize_only route targets.
+            _raise_materialize_only_route_guard(board, task_id)
+
         # --- assignee ----------------------------------------------------
         if payload.assignee is not None:
             try:

@@ -436,6 +436,52 @@ def test_dashboard_refuses_ready_for_materialize_only_route_target(client):
     assert after.status == "blocked"
 
 
+def test_dashboard_refuses_materialize_only_ready_before_partial_assignee_mutation(client):
+    kb.init_db(board="attention-intake")
+    kb.init_db(board="agent-research-intake")
+    conn = kb.connect(board="agent-research-intake")
+    try:
+        target_id = kb.create_task(conn, title="guarded route target", assignee=None)
+        assert kb.block_task(conn, target_id, reason="materialize_only route target")
+    finally:
+        conn.close()
+
+    home = Path(os.environ["HERMES_HOME"])
+    register = home / "artifacts" / "attention-intake" / "register.jsonl"
+    register.parent.mkdir(parents=True, exist_ok=True)
+    register.write_text(
+        json.dumps(
+            {
+                "event": "intake_link_assessed",
+                "source_task": "t_source",
+                "url": "https://example.test/paper",
+                "verdict": "route_elsewhere",
+                "routed_to_board": "agent-research-intake",
+                "routed_to_task": target_id,
+                "route_materialization": {"mode": "materialize_only"},
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    r = client.patch(
+        f"/api/plugins/kanban/tasks/{target_id}?board=agent-research-intake",
+        json={"status": "ready", "assignee": "orchestrator"},
+    )
+
+    assert r.status_code == 409
+    assert "materialize_only routed target" in r.json()["detail"]
+    conn = kb.connect(board="agent-research-intake")
+    try:
+        after = kb.get_task(conn, target_id)
+    finally:
+        conn.close()
+    assert after is not None
+    assert after.status == "blocked"
+    assert after.assignee is None
+
+
 def test_patch_schedule_then_unblock(client):
     t = client.post("/api/plugins/kanban/tasks", json={"title": "x"}).json()["task"]
     r = client.patch(
