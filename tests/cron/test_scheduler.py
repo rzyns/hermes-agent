@@ -536,6 +536,32 @@ class TestDeliverResultWrapping:
         assert "Here is today's summary." in sent_content
         assert "To stop or manage this job" in sent_content
 
+    def test_delivery_does_not_wrap_no_agent_script_output(self):
+        """no_agent script output is delivered verbatim, without cron header/footer."""
+        from gateway.config import Platform
+
+        pconfig = MagicMock()
+        pconfig.enabled = True
+        mock_cfg = MagicMock()
+        mock_cfg.platforms = {Platform.TELEGRAM: pconfig}
+
+        with patch("gateway.config.load_gateway_config", return_value=mock_cfg), \
+             patch("tools.send_message_tool._send_to_platform", new=AsyncMock(return_value={"success": True})) as send_mock:
+            job = {
+                "id": "watchdog-job",
+                "name": "intake-register-drift-watchdog",
+                "deliver": "origin",
+                "origin": {"platform": "telegram", "chat_id": "123"},
+                "no_agent": True,
+            }
+            _deliver_result(job, "Intake register drift detected: 10 alert-worthy errors")
+
+        send_mock.assert_called_once()
+        sent_content = send_mock.call_args.kwargs.get("content") or send_mock.call_args[0][-1]
+        assert sent_content == "Intake register drift detected: 10 alert-worthy errors"
+        assert "Cronjob Response" not in sent_content
+        assert "To stop or manage this job" not in sent_content
+
     def test_delivery_uses_job_id_when_no_name(self):
         """When a job has no name, the wrapper should fall back to job id."""
         from gateway.config import Platform

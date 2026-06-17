@@ -828,6 +828,13 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
     except Exception:
         pass
 
+    # no_agent jobs are script-only watchdogs/alerts. Their stdout is the
+    # exact user-facing payload by contract, so do not add the generic cron
+    # header/footer; on tight Discord limits the footer can otherwise become a
+    # useless standalone "(2/2)" message.
+    if job.get("no_agent"):
+        wrap_response = False
+
     if wrap_response:
         task_name = job.get("name", job["id"])
         job_id = job.get("id", "")
