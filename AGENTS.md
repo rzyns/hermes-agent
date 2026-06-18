@@ -1367,3 +1367,8 @@ not the specific names.
 
 Reviewers should reject new change-detector tests; authors should convert
 them into invariants before re-requesting review.
+
+
+<!-- gbrain:retrieval-reflex:resolver-rows -->
+- retrieval-reflex | a named person/company/project/place becomes the subject; a brain-page pointer appears in context; "who is", "what do we know about", "tell me about"; about to assert a non-trivial detail about a named entity
+<!-- /gbrain:retrieval-reflex:resolver-rows -->
