@@ -1845,7 +1845,52 @@ class SessionDB:
 
         return cleaned
 
-    def _validate_title_unique(self, conn, session_id: str, title: str) -> None:
+    def _is_compression_ancestor(
+        self, conn, *, ancestor_id: str, descendant_id: str
+    ) -> bool:
+        """Return True if *ancestor_id* is a compression predecessor of
+        *descendant_id* (walking parent links up the continuation chain).
+
+        The continuation edge is the canonical one shared with
+        :func:`_ephemeral_child_sql` / :meth:`set_session_archived`
+        (``_COMPRESSION_CHILD_SQL``): a parent → child edge counts only when the
+        parent ended with ``end_reason = 'compression'`` and the child started
+        at or after the parent's ``ended_at``, which distinguishes continuations
+        from delegate subagents / branch children that also carry a
+        ``parent_session_id``. Expressed as a single recursive CTE rather than a
+        per-hop Python walk so the edge definition lives in exactly one place.
+        """
+        if not ancestor_id or not descendant_id or ancestor_id == descendant_id:
+            return False
+        # Walk parent links up from the descendant, following only compression
+        # continuation edges, and check whether ancestor_id is reached.
+        edge = _COMPRESSION_CHILD_SQL.format(a="child")
+        row = conn.execute(
+            f"""
+            WITH RECURSIVE ancestors(id) AS (
+                SELECT ?
+                UNION
+                SELECT parent.id
+                FROM ancestors a
+                JOIN sessions child ON child.id = a.id
+                JOIN sessions parent ON parent.id = child.parent_session_id
+                WHERE {edge}
+            )
+            SELECT 1 FROM ancestors WHERE id = ? AND id != ? LIMIT 1
+            """,
+            (descendant_id, ancestor_id, descendant_id),
+        ).fetchone()
+        return row is not None
+
+    def _validate_title_unique(
+        self,
+        conn,
+        session_id: str,
+        title: str,
+        *,
+        allow_compression_ancestor_transfer: bool = False,
+        title_updated_at: Optional[float] = None,
+    ) -> None:
         if not title:
             return
         cursor = conn.execute(
@@ -1853,10 +1898,25 @@ class SessionDB:
             (title, session_id),
         )
         conflict = cursor.fetchone()
-        if conflict:
-            raise ValueError(
-                f"Title '{title}' is already in use by session {conflict['id']}"
+        if not conflict:
+            return
+        conflict_id = conflict["id"]
+        if allow_compression_ancestor_transfer and self._is_compression_ancestor(
+            conn, ancestor_id=conflict_id, descendant_id=session_id
+        ):
+            if title_updated_at is None:
+                title_updated_at = time.time()
+            conn.execute(
+                """UPDATE sessions
+                   SET title = NULL,
+                       title_source = NULL,
+                       title_updated_at = ?,
+                       title_revision_count = COALESCE(title_revision_count, 0) + 1
+                   WHERE id = ?""",
+                (title_updated_at, conflict_id),
             )
+            return
+        raise ValueError(f"Title '{title}' is already in use by session {conflict_id}")
 
     def set_session_title(
         self,
@@ -1886,7 +1946,13 @@ class SessionDB:
         now = time.time()
 
         def _do(conn):
-            self._validate_title_unique(conn, session_id, title)
+            self._validate_title_unique(
+                conn,
+                session_id,
+                title,
+                allow_compression_ancestor_transfer=True,
+                title_updated_at=now,
+            )
             cursor = conn.execute(
                 """UPDATE sessions
                    SET title = ?,
