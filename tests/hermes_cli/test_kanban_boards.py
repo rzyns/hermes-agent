@@ -176,6 +176,15 @@ class TestCurrentBoard:
         assert not kb.board_exists("ghost")
         assert [b["slug"] for b in kb.list_boards()] == ["default"]
 
+    def test_empty_db_only_board_dir_does_not_count_as_existing(self, fresh_home):
+        """Lazy-init/probe DBs with no metadata and no tasks are not boards."""
+        kb.init_db(board="empty-probe")
+
+        assert (kb.board_dir("empty-probe") / "kanban.db").exists()
+        assert not (kb.board_dir("empty-probe") / "board.json").exists()
+        assert not kb.board_exists("empty-probe")
+        assert [b["slug"] for b in kb.list_boards()] == ["default"]
+
     def test_env_beats_file(self, fresh_home, monkeypatch):
         kb.create_board("a")
         kb.create_board("b")
@@ -218,6 +227,16 @@ class TestBoardCRUD:
         kb.create_board("foo", name="Foo Board", description="test")
         slugs = [b["slug"] for b in kb.list_boards()]
         assert slugs == ["default", "foo"]
+
+    def test_db_only_board_with_tasks_still_lists(self, fresh_home):
+        """Legacy DB-only boards with task rows still get synthesized metadata."""
+        with kb.connect(board="legacy-db-only") as conn:
+            kb.create_task(conn, title="legacy task")
+
+        assert not (kb.board_dir("legacy-db-only") / "board.json").exists()
+        assert kb.board_exists("legacy-db-only")
+        slugs = [b["slug"] for b in kb.list_boards()]
+        assert slugs == ["default", "legacy-db-only"]
 
     def test_create_is_idempotent(self, fresh_home):
         kb.create_board("bar")

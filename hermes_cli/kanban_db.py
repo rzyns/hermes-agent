@@ -445,18 +445,44 @@ def board_dir(board: Optional[str] = None) -> Path:
     return boards_root() / slug
 
 
+def _db_only_board_should_be_visible(db_path: Path) -> bool:
+    """Return whether a metadata-less board DB should be surfaced.
+
+    Lazy probes can materialize an otherwise-empty ``kanban.db`` under a
+    directory that is not actually a Kanban board.  Treat clean, readable
+    zero-task DB-only directories as orphans, but keep DB-only directories
+    that contain tasks for legacy/back-compat installs.
+
+    If the DB cannot be inspected, keep it visible so health/degraded-board
+    surfaces can report the problem instead of silently hiding possible data.
+    """
+    try:
+        uri = db_path.expanduser().resolve().as_uri() + "?mode=ro"
+        with contextlib.closing(sqlite3.connect(uri, uri=True)) as conn:
+            row = conn.execute("SELECT COUNT(*) FROM tasks").fetchone()
+            return bool(row and int(row[0] or 0) > 0)
+    except (OSError, sqlite3.Error, ValueError):
+        return True
+
+
 def board_exists(board: Optional[str] = None) -> bool:
-    """Return True if the board has persisted metadata or a DB on disk.
+    """Return True if the board has metadata or non-empty DB state.
 
     ``default`` is considered to always exist — its DB is created
     on first :func:`connect` and there's no way for it to be missing
     in a configuration where the kanban feature is usable at all.
+
+    Non-default directories with only a clean zero-task ``kanban.db`` and no
+    ``board.json`` are treated as lazy-init/probe orphans, not live boards.
     """
     slug = _normalize_board_slug(board) or DEFAULT_BOARD
     if slug == DEFAULT_BOARD:
         return True
     d = board_dir(slug)
-    return (d / "board.json").exists() or (d / "kanban.db").exists()
+    if (d / "board.json").exists():
+        return True
+    db_path = d / "kanban.db"
+    return db_path.exists() and _db_only_board_should_be_visible(db_path)
 
 
 def kanban_db_path(board: Optional[str] = None) -> Path:
@@ -775,7 +801,10 @@ def list_boards(*, include_archived: bool = True) -> list[dict]:
     Always includes ``default`` (even when the ``boards/default/``
     metadata dir doesn't exist, because its DB is at the legacy path).
     Other boards are discovered by scanning ``boards/`` for subdirectories
-    that either contain a ``kanban.db`` or a ``board.json``.
+    that contain ``board.json`` or non-empty/degraded DB-only state.
+
+    Clean zero-task DB-only directories are skipped: those are usually
+    lazy-init/probe artifacts rather than intentionally created boards.
 
     Returns a list of metadata dicts, sorted with ``default`` first and
     the rest alphabetically.
@@ -803,7 +832,9 @@ def list_boards(*, include_archived: bool = True) -> list[dict]:
                 continue
             has_db = (child / "kanban.db").exists()
             has_meta = (child / "board.json").exists()
-            if not (has_db or has_meta):
+            if not has_meta and not (
+                has_db and _db_only_board_should_be_visible(child / "kanban.db")
+            ):
                 continue
             meta = read_board_metadata(normed)
             if meta.get("archived") and not include_archived:
