@@ -28,6 +28,9 @@ def kanban_home(tmp_path, monkeypatch):
     home = tmp_path / ".hermes"
     home.mkdir()
     monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.delenv("HERMES_KANBAN_HOME", raising=False)
+    monkeypatch.delenv("HERMES_KANBAN_DB", raising=False)
+    monkeypatch.delenv("HERMES_KANBAN_BOARD", raising=False)
     monkeypatch.setattr(Path, "home", lambda: tmp_path)
     kb.init_db()
     return home
@@ -127,6 +130,32 @@ def test_prose_phantom_refs_clears_on_later_clean_edit():
     ]
     diags = kd.compute_task_diagnostics(task, events, [])
     assert diags == []
+
+
+def test_unqualified_cross_board_refs_fires_separately_from_phantoms():
+    task = _task(status="done")
+    events = [
+        _event("completed", ts=100, summary="referenced source task"),
+        _event(
+            "unqualified_cross_board_references",
+            ts=101,
+            refs=[{
+                "ref": "t_deadbeef99",
+                "task_id": "t_deadbeef99",
+                "boards": ["attention-intake"],
+            }],
+            source="completion_summary",
+        ),
+    ]
+    diags = kd.compute_task_diagnostics(task, events, [])
+    assert len(diags) == 1
+    assert diags[0].kind == "unqualified_cross_board_refs"
+    assert diags[0].severity == "warning"
+    assert diags[0].data["refs"] == [{
+        "ref": "t_deadbeef99",
+        "task_id": "t_deadbeef99",
+        "boards": ["attention-intake"],
+    }]
 
 
 def test_repeated_failures_fires_at_threshold_on_spawn():
@@ -613,6 +642,66 @@ def test_stranded_in_ready_works_on_real_db_row(kanban_home):
         assert stranded[0].data["assignee"] == "ghost"
     finally:
         conn.close()
+
+
+def test_complete_task_warns_for_bare_cross_board_reference(kanban_home):
+    kb.create_board("attention-intake")
+    kb.create_board("agent-research-intake")
+
+    with kb.connect(board="attention-intake") as source_conn:
+        source_id = kb.create_task(source_conn, title="source link")
+
+    with kb.connect(board="agent-research-intake") as target_conn:
+        target_id = kb.create_task(target_conn, title="research target")
+        assert kb.complete_task(
+            target_conn,
+            target_id,
+            summary=f"Processed source {source_id} and wrote findings.",
+        )
+        task_row = target_conn.execute(
+            "SELECT * FROM tasks WHERE id = ?", (target_id,)
+        ).fetchone()
+        events = list(target_conn.execute(
+            "SELECT * FROM task_events WHERE task_id = ? ORDER BY id",
+            (target_id,),
+        ).fetchall())
+
+    diags = kd.compute_task_diagnostics(task_row, events, [])
+    assert [d.kind for d in diags] == ["unqualified_cross_board_refs"]
+    assert diags[0].data["refs"] == [{
+        "ref": source_id,
+        "task_id": source_id,
+        "boards": ["attention-intake"],
+    }]
+
+
+def test_complete_task_accepts_board_qualified_cross_board_reference(kanban_home):
+    kb.create_board("attention-intake")
+    kb.create_board("agent-research-intake")
+
+    with kb.connect(board="attention-intake") as source_conn:
+        source_id = kb.create_task(source_conn, title="source link")
+
+    with kb.connect(board="agent-research-intake") as target_conn:
+        target_id = kb.create_task(target_conn, title="research target")
+        assert kb.complete_task(
+            target_conn,
+            target_id,
+            summary=f"Processed source attention-intake/{source_id}.",
+        )
+        task_row = target_conn.execute(
+            "SELECT * FROM tasks WHERE id = ?", (target_id,)
+        ).fetchone()
+        events = list(target_conn.execute(
+            "SELECT * FROM task_events WHERE task_id = ? ORDER BY id",
+            (target_id,),
+        ).fetchall())
+
+    diags = kd.compute_task_diagnostics(task_row, events, [])
+    assert [d for d in diags if d.kind in {
+        "prose_phantom_refs",
+        "unqualified_cross_board_refs",
+    }] == []
 
 
 

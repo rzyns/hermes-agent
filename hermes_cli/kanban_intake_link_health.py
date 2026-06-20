@@ -15,6 +15,8 @@ from pathlib import Path
 from typing import Any, Iterable
 
 URL_RE = __import__("re").compile(r"https?://[^\s)\]}>\"`']+")
+DEFAULT_BOARD = "attention-intake"
+TERMINAL_STATUSES = {"done", "archived"}
 
 log = logging.getLogger(__name__)
 
@@ -172,6 +174,61 @@ def scan_board_for_health(
         "scanned_task_count": len(tasks),
         "counts": counts,
         "tasks": tasks,
+    }
+
+
+def audit_active_url_scratch_workspaces(
+    conn: sqlite3.Connection,
+    *,
+    board: str = DEFAULT_BOARD,
+    hermes_home: Path | None = None,
+) -> dict[str, Any]:
+    """Read-only audit for active URL-bearing tasks still using scratch.
+
+    Scratch workspaces are disposable on completion. Link/research tasks that
+    mention URLs usually need durable evidence under ``artifacts/<board>/<task>``;
+    this audit only reports candidates and never mutates task rows.
+    """
+    home = hermes_home or Path(os.environ.get("HERMES_HOME", str(Path.home() / ".hermes")))
+    home = Path(home)
+    rows = conn.execute(
+        """
+        SELECT id, title, body, status, workspace_kind, workspace_path
+          FROM tasks
+         WHERE status NOT IN ('done', 'archived')
+         ORDER BY created_at, id
+        """
+    ).fetchall()
+    findings: list[dict[str, Any]] = []
+    for row in rows:
+        if (row["workspace_kind"] or "scratch") != "scratch":
+            continue
+        url = _extract_url("\n".join([row["title"] or "", row["body"] or ""]))
+        if not url:
+            continue
+        suggested = home / "artifacts" / board / row["id"]
+        findings.append({
+            "kind": "active_url_scratch_workspace",
+            "severity": "warning",
+            "board": board,
+            "task_id": row["id"],
+            "title": row["title"],
+            "status": row["status"],
+            "url": url,
+            "workspace_kind": row["workspace_kind"] or "scratch",
+            "workspace_path": row["workspace_path"],
+            "suggested_artifact_root": str(suggested),
+            "detail": (
+                "Active URL-bearing task uses disposable scratch workspace; "
+                "preserve durable evidence under the suggested artifact root "
+                "or convert workspace_kind/workspace_path together before completion."
+            ),
+        })
+    return {
+        "board": board,
+        "scanned_task_count": len(rows),
+        "finding_count": len(findings),
+        "findings": findings,
     }
 
 

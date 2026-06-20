@@ -25,6 +25,9 @@ def _tmp_env(tmp_path, monkeypatch):
     home = tmp_path / ".hermes"
     home.mkdir()
     monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.delenv("HERMES_KANBAN_HOME", raising=False)
+    monkeypatch.delenv("HERMES_KANBAN_DB", raising=False)
+    monkeypatch.delenv("HERMES_KANBAN_BOARD", raising=False)
     monkeypatch.setattr(Path, "home", lambda: tmp_path)
     kb.init_db()
     yield
@@ -254,3 +257,58 @@ def test_scan_board_for_health_catches_body_empty_rows(conn, tmp_path, monkeypat
     assert result["tasks"][0]["task_id"] == tid
     assert result["tasks"][0]["verdict"] == "incomplete_body"
     assert result["counts"]["incomplete_body"] == 1
+
+
+# ---------------------------------------------------------------------------
+# scratch URL workspace audit
+# ---------------------------------------------------------------------------
+
+
+def test_audit_active_url_scratch_workspaces_reports_only_active_scratch_url_tasks(conn, tmp_path):
+    scratch_id = kb.create_task(
+        conn,
+        title="Investigate https://example.com/scratch",
+        body="Capture durable evidence for this URL.",
+        workspace_kind="scratch",
+        created_by="test",
+    )
+    kb.create_task(
+        conn,
+        title="Investigate https://example.com/durable",
+        body="Already durable.",
+        workspace_kind="dir",
+        workspace_path=str(tmp_path / "artifacts" / "attention-intake" / "durable"),
+        created_by="test",
+    )
+    done_id = kb.create_task(
+        conn,
+        title="Old https://example.com/done",
+        body="Terminal rows are not active audit findings.",
+        workspace_kind="scratch",
+        created_by="test",
+    )
+    assert kb.complete_task(conn, done_id, summary="done")
+    kb.create_task(
+        conn,
+        title="No URL here",
+        body="Plain work item.",
+        workspace_kind="scratch",
+        created_by="test",
+    )
+
+    result = kih.audit_active_url_scratch_workspaces(
+        conn,
+        board="attention-intake",
+        hermes_home=tmp_path,
+    )
+
+    assert result["scanned_task_count"] == 3
+    assert result["finding_count"] == 1
+    finding = result["findings"][0]
+    assert finding["kind"] == "active_url_scratch_workspace"
+    assert finding["task_id"] == scratch_id
+    assert finding["url"] == "https://example.com/scratch"
+    assert finding["workspace_kind"] == "scratch"
+    assert finding["suggested_artifact_root"] == str(
+        tmp_path / "artifacts" / "attention-intake" / scratch_id
+    )

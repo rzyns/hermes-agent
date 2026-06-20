@@ -3959,39 +3959,191 @@ def _verify_created_cards(
 # ``_new_task_id`` below. Kept permissive on length for forward compat:
 # accept 8+ hex chars after the ``t_`` prefix.
 _TASK_ID_PROSE_RE = re.compile(r"\bt_[a-f0-9]{8,}\b")
+_TASK_REF_PROSE_RE = re.compile(
+    r"(?<![A-Za-z0-9_\-])"
+    r"(?:(?P<board>[A-Za-z0-9][A-Za-z0-9_\-]{0,63})[/:])?"
+    r"(?P<task_id>t_[a-f0-9]{8,})\b"
+)
+
+
+def _connection_db_file(conn: sqlite3.Connection) -> Optional[Path]:
+    try:
+        row = conn.execute("PRAGMA database_list").fetchone()
+    except sqlite3.Error:
+        return None
+    if not row:
+        return None
+    try:
+        raw = row["file"]
+    except (TypeError, KeyError, IndexError):
+        raw = row[2] if len(row) >= 3 else None
+    if not raw:
+        return None
+    try:
+        return Path(str(raw)).expanduser().resolve(strict=False)
+    except OSError:
+        return Path(str(raw)).expanduser()
+
+
+def _infer_board_for_connection(conn: sqlite3.Connection) -> str:
+    """Best-effort board slug for ``conn``.
+
+    ``complete_task`` only receives a SQLite connection, not the board slug used
+    to open it. Infer the slug from the main database path so prose reference
+    scanning checks same-board refs against the actual board being completed,
+    not whatever ``HERMES_KANBAN_BOARD`` happens to say in this process.
+    """
+    db_file = _connection_db_file(conn)
+    if db_file is not None:
+        for meta in list_boards(include_archived=True):
+            slug = str(meta.get("slug") or meta.get("id") or "").strip()
+            if not slug:
+                continue
+            try:
+                candidate = kanban_db_path(slug).expanduser().resolve(strict=False)
+            except OSError:
+                candidate = kanban_db_path(slug).expanduser()
+            if candidate == db_file:
+                return slug
+    return get_current_board()
+
+
+def _task_exists_in_conn(conn: sqlite3.Connection, task_id: str) -> bool:
+    try:
+        row = conn.execute("SELECT 1 FROM tasks WHERE id = ? LIMIT 1", (task_id,)).fetchone()
+    except sqlite3.Error:
+        return False
+    return bool(row)
+
+
+def _task_exists_on_board(
+    task_id: str,
+    board: str,
+    *,
+    current_conn: Optional[sqlite3.Connection] = None,
+    current_board: Optional[str] = None,
+) -> bool:
+    if current_conn is not None and current_board == board:
+        return _task_exists_in_conn(current_conn, task_id)
+    try:
+        with connect_closing(board=board) as other:
+            return _task_exists_in_conn(other, task_id)
+    except Exception:
+        return False
+
+
+def _boards_containing_task(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    current_board: str,
+) -> list[str]:
+    boards: list[str] = []
+    for meta in list_boards(include_archived=True):
+        slug = str(meta.get("slug") or meta.get("id") or "").strip()
+        if not slug or slug in boards:
+            continue
+        if _task_exists_on_board(
+            task_id,
+            slug,
+            current_conn=conn,
+            current_board=current_board,
+        ):
+            boards.append(slug)
+    return boards
+
+
+def _append_unique(items: list[Any], item: Any) -> None:
+    if item not in items:
+        items.append(item)
+
+
+def _scan_prose_for_task_reference_issues(
+    conn: sqlite3.Connection,
+    text: str,
+    *,
+    current_board: Optional[str] = None,
+) -> dict[str, Any]:
+    """Return structured advisory issues for task refs in free-form prose.
+
+    Bare task ids are board-local. A bare ``t_<hex>`` that exists only on a
+    different board is not hallucinated, but it is ambiguous for downstream
+    consumers; report it separately so diagnostics can ask workers to use a
+    board-qualified ref such as ``attention-intake/t_deadbeef``.
+    """
+    out: dict[str, Any] = {
+        "phantom_refs": [],
+        "qualified_phantom_refs": [],
+        "unqualified_cross_board_refs": [],
+        "resolved_qualified_refs": [],
+    }
+    if not text:
+        return out
+    current_board = current_board or _infer_board_for_connection(conn)
+
+    seen_refs: set[tuple[Optional[str], str, str]] = set()
+    for match in _TASK_REF_PROSE_RE.finditer(text):
+        raw_ref = match.group(0)
+        task_id = match.group("task_id")
+        board_raw = match.group("board")
+        board = board_raw.lower() if board_raw else None
+        key = (board, task_id, raw_ref)
+        if key in seen_refs:
+            continue
+        seen_refs.add(key)
+
+        if board:
+            try:
+                board_ok = board_exists(board)
+            except ValueError:
+                board_ok = False
+            if board_ok and _task_exists_on_board(
+                task_id,
+                board,
+                current_conn=conn,
+                current_board=current_board,
+            ):
+                _append_unique(out["resolved_qualified_refs"], {
+                    "ref": raw_ref,
+                    "board": board,
+                    "task_id": task_id,
+                })
+                continue
+            reason = "unknown_task" if board_ok else "unknown_board"
+            _append_unique(out["phantom_refs"], raw_ref)
+            _append_unique(out["qualified_phantom_refs"], {
+                "ref": raw_ref,
+                "board": board,
+                "task_id": task_id,
+                "reason": reason,
+            })
+            continue
+
+        if _task_exists_in_conn(conn, task_id):
+            continue
+        boards = _boards_containing_task(conn, task_id, current_board=current_board)
+        boards = [b for b in boards if b != current_board]
+        if boards:
+            _append_unique(out["unqualified_cross_board_refs"], {
+                "ref": raw_ref,
+                "task_id": task_id,
+                "boards": boards,
+            })
+        else:
+            _append_unique(out["phantom_refs"], task_id)
+    return out
 
 
 def _scan_prose_for_phantom_ids(
     conn: sqlite3.Connection,
     text: str,
 ) -> list[str]:
-    """Regex-scan free-form text for ``t_<hex>`` references; return the
-    ones that don't exist in ``tasks``.
+    """Regex-scan free-form text and return refs that do not resolve anywhere.
 
-    Used as a non-blocking advisory check on completion summaries. An
-    empty return means "no suspicious references found" — either the
-    text had no IDs at all, or every ID it mentioned resolves to a real
-    task. Duplicates are deduped.
+    Back-compat wrapper for older callers; cross-board-known bare refs are no
+    longer considered phantom here.
     """
-    if not text:
-        return []
-    matches = _TASK_ID_PROSE_RE.findall(text)
-    if not matches:
-        return []
-    # Dedupe preserving order.
-    seen: set[str] = set()
-    unique: list[str] = []
-    for m in matches:
-        if m not in seen:
-            seen.add(m)
-            unique.append(m)
-    placeholders = ",".join(["?"] * len(unique))
-    rows = conn.execute(
-        f"SELECT id FROM tasks WHERE id IN ({placeholders})",
-        tuple(unique),
-    ).fetchall()
-    existing = {r["id"] for r in rows}
-    return [m for m in unique if m not in existing]
+    return list(_scan_prose_for_task_reference_issues(conn, text)["phantom_refs"])
 
 
 class HallucinatedCardsError(ValueError):
@@ -4045,10 +4197,11 @@ def complete_task(
     ``completed`` event payload.
 
     After a successful completion, ``summary`` and ``result`` are scanned
-    for prose references like ``t_deadbeefcafe`` that do not resolve.
-    Any suspected phantom references are recorded as a
-    ``suspected_hallucinated_references`` event. This pass is advisory
-    and never blocks.
+    for prose references like ``t_deadbeefcafe``. Genuinely unresolved
+    refs are recorded as ``suspected_hallucinated_references``; bare refs
+    that exist only on another board are recorded separately as
+    ``unqualified_cross_board_references`` so workers can qualify them as
+    ``board/task_id``. This pass is advisory and never blocks.
     """
     now = int(time.time())
 
@@ -4161,23 +4314,41 @@ def complete_task(
             completed_payload,
             run_id=run_id,
         )
-    # Prose-scan the summary + result for t_<hex> references that do
-    # not resolve. Advisory — does not block the completion. Runs in
-    # its own txn so the completion itself is already durable by the
-    # time we emit the warning.
+    # Prose-scan the summary + result for task-id references. Advisory — does
+    # not block the completion. Runs in its own txn so the completion itself is
+    # already durable by the time we emit any warning.
     scan_text = " ".join(filter(None, [summary, result]))
     if scan_text:
-        phantom_refs = _scan_prose_for_phantom_ids(conn, scan_text)
+        ref_issues = _scan_prose_for_task_reference_issues(conn, scan_text)
+        verified_set = set(verified_cards)
         # Drop any phantom refs that were already flagged as verified
         # above (shouldn't happen — verified means they exist — but
         # belt-and-suspenders).
-        phantom_refs = [p for p in phantom_refs if p not in set(verified_cards)]
+        phantom_refs = [
+            p for p in ref_issues.get("phantom_refs", [])
+            if str(p).split("/")[-1].split(":")[-1] not in verified_set
+        ]
         if phantom_refs:
+            payload = {
+                "phantom_refs": phantom_refs,
+                "source": "completion_summary",
+            }
+            qualified = ref_issues.get("qualified_phantom_refs") or []
+            if qualified:
+                payload["qualified_phantom_refs"] = qualified
             with write_txn(conn):
                 _append_event(
                     conn, task_id, "suspected_hallucinated_references",
+                    payload,
+                    run_id=run_id,
+                )
+        cross_board_refs = ref_issues.get("unqualified_cross_board_refs") or []
+        if cross_board_refs:
+            with write_txn(conn):
+                _append_event(
+                    conn, task_id, "unqualified_cross_board_references",
                     {
-                        "phantom_refs": phantom_refs,
+                        "refs": cross_board_refs,
                         "source": "completion_summary",
                     },
                     run_id=run_id,
@@ -4614,6 +4785,49 @@ def block_task(
                 summary=reason,
             )
         _append_event(conn, task_id, "blocked", {"reason": reason}, run_id=run_id)
+        return True
+
+
+def record_blocked_hold(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    reason: Optional[str] = None,
+    payload: Optional[dict[str, Any]] = None,
+    clear_assignee: bool = False,
+) -> bool:
+    """Record a sticky blocked hold for an existing non-terminal task.
+
+    ``block_task`` intentionally only transitions active ``running``/``ready``
+    work. Some safety workflows create a card directly in ``blocked`` (for
+    example materialize-only route targets) and still need the same sticky
+    ``blocked`` event so ``recompute_ready`` cannot silently auto-promote the
+    card. This helper keeps that case explicit and auditable.
+    """
+    with write_txn(conn):
+        row = conn.execute(
+            "SELECT status FROM tasks WHERE id = ?", (task_id,)
+        ).fetchone()
+        if row is None or row["status"] in {"done", "archived"}:
+            return False
+        assignee_sql = ", assignee = NULL" if clear_assignee else ""
+        conn.execute(
+            f"""
+            UPDATE tasks
+               SET status        = 'blocked',
+                   claim_lock    = NULL,
+                   claim_expires = NULL,
+                   worker_pid    = NULL,
+                   current_run_id= NULL
+                   {assignee_sql}
+             WHERE id = ?
+            """,
+            (task_id,),
+        )
+        event_payload = {"reason": reason}
+        if payload:
+            event_payload.update(payload)
+        _append_event(conn, task_id, "blocked", event_payload)
         return True
 
 

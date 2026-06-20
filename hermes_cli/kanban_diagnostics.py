@@ -492,10 +492,15 @@ def _rule_prose_phantom_refs(task, events, runs, now, cfg) -> list[Diagnostic]:
     if not hits:
         return []
     phantom_refs: list[str] = []
+    qualified_refs: list[dict] = []
     for ev in hits:
-        for pid in _parse_payload(ev).get("phantom_refs", []) or []:
+        payload = _parse_payload(ev)
+        for pid in payload.get("phantom_refs", []) or []:
             if pid not in phantom_refs:
                 phantom_refs.append(pid)
+        for item in payload.get("qualified_phantom_refs", []) or []:
+            if isinstance(item, dict) and item not in qualified_refs:
+                qualified_refs.append(item)
     running = _task_field(task, "status") == "running"
     return [Diagnostic(
         kind="prose_phantom_refs",
@@ -503,15 +508,47 @@ def _rule_prose_phantom_refs(task, events, runs, now, cfg) -> list[Diagnostic]:
         title="Completion summary references unknown task ids",
         detail=(
             "The completion summary mentions task ids that don't resolve "
-            "in this board's database. The completion itself succeeded, "
-            "but downstream consumers parsing the summary may be pointed "
-            "at cards that never existed."
+            "in this board's database or in a board-qualified target. The "
+            "completion itself succeeded, but downstream consumers parsing "
+            "the summary may be pointed at cards that never existed."
         ),
         actions=_generic_recovery_actions(task, running=running),
         first_seen_at=_event_ts(hits[0]),
         last_seen_at=_event_ts(hits[-1]),
         count=len(hits),
-        data={"phantom_refs": phantom_refs},
+        data={
+            "phantom_refs": phantom_refs,
+            "qualified_phantom_refs": qualified_refs,
+        },
+    )]
+
+
+def _rule_unqualified_cross_board_refs(task, events, runs, now, cfg) -> list[Diagnostic]:
+    """Advisory prose-scan: bare ``t_<hex>`` refs point at another board."""
+    hits = _active_hallucination_events(events, "unqualified_cross_board_references")
+    if not hits:
+        return []
+    refs: list[dict] = []
+    for ev in hits:
+        for item in _parse_payload(ev).get("refs", []) or []:
+            if isinstance(item, dict) and item not in refs:
+                refs.append(item)
+    running = _task_field(task, "status") == "running"
+    return [Diagnostic(
+        kind="unqualified_cross_board_refs",
+        severity="warning",
+        title="Completion summary uses unqualified cross-board task ids",
+        detail=(
+            "The completion summary mentions bare task ids that exist on "
+            "other boards, not this one. The references are probably real, "
+            "but downstream consumers need board-qualified refs such as "
+            "attention-intake/t_deadbeef or structured metadata fields."
+        ),
+        actions=_generic_recovery_actions(task, running=running),
+        first_seen_at=_event_ts(hits[0]),
+        last_seen_at=_event_ts(hits[-1]),
+        count=len(hits),
+        data={"refs": refs},
     )]
 
 
@@ -980,6 +1017,7 @@ _RULES: list[RuleFn] = [
     _rule_hallucinated_cards,
     _rule_triage_aux_unavailable,
     _rule_prose_phantom_refs,
+    _rule_unqualified_cross_board_refs,
     _rule_repeated_failures,
     _rule_repeated_crashes,
     _rule_stuck_in_blocked,
@@ -994,6 +1032,7 @@ DIAGNOSTIC_KINDS = (
     "hallucinated_cards",
     "triage_aux_unavailable",
     "prose_phantom_refs",
+    "unqualified_cross_board_refs",
     "repeated_failures",
     "repeated_crashes",
     "stuck_in_blocked",

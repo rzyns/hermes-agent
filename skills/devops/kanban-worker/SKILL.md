@@ -82,6 +82,7 @@ kanban_complete(
     summary="3 competing libraries reviewed; vLLM wins on throughput, SGLang on latency, Tensorrt-LLM on memory efficiency",
     metadata={
         "sources_read": 12,
+        "source_ref": "attention-intake/t_source",  # board-qualified if cross-board
         "recommendation": "vLLM",
         "benchmarks": {"vllm": 1.0, "sglang": 0.87, "trtllm": 0.72},
     },
@@ -107,20 +108,30 @@ Shape `metadata` so downstream parsers (reviewers, aggregators, schedulers) can 
 
 ## Deliverable files in `kanban_complete`
 
-When your task produces human-consumable files — reports, charts, screenshots, rendered HTML/PDF, spreadsheets, audio/video, archives, JSON/YAML/CSV exports, or other final deliverables — attach them directly to completion:
+When your task produces human-consumable files — reports, charts, screenshots, rendered HTML/PDF, spreadsheets, audio/video, archives, JSON/YAML/CSV exports, or other final deliverables — keep them under `$HERMES_KANBAN_WORKSPACE` (or another explicit durable task workspace), write an `artifact-manifest.json`, and attach the final paths directly to completion:
 
 ```python
+from hermes_cli.kanban_artifacts import write_artifact_manifest
+
+manifest = write_artifact_manifest(
+    task_id=os.environ["HERMES_KANBAN_TASK"],
+    workspace_path=os.environ["HERMES_KANBAN_WORKSPACE"],
+    artifacts=["/home/openclaw/.hermes/artifacts/project/t_task/report.pdf"],
+    metadata={"source_ref": "attention-intake/t_source"},
+)
+
 kanban_complete(
     summary="rendered the comparison chart and packet",
-    artifacts=[
-        "/tmp/q3-revenue.png",
-        "/home/openclaw/.hermes/artifacts/project/report.pdf",
-    ],
-    metadata={"artifact_count": 2},
+    artifacts=["/home/openclaw/.hermes/artifacts/project/t_task/report.pdf"],
+    metadata={
+        "artifact_count": 1,
+        "artifact_manifest_path": manifest["manifest_path"],
+        "artifact_manifest": manifest,
+    },
 )
 ```
 
-Use `artifacts=[...]` for final deliverables the human should receive with the completion notification. The paths must be absolute and must exist on disk when the notifier runs; missing files are silently skipped. Do not attach transient scratch files, source files, logs, secrets, or files that merely support your internal reasoning. If the file is evidence rather than a deliverable, keep it as a compact metadata/comment path with checksum instead of uploading it by default.
+Use `artifacts=[...]` for final deliverables the human should receive with the completion notification. The paths must be absolute, durable, and must exist on disk when the notifier runs; missing files are silently skipped. Do not attach transient scratch files, source files, logs, secrets, or files that merely support your internal reasoning. If the file is evidence rather than a deliverable, keep it as a compact metadata/comment path with checksum instead of uploading it by default.
 
 For evidence-heavy tasks, include compact proof pointers rather than raw dumps. Preferred keys: `evidence_bundle`, `raw_transcript`, `claim_ledger`, `commands_run`, `artifacts` with checksums, and `cleanup_verification` when runtime processes, listeners, installs, or generated artifacts were involved. Complete only from fresh evidence you personally verified in the current run; if a completion claim has no proof object, remove it, downgrade it to an assumption, or block. See `agent-qa-gates` → `references/hermes-native-evidence-bundles.md` for the full Evidence Bundle Gate.
 
@@ -148,7 +159,7 @@ kanban_complete(
 )
 ```
 
-If a `kanban_create` call fails (exception, tool_error), the card was NOT created — do not include a phantom id for it. Retry the create, or omit the id and mention the failure in your summary. The prose-scan pass also catches `t_<hex>` references in your free-form summary that don't resolve; these don't block the completion but show up as advisory warnings on the task in the dashboard.
+If a `kanban_create` call fails (exception, tool_error), the card was NOT created — do not include a phantom id for it. Retry the create, or omit the id and mention the failure in your summary. The prose-scan pass also catches `t_<hex>` references in your free-form summary: genuinely unknown ids show as advisory phantom-reference warnings, while bare ids that exist only on another board show as unqualified cross-board warnings. Use `board/task_id` in prose and structured metadata for cross-board references.
 
 ## Block reasons that get answered fast
 

@@ -413,6 +413,8 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
     p_ilh.add_argument("--task-id", default=None, help="Inspect a single task id (omit to scan board)")
     p_ilh.add_argument("--board", default=kih.DEFAULT_BOARD if hasattr(kih, 'DEFAULT_BOARD') else "attention-intake",
                        help="Board slug (default: attention-intake)")
+    p_ilh.add_argument("--scratch-url-audit", action="store_true",
+                       help="Read-only audit for active URL tasks still using disposable scratch workspaces")
     p_ilh.add_argument("--json", action="store_true", help="Emit JSON output")
 
     # --- swarm ---
@@ -1643,7 +1645,14 @@ def _cmd_intake_link_health(args: argparse.Namespace) -> int:
     board = getattr(args, "board", "attention-intake")
     task_id = getattr(args, "task_id", None)
 
-    if task_id:
+    if getattr(args, "scratch_url_audit", False):
+        with kb.connect(board=board) as conn:
+            result = kih.audit_active_url_scratch_workspaces(
+                conn,
+                board=board,
+                hermes_home=Path.home() / ".hermes",
+            )
+    elif task_id:
         # Single-task mode: read task body via DB and check register.
         with kb.connect(board=board) as conn:
             row = conn.execute(
@@ -1662,6 +1671,17 @@ def _cmd_intake_link_health(args: argparse.Namespace) -> int:
     if getattr(args, "json", False):
         import json
         print(json.dumps(result, indent=2, default=str, ensure_ascii=False))
+    elif getattr(args, "scratch_url_audit", False):
+        print(
+            f"Board: {result.get('board', board)} — "
+            f"{result.get('finding_count', 0)} active scratch URL finding(s) "
+            f"across {result.get('scanned_task_count', 0)} active task(s)"
+        )
+        for finding in result.get("findings", []):
+            print(
+                f"  {finding['task_id']} [{finding['status']}]: {finding['url']} "
+                f"-> {finding['suggested_artifact_root']}"
+            )
     else:
         # Human-readable compact summary.
         counts = result.get("counts", {})
