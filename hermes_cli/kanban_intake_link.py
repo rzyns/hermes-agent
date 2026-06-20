@@ -29,11 +29,34 @@ DEFAULT_BOARD = "attention-intake"
 DEFAULT_ASSIGNEE = "link-analyst"
 DEFAULT_TRIAGE = True
 DEFAULT_PRIORITY = 0
+_TERMINAL_STATUSES = {"done", "archived"}
 
 
 def _artifact_root() -> Path:
     """Resolve the attention-intake artifact root from the active Hermes home."""
     return get_default_hermes_root() / "artifacts" / "attention-intake"
+
+
+def _task_artifact_dir(task_id: str) -> Path:
+    return _artifact_root() / task_id
+
+
+def _ensure_durable_workspace(conn, task_id: str) -> str:
+    """Ensure ``task_id`` has the first-class durable link-drop workspace."""
+    task_artifact_dir = _task_artifact_dir(task_id)
+    try:
+        task_artifact_dir.mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        log.warning("Could not mkdir artifact dir %s: %s", task_artifact_dir, exc)
+    ws_path = str(task_artifact_dir)
+    kb.set_workspace(
+        conn,
+        task_id,
+        workspace_kind="dir",
+        workspace_path=ws_path,
+    )
+    return ws_path
+
 
 # ---------------------------------------------------------------------------
 # URL canonicalisation
@@ -177,6 +200,50 @@ def _write_register_entry(
         log.warning("Could not write provisional register entry: %s", exc)
 
 
+def _repair_active_existing_link_row(
+    conn,
+    task_id: str,
+    *,
+    url: str,
+    context: Optional[str],
+    note: Optional[str],
+    board: str,
+    assignee: str,
+    idempotency_key: str,
+    source: str,
+) -> None:
+    """Repair a non-terminal idempotency-hit row to the durable contract.
+
+    Older link-drop rows could be born as disposable ``scratch`` tasks.  A
+    duplicate link drop should not create a new card, but it also must not
+    keep an active card on scratch.  Completed rows are intentionally left
+    untouched so duplicate drops do not rewrite assessment history.
+    """
+    existing = kb.get_task(conn, task_id)
+    if not existing or existing.status in _TERMINAL_STATUSES:
+        return
+
+    ws_path = _ensure_durable_workspace(conn, task_id)
+    body = existing.body or ""
+    if "Attention Intake link-drop path." in body and ws_path in body:
+        return
+
+    kb.update_task_body(
+        conn,
+        task_id,
+        build_intake_link_body(
+            url=url,
+            context=context,
+            note=note,
+            source=source,
+            board=board,
+            assignee=assignee,
+            idempotency_key=idempotency_key,
+            workspace_path=ws_path,
+        ),
+    )
+
+
 # ---------------------------------------------------------------------------
 # Core helper
 # ---------------------------------------------------------------------------
@@ -221,7 +288,19 @@ def create_intake_link(
             (effective_idempotency,),
         ).fetchone()
         if existing_row:
-            return existing_row["id"]
+            existing_id = existing_row["id"]
+            _repair_active_existing_link_row(
+                conn,
+                existing_id,
+                url=url,
+                context=context,
+                note=note,
+                board=board,
+                assignee=assignee,
+                idempotency_key=effective_idempotency,
+                source=source,
+            )
+            return existing_id
 
     # Generate the task id first (idempotency will reuse existing).
     # We need the id to interpolate the workspace path.
@@ -253,17 +332,16 @@ def create_intake_link(
     # Robustly detect a truly-fresh row, even when the board has a
     # default_workdir that auto-fills workspace_path.  An idempotency-hit
     # will already carry our contract body; anything else needs patching.
-    needs_patch = existing and (existing.body is None or "Attention Intake link-drop path." not in existing.body)
+    expected_ws_path = str(_task_artifact_dir(new_task_id))
+    needs_patch = existing and (
+        existing.body is None
+        or "Attention Intake link-drop path." not in existing.body
+        or existing.workspace_kind != "dir"
+        or existing.workspace_path != expected_ws_path
+    )
     if needs_patch:
         # Newly created by us in this call (fresh row). Patch ws_path + body.
-        task_artifact_dir = _artifact_root() / new_task_id
-        ws_path = str(task_artifact_dir)
-
-        # Attempt mkdir; warn but don't fail.
-        try:
-            task_artifact_dir.mkdir(parents=True, exist_ok=True)
-        except OSError as exc:
-            log.warning("Could not mkdir artifact dir %s: %s", task_artifact_dir, exc)
+        ws_path = _ensure_durable_workspace(conn, new_task_id)
 
         # Build body with resolved paths.
         body = build_intake_link_body(
@@ -277,8 +355,8 @@ def create_intake_link(
             workspace_path=ws_path,
         )
 
-        # Patch workspace_path and body on the row.
-        kb.set_workspace_path(conn, new_task_id, ws_path)
+        # Patch body on the row. ``_ensure_durable_workspace`` already patched
+        # workspace_kind + workspace_path together.
         kb.update_task_body(conn, new_task_id, body)
 
         # Provisional register write.

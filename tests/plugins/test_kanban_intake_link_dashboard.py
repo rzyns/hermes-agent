@@ -73,7 +73,10 @@ def test_create_intake_link_basic(client):
     assert "https://example.com/article" in task["body"]
     assert task["status"] == "triage"
     assert task["assignee"] == "link-analyst"
+    assert task["workspace_kind"] == "dir"
     assert task["workspace_path"] is not None
+    expected = Path(os.environ["HERMES_HOME"]) / "artifacts" / "attention-intake" / task["id"]
+    assert task["workspace_path"] == str(expected)
     # Ensure workspace dir was created.
     assert Path(task["workspace_path"]).exists()
 

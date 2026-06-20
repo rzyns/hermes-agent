@@ -5228,6 +5228,36 @@ def set_workspace_path(
         )
 
 
+def set_workspace(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    workspace_kind: str,
+    workspace_path: Optional[Path | str] = None,
+) -> None:
+    """Update a task's workspace kind and path together.
+
+    Use this for repair paths that need to upgrade a malformed row from a
+    scratch workspace to a durable directory.  Updating ``workspace_path``
+    alone leaves split-brain cleanup semantics: the row points at a durable
+    directory but still claims to be disposable scratch.
+    """
+    if workspace_kind not in VALID_WORKSPACE_KINDS:
+        raise ValueError(
+            f"workspace_kind must be one of {sorted(VALID_WORKSPACE_KINDS)}, "
+            f"got {workspace_kind!r}"
+        )
+    with write_txn(conn):
+        conn.execute(
+            "UPDATE tasks SET workspace_kind = ?, workspace_path = ? WHERE id = ?",
+            (
+                workspace_kind,
+                str(workspace_path) if workspace_path is not None else None,
+                task_id,
+            ),
+        )
+
+
 def update_task_body(
     conn: sqlite3.Connection, task_id: str, body: str
 ) -> None:

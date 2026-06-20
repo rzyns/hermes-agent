@@ -174,7 +174,9 @@ def test_create_intake_link_basic(conn):
     assert task.title.startswith("Link drop:")
     assert "https://example.com/foo" in task.body
     assert "needs_assessment" in task.body
+    assert task.workspace_kind == "dir"
     assert task.workspace_path is not None
+    assert task.workspace_path == str(Path(os.environ["HERMES_HOME"]) / "artifacts" / "attention-intake" / tid)
     assert Path(task.workspace_path).exists()
     assert task.assignee == "link-analyst"
     assert task.status == "triage"
@@ -185,6 +187,40 @@ def test_create_intake_link_idempotency(conn):
     tid1 = kil.create_intake_link(conn, url="https://example.com/foo")
     tid2 = kil.create_intake_link(conn, url="https://example.com/foo")
     assert tid1 == tid2
+
+
+def test_create_intake_link_idempotency_repairs_active_scratch_row(conn):
+    """A duplicate drop repairs old active rows born before the dir contract."""
+    url = "https://example.com/legacy-scratch"
+    key = kil.canonical_url_hash(url)
+    legacy_id = kb.create_task(
+        conn,
+        title="Legacy link drop",
+        body="legacy body without durable workspace contract",
+        assignee="link-analyst",
+        created_by="dashboard",
+        workspace_kind="scratch",
+        triage=True,
+        idempotency_key=key,
+    )
+
+    duplicate_id = kil.create_intake_link(
+        conn,
+        url=url,
+        context="new context",
+        note="duplicate drop",
+        source="dashboard",
+    )
+
+    assert duplicate_id == legacy_id
+    task = kb.get_task(conn, legacy_id)
+    expected = Path(os.environ["HERMES_HOME"]) / "artifacts" / "attention-intake" / legacy_id
+    assert task.workspace_kind == "dir"
+    assert task.workspace_path == str(expected)
+    assert expected.exists()
+    assert "Attention Intake link-drop path." in task.body
+    assert str(expected) in task.body
+    assert url in task.body
 
 
 def test_create_intake_link_idempotency_does_not_rewrite_completed_assessment(conn, tmp_path, monkeypatch):
