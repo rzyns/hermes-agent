@@ -27,15 +27,39 @@ TitleCallback = Callable[[str], None]
 _TITLE_PROMPT = (
     "Generate a concise, human-browsable title for this Hermes session. "
     "Prefer the specific object, repo, bug, system, artifact, or decision over "
-    "generic task words. Include enough distinguishing nouns to tell this "
-    "session apart from adjacent sessions. Avoid vague titles like "
-    "'Troubleshooting Issue', 'Code Review', 'Hermes Debugging', or "
-    "'Session Title'. Return ONLY 4-10 words: no quotes, no prefix, no "
-    "trailing punctuation."
+    "generic task words. Write the title in the same language the user is "
+    "writing in. Include enough distinguishing nouns to tell this session apart "
+    "from adjacent sessions. Avoid vague titles like 'Troubleshooting Issue', "
+    "'Code Review', 'Hermes Debugging', or 'Session Title'. Return ONLY 4-10 "
+    "words: no quotes, no prefix, no trailing punctuation."
+)
+
+_TITLE_PROMPT_PINNED_LANGUAGE = (
+    "Generate a concise, human-browsable title for this Hermes session. "
+    "Prefer the specific object, repo, bug, system, artifact, or decision over "
+    "generic task words. Write the title in {language}. Include enough "
+    "distinguishing nouns to tell this session apart from adjacent sessions. "
+    "Avoid vague titles like 'Troubleshooting Issue', 'Code Review', "
+    "'Hermes Debugging', or 'Session Title'. Return ONLY 4-10 words: no quotes, "
+    "no prefix, no trailing punctuation."
 )
 
 _MAX_FIELD_CHARS = 900
 _MAX_CONTEXT_CHARS = 4000
+
+
+def _title_language() -> str:
+    """Return configured title language, or empty string to match the user."""
+    try:
+        from hermes_cli.config import load_config
+
+        return str(
+            ((load_config() or {}).get("auxiliary") or {})
+            .get("title_generation", {})
+            .get("language", "")
+        ).strip()
+    except Exception:
+        return ""
 
 
 def _stringify_content(content: Any) -> str:
@@ -156,8 +180,11 @@ def generate_title(
         assistant_snippet = assistant_response[:500] if assistant_response else ""
         prompt_body = f"User: {user_snippet}\n\nAssistant: {assistant_snippet}"
 
+    language = _title_language()
+    prompt = _TITLE_PROMPT_PINNED_LANGUAGE.format(language=language) if language else _TITLE_PROMPT
+
     messages = [
-        {"role": "system", "content": _TITLE_PROMPT},
+        {"role": "system", "content": prompt},
         {"role": "user", "content": prompt_body},
     ]
 
