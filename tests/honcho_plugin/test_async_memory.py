@@ -214,10 +214,82 @@ class TestResolveSessionNameTitle:
         result = cfg.resolve_session_name("/some/dir", session_id=None)
         assert result == "dir"
 
-    def test_title_beats_session_id(self):
+    def test_title_still_beats_session_id_without_gateway_key(self):
         cfg = HonchoClientConfig(session_strategy="per-session")
         result = cfg.resolve_session_name("/some/dir", session_title="my-title", session_id="20260309_175514_9797dd")
         assert result == "my-title"
+
+    def test_gateway_key_beats_title_for_gateway_sessions(self):
+        cfg = HonchoClientConfig(session_strategy="per-session")
+        result = cfg.resolve_session_name(
+            "/some/dir",
+            session_title="pretty title",
+            session_id="20260309_175514_9797dd",
+            gateway_session_key="webui:session:abc123",
+        )
+        assert result == "webui-session-abc123"
+
+    def test_gateway_key_with_peer_prefix(self):
+        cfg = HonchoClientConfig(
+            session_strategy="per-session",
+            peer_name="eri",
+            session_peer_prefix=True,
+        )
+        result = cfg.resolve_session_name(
+            "/some/dir",
+            session_title="pretty title",
+            session_id="20260309_175514_9797dd",
+            gateway_session_key="webui:session:abc123",
+        )
+        assert result == "eri-webui-session-abc123"
+
+    def test_manual_override_still_beats_gateway_key_and_title(self):
+        cfg = HonchoClientConfig(
+            session_strategy="per-session",
+            sessions={"/some/dir": "manual-name"},
+        )
+        result = cfg.resolve_session_name(
+            "/some/dir",
+            session_title="pretty title",
+            session_id="20260309_175514_9797dd",
+            gateway_session_key="webui:session:abc123",
+        )
+        assert result == "manual-name"
+
+    def test_invalid_gateway_key_falls_back_to_title(self):
+        cfg = HonchoClientConfig(session_strategy="per-session")
+        result = cfg.resolve_session_name(
+            "/some/dir",
+            session_title="pretty title",
+            session_id="20260309_175514_9797dd",
+            gateway_session_key="!!! ###",
+        )
+        assert result == "pretty-title"
+
+    def test_overlong_gateway_key_with_peer_prefix_is_limited(self):
+        cfg = HonchoClientConfig(
+            session_strategy="per-session",
+            peer_name="eri",
+            session_peer_prefix=True,
+        )
+        result = cfg.resolve_session_name(
+            "/some/dir",
+            gateway_session_key="webui:" + "x" * 180,
+        )
+        assert result.startswith("eri-webui-")
+        assert len(result) <= cfg._HONCHO_SESSION_ID_MAX_LEN
+
+    def test_session_name_candidates_include_gateway_primary_and_legacy_title(self):
+        cfg = HonchoClientConfig(session_strategy="per-session")
+        candidates = cfg.resolve_session_name_candidates(
+            "/some/dir",
+            session_title="pretty title",
+            session_id="20260309_175514_9797dd",
+            gateway_session_key="webui:session:abc123",
+        )
+        assert candidates[0] == ("gateway_session_key", "webui-session-abc123")
+        assert ("session_title", "pretty-title") in candidates
+        assert ("session_id", "20260309_175514_9797dd") in candidates
 
     def test_manual_beats_session_id(self):
         cfg = HonchoClientConfig(session_strategy="per-session", sessions={"/some/dir": "pinned"})
@@ -339,6 +411,23 @@ class TestHonchoProviderSessionSwitch:
         assert manager.requested_session_keys == ["old-session", "new-session"]
         assert manager.flushed_session_keys == ["old-session", "new-session"]
         assert provider._session_key == "new-session"
+
+    def test_session_switch_prefers_gateway_key_over_title(self):
+        provider, manager = self._make_ready_provider()
+
+        provider.on_session_switch(
+            "new-session",
+            parent_session_id="old-session",
+            session_title="pretty title",
+            gateway_session_key="webui:session:abc123",
+            reset=False,
+        )
+        provider.sync_turn("after", "new response")
+        provider._sync_thread.join(timeout=2)
+
+        assert manager.requested_session_keys == ["webui-session-abc123"]
+        assert manager.flushed_session_keys == ["webui-session-abc123"]
+        assert provider._session_key == "webui-session-abc123"
 
 
 class TestMessageNoiseFilters:
