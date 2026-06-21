@@ -15,6 +15,7 @@ from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 
+from plugins.memory.honcho import HonchoMemoryProvider
 from plugins.memory.honcho.client import HonchoClientConfig
 from plugins.memory.honcho.session import (
     HonchoSession,
@@ -284,6 +285,60 @@ class TestSaveRouting:
             assert mock_flush.call_count == 0
             mgr.save(sess)  # turn 5
             assert mock_flush.call_count == 1
+
+
+class _CaptureSyncManager:
+    def __init__(self):
+        self.requested_session_keys = []
+        self.flushed_session_keys = []
+        self.sessions = {}
+
+    def get_or_create(self, session_key: str):
+        self.requested_session_keys.append(session_key)
+        if session_key not in self.sessions:
+            self.sessions[session_key] = _make_session(
+                key=session_key,
+                honcho_session_id=session_key,
+            )
+        return self.sessions[session_key]
+
+    def _flush_session(self, session):
+        self.flushed_session_keys.append(session.key)
+        return True
+
+
+class TestHonchoProviderSessionSwitch:
+    def _make_ready_provider(self) -> tuple[HonchoMemoryProvider, _CaptureSyncManager]:
+        provider = HonchoMemoryProvider()
+        provider._config = HonchoClientConfig(
+            session_strategy="per-session",
+            write_frequency="turn",
+            enabled=True,
+            api_key="test-key",
+        )
+        manager = _CaptureSyncManager()
+        provider._manager = manager
+        provider._session_initialized = True
+        provider._session_key = provider._resolve_session_key(provider._config, "old-session")
+        return provider, manager
+
+    def test_session_switch_updates_cached_key_for_later_sync_turns(self):
+        provider, manager = self._make_ready_provider()
+
+        provider.sync_turn("before", "old response")
+        provider._sync_thread.join(timeout=2)
+
+        provider.on_session_switch(
+            "new-session",
+            parent_session_id="old-session",
+            reset=False,
+        )
+        provider.sync_turn("after", "new response")
+        provider._sync_thread.join(timeout=2)
+
+        assert manager.requested_session_keys == ["old-session", "new-session"]
+        assert manager.flushed_session_keys == ["old-session", "new-session"]
+        assert provider._session_key == "new-session"
 
 
 class TestMessageNoiseFilters:
