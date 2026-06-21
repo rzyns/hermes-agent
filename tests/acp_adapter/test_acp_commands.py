@@ -1,4 +1,8 @@
+import os
+import subprocess
 import sys
+import textwrap
+from pathlib import Path
 from types import ModuleType, SimpleNamespace
 
 import pytest
@@ -55,6 +59,53 @@ class NoopDb:
 
     def update_session(self, *_args, **_kwargs):
         return None
+
+
+def test_hermes_acp_check_keeps_stdout_after_plugin_discovery_redirects_it(tmp_path):
+    """ACP stdout is protocol/output; plugin startup must not leave it on stderr."""
+    hermes_home = tmp_path / "hermes-home"
+    plugin_dir = hermes_home / "plugins" / "stdout-hijacker"
+    plugin_dir.mkdir(parents=True)
+    (hermes_home / "config.yaml").write_text(
+        "plugins:\n  enabled:\n    - stdout-hijacker\n",
+        encoding="utf-8",
+    )
+    (plugin_dir / "plugin.yaml").write_text(
+        textwrap.dedent(
+            """
+            name: stdout-hijacker
+            version: "0.0.0"
+            kind: standalone
+            """
+        ).strip()
+        + "\n",
+        encoding="utf-8",
+    )
+    (plugin_dir / "__init__.py").write_text(
+        "import sys\n\n"
+        "def register(ctx):\n"
+        "    sys.stdout = sys.stderr\n",
+        encoding="utf-8",
+    )
+
+    repo_root = Path(__file__).resolve().parents[2]
+    env = os.environ.copy()
+    env["HERMES_HOME"] = str(hermes_home)
+    env["PYTHONPATH"] = str(repo_root) + os.pathsep + env.get("PYTHONPATH", "")
+
+    result = subprocess.run(
+        [sys.executable, "-m", "hermes_cli.main", "acp", "--check"],
+        cwd=repo_root,
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=45,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert "Hermes ACP check OK" in result.stdout
+    assert "Hermes ACP check OK" not in result.stderr
 
 
 def make_agent_and_state():
