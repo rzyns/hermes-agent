@@ -160,6 +160,34 @@ def _parse_string_map(host_obj: dict, root_obj: dict, key: str) -> dict[str, str
     return result
 
 
+def _parse_string_list(host_obj: dict, root_obj: dict, key: str) -> list[str]:
+    """Parse a list of strings with host-level whole-list override.
+
+    Accepts either bare strings or objects with a ``pattern``/``regex``/``value``
+    field so configs can name regexes without changing the runtime shape.
+    """
+    source = host_obj[key] if key in host_obj else root_obj.get(key)
+    if source is None:
+        return []
+    if isinstance(source, str):
+        items = [source]
+    elif isinstance(source, list):
+        items = source
+    else:
+        return []
+
+    result: list[str] = []
+    for item in items:
+        if isinstance(item, dict):
+            value = item.get("pattern") or item.get("regex") or item.get("value")
+        else:
+            value = item
+        text = str(value).strip() if value is not None else ""
+        if text:
+            result.append(text)
+    return result
+
+
 def _parse_optional_string(
     host_obj: dict, root_obj: dict, key: str, default: str = ""
 ) -> str:
@@ -349,6 +377,10 @@ class HonchoClientConfig:
     # Honcho API limits — configurable for self-hosted instances
     # Max chars per message sent via add_messages() (Honcho cloud: 25000)
     message_max_chars: int = 25000
+    # Regexes for dropping transient operational messages before they reach
+    # Honcho's derivation pipeline. Host-level ``messageNoiseFilters`` replaces
+    # the root list as a whole.
+    message_noise_filters: list[str] = field(default_factory=list)
     # Max chars for dialectic query input to peer.chat() (Honcho cloud: 10000)
     dialectic_max_input_chars: int = 10000
     # Recall mode: how memory retrieval works when Honcho is active.
@@ -578,6 +610,11 @@ class HonchoClientConfig:
                 host_block.get("messageMaxChars"),
                 raw.get("messageMaxChars"),
                 default=25000,
+            ),
+            message_noise_filters=_parse_string_list(
+                host_block,
+                raw,
+                "messageNoiseFilters",
             ),
             dialectic_max_input_chars=_parse_int_config(
                 host_block.get("dialecticMaxInputChars"),

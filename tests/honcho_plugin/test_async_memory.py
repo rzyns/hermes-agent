@@ -11,6 +11,7 @@ Covers:
 
 import json
 import time
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 
@@ -44,6 +45,36 @@ def _make_manager(write_frequency="turn") -> HonchoSessionManager:
     mgr = HonchoSessionManager(config=cfg)
     mgr._honcho = MagicMock()
     return mgr
+
+
+class _FakePeer:
+    def __init__(self, peer_id: str):
+        self.peer_id = peer_id
+
+    def message(self, content: str):
+        return SimpleNamespace(peer_id=self.peer_id, content=content)
+
+
+def _make_manager_with_flush_fakes(message_noise_filters=None):
+    cfg = HonchoClientConfig(
+        write_frequency="turn",
+        api_key="test-key",
+        enabled=True,
+        message_noise_filters=message_noise_filters or [],
+    )
+    mgr = HonchoSessionManager(config=cfg)
+    session = _make_session(
+        key="cli:test",
+        user_peer_id="eri",
+        assistant_peer_id="hermes",
+        honcho_session_id="cli-test",
+    )
+    mgr._cache[session.key] = session
+    mgr._peers_cache[session.user_peer_id] = _FakePeer(session.user_peer_id)
+    mgr._peers_cache[session.assistant_peer_id] = _FakePeer(session.assistant_peer_id)
+    honcho_session = MagicMock()
+    mgr._sessions_cache[session.honcho_session_id] = honcho_session
+    return mgr, session, honcho_session
 
 
 # ---------------------------------------------------------------------------
@@ -90,6 +121,33 @@ class TestWriteFrequencyParsing:
         }))
         cfg = HonchoClientConfig.from_global_config(config_path=cfg_file)
         assert cfg.write_frequency == "session"
+
+    def test_message_noise_filters_parse_root_strings_and_objects(self, tmp_path):
+        cfg_file = tmp_path / "config.json"
+        cfg_file.write_text(json.dumps({
+            "apiKey": "k",
+            "messageNoiseFilters": [
+                "startup smoke",
+                {"name": "task id", "pattern": "^t_[0-9a-f]{8}$"},
+                {"regex": "^proc_.*$"},
+            ],
+        }))
+        cfg = HonchoClientConfig.from_global_config(config_path=cfg_file)
+        assert cfg.message_noise_filters == [
+            "startup smoke",
+            "^t_[0-9a-f]{8}$",
+            "^proc_.*$",
+        ]
+
+    def test_message_noise_filters_host_block_overrides_root(self, tmp_path):
+        cfg_file = tmp_path / "config.json"
+        cfg_file.write_text(json.dumps({
+            "apiKey": "k",
+            "messageNoiseFilters": ["root-filter"],
+            "hosts": {"hermes": {"messageNoiseFilters": ["host-filter"]}},
+        }))
+        cfg = HonchoClientConfig.from_global_config(config_path=cfg_file)
+        assert cfg.message_noise_filters == ["host-filter"]
 
     def test_defaults_to_async(self, tmp_path):
         cfg_file = tmp_path / "config.json"
@@ -226,6 +284,64 @@ class TestSaveRouting:
             assert mock_flush.call_count == 0
             mgr.save(sess)  # turn 5
             assert mock_flush.call_count == 1
+
+
+class TestMessageNoiseFilters:
+    FILTERS = [
+        r"\bstartup smoke\b",
+        r"\brespond\s+OK\s+only\b",
+        r"^\s*t_[0-9a-f]{8}\s*$",
+        r"^\s*proc_[A-Za-z0-9_:-]+\s*$",
+        r"\bmessage sent at timestamp\b",
+        r"\bone[- ]off command[- ]format instruction\b",
+    ]
+
+    def test_flush_filters_transient_noise_and_keeps_durable_message(self):
+        mgr, session, honcho_session = _make_manager_with_flush_fakes(self.FILTERS)
+        session.add_message("user", "startup smoke: respond OK only")
+        session.add_message("user", "t_e7f0d4a8")
+        session.add_message("assistant", "proc_7c69a48298f2")
+        session.add_message("assistant", "message sent at timestamp 2026-06-21T10:00:00Z")
+        session.add_message("user", "one-off command-format instruction: reply CSV for this command")
+        session.add_message("user", "Janusz prefers rigorous review before memory cleanup.")
+
+        assert mgr._flush_session(session) is True
+
+        honcho_session.add_messages.assert_called_once()
+        sent = honcho_session.add_messages.call_args.args[0]
+        assert [message.content for message in sent] == [
+            "Janusz prefers rigorous review before memory cleanup."
+        ]
+        assert all(message.get("_synced") for message in session.messages)
+        assert [message.get("_filtered", False) for message in session.messages] == [
+            True,
+            True,
+            True,
+            True,
+            True,
+            False,
+        ]
+
+    def test_flush_marks_all_filtered_messages_synced_without_add_messages(self):
+        mgr, session, honcho_session = _make_manager_with_flush_fakes(self.FILTERS)
+        session.add_message("user", "respond OK only")
+        session.add_message("assistant", "t_03c8f3d0")
+
+        assert mgr._flush_session(session) is True
+
+        honcho_session.add_messages.assert_not_called()
+        assert all(message.get("_synced") for message in session.messages)
+        assert all(message.get("_filtered") for message in session.messages)
+
+    def test_invalid_noise_filter_is_ignored_fail_open(self):
+        mgr, session, honcho_session = _make_manager_with_flush_fakes(["["])
+        session.add_message("user", "startup smoke: respond OK only")
+
+        assert mgr._flush_session(session) is True
+
+        honcho_session.add_messages.assert_called_once()
+        sent = honcho_session.add_messages.call_args.args[0]
+        assert [message.content for message in sent] == ["startup smoke: respond OK only"]
 
 
 # ---------------------------------------------------------------------------
