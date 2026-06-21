@@ -106,23 +106,31 @@ kanban_complete(
 
 Shape `metadata` so downstream parsers (reviewers, aggregators, schedulers) can use it without re-reading your prose.
 
-## Deliverable files in `kanban_complete`
+## Shipping deliverables (`artifacts=[...]`)
 
-When your task produces human-consumable files — reports, charts, screenshots, rendered HTML/PDF, spreadsheets, audio/video, archives, JSON/YAML/CSV exports, or other final deliverables — keep them under `$HERMES_KANBAN_WORKSPACE` (or another explicit durable task workspace), write an `artifact-manifest.json`, and attach the final paths directly to completion:
+If your task produced files a human actually wants — reports, charts, screenshots, rendered HTML/PDF, spreadsheets, generated images, audio/video, archives, JSON/YAML/CSV exports, or other final deliverables — pass their **absolute paths** to `kanban_complete(artifacts=[...])`. The gateway notifier uploads each one as a native attachment to whoever subscribed to the task, so the deliverable lands in their chat alongside the completion message instead of being only a path they have to fetch.
+
+Keep deliverables under `$HERMES_KANBAN_WORKSPACE` or another explicit durable task workspace, write an `artifact-manifest.json`, and attach the final paths directly to completion:
 
 ```python
+import os
+from pathlib import Path
+
 from hermes_cli.kanban_artifacts import write_artifact_manifest
+
+workspace = Path(os.environ["HERMES_KANBAN_WORKSPACE"])
+artifact = workspace / "report.pdf"
 
 manifest = write_artifact_manifest(
     task_id=os.environ["HERMES_KANBAN_TASK"],
-    workspace_path=os.environ["HERMES_KANBAN_WORKSPACE"],
-    artifacts=["/home/openclaw/.hermes/artifacts/project/t_task/report.pdf"],
+    workspace_path=workspace,
+    artifacts=[artifact],
     metadata={"source_ref": "attention-intake/t_source"},
 )
 
 kanban_complete(
-    summary="rendered the comparison chart and packet",
-    artifacts=["/home/openclaw/.hermes/artifacts/project/t_task/report.pdf"],
+    summary="rendered the comparison chart and packet; report attached",
+    artifacts=[str(artifact)],
     metadata={
         "artifact_count": 1,
         "artifact_manifest_path": manifest["manifest_path"],
@@ -131,9 +139,17 @@ kanban_complete(
 )
 ```
 
-Use `artifacts=[...]` for final deliverables the human should receive with the completion notification. The paths must be absolute, durable, and must exist on disk when the notifier runs; missing files are silently skipped. Do not attach transient scratch files, source files, logs, secrets, or files that merely support your internal reasoning. If the file is evidence rather than a deliverable, keep it as a compact metadata/comment path with checksum instead of uploading it by default.
+Images and video embed inline; PDFs, docx, csv/xlsx/json/yaml, pptx, zip/tar/gz, audio, and html upload as files. Rules:
+
+- **Absolute paths only**, and the file must still exist when you complete — missing files are silently skipped.
+- **Only real deliverables.** Skip transient scratch files, source files, intermediate logs, secrets, bulky generated junk, and inputs the human already has.
+- `artifacts` is the **top-level** parameter the notifier reads. Do not bury deliverable paths in `metadata` (e.g. `metadata.codex_lane.artifacts`) and expect them to upload — the notifier only scans the top-level `artifacts` list, with a best-effort fallback over your `summary`/`result` text. Metadata paths are for downstream-worker bookkeeping, not delivery.
+- A bare string is auto-promoted to a one-element list, and it merges with any pre-existing `metadata.artifacts` without dupes.
+- If a file is evidence rather than a human-facing deliverable, keep it as a compact metadata/comment path with checksum instead of uploading it by default.
 
 For evidence-heavy tasks, include compact proof pointers rather than raw dumps. Preferred keys: `evidence_bundle`, `raw_transcript`, `claim_ledger`, `commands_run`, `artifacts` with checksums, and `cleanup_verification` when runtime processes, listeners, installs, or generated artifacts were involved. Complete only from fresh evidence you personally verified in the current run; if a completion claim has no proof object, remove it, downgrade it to an assumption, or block. See `agent-qa-gates` → `references/hermes-native-evidence-bundles.md` for the full Evidence Bundle Gate.
+
+Same primitive works outside kanban: any agent surface delivers a file just by writing its absolute path into the response, and Slack/Discord/Telegram/etc. upload it natively — the `artifacts` param is the structured kanban entry point.
 
 ## Claiming cards you actually created
 
