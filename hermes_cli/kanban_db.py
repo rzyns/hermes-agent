@@ -1489,6 +1489,21 @@ class KanbanDbCorruptError(RuntimeError):
             f"Original preserved; backup at {backup_str}."
         )
 
+
+_TRANSIENT_INTEGRITY_CHECK_IO_MARKERS = (
+    # SQLite extended result code 522 is SQLITE_IOERR_SHORT_READ. During live
+    # WAL/checkpoint/filesystem windows, PRAGMA integrity_check may return this
+    # as a result row instead of raising sqlite3.OperationalError. Treat it like
+    # the same transient I/O class so one short read does not poison the
+    # per-process corrupt-DB cache for otherwise healthy bytes.
+    "unable to get the page. error code=522",
+)
+
+
+def _is_transient_integrity_check_io_result(result: object) -> bool:
+    text = str(result or "").casefold()
+    return any(marker in text for marker in _TRANSIENT_INTEGRITY_CHECK_IO_MARKERS)
+
 def _file_sha256(path: Path) -> str:
     """Return a content digest for corrupt-backup deduplication."""
     h = hashlib.sha256()
@@ -1648,7 +1663,12 @@ def _guard_existing_db_is_healthy(path: Path) -> None:
             finally:
                 probe.close()
             if not row or (row[0] or "").lower() != "ok":
-                reason = f"integrity_check returned {row[0] if row else '<no row>'!r}"
+                detail = row[0] if row else "<no row>"
+                if _is_transient_integrity_check_io_result(detail):
+                    raise sqlite3.OperationalError(
+                        f"transient integrity_check I/O failure: {detail}"
+                    )
+                reason = f"integrity_check returned {detail!r}"
         except sqlite3.OperationalError:
             # Lock contention, busy, transient IO — not corruption. Let it propagate.
             raise

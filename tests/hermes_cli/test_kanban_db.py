@@ -186,6 +186,69 @@ def test_connect_rejects_tls_record_in_sqlite_header(tmp_path, monkeypatch):
     assert "53 51 4c 69 74 17 03 03 00 13" in msg
 
 
+def test_integrity_guard_treats_short_read_rows_as_transient(tmp_path, monkeypatch):
+    """Transient SQLite short-read rows must not poison the corrupt-DB cache."""
+    db_path = tmp_path / "kanban.db"
+    db_path.write_bytes(kb._SQLITE_HEADER + b"healthy bytes with transient read failure")
+    resolved = str(db_path.resolve())
+    kb._INITIALIZED_PATHS.discard(resolved)
+    kb._INITIALIZED_PATH_FINGERPRINTS.pop(resolved, None)
+    kb._CORRUPT_DB_BACKUPS.pop(resolved, None)
+
+    integrity_results = [
+        "*** in database main ***\nTree 8 page 2837: unable to get the page. error code=522",
+        "ok",
+    ]
+
+    class FakeProbe:
+        def __init__(self, integrity_result: str):
+            self.integrity_result = integrity_result
+
+        def execute(self, sql):
+            class FakeCursor:
+                def __init__(self, value: str):
+                    self.value = value
+
+                def fetchone(self):
+                    return (self.value,)
+
+            if "integrity_check" in sql:
+                return FakeCursor(self.integrity_result)
+            return FakeCursor("ok")
+
+        def close(self):
+            pass
+
+    backups: list[Path] = []
+
+    def fake_connect(*_args, **_kwargs):
+        return FakeProbe(integrity_results.pop(0))
+
+    def fake_backup(path: Path) -> Path:
+        backup = path.with_name(f"{path.name}.corrupt.{len(backups)}.bak")
+        backups.append(backup)
+        return backup
+
+    monkeypatch.setattr(kb.sqlite3, "connect", fake_connect)
+    monkeypatch.setattr(kb, "_backup_corrupt_db", fake_backup)
+
+    with pytest.raises(sqlite3.OperationalError, match="unable to get the page"):
+        kb._guard_existing_db_is_healthy(db_path)
+
+    assert backups == []
+    assert resolved not in kb._CORRUPT_DB_BACKUPS
+    assert resolved not in kb._INITIALIZED_PATH_FINGERPRINTS
+
+    kb._guard_existing_db_is_healthy(db_path)
+
+    assert backups == []
+    assert resolved not in kb._CORRUPT_DB_BACKUPS
+    assert kb._INITIALIZED_PATH_FINGERPRINTS[resolved] == (
+        db_path.stat().st_mtime_ns,
+        db_path.stat().st_size,
+    )
+
+
 def test_integrity_guard_reuses_backup_for_unchanged_corrupt_db(tmp_path, monkeypatch):
     """Repeated opens of one unchanged corrupt DB should not create backups forever."""
     db_path = tmp_path / "kanban.db"
