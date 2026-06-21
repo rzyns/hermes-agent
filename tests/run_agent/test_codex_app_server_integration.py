@@ -84,6 +84,41 @@ class TestRunConversationCodexPath:
         assert result["codex_thread_id"] == "thread-stub-1"
         assert result["codex_turn_id"] == "turn-stub-1"
 
+    def test_early_return_emits_session_end_hook_once(
+        self, fake_session, monkeypatch
+    ):
+        """Early-return runtimes still must close per-turn plugin state.
+
+        The Langfuse plugin opens its root observation in ``pre_llm_call`` and
+        closes it in ``on_session_end``. The codex_app_server path returns before
+        the standard chat loop/finalizer, so it is a compact regression for the
+        shutdown-time OpenTelemetry finalizer traceback caused by leaked Langfuse
+        context managers.
+        """
+        import hermes_cli.plugins as plugins_mod
+
+        hook_calls = []
+
+        def fake_invoke_hook(name, **kwargs):
+            hook_calls.append((name, kwargs))
+            return []
+
+        monkeypatch.setattr(plugins_mod, "invoke_hook", fake_invoke_hook)
+        agent = _make_codex_agent()
+
+        with patch.object(agent, "_spawn_background_review", return_value=None):
+            result = agent.run_conversation("hello there")
+
+        assert result["completed"] is True
+        session_end_calls = [
+            kwargs for name, kwargs in hook_calls if name == "on_session_end"
+        ]
+        assert len(session_end_calls) == 1
+        assert session_end_calls[0]["session_id"] == agent.session_id
+        assert session_end_calls[0]["task_id"]
+        assert session_end_calls[0]["turn_id"]
+        assert session_end_calls[0]["completed"] is True
+
     def test_codex_app_server_token_usage_updates_session_accounting(self, monkeypatch):
         def fake_run_turn(self, user_input: str, **kwargs):
             return TurnResult(
