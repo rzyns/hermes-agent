@@ -608,8 +608,6 @@ from hermes_cli.model_setup_flows import (
     _model_flow_xai_oauth,
     _model_flow_qwen_oauth,
     _model_flow_minimax_oauth,
-    _model_flow_google_gemini_cli,
-    _model_flow_google_antigravity,
     _model_flow_custom,
     _model_flow_azure_foundry,
     _model_flow_named_custom,
@@ -3089,10 +3087,6 @@ def select_provider_and_model(args=None):
         _model_flow_qwen_oauth(config, current_model)
     elif selected_provider == "minimax-oauth":
         _model_flow_minimax_oauth(config, current_model, args=args)
-    elif selected_provider == "google-gemini-cli":
-        _model_flow_google_gemini_cli(config, current_model)
-    elif selected_provider == "google-antigravity":
-        _model_flow_google_antigravity(config, current_model)
     elif selected_provider == "copilot-acp":
         _model_flow_copilot_acp(config, current_model)
     elif selected_provider == "copilot":
@@ -8064,10 +8058,26 @@ def _cmd_update_check(branch: str = "main", *, branch_explicit: bool = False):
     # Note: upstream/<branch> may not exist for non-main branches (a fork's
     # bb/gui has no upstream counterpart), so when the caller picks a
     # non-default branch we skip the upstream probe and use origin directly.
+    # Installer checkouts are shallow (`git clone --depth 1`). A plain
+    # `git fetch` would unshallow the repo (dragging in the whole history —
+    # the exact cost the shallow clone avoided) and the rev-list count below
+    # would then report a huge bogus "behind" number. Detect shallow up front:
+    # fetch with --depth 1 to preserve the boundary and report presence-only.
+    is_shallow = (
+        subprocess.run(
+            git_cmd + ["rev-parse", "--is-shallow-repository"],
+            cwd=PROJECT_ROOT,
+            capture_output=True,
+            text=True,
+        ).stdout.strip()
+        == "true"
+    )
+    depth_args = ["--depth", "1"] if is_shallow else []
+
     if branch == "main":
         print("→ Fetching from upstream...")
         fetch_result = subprocess.run(
-            git_cmd + ["fetch", "upstream", branch],
+            git_cmd + ["fetch"] + depth_args + ["upstream", branch],
             cwd=PROJECT_ROOT,
             capture_output=True,
             text=True,
@@ -8076,7 +8086,7 @@ def _cmd_update_check(branch: str = "main", *, branch_explicit: bool = False):
             # Fallback to origin if upstream doesn't exist
             print("→ Fetching from origin...")
             fetch_result = subprocess.run(
-                git_cmd + ["fetch", "origin", branch],
+                git_cmd + ["fetch"] + depth_args + ["origin", branch],
                 cwd=PROJECT_ROOT,
                 capture_output=True,
                 text=True,
@@ -8090,7 +8100,7 @@ def _cmd_update_check(branch: str = "main", *, branch_explicit: bool = False):
         # Non-default branch: compare against origin/<branch> directly.
         print("→ Fetching from origin...")
         fetch_result = subprocess.run(
-            git_cmd + ["fetch", "origin", branch],
+            git_cmd + ["fetch"] + depth_args + ["origin", branch],
             cwd=PROJECT_ROOT,
             capture_output=True,
             text=True,
@@ -8123,6 +8133,26 @@ def _cmd_update_check(branch: str = "main", *, branch_explicit: bool = False):
     if verify_result.returncode != 0:
         print(f"✗ Branch '{branch}' not found on {compare_branch.split('/', 1)[0]}.")
         sys.exit(1)
+
+    if is_shallow:
+        # No history to count across the shallow boundary. Compare tip SHAs and
+        # report presence-only (mirrors the banner's _check_via_local_git).
+        head_sha = subprocess.run(
+            git_cmd + ["rev-parse", "HEAD"],
+            cwd=PROJECT_ROOT, capture_output=True, text=True,
+        ).stdout.strip()
+        target_sha = subprocess.run(
+            git_cmd + ["rev-parse", compare_branch],
+            cwd=PROJECT_ROOT, capture_output=True, text=True,
+        ).stdout.strip()
+        if head_sha and target_sha and head_sha == target_sha:
+            print("✓ Already up to date.")
+        else:
+            print(f"⚕ Update available (behind {compare_branch}).")
+            from hermes_cli.config import recommended_update_command
+
+            print(f"  Run '{recommended_update_command()}' to install.")
+        return
 
     rev_result = subprocess.run(
         git_cmd + ["rev-list", f"HEAD..{compare_branch}", "--count"],
@@ -8419,6 +8449,31 @@ def _pause_windows_gateways_for_update() -> dict | None:
         logger.debug("Could not discover Windows gateway PIDs before update: %s", exc)
         return None
     if not running_pids:
+        # No gateway is running right now, but the user may have installed an
+        # autostart entry (Scheduled Task or Startup-folder login item) — that
+        # is an explicit "I want a gateway" signal. A gateway that died between
+        # updates (e.g. the spawning terminal/TUI closed, taking its child with
+        # it) would otherwise never come back: the autostart entry only fires on
+        # the next login, and the update flow's resume path only relaunched
+        # gateways that were running when the update began. Cold-start one after
+        # the update so an installed gateway is actually up post-update. Users
+        # who run gateway-less (no autostart entry) get nothing forced on them.
+        try:
+            from hermes_cli import gateway_windows
+
+            if gateway_windows.is_installed():
+                return {
+                    "resume_needed": True,
+                    "profiles": {},
+                    "unmapped_pids": [],
+                    "unmapped": [],
+                    "cold_start_if_installed": True,
+                }
+        except Exception as exc:
+            logger.debug(
+                "Could not check Windows gateway autostart state before update: %s",
+                exc,
+            )
         return None
 
     profile_processes = {}
@@ -8496,6 +8551,51 @@ def _pause_windows_gateways_for_update() -> dict | None:
     }
 
 
+def _cold_start_windows_gateway_after_update() -> None:
+    """Start a fresh detached gateway after update when one is installed but down.
+
+    Invoked from ``_resume_windows_gateways_after_update`` for the
+    ``cold_start_if_installed`` case: no gateway was running when the update
+    began, but an autostart entry (Scheduled Task / Startup-folder login item)
+    is installed, signalling the user wants a gateway. Unlike the relaunch
+    paths — which watch an old PID and respawn once it exits — this is a direct
+    fresh spawn via the same windowless ``pythonw`` + breakaway path that
+    ``hermes gateway start`` uses (``gateway_windows._spawn_detached``).
+
+    Best-effort and idempotent: re-checks that nothing is running first so a
+    concurrent start (e.g. the autostart entry firing) can't produce a
+    duplicate gateway.
+    """
+    if not _is_windows():
+        return
+    try:
+        from hermes_cli import gateway_windows
+        from hermes_cli.gateway import find_gateway_pids
+    except Exception as exc:
+        logger.debug("Could not load Windows gateway cold-start helpers: %s", exc)
+        return
+
+    # Re-check liveness right before spawning — between pause and resume the
+    # autostart entry may have already brought a gateway up, or a leftover
+    # process may have re-registered. Don't double-start.
+    try:
+        if list(find_gateway_pids(all_profiles=True)):
+            return
+    except Exception as exc:
+        logger.debug("Could not re-check gateway liveness before cold-start: %s", exc)
+        return
+
+    try:
+        pid = gateway_windows._spawn_detached()
+    except Exception as exc:
+        logger.debug("Could not cold-start Windows gateway after update: %s", exc)
+        return
+
+    if pid:
+        print()
+        print(f"  ✓ Starting Windows gateway after update (PID {pid})")
+
+
 def _resume_windows_gateways_after_update(token: dict | None) -> None:
     """Restart Windows profile gateways previously paused for update."""
     if not token or not token.get("resume_needed"):
@@ -8506,7 +8606,10 @@ def _resume_windows_gateways_after_update(token: dict | None) -> None:
 
     profiles = token.get("profiles") or {}
     unmapped = token.get("unmapped") or []
+    cold_start = bool(token.get("cold_start_if_installed"))
     if not profiles and not any(u.get("argv") for u in unmapped):
+        if cold_start:
+            _cold_start_windows_gateway_after_update()
         return
 
     try:
@@ -11103,6 +11206,147 @@ def _dashboard_listening(host: str, port: int) -> bool:
         return False
 
 
+def _maybe_setup_dashboard_auth_interactively(args) -> None:
+    """Offer to configure dashboard auth when a non-loopback bind has none.
+
+    Called from ``cmd_dashboard`` just before ``start_server``. The auth
+    gate engages on every non-loopback bind (``--insecure`` is a no-op since
+    the June 2026 hardening), and ``start_server`` fails closed when no
+    ``DashboardAuthProvider`` is registered. Rather than greet an interactive
+    operator with that hard error, prompt them to set up the bundled
+    username/password provider on the spot — or point them at
+    ``hermes dashboard register`` for OAuth.
+
+    No-ops (so the existing fail-closed ``SystemExit`` remains the backstop)
+    when:
+      * the bind is loopback (gate never engages), or
+      * a provider is already registered, or
+      * stdin/stdout isn't a TTY (Docker/s6, CI, piped ``--no-open`` runs).
+    """
+    host = getattr(args, "host", "127.0.0.1") or "127.0.0.1"
+
+    try:
+        from hermes_cli.web_server import should_require_auth
+        if not should_require_auth(host):
+            return  # loopback bind — gate never engages
+    except Exception:
+        return  # if we can't tell, defer to start_server's own gate
+
+    try:
+        from hermes_cli.dashboard_auth import list_providers
+        if list_providers():
+            return  # a provider is already configured/registered
+    except Exception:
+        return
+
+    # Only prompt an interactive operator. Non-TTY callers fall through to
+    # start_server's fail-closed SystemExit (with the corrected fix hint).
+    if not (sys.stdin.isatty() and sys.stdout.isatty()):
+        return
+
+    print()
+    print(
+        f"⚠ The dashboard is binding to a non-loopback address ({host}) and "
+        f"needs an auth provider."
+    )
+    print(
+        "  Non-loopback binds always require authentication "
+        "(--insecure no longer bypasses this)."
+    )
+    print()
+    print("  How do you want to authenticate the dashboard?")
+    print("    [1] Username & password (quickest; for a trusted LAN / VPN)")
+    print("    [2] OAuth via Nous Portal (run `hermes dashboard register`)")
+    print("    [3] Cancel")
+    print()
+
+    try:
+        choice = input("  Choice [1]: ").strip() or "1"
+    except (EOFError, KeyboardInterrupt):
+        print("\n  Cancelled.")
+        sys.exit(1)
+
+    if choice == "2":
+        print()
+        print(
+            "  Run this on the host where the dashboard lives, then start "
+            "the dashboard again:\n"
+            "    hermes dashboard register\n"
+            "  It provisions a Nous Portal OAuth client and writes "
+            "HERMES_DASHBOARD_OAUTH_CLIENT_ID into ~/.hermes/.env for you.\n"
+            "  Docs: https://hermes-agent.nousresearch.com/docs/"
+            "user-guide/features/web-dashboard#authentication-gated-mode"
+        )
+        sys.exit(0)
+
+    if choice not in ("1",):
+        print("  Cancelled.")
+        sys.exit(1)
+
+    # ── Username/password setup ──────────────────────────────────────────
+    import getpass
+    import secrets
+
+    print()
+    try:
+        username = input("  Username [admin]: ").strip() or "admin"
+        password = getpass.getpass("  Password: ")
+        confirm = getpass.getpass("  Confirm password: ")
+    except (EOFError, KeyboardInterrupt):
+        print("\n  Cancelled.")
+        sys.exit(1)
+
+    if not password:
+        print("  ✗ Empty password — aborting.")
+        sys.exit(1)
+    if password != confirm:
+        print("  ✗ Passwords don't match — aborting.")
+        sys.exit(1)
+
+    try:
+        from plugins.dashboard_auth.basic import hash_password
+    except Exception as exc:
+        print(f"  ✗ Could not load the password provider: {exc}")
+        sys.exit(1)
+
+    password_hash = hash_password(password)
+    # A stable token-signing secret so sessions survive a dashboard restart.
+    secret = secrets.token_urlsafe(32)
+
+    try:
+        from hermes_cli.config import load_config, save_config
+
+        cfg = load_config()
+        dash = cfg.setdefault("dashboard", {})
+        basic = dash.setdefault("basic_auth", {})
+        basic["username"] = username
+        basic["password_hash"] = password_hash
+        # Never persist plaintext: clear any stale plaintext password key.
+        basic["password"] = ""
+        if not str(basic.get("secret", "") or "").strip():
+            basic["secret"] = secret
+        save_config(cfg)
+    except Exception as exc:
+        print(f"  ✗ Failed to write config.yaml: {exc}")
+        sys.exit(1)
+
+    # Re-run plugin discovery so the basic provider registers from the
+    # just-written config before start_server's gate check runs.
+    try:
+        from hermes_cli.plugins import discover_plugins
+
+        discover_plugins(force=True)
+    except Exception as exc:
+        print(f"  ⚠ Plugin re-discovery failed ({exc}); the gate may still "
+              "fail closed. Set the password again or restart the dashboard.")
+
+    print()
+    print(f"  ✓ Username/password auth configured (user: {username}).")
+    print("    Saved to config.yaml under dashboard.basic_auth.")
+    print("    Sign in at the dashboard with these credentials.")
+    print()
+
+
 def cmd_dashboard(args):
     """Start the web UI server, or (with --stop/--status) manage running ones."""
     # --status: report running dashboards and exit, no deps needed.
@@ -11294,6 +11538,13 @@ def cmd_dashboard(args):
 
     from hermes_cli.web_server import start_server
 
+    # Interactive auth setup: if this bind will engage the auth gate but no
+    # provider is registered yet, offer to configure one here (TTY only)
+    # instead of hard-failing inside start_server. Non-interactive callers
+    # (Docker/s6, CI, --no-open pipelines) fall through to start_server's
+    # fail-closed SystemExit unchanged.
+    _maybe_setup_dashboard_auth_interactively(args)
+
     # The in-browser Chat tab (the embedded TUI over PTY/WebSocket) is always
     # available — the desktop app and the dashboard's own Chat tab both rely on
     # the `/api/ws` + `/api/pty` sockets, so there is no reason to gate them.
@@ -11370,7 +11621,7 @@ def _build_provider_choices() -> list[str]:
         # Fallback: static list guarantees the CLI always works
         return [
             "auto", "openrouter", "nous", "openai-codex", "xai-oauth", "copilot-acp", "copilot",
-            "anthropic", "gemini", "google-gemini-cli", "google-antigravity", "xai", "bedrock", "azure-foundry",
+            "anthropic", "gemini", "xai", "bedrock", "azure-foundry",
             "ollama-cloud", "huggingface", "zai", "kimi-coding", "kimi-coding-cn",
             "stepfun", "minimax", "minimax-cn", "kilocode", "novita", "xiaomi", "arcee",
             "nvidia", "deepseek", "alibaba", "qwen-oauth", "opencode-zen", "opencode-go",
