@@ -214,8 +214,23 @@ class TestResolveSessionNameTitle:
         result = cfg.resolve_session_name("/some/dir", session_id=None)
         assert result == "dir"
 
-    def test_title_still_beats_session_id_without_gateway_key(self):
+    def test_per_session_id_beats_title(self):
+        # per-session: the run's session_id is authoritative; an (auto-)generated
+        # title must NOT remap a live conversation onto a second Honcho session.
         cfg = HonchoClientConfig(session_strategy="per-session")
+        result = cfg.resolve_session_name("/some/dir", session_title="my-title", session_id="20260309_175514_9797dd")
+        assert result == "20260309_175514_9797dd"
+
+    def test_per_session_id_beats_manual_map(self):
+        # per-session: session_id also wins over a stale cwd map entry (e.g. the
+        # desktop launching from a mapped home dir).
+        cfg = HonchoClientConfig(session_strategy="per-session", sessions={"/some/dir": "pinned"})
+        result = cfg.resolve_session_name("/some/dir", session_id="20260309_175514_9797dd")
+        assert result == "20260309_175514_9797dd"
+
+    def test_title_still_applies_for_non_per_session(self):
+        # Outside per-session, /title still names the Honcho session.
+        cfg = HonchoClientConfig(session_strategy="per-directory")
         result = cfg.resolve_session_name("/some/dir", session_title="my-title", session_id="20260309_175514_9797dd")
         assert result == "my-title"
 
@@ -243,7 +258,7 @@ class TestResolveSessionNameTitle:
         )
         assert result == "eri-webui-session-abc123"
 
-    def test_manual_override_still_beats_gateway_key_and_title(self):
+    def test_gateway_key_beats_manual_map_and_title(self):
         cfg = HonchoClientConfig(
             session_strategy="per-session",
             sessions={"/some/dir": "manual-name"},
@@ -254,14 +269,23 @@ class TestResolveSessionNameTitle:
             session_id="20260309_175514_9797dd",
             gateway_session_key="webui:session:abc123",
         )
-        assert result == "manual-name"
+        assert result == "webui-session-abc123"
 
-    def test_invalid_gateway_key_falls_back_to_title(self):
+    def test_invalid_gateway_key_falls_back_to_per_session_id(self):
         cfg = HonchoClientConfig(session_strategy="per-session")
         result = cfg.resolve_session_name(
             "/some/dir",
             session_title="pretty title",
             session_id="20260309_175514_9797dd",
+            gateway_session_key="!!! ###",
+        )
+        assert result == "20260309_175514_9797dd"
+
+    def test_invalid_gateway_key_falls_back_to_title_for_non_per_session(self):
+        cfg = HonchoClientConfig(session_strategy="per-directory")
+        result = cfg.resolve_session_name(
+            "/some/dir",
+            session_title="pretty title",
             gateway_session_key="!!! ###",
         )
         assert result == "pretty-title"
@@ -290,11 +314,6 @@ class TestResolveSessionNameTitle:
         assert candidates[0] == ("gateway_session_key", "webui-session-abc123")
         assert ("session_title", "pretty-title") in candidates
         assert ("session_id", "20260309_175514_9797dd") in candidates
-
-    def test_manual_beats_session_id(self):
-        cfg = HonchoClientConfig(session_strategy="per-session", sessions={"/some/dir": "pinned"})
-        result = cfg.resolve_session_name("/some/dir", session_id="20260309_175514_9797dd")
-        assert result == "pinned"
 
     def test_global_strategy_returns_workspace(self):
         cfg = HonchoClientConfig(session_strategy="global", workspace_id="my-workspace")

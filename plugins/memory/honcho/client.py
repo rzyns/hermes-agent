@@ -749,12 +749,12 @@ class HonchoClientConfig:
         session_id: str | None = None,
         gateway_session_key: str | None = None,
     ) -> list[tuple[str, str]]:
-        """Return ordered plausible Honcho session keys for diagnostics/readback.
+        """Return plausible Honcho session keys for diagnostics/readback.
 
-        Explicit sources (manual map, gateway key, display title, raw session ID)
-        appear first in resolver precedence order, followed by strategy fallback
+        Stable identifiers (gateway key, raw session id) are listed before
+        user-facing labels (manual map, title), followed by strategy fallback
         handles (repo, directory, global). ``resolve_session_name()`` still
-        applies ``session_strategy`` when choosing among those fallback handles.
+        applies strategy-dependent precedence when choosing the active key.
         """
         if not cwd:
             cwd = os.getcwd()
@@ -765,10 +765,10 @@ class HonchoClientConfig:
             if key:
                 candidates.append((source, key))
 
-        add("manual_override", self.sessions.get(cwd))
         add("gateway_session_key", self._gateway_session_name(gateway_session_key))
-        add("session_title", self._title_session_name(session_title))
         add("session_id", self._session_id_session_name(session_id))
+        add("manual_override", self.sessions.get(cwd))
+        add("session_title", self._title_session_name(session_title))
 
         repo_name = self._git_repo_name(cwd)
         if repo_name:
@@ -787,10 +787,11 @@ class HonchoClientConfig:
         """Resolve Honcho session name.
 
         Resolution order:
-          1. Manual directory override from sessions map
-          2. Gateway session key (stable per-chat identifier from gateway platforms)
-          3. Hermes session title (display label / legacy non-gateway remap)
-          4. per-session strategy — Hermes session_id ({timestamp}_{hex})
+          1. Gateway session key (stable per-chat identifier from gateway platforms)
+          2. per-session strategy — Hermes session_id ({timestamp}_{hex}); authoritative,
+             so a generated title or cwd map never remaps a live conversation
+          3. Manual directory override from sessions map (non-per-session)
+          4. Hermes session title (from /title command; non-per-session)
           5. per-repo strategy — git repo root directory name
           6. per-directory strategy — directory basename
           7. global strategy — workspace name
@@ -805,17 +806,25 @@ class HonchoClientConfig:
             gateway_session_key=gateway_session_key,
         ))
 
-        # Explicit/manual keys and gateway keys are source-level overrides that
-        # beat presentation metadata and strategy-based fallback resolution.
-        if candidate_map.get("manual_override"):
-            return candidate_map["manual_override"]
+        # Gateway per-chat key wins everywhere — gateways (telegram/discord/…)
+        # need per-chat isolation no cwd/strategy name can provide.
         if candidate_map.get("gateway_session_key"):
             return candidate_map["gateway_session_key"]
+
+        # per-session: the run's session_id IS the identity — resolve before the
+        # cwd map / title so an auto-generated title can't remap a live
+        # conversation onto a second Honcho session mid-stream.
+        if self.session_strategy == "per-session" and candidate_map.get("session_id"):
+            return candidate_map["session_id"]
+
+        # Manual override (cwd → name), for non-per-session strategies.
+        if candidate_map.get("manual_override"):
+            return candidate_map["manual_override"]
+
+        # /title mid-session remap (non-per-session).
         if candidate_map.get("session_title"):
             return candidate_map["session_title"]
 
-        if self.session_strategy == "per-session" and candidate_map.get("session_id"):
-            return candidate_map["session_id"]
         if self.session_strategy == "per-repo" and candidate_map.get("repo"):
             return candidate_map["repo"]
         if self.session_strategy in {"per-directory", "per-session", "per-repo"}:
@@ -824,6 +833,39 @@ class HonchoClientConfig:
 
 
 _honcho_client_slot: SingletonSlot = SingletonSlot()
+
+
+def _apply_fresh_oauth_token(config: HonchoClientConfig) -> None:
+    """Refresh a near-expiry OAuth grant and point ``config.api_key`` at it.
+
+    No-op for static API keys or when refresh fails (fail-open: the stale token
+    is left in place and the existing 401 handling degrades gracefully).
+    """
+    try:
+        from plugins.memory.honcho import oauth
+
+        token, _ = oauth.ensure_fresh_token(resolve_config_path(), config.host)
+        if token:
+            config.api_key = token
+    except Exception:
+        logger.warning("Honcho OAuth pre-build refresh failed", exc_info=True)
+
+
+def _refresh_cached_oauth(client: "Honcho", config: HonchoClientConfig | None) -> None:
+    """Rotate the cached client's Bearer in place when its OAuth token is stale.
+
+    If the SDK shape changed and the in-place rotation can't apply, the slot is
+    reset so the next acquisition rebuilds with the fresh token.
+    """
+    try:
+        from plugins.memory.honcho import oauth
+
+        host = config.host if config is not None else resolve_active_host()
+        token, refreshed = oauth.ensure_fresh_token(resolve_config_path(), host)
+        if refreshed and token and not oauth.apply_token_to_client(client, token):
+            _honcho_client_slot.reset()
+    except Exception:
+        logger.warning("Honcho OAuth cached refresh failed", exc_info=True)
 
 
 def get_honcho_client(config: HonchoClientConfig | None = None) -> Honcho:
@@ -838,10 +880,15 @@ def get_honcho_client(config: HonchoClientConfig | None = None) -> Honcho:
     """
     cached = _honcho_client_slot.peek()
     if cached is not None:
+        _refresh_cached_oauth(cached, config)
         return cached
 
     if config is None:
         config = HonchoClientConfig.from_global_config()
+
+    # Refresh a near-expiry OAuth grant before the first build so the client
+    # starts with a live access token rather than 401ing an hour in.
+    _apply_fresh_oauth_token(config)
 
     if not config.api_key and not config.base_url:
         raise ValueError(
