@@ -168,6 +168,7 @@ export async function listSessions(
 // consumes the whole recents page and starves real conversations.
 export interface SessionSourceFilter {
   source?: string
+  sources?: string[]
   excludeSources?: string[]
 }
 
@@ -181,6 +182,9 @@ export async function listAllProfileSessions(
 ): Promise<PaginatedSessions> {
   const sourceParam = filter.source ? `&source=${encodeURIComponent(filter.source)}` : ''
 
+  const sourcesParam =
+    !filter.source && filter.sources?.length ? `&sources=${encodeURIComponent(filter.sources.join(','))}` : ''
+
   const excludeParam = filter.excludeSources?.length
     ? `&exclude_sources=${encodeURIComponent(filter.excludeSources.join(','))}`
     : ''
@@ -188,7 +192,7 @@ export async function listAllProfileSessions(
   const result = await window.hermesDesktop.api<PaginatedSessions>({
     path:
       `/api/profiles/sessions?limit=${limit}&offset=0&min_messages=${Math.max(0, minMessages)}` +
-      `&archived=${archived}&order=${order}&profile=${encodeURIComponent(profile)}${sourceParam}${excludeParam}`,
+      `&archived=${archived}&order=${order}&profile=${encodeURIComponent(profile)}${sourceParam}${sourcesParam}${excludeParam}`,
     timeoutMs: SESSION_LIST_REQUEST_TIMEOUT_MS
   })
 
@@ -353,10 +357,7 @@ export function getMemoryProviderConfig(provider: string): Promise<MemoryProvide
   })
 }
 
-export function saveMemoryProviderConfig(
-  provider: string,
-  values: Record<string, string>
-): Promise<{ ok: boolean }> {
+export function saveMemoryProviderConfig(provider: string, values: Record<string, string>): Promise<{ ok: boolean }> {
   return window.hermesDesktop.api<{ ok: boolean }>({
     path: `/api/memory/providers/${encodeURIComponent(provider)}/config`,
     method: 'PUT',

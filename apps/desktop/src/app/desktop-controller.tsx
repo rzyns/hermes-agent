@@ -16,12 +16,8 @@ import { formatRefValue } from '../components/assistant-ui/directive-text'
 import { getCronJobs, getSessionMessages, listAllProfileSessions, type SessionInfo, triggerCronJob } from '../hermes'
 import { type ChatMessage, chatMessageText, preserveLocalAssistantErrors, toChatMessages } from '../lib/chat-messages'
 import { storedSessionIdForNotification } from '../lib/session-ids'
-import {
-  isMessagingSource,
-  LOCAL_SESSION_SOURCE_IDS,
-  MESSAGING_SESSION_SOURCE_IDS,
-  normalizeSessionSource
-} from '../lib/session-source'
+import { isMessagingSource, LOCAL_SESSION_SOURCE_IDS, normalizeSessionSource } from '../lib/session-source'
+import { sessionMatchesSidebarSources, sidebarSessionSourceFilter } from '../lib/sidebar-session-sources'
 import { latestSessionTodos } from '../lib/todos'
 import { setCronFocusJobId, setCronJobs } from '../store/cron'
 import {
@@ -60,10 +56,11 @@ import {
   $gatewayState,
   $messages,
   $messagingSessions,
-  $resumeFailedSessionId,
   $resumeExhaustedSessionId,
+  $resumeFailedSessionId,
   $selectedStoredSessionId,
   $sessions,
+  $sidebarSessionSourceIds,
   $workingSessionIds,
   CRON_SECTION_LIMIT,
   getRecentlySettledSessionIds,
@@ -149,12 +146,6 @@ const SkillsView = lazy(async () => ({ default: (await import('./skills')).Skill
 // this cadence while the app is open + visible so new runs surface promptly
 // instead of waiting for the next user-triggered refreshSessions().
 const CRON_POLL_INTERVAL_MS = 30_000
-// The recents list is local-only: cron rows have their own section, and each
-// messaging platform (telegram, discord, …) is fetched separately into its own
-// self-managed sidebar section (refreshMessagingSessions). Excluding both here
-// keeps "Load more" paging through interactive local chats instead of
-// interleaving gateway threads that bury them.
-const SIDEBAR_EXCLUDED_SOURCES = ['cron', 'subagent', 'tool', ...MESSAGING_SESSION_SOURCE_IDS]
 // The messaging slice is the inverse: drop cron + every local source so only
 // external-platform conversations remain, then split per platform in the UI.
 const MESSAGING_EXCLUDED_SOURCES = ['cron', ...LOCAL_SESSION_SOURCE_IDS]
@@ -216,6 +207,19 @@ export function DesktopController() {
   const terminalTakeover = useStore($terminalTakeover)
   const panesFlipped = useStore($panesFlipped)
   const profileScope = useStore($profileScope)
+  const sidebarSessionSourceIds = useStore($sidebarSessionSourceIds)
+
+  const sidebarSourceFilter = useMemo(
+    () => sidebarSessionSourceFilter(sidebarSessionSourceIds),
+    [sidebarSessionSourceIds]
+  )
+
+  const filterSidebarRows = useCallback(
+    (rows: SessionInfo[]) =>
+      rows.filter(session => sessionMatchesSidebarSources(session.source, sidebarSessionSourceIds)),
+    [sidebarSessionSourceIds]
+  )
+
   // Below SIDEBAR_COLLAPSE_BREAKPOINT_PX there's no room for a docked rail —
   // collapse both sidebars (without touching their stored open state) so the
   // hover-reveal overlay becomes the way in. Restores once it's wide again.
@@ -455,13 +459,12 @@ export function DesktopController() {
       // recency page — the empty-history-on-profile-switch bug.
       const sessionProfile = profileScope === ALL_PROFILES ? 'all' : profileScope
 
-      const result = await listAllProfileSessions(limit, 1, 'exclude', 'recent', sessionProfile, {
-        excludeSources: SIDEBAR_EXCLUDED_SOURCES
-      })
+      const result = await listAllProfileSessions(limit, 1, 'exclude', 'recent', sessionProfile, sidebarSourceFilter)
+      const incomingSessions = filterSidebarRows(result.sessions)
 
       if (refreshSessionsRequestRef.current === requestId) {
-        setSessions(prev => mergeSessionPage(prev, result.sessions, sessionsToKeep()))
-        setSessionsTotal(typeof result.total === 'number' ? result.total : result.sessions.length)
+        setSessions(prev => mergeSessionPage(filterSidebarRows(prev), incomingSessions, sessionsToKeep()))
+        setSessionsTotal(typeof result.total === 'number' ? result.total : incomingSessions.length)
         setSessionProfileTotals(result.profile_totals ?? {})
       }
     } finally {
@@ -473,7 +476,14 @@ export function DesktopController() {
     void refreshCronSessions()
     void refreshCronJobs()
     void refreshMessagingSessions()
-  }, [profileScope, refreshCronSessions, refreshCronJobs, refreshMessagingSessions])
+  }, [
+    filterSidebarRows,
+    profileScope,
+    refreshCronSessions,
+    refreshCronJobs,
+    refreshMessagingSessions,
+    sidebarSourceFilter
+  ])
 
   const loadMoreSessions = useCallback(() => {
     bumpSessionsLimit()
@@ -493,25 +503,35 @@ export function DesktopController() {
 
   // ALL-profiles view pages one profile at a time: fetch that profile's next
   // page and merge it in place, leaving every other profile's rows untouched.
-  const loadMoreSessionsForProfile = useCallback(async (profile: string) => {
-    const key = normalizeProfileKey(profile)
-    const inKey = (s: SessionInfo) => normalizeProfileKey(s.profile) === key
-    const loaded = $sessions.get().filter(inKey).length
+  const loadMoreSessionsForProfile = useCallback(
+    async (profile: string) => {
+      const key = normalizeProfileKey(profile)
+      const inKey = (s: SessionInfo) => normalizeProfileKey(s.profile) === key
+      const loaded = filterSidebarRows($sessions.get().filter(inKey)).length
 
-    const result = await listAllProfileSessions(loaded + SIDEBAR_SESSIONS_PAGE_SIZE, 1, 'exclude', 'recent', key, {
-      excludeSources: SIDEBAR_EXCLUDED_SOURCES
-    })
+      const result = await listAllProfileSessions(
+        loaded + SIDEBAR_SESSIONS_PAGE_SIZE,
+        1,
+        'exclude',
+        'recent',
+        key,
+        sidebarSourceFilter
+      )
 
-    const keep = sessionsToKeep(key)
+      const incomingSessions = filterSidebarRows(result.sessions)
 
-    setSessions(prev => [
-      ...prev.filter(s => !inKey(s)),
-      ...mergeSessionPage(prev.filter(inKey), result.sessions, keep)
-    ])
+      const keep = sessionsToKeep(key)
 
-    const total = result.profile_totals?.[key] ?? result.total ?? result.sessions.length
-    setSessionProfileTotals(prev => ({ ...prev, [key]: Math.max(total, result.sessions.length) }))
-  }, [])
+      setSessions(prev => [
+        ...prev.filter(s => !inKey(s)),
+        ...mergeSessionPage(filterSidebarRows(prev.filter(inKey)), incomingSessions, keep)
+      ])
+
+      const total = result.profile_totals?.[key] ?? result.total ?? incomingSessions.length
+      setSessionProfileTotals(prev => ({ ...prev, [key]: Math.max(total, incomingSessions.length) }))
+    },
+    [filterSidebarRows, sidebarSourceFilter]
+  )
 
   const toggleSelectedPin = useCallback(() => {
     const sessionId = $selectedStoredSessionId.get()

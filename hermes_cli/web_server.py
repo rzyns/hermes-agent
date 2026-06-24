@@ -2949,6 +2949,7 @@ async def get_sessions(
     archived: str = "exclude",
     order: str = "created",
     source: str = None,
+    sources: str = None,
     exclude_sources: str = None,
     profile: Optional[str] = None,
 ):
@@ -2984,12 +2985,17 @@ async def get_sessions(
             archived_only = archived == "only"
             include_archived = archived == "include"
             # Optional source scoping: ``source`` includes a single class,
+            # ``sources`` includes a comma-separated allowlist, and
             # ``exclude_sources`` (comma-separated) drops classes. The desktop
-            # uses these to split recents (exclude=cron) from the cron-jobs
-            # section (source=cron) into two independent lists.
-            exclude_list = [s for s in (exclude_sources or "").split(",") if s.strip()]
+            # uses these to split recents from scheduler/messaging slices and to
+            # support a user-selected sidebar allowlist without client-side page
+            # starvation.
+            source_filter = source or None
+            sources_list = [s.strip() for s in (sources or "").split(",") if s.strip()]
+            exclude_list = [s.strip() for s in (exclude_sources or "").split(",") if s.strip()]
             sessions = db.list_sessions_rich(
-                source=source or None,
+                source=source_filter,
+                sources=None if source_filter else (sources_list or None),
                 exclude_sources=exclude_list or None,
                 limit=limit,
                 offset=offset,
@@ -2999,7 +3005,8 @@ async def get_sessions(
                 order_by_last_active=order == "recent",
             )
             total = db.session_count(
-                source=source or None,
+                source=source_filter,
+                sources=None if source_filter else (sources_list or None),
                 exclude_sources=exclude_list or None,
                 min_message_count=min_message_count,
                 include_archived=include_archived,
@@ -3036,6 +3043,7 @@ async def get_profiles_sessions(
     order: str = "recent",
     profile: str = "all",
     source: str = None,
+    sources: str = None,
     exclude_sources: str = None,
 ):
     """Unified, read-only session list aggregated across ALL profiles.
@@ -3073,10 +3081,12 @@ async def get_profiles_sessions(
     archived_only = archived == "only"
     include_archived = archived == "include"
     # Source scoping (see /api/sessions): recents pass exclude_sources=cron,
-    # the cron-jobs section passes source=cron — two independent lists so
-    # newest cron sessions can't starve the recents page.
+    # the cron-jobs section passes source=cron, and Desktop settings can pass a
+    # multi-source allowlist — independent lists so newest cron/API sessions
+    # can't starve the local recents page.
     source_filter = source or None
-    exclude_list = [s for s in (exclude_sources or "").split(",") if s.strip()]
+    sources_list = [s.strip() for s in (sources or "").split(",") if s.strip()]
+    exclude_list = [s.strip() for s in (exclude_sources or "").split(",") if s.strip()]
     # Over-fetch per profile so the merged+sorted window is correct for the
     # requested page. Capped so a huge profile can't blow up the response.
     per_profile = min(max(limit + offset, limit), 500)
@@ -3101,6 +3111,7 @@ async def get_profiles_sessions(
         try:
             rows = db.list_sessions_rich(
                 source=source_filter,
+                sources=None if source_filter else (sources_list or None),
                 exclude_sources=exclude_list or None,
                 limit=per_profile,
                 offset=0,
@@ -3111,6 +3122,7 @@ async def get_profiles_sessions(
             )
             profile_total = db.session_count(
                 source=source_filter,
+                sources=None if source_filter else (sources_list or None),
                 exclude_sources=exclude_list or None,
                 min_message_count=min_message_count,
                 include_archived=include_archived,

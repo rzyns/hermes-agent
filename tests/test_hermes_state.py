@@ -1526,6 +1526,13 @@ class TestCounts:
         assert db.session_count(source="cli") == 2
         assert db.session_count(source="telegram") == 1
 
+    def test_session_count_by_source_allowlist(self, db):
+        db.create_session(session_id="s1", source="cli")
+        db.create_session(session_id="s2", source="tui")
+        db.create_session(session_id="s3", source="webui")
+        db.create_session(session_id="s4", source="acp")
+        assert db.session_count(sources=["cli", "tui", "webui"]) == 3
+
     def test_message_count_total(self, db):
         assert db.message_count() == 0
         db.create_session(session_id="s1", source="cli")
@@ -3131,6 +3138,14 @@ class TestListSessionsRich:
         sessions = db.list_sessions_rich(source="cli")
         assert len(sessions) == 1
         assert sessions[0]["id"] == "s1"
+
+    def test_rich_list_source_allowlist_filter(self, db):
+        db.create_session("s1", "cli")
+        db.create_session("s2", "tui")
+        db.create_session("s3", "webui")
+        db.create_session("s4", "acp")
+        sessions = db.list_sessions_rich(sources=["cli", "tui", "webui"], limit=10)
+        assert {session["id"] for session in sessions} == {"s1", "s2", "s3"}
 
     def test_preview_newlines_collapsed(self, db):
         db.create_session("s1", "cli")

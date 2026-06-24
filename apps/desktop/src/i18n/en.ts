@@ -634,6 +634,17 @@ export const en: Translations = {
         'New sessions start in this folder unless you pick another. Leave it unset to use your home directory.',
       defaultDirUpdated: 'Default project directory updated — start a new chat (Ctrl/⌘+N) for it to take effect',
       defaultsTo: label => `Defaults to ${label}.`,
+      sidebarSourcesTitle: 'Sidebar sources',
+      sidebarSourcesDesc:
+        'Choose which session sources appear in the main sidebar recents list. Default keeps Hermes’ built-in cron and messaging grouping; selecting sources shows only those sources.',
+      sidebarSourcesDefaultMode: 'Built-in sidebar grouping',
+      sidebarSourcesDefaultSummary:
+        'Main recents exclude cron, tools, subagents, and messaging platforms; those sources stay in their own sections.',
+      sidebarSourcesCustomMode: 'Selected sources only',
+      sidebarSourcesSelectedSummary: sources => `Main recents show only: ${sources}.`,
+      sidebarSourcesPresetLocal: 'CLI + TUI + WebUI',
+      sidebarSourcesUseDefault: 'Use default',
+      sidebarSourcesToggle: source => `Show ${source} sessions in the sidebar`,
       change: 'Change',
       choose: 'Choose',
       clear: 'Clear',
@@ -1805,7 +1816,8 @@ export const en: Translations = {
       restoreCheckpoint: 'Restore checkpoint',
       restoreFromHere: 'Restore checkpoint — rerun from this prompt',
       restoreTitle: 'Restore to this checkpoint?',
-      restoreBody: 'Everything after this prompt is removed from the conversation, and the prompt runs again from here.',
+      restoreBody:
+        'Everything after this prompt is removed from the conversation, and the prompt runs again from here.',
       restoreConfirm: 'Restore & rerun',
       restoreNext: 'Restore next checkpoint',
       goForward: 'Go forward',
@@ -1904,7 +1916,8 @@ export const en: Translations = {
     editFailed: 'Edit failed',
     resumeFailed: 'Resume failed',
     resumeStrandedTitle: "Couldn't load this session",
-    resumeStrandedBody: 'The connection to this session failed and automatic retries gave up. Check that the gateway is running, then try again.',
+    resumeStrandedBody:
+      'The connection to this session failed and automatic retries gave up. Check that the gateway is running, then try again.',
     resumeRetry: 'Retry',
     nothingToBranch: 'Nothing to branch',
     branchNeedsChat: 'Start or resume a chat before branching.',

@@ -2250,6 +2250,7 @@ class SessionDB:
     def list_sessions_rich(
         self,
         source: str = None,
+        sources: List[str] = None,
         exclude_sources: List[str] = None,
         limit: int = 20,
         offset: int = 0,
@@ -2309,9 +2310,15 @@ class SessionDB:
             where_clauses.append(_LISTABLE_CHILD_SQL)
             where_clauses.append(f"{_delegate_from_json('s.model_config')} IS NULL")
 
+        source_list = [s for s in (sources or []) if s]
+
         if source:
             where_clauses.append("s.source = ?")
             params.append(source)
+        elif source_list:
+            placeholders = ",".join("?" for _ in source_list)
+            where_clauses.append(f"s.source IN ({placeholders})")
+            params.extend(source_list)
         if exclude_sources:
             placeholders = ",".join("?" for _ in exclude_sources)
             where_clauses.append(f"s.source NOT IN ({placeholders})")
@@ -4021,6 +4028,7 @@ class SessionDB:
     def session_count(
         self,
         source: str = None,
+        sources: List[str] = None,
         min_message_count: int = 0,
         include_archived: bool = False,
         archived_only: bool = False,
@@ -4050,9 +4058,15 @@ class SessionDB:
             # children (parent ended with end_reason='branched').
             where_clauses.append(_LISTABLE_CHILD_SQL)
             where_clauses.append(f"{_delegate_from_json('s.model_config')} IS NULL")
+        source_list = [s for s in (sources or []) if s]
+
         if source:
             where_clauses.append("s.source = ?")
             params.append(source)
+        elif source_list:
+            placeholders = ",".join("?" for _ in source_list)
+            where_clauses.append(f"s.source IN ({placeholders})")
+            params.extend(source_list)
         if exclude_sources:
             placeholders = ",".join("?" for _ in exclude_sources)
             where_clauses.append(f"s.source NOT IN ({placeholders})")

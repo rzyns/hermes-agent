@@ -4,7 +4,15 @@ import { lastVisibleMessageIsUser } from '@/app/chat/thread-loading'
 import type { ContextSuggestion } from '@/app/types'
 import type { HermesConnection } from '@/global'
 import type { ChatMessage } from '@/lib/chat-messages'
-import { persistBoolean, persistString, storedBoolean, storedString } from '@/lib/storage'
+import { normalizeSidebarSourceIds } from '@/lib/sidebar-session-sources'
+import {
+  persistBoolean,
+  persistString,
+  persistStringArray,
+  storedBoolean,
+  storedString,
+  storedStringArray
+} from '@/lib/storage'
 import type { SessionInfo, UsageStats } from '@/types/hermes'
 
 type Updater<T> = T | ((current: T) => T)
@@ -20,6 +28,7 @@ const COMPOSER_MODEL_KEY = 'hermes.desktop.composer.model'
 const COMPOSER_PROVIDER_KEY = 'hermes.desktop.composer.provider'
 const COMPOSER_EFFORT_KEY = 'hermes.desktop.composer.reasoning-effort'
 const COMPOSER_FAST_KEY = 'hermes.desktop.composer.fast'
+const SIDEBAR_SESSION_SOURCE_IDS_KEY = 'hermes.desktop.sidebar.session-source-ids'
 
 let configuredDefaultProjectDir = ''
 
@@ -30,6 +39,7 @@ function workspaceCwdKey(connection: HermesConnection | null = $connection.get()
 
   const base = encodeURIComponent(connection.baseUrl || 'remote')
   const profile = encodeURIComponent(connection.profile || 'default')
+
   return `${WORKSPACE_CWD_KEY}.remote.${base}.${profile}`
 }
 
@@ -75,6 +85,7 @@ export async function ensureDefaultWorkspaceCwd(): Promise<void> {
 
   if ($connection.get()?.mode === 'remote') {
     seedLiveCwd(remembered)
+
     return
   }
 
@@ -151,13 +162,12 @@ export function mergeSessionPage(
   }
 
   const incomingIds = new Set(incoming.map(session => session.id))
+
   // Deduplicate by compression lineage: when auto-compression rotates the tip
   // id (old #4 → new #5), the incoming page carries the new tip but the
   // previous list still holds the old one.  Without lineage-level dedup both
   // rows survive as separate sidebar entries (fixes #43483).
-  const incomingLineageKeys = new Set(
-    incoming.map(session => session._lineage_root_id ?? session.id)
-  )
+  const incomingLineageKeys = new Set(incoming.map(session => session._lineage_root_id ?? session.id))
 
   const survivors = previous.filter(
     session =>
@@ -240,6 +250,9 @@ export const $currentProvider = atom(storedString(COMPOSER_PROVIDER_KEY) ?? '')
 export const $currentReasoningEffort = atom(storedString(COMPOSER_EFFORT_KEY) ?? '')
 export const $currentServiceTier = atom('')
 export const $currentFastMode = atom(storedBoolean(COMPOSER_FAST_KEY, false))
+export const $sidebarSessionSourceIds = atom<string[]>(
+  normalizeSidebarSourceIds(storedStringArray(SIDEBAR_SESSION_SOURCE_IDS_KEY))
+)
 // Effective approval-bypass state mirrored from the gateway (session.info).
 // Persistence lives in the backend config (approvals.mode), so this is a plain
 // reflection of the truth the gateway reports rather than its own store.
@@ -304,6 +317,15 @@ export const setCurrentServiceTier = (next: Updater<string>) => updateAtom($curr
 export const setCurrentFastMode = (next: Updater<boolean>) => {
   updateAtom($currentFastMode, next)
   persistBoolean(COMPOSER_FAST_KEY, $currentFastMode.get())
+}
+
+export const setSidebarSessionSourceIds = (next: Updater<string[]>) => {
+  const current = $sidebarSessionSourceIds.get()
+  const value = typeof next === 'function' ? (next as (current: string[]) => string[])(current) : next
+  const normalized = normalizeSidebarSourceIds(value)
+
+  $sidebarSessionSourceIds.set(normalized)
+  persistStringArray(SIDEBAR_SESSION_SOURCE_IDS_KEY, normalized)
 }
 
 export const setYoloActive = (next: Updater<boolean>) => updateAtom($yoloActive, next)

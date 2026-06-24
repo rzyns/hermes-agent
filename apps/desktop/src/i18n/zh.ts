@@ -367,7 +367,8 @@ export const zh: Translations = {
       importedBadge: '已导入',
       pet: {
         title: '宠物',
-        intro: '领养一只悬浮在应用上的 petdex 动画宠物，它会根据 Hermes 的状态做出反应——工具执行时奔跑、成功时欢呼、出错时沮丧。',
+        intro:
+          '领养一只悬浮在应用上的 petdex 动画宠物，它会根据 Hermes 的状态做出反应——工具执行时奔跑、成功时欢呼、出错时沮丧。',
         restartHint: '宠物功能需要重启——当前运行的应用在此功能加入前启动。请退出并重新打开 Hermes，然后回到此处。',
         scaleTitle: '大小',
         scaleDesc: '调整悬浮宠物的大小，所有界面即时生效。',
@@ -822,6 +823,16 @@ export const zh: Translations = {
       defaultDirDesc: '新会话默认从此文件夹开始，除非你选择其他目录。留空则使用你的 home 目录。',
       defaultDirUpdated: '默认项目目录已更新',
       defaultsTo: label => `默认使用 ${label}。`,
+      sidebarSourcesTitle: '侧边栏来源',
+      sidebarSourcesDesc:
+        '选择哪些会话来源显示在主侧边栏最近列表中。默认会保留 Hermes 内置的定时任务和消息平台分组；选择来源后只显示这些来源。',
+      sidebarSourcesDefaultMode: '内置侧边栏分组',
+      sidebarSourcesDefaultSummary: '主最近列表会排除定时任务、工具、子代理和消息平台；这些来源仍在各自分组中显示。',
+      sidebarSourcesCustomMode: '仅选中来源',
+      sidebarSourcesSelectedSummary: sources => `主最近列表仅显示：${sources}。`,
+      sidebarSourcesPresetLocal: 'CLI + TUI + WebUI',
+      sidebarSourcesUseDefault: '使用默认',
+      sidebarSourcesToggle: source => `在侧边栏显示 ${source} 会话`,
       change: '更改',
       choose: '选择',
       clear: '清除',
@@ -1607,11 +1618,13 @@ export const zh: Translations = {
     manualBody: '你是从命令行安装的 Hermes，因此更新也需要在那里运行。请将此命令粘贴到终端：',
     manualPickedUp: '下次启动 Hermes 时会使用新版本。',
     guiSkewTitle: '请更新桌面应用',
-    guiSkewBody: '后端已更新，但此桌面应用包未更改。请更新或重新安装 Hermes 桌面应用（你的 AppImage / .deb / .rpm）以保持一致。',
+    guiSkewBody:
+      '后端已更新，但此桌面应用包未更改。请更新或重新安装 Hermes 桌面应用（你的 AppImage / .deb / .rpm）以保持一致。',
     copy: '复制',
     copied: '已复制',
     done: '完成',
-    applyingBody: 'Hermes 更新器会在自己的窗口中接管，并在完成后自动重新打开 Hermes。更新期间请不要自行重新打开 Hermes。',
+    applyingBody:
+      'Hermes 更新器会在自己的窗口中接管，并在完成后自动重新打开 Hermes。更新期间请不要自行重新打开 Hermes。',
     applyingBodyBackend: '远程后端正在应用更新并将重启。恢复后 Hermes 会自动重新连接。',
     applyingClose: '此窗口会在更新期间关闭，随后 Hermes 会自动重新打开。',
     errorTitle: '更新未完成',
