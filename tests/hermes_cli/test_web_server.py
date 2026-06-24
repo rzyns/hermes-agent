@@ -503,6 +503,55 @@ class TestWebServerEndpoints:
         assert row["title_updated_at"] is not None
         assert row["title_revision_count"] == 1
 
+    def test_get_sessions_omits_prompt_and_model_config_payloads(self):
+        """Session list rows must stay lightweight for desktop cold-start fanout."""
+        from hermes_state import SessionDB
+
+        db = SessionDB()
+        try:
+            db.create_session(
+                session_id="heavy-list-row",
+                source="webui",
+                model_config={"max_iterations": 256, "nested": {"value": "kept-in-db"}},
+                system_prompt="heavy prompt " * 1000,
+            )
+        finally:
+            db.close()
+
+        resp = self.client.get("/api/sessions?limit=20&offset=0")
+        assert resp.status_code == 200
+        rows = resp.json()["sessions"]
+        row = next(s for s in rows if s["id"] == "heavy-list-row")
+        assert "system_prompt" not in row
+        assert "model_config" not in row
+        assert row["source"] == "webui"
+        assert row["model"] is None
+
+    def test_get_profiles_sessions_omits_prompt_and_model_config_payloads(self):
+        """Cross-profile session rows must not ship prompt/config blobs to desktop."""
+        from hermes_state import SessionDB
+
+        db = SessionDB()
+        try:
+            db.create_session(
+                session_id="heavy-profile-list-row",
+                source="webui",
+                model_config={"max_iterations": 256, "nested": {"value": "kept-in-db"}},
+                system_prompt="heavy prompt " * 1000,
+            )
+        finally:
+            db.close()
+
+        resp = self.client.get("/api/profiles/sessions?limit=20&offset=0&profile=all")
+        assert resp.status_code == 200
+        rows = resp.json()["sessions"]
+        row = next(s for s in rows if s["id"] == "heavy-profile-list-row")
+        assert "system_prompt" not in row
+        assert "model_config" not in row
+        assert row["source"] == "webui"
+        assert row["model"] is None
+        assert row["profile"] == "default"
+
     def test_get_sessions_forwards_min_messages(self, monkeypatch):
         """The ?min_messages= filter must reach SessionDB.
 

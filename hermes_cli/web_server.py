@@ -2941,6 +2941,22 @@ async def get_action_status(name: str, lines: int = 200):
     }
 
 
+_SESSION_LIST_OMITTED_FIELDS = ("system_prompt", "model_config")
+
+
+def _compact_session_list_row(row: Dict[str, Any]) -> Dict[str, Any]:
+    """Remove heavyweight fields from session-list API rows.
+
+    ``SessionDB.list_sessions_rich()`` serves internal CLI/resume callers too, so
+    keep it full-fidelity there. The dashboard/desktop list endpoints are
+    high-fanout cold-start paths and should not ship per-session prompt/config
+    blobs that list UIs do not consume.
+    """
+    for field in _SESSION_LIST_OMITTED_FIELDS:
+        row.pop(field, None)
+    return row
+
+
 @app.get("/api/sessions")
 async def get_sessions(
     limit: int = 20,
@@ -3024,6 +3040,7 @@ async def get_sessions(
                     s["is_default_profile"] = profile_name == "default"
                 # SQLite stores the flag as 0/1; expose a real JSON boolean.
                 s["archived"] = bool(s.get("archived"))
+                _compact_session_list_row(s)
             return {"sessions": sessions, "total": total, "limit": limit, "offset": offset}
         finally:
             db.close()
@@ -3139,6 +3156,7 @@ async def get_profiles_sessions(
                     and (now - s.get("last_active", s.get("started_at", 0))) < 300
                 )
                 s["archived"] = bool(s.get("archived"))
+                _compact_session_list_row(s)
                 merged.append(s)
         except Exception as exc:
             errors.append({"profile": name, "error": str(exc)})
