@@ -5,7 +5,15 @@ import { afterEach, describe, expect, it, vi } from 'vitest'
 
 import { getSessionMessages } from '@/hermes'
 import { $activeGatewayProfile, $newChatProfile } from '@/store/profile'
-import { $currentCwd, $messages, $resumeFailedSessionId, setMessages, setResumeFailedSessionId } from '@/store/session'
+import {
+  $currentCwd,
+  $messages,
+  $resumeFailedSessionId,
+  $sessions,
+  setMessages,
+  setResumeFailedSessionId,
+  setSessions
+} from '@/store/session'
 
 import type { ClientSessionState } from '../../types'
 
@@ -55,14 +63,18 @@ function Harness({
   return null
 }
 
-async function createWith(profileSetup: () => void): Promise<Record<string, unknown> | undefined> {
+async function createWith(
+  profileSetup: () => void,
+  createResponse: Record<string, unknown> = { session_id: RUNTIME_SESSION_ID, stored_session_id: null },
+  preview?: string | null
+): Promise<Record<string, unknown> | undefined> {
   let createParams: Record<string, unknown> | undefined
 
   const requestGateway = vi.fn(async (method: string, params?: Record<string, unknown>) => {
     if (method === 'session.create') {
       createParams = params
 
-      return { session_id: RUNTIME_SESSION_ID, stored_session_id: null } as never
+      return createResponse as never
     }
 
     return {} as never
@@ -74,7 +86,7 @@ async function createWith(profileSetup: () => void): Promise<Record<string, unkn
   let create: ((preview?: string | null) => Promise<string | null>) | null = null
   render(<Harness onReady={c => (create = c)} requestGateway={requestGateway} />)
   await waitFor(() => expect(create).not.toBeNull())
-  await create!()
+  await create!(preview)
 
   return createParams
 }
@@ -82,6 +94,7 @@ async function createWith(profileSetup: () => void): Promise<Record<string, unkn
 describe('createBackendSessionForSend profile routing', () => {
   afterEach(() => {
     cleanup()
+    setSessions([])
     $newChatProfile.set(null)
     $activeGatewayProfile.set('default')
     vi.restoreAllMocks()
@@ -116,6 +129,29 @@ describe('createBackendSessionForSend profile routing', () => {
     })
 
     expect(params).toMatchObject({ profile: 'default' })
+  })
+
+  it('marks desktop-created sessions as desktop for source-filtered sidebars', async () => {
+    const params = await createWith(
+      () => {
+        $activeGatewayProfile.set('default')
+        $newChatProfile.set(null)
+      },
+      {
+        info: { cwd: '/tmp/hermes-desktop', model: 'gpt-test' },
+        message_count: 1,
+        session_id: RUNTIME_SESSION_ID,
+        stored_session_id: 'stored-desktop-001'
+      },
+      'first prompt'
+    )
+
+    expect(params).toMatchObject({ profile: 'default', source: 'desktop' })
+    expect($sessions.get()[0]).toMatchObject({
+      id: 'stored-desktop-001',
+      preview: 'first prompt',
+      source: 'desktop'
+    })
   })
 })
 
