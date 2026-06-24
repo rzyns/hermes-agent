@@ -276,7 +276,7 @@ export const zh: Translations = {
       keysTools: '工具',
       keysSettings: '设置',
       mcp: 'MCP',
-      archivedChats: '已归档对话',
+      archivedChats: '会话',
       about: '关于',
       notifications: '通知'
     },
@@ -333,7 +333,7 @@ export const zh: Translations = {
       gateway: '网关连接…',
       keys: '搜索 API 密钥…',
       mcp: '搜索 MCP 服务器…',
-      sessions: '搜索已归档会话…'
+      sessions: '搜索会话…'
     },
     modeOptions: {
       light: { label: '明亮', description: '明亮的桌面界面' },

@@ -281,7 +281,7 @@ export const en: Translations = {
       keysTools: 'Tools',
       keysSettings: 'Settings',
       mcp: 'MCP',
-      archivedChats: 'Archived Chats',
+      archivedChats: 'Sessions',
       about: 'About',
       notifications: 'Notifications'
     },
@@ -339,7 +339,7 @@ export const en: Translations = {
       gateway: 'Gateway connection...',
       keys: 'Search API keys...',
       mcp: 'Search MCP servers...',
-      sessions: 'Search archived sessions...'
+      sessions: 'Search sessions...'
     },
     modeOptions: {
       light: { label: 'Light', description: 'Bright desktop surfaces' },
