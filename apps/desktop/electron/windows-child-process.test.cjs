@@ -12,7 +12,7 @@ function readElectronFile(name) {
 }
 
 function requireHiddenChildOptions(source, needle) {
-  const index = source.indexOf(needle)
+  const index = typeof needle === 'string' ? source.indexOf(needle) : source.search(needle)
   assert.notEqual(index, -1, `missing call site: ${needle}`)
   const snippet = source.slice(index, index + 700)
   assert.match(
@@ -27,15 +27,15 @@ test('desktop background child processes opt into hidden Windows consoles', () =
 
   assert.match(source, /function hiddenWindowsChildOptions\(options = \{\}\)/)
 
-  requireHiddenChildOptions(source, "execFileSync(\n          'reg'")
-  requireHiddenChildOptions(source, 'execFileSync(pyExe')
-  requireHiddenChildOptions(source, 'spawn(resolveGitBinary()')
-  requireHiddenChildOptions(source, "execFileSync('taskkill'")
-  requireHiddenChildOptions(source, 'spawn(command, args')
-  requireHiddenChildOptions(source, "spawn('curl'")
-  requireHiddenChildOptions(source, 'spawn(backend.command, backend.args')
-  requireHiddenChildOptions(source, 'hermesProcess = spawn(backend.command, backend.args')
-  requireHiddenChildOptions(source, "spawn(py, ['-m', 'hermes_cli.main', 'uninstall', '--gui-summary']")
+  requireHiddenChildOptions(source, /execFileSync\(\n\s+'reg',/)
+  requireHiddenChildOptions(source, /execFileSync\(\n\s+pyExe,/)
+  requireHiddenChildOptions(source, /spawn\(\n\s+resolveGitBinary\(\),/)
+  requireHiddenChildOptions(source, /execFileSync\('taskkill'/)
+  requireHiddenChildOptions(source, /spawn\(\n\s+command,\n\s+args,\n\s+hiddenWindowsChildOptions\(/)
+  requireHiddenChildOptions(source, /spawn\('curl'/)
+  requireHiddenChildOptions(source, /spawn\(\n\s+backend\.command,\n\s+backend\.args,/)
+  requireHiddenChildOptions(source, /hermesProcess = spawn\(\n\s+backend\.command,\n\s+backend\.args,/)
+  requireHiddenChildOptions(source, /spawn\(\n\s+py,\n\s+\['-m', 'hermes_cli\.main', 'uninstall', '--gui-summary']/)
 })
 
 test('intentional or interactive desktop child processes stay documented', () => {

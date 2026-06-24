@@ -20,7 +20,6 @@ const crypto = require('node:crypto')
 const fs = require('node:fs')
 const http = require('node:http')
 const https = require('node:https')
-const net = require('node:net')
 const path = require('node:path')
 const { pathToFileURL } = require('node:url')
 const { execFileSync, spawn } = require('node:child_process')
@@ -5192,6 +5191,15 @@ async function startHermes() {
     const backendStartFailed = new Promise((_resolve, reject) => {
       rejectBackendStart = reject
     })
+    // Arm the READY watcher before any awaited boot-progress update can yield
+    // back to Electron's event loop. Warm local backends can announce their
+    // ephemeral port almost immediately; if the listener is attached only after
+    // the progress await below, rememberLog can record the READY line while
+    // waitForDashboardPort misses it and later times out.
+    const backendPortReady = Promise.race([waitForDashboardPort(hermesProcess), backendStartFailed])
+    // Mark the intentionally-later await as handled so an early spawn failure
+    // cannot surface as an unhandled rejection while the boot UI is updating.
+    void backendPortReady.catch(() => {})
     hermesProcess.once('error', error => {
       rememberLog(`Hermes backend failed to start: ${error.message}`)
       updateBootProgress(
@@ -5233,8 +5241,8 @@ async function startHermes() {
     })
 
     await advanceBootProgress('backend.port', 'Waiting for Hermes backend to launch', 86)
-    // Discover the ephemeral port the child bound to
-    const port = await Promise.race([waitForDashboardPort(hermesProcess), backendStartFailed])
+    // Discover the ephemeral port the child bound to.
+    const port = await backendPortReady
 
     const baseUrl = `http://127.0.0.1:${port}`
     await advanceBootProgress('backend.wait', 'Waiting for Hermes backend to become ready', 90)
