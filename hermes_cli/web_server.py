@@ -12322,6 +12322,67 @@ def _safe_plugin_api_relpath(api_field: Any, *, dashboard_dir: Path) -> Optional
 # by the discovery-time scrub and the mount-time refuse guards so a typo in one
 # site cannot silently disable a security gate (GHSA-5qr3-c538-wm9j / #43719).
 _NON_BUNDLED_PLUGIN_SOURCES = frozenset({"user", "project"})
+_TRUSTED_DASHBOARD_PLUGIN_API_ROOTS_ENV = "HERMES_DASHBOARD_TRUSTED_PLUGIN_API_ROOTS"
+
+
+def _trusted_dashboard_plugin_api_roots() -> list[Path]:
+    """Return explicitly trusted non-bundled dashboard plugin API roots.
+
+    Dashboard backend plugin APIs are Python code imported into the dashboard
+    process, so non-bundled plugin APIs stay disabled by default.  Local
+    operators may opt specific controlled plugin/dashboard directories back in
+    with an absolute ``os.pathsep``-separated allowlist.  Paths are resolved so
+    live-dev symlinks under ``~/.hermes/plugins`` are matched by their real
+    source directory rather than by an attacker-controlled link spelling.
+    """
+    raw = os.getenv(_TRUSTED_DASHBOARD_PLUGIN_API_ROOTS_ENV, "")
+    roots: list[Path] = []
+    for part in raw.split(os.pathsep):
+        text = part.strip()
+        if not text:
+            continue
+        candidate = Path(text).expanduser()
+        if not candidate.is_absolute():
+            _log.warning(
+                "Ignoring non-absolute %s entry: %r",
+                _TRUSTED_DASHBOARD_PLUGIN_API_ROOTS_ENV,
+                text,
+            )
+            continue
+        try:
+            resolved = candidate.resolve()
+        except (OSError, RuntimeError) as exc:
+            _log.warning(
+                "Ignoring unresolved %s entry %r: %s",
+                _TRUSTED_DASHBOARD_PLUGIN_API_ROOTS_ENV,
+                text,
+                exc,
+            )
+            continue
+        if not resolved.is_dir():
+            _log.warning(
+                "Ignoring non-directory %s entry: %s",
+                _TRUSTED_DASHBOARD_PLUGIN_API_ROOTS_ENV,
+                resolved,
+            )
+            continue
+        roots.append(resolved)
+    return roots
+
+
+def _dashboard_plugin_api_root_is_trusted(*, dashboard_dir: Path) -> bool:
+    """Whether a plugin dashboard dir is under an explicit trusted API root."""
+    try:
+        resolved_dashboard = dashboard_dir.resolve()
+    except (OSError, RuntimeError):
+        return False
+    for trusted_root in _trusted_dashboard_plugin_api_roots():
+        try:
+            resolved_dashboard.relative_to(trusted_root)
+            return True
+        except ValueError:
+            continue
+    return False
 
 
 def _discover_dashboard_plugins() -> list:
@@ -12401,15 +12462,29 @@ def _discover_dashboard_plugins() -> list:
                 dashboard_dir = child / "dashboard"
                 safe_api = _safe_plugin_api_relpath(raw_api, dashboard_dir=dashboard_dir)
                 if source in _NON_BUNDLED_PLUGIN_SOURCES and safe_api:
-                    _log.warning(
-                        "Plugin %s: refusing dashboard backend api=%s "
-                        "(only bundled plugins may auto-import Python "
-                        "backend routes; non-bundled plugins may extend "
-                        "the dashboard with static UI assets only)",
-                        name, safe_api,
-                    )
-                    safe_api = None
-                    raw_api = None
+                    if _dashboard_plugin_api_root_is_trusted(dashboard_dir=dashboard_dir):
+                        _log.warning(
+                            "Plugin %s: allowing non-bundled dashboard backend "
+                            "api=%s because its dashboard directory is under "
+                            "an explicit %s root; only trust local plugin code "
+                            "you control",
+                            name,
+                            safe_api,
+                            _TRUSTED_DASHBOARD_PLUGIN_API_ROOTS_ENV,
+                        )
+                    else:
+                        _log.warning(
+                            "Plugin %s: refusing dashboard backend api=%s "
+                            "(only bundled plugins may auto-import Python "
+                            "backend routes by default; set %s to an absolute "
+                            "controlled plugin/dashboard directory to trust a "
+                            "specific local non-bundled backend)",
+                            name,
+                            safe_api,
+                            _TRUSTED_DASHBOARD_PLUGIN_API_ROOTS_ENV,
+                        )
+                        safe_api = None
+                        raw_api = None
                 if raw_api and safe_api is None:
                     _log.warning(
                         "Plugin %s: refusing unsafe api path %r (must be a "
@@ -12860,7 +12935,10 @@ def _mount_plugin_api_routes():
             if not api_file_name:
                 continue
             source = plugin.get("source")
-            if source in _NON_BUNDLED_PLUGIN_SOURCES:
+            dashboard_dir = Path(plugin["_dir"])
+            if source in _NON_BUNDLED_PLUGIN_SOURCES and not _dashboard_plugin_api_root_is_trusted(
+                dashboard_dir=dashboard_dir
+            ):
                 # Backend Python auto-import is reserved for bundled plugins;
                 # user and project plugins extend the dashboard with static UI
                 # assets only (GHSA-5qr3-c538-wm9j / #43719). Defence-in-depth:
@@ -12876,13 +12954,15 @@ def _mount_plugin_api_routes():
                     ),
                 }.get(source, "only bundled plugins may auto-import Python code")
                 _log.warning(
-                    "Plugin %s: ignoring backend api=%s (%s)",
+                    "Plugin %s: ignoring backend api=%s (%s; set %s to an "
+                    "absolute controlled plugin/dashboard directory to trust "
+                    "a specific local non-bundled backend)",
                     plugin_name,
                     api_file_name,
                     _reason,
+                    _TRUSTED_DASHBOARD_PLUGIN_API_ROOTS_ENV,
                 )
                 continue
-            dashboard_dir = Path(plugin["_dir"])
             api_path = dashboard_dir / api_file_name
             try:
                 resolved_api = api_path.resolve()

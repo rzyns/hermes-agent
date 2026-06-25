@@ -10,9 +10,9 @@ The Hermes web dashboard (`hermes dashboard`) is built to be reskinned and exten
 
 1. **Themes** — YAML files that repaint the dashboard's palette, typography, layout, and per-component chrome. Drop a file in `~/.hermes/dashboard-themes/`; it appears in the theme switcher.
 2. **UI plugins** — a directory with `manifest.json` + a JavaScript bundle that registers a tab, replaces a built-in page, augments one via page-scoped slots, or injects components into named shell slots.
-3. **Backend plugins** — a Python file inside that plugin directory that exposes a FastAPI `router`; routes are mounted under `/api/plugins/<name>/` and called from the plugin's UI.
+3. **Backend plugins** — a Python file inside that plugin directory that exposes a FastAPI `router`; routes are mounted under `/api/plugins/<name>/` and called from the plugin's UI. Python backends are auto-imported for bundled plugins; user/project plugin backends require an explicit trusted-root allowlist because they execute inside the dashboard process.
 
-All three are **drop-in at runtime**: no repo clone, no `npm run build`, no patching the dashboard source. This page is the canonical reference for all three.
+Themes and UI plugins are **drop-in at runtime**: no repo clone, no `npm run build`, no patching the dashboard source. Backend APIs are also runtime-loaded once the plugin is bundled or explicitly trusted. This page is the canonical reference for all three.
 
 If you just want to use the dashboard, see [Web Dashboard](./web-dashboard). If you want to reskin the terminal CLI (not the web dashboard), see [Skins & Themes](./skins) — the CLI skin system is unrelated to dashboard themes.
 
@@ -478,7 +478,7 @@ None of them are required; include only the layers you need.
 | `slots` | No | Named shell slots this plugin populates. **Documentation aid only** — actual registration happens from the JS bundle via `registerSlot()`. Listing slots here makes discovery surfaces more informative. |
 | `entry` | Yes | Path to the JS bundle relative to `dashboard/`. Defaults to `dist/index.js`. |
 | `css` | No | Path to a CSS file to inject as a `<link>` tag. |
-| `api` | No | Path to a Python file with FastAPI routes. Mounted at `/api/plugins/<name>/`. |
+| `api` | No | Path to a Python file with FastAPI routes. Mounted at `/api/plugins/<name>/` for bundled plugins, or for user/project plugins whose resolved plugin/dashboard directory is explicitly trusted via `HERMES_DASHBOARD_TRUSTED_PLUGIN_API_ROOTS`. |
 
 #### Available icons
 
@@ -744,7 +744,18 @@ Routes are mounted under `/api/plugins/<name>/`, so the above becomes:
 - `GET  /api/plugins/my-plugin/data`
 - `POST /api/plugins/my-plugin/action`
 
-Plugin API routes bypass session-token authentication since the dashboard server binds to localhost by default. **Don't expose the dashboard on a public interface with `--host 0.0.0.0` if you run untrusted plugins** — their routes become reachable too.
+:::warning Backend APIs execute trusted Python
+`dashboard/plugin_api.py` is imported into the dashboard server process. For that reason, Hermes auto-imports Python backend APIs only for bundled plugins by default. A user or project plugin can still expose a backend API, but the dashboard process must explicitly trust the resolved plugin root or `dashboard/` directory with an absolute, `os.pathsep`-separated allowlist:
+
+```bash
+HERMES_DASHBOARD_TRUSTED_PLUGIN_API_ROOTS=/absolute/path/to/my-plugin \
+  hermes dashboard
+```
+
+For live-dev symlinks under `~/.hermes/plugins`, trust the real source plugin directory or the symlink path; Hermes resolves both before matching. Only add directories containing local plugin code you control.
+:::
+
+Plugin API routes use the dashboard session-token fetch helper from the UI (`SDK.fetchJSON`). Treat backend code as local trusted code; do not expose the dashboard on a public interface with `--host 0.0.0.0` if you run plugins you do not control.
 
 #### Accessing Hermes internals
 
@@ -910,9 +921,10 @@ The `sidebar` slot only renders when the active theme has `layoutVariant: cockpi
 
 **Plugin backend routes return 404.**
 1. Confirm the manifest has `"api": "plugin_api.py"` pointing to an existing file inside `dashboard/`.
-2. Restart `hermes dashboard` — plugin API routes are mounted once at startup, **not** on rescan.
-3. Check that `plugin_api.py` exports a module-level `router = APIRouter()`. Other export names are not picked up.
-4. Tail `~/.hermes/logs/errors.log` for `Failed to load plugin <name> API routes` — import errors are logged there.
+2. Check `GET /api/dashboard/plugins`: if your plugin shows `"has_api": false`, the backend was not accepted by discovery. Bundled plugin APIs are accepted by default; user/project plugin APIs require `HERMES_DASHBOARD_TRUSTED_PLUGIN_API_ROOTS=/absolute/path/to/plugin-or-dashboard` in the dashboard process environment.
+3. Restart `hermes dashboard` — plugin API routes are mounted once at startup, **not** on rescan.
+4. Check that `plugin_api.py` exports a module-level `router = APIRouter()`. Other export names are not picked up.
+5. Tail `~/.hermes/logs/errors.log` or the dashboard service logs for `Failed to load plugin <name> API routes` or `refusing dashboard backend api=...` — import and trust-gate errors are logged there.
 
 **Theme change drops my color overrides.**
 `colorOverrides` are scoped to the active theme and cleared on theme switch — that's by design. If you want overrides that persist, put them in your theme's YAML, not in the live switcher.
