@@ -18,6 +18,7 @@ import os
 import stat
 import time
 import uuid
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -795,7 +796,11 @@ class TestCapabilitiesEndpoint:
             assert data["runtime"]["tool_execution"] == "server"
             assert data["runtime"]["split_runtime"] is False
             assert "API-server host" in data["runtime"]["description"]
+            assert data["raw_model_proxy"]["enabled"] is True
+            assert data["raw_model_proxy"]["model_prefix"] == "raw/"
+            assert data["raw_model_proxy"]["tool_execution"] == "client"
             assert data["features"]["chat_completions"] is True
+            assert data["features"]["raw_model_proxy"] is True
             assert data["features"]["run_status"] is True
             assert data["features"]["run_events_sse"] is True
             assert data["features"]["session_continuity_header"] == "X-Hermes-Session-Id"
@@ -1001,6 +1006,170 @@ class TestChatCompletionsEndpoint:
         async with TestClient(TestServer(app)) as cli:
             resp = await cli.post("/v1/chat/completions", json={"model": "test", "messages": []})
             assert resp.status == 400
+
+    @pytest.mark.asyncio
+    async def test_raw_model_proxy_returns_provider_tool_calls_without_running_agent(self, adapter, monkeypatch):
+        captured = {}
+
+        class FakeCompletions:
+            def create(self, **kwargs):
+                captured.update(kwargs)
+                return SimpleNamespace(
+                    id="chatcmpl_raw_test",
+                    object="chat.completion",
+                    created=123,
+                    model=kwargs["model"],
+                    choices=[
+                        SimpleNamespace(
+                            index=0,
+                            message=SimpleNamespace(
+                                role="assistant",
+                                content=None,
+                                tool_calls=[
+                                    SimpleNamespace(
+                                        id="call_lookup_weather",
+                                        type="function",
+                                        function=SimpleNamespace(
+                                            name="lookup_weather",
+                                            arguments='{"city":"Detroit"}',
+                                        ),
+                                    )
+                                ],
+                            ),
+                            finish_reason="tool_calls",
+                        )
+                    ],
+                    usage=SimpleNamespace(
+                        prompt_tokens=12,
+                        completion_tokens=3,
+                        total_tokens=15,
+                    ),
+                )
+
+        fake_client = SimpleNamespace(chat=SimpleNamespace(completions=FakeCompletions()))
+
+        def fake_resolve(provider, **kwargs):
+            assert provider == "openai-codex"
+            assert kwargs["model"] == "gpt-5.5"
+            return fake_client, kwargs["model"]
+
+        monkeypatch.setattr("agent.auxiliary_client.resolve_provider_client", fake_resolve)
+
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            with patch.object(adapter, "_run_agent", new_callable=AsyncMock) as mock_run:
+                resp = await cli.post(
+                    "/v1/chat/completions",
+                    json={
+                        "model": "raw/openai-codex/gpt-5.5",
+                        "messages": [{"role": "user", "content": "weather?"}],
+                        "tools": [
+                            {
+                                "type": "function",
+                                "function": {
+                                    "name": "lookup_weather",
+                                    "parameters": {"type": "object"},
+                                },
+                            }
+                        ],
+                        "tool_choice": {
+                            "type": "function",
+                            "function": {"name": "lookup_weather"},
+                        },
+                        "temperature": 0.2,
+                        "response_format": {"type": "json_object"},
+                        "max_completion_tokens": 64,
+                    },
+                )
+                assert resp.status == 200
+                data = await resp.json()
+        assert data["object"] == "chat.completion"
+        assert data["model"] == "gpt-5.5"
+        choice = data["choices"][0]
+        assert choice["finish_reason"] == "tool_calls"
+        assert choice["message"]["tool_calls"] == [
+            {
+                "id": "call_lookup_weather",
+                "type": "function",
+                "function": {
+                    "name": "lookup_weather",
+                    "arguments": '{"city":"Detroit"}',
+                },
+            }
+        ]
+        assert captured["messages"] == [{"role": "user", "content": "weather?"}]
+        assert captured["tools"][0]["function"]["name"] == "lookup_weather"
+        assert captured["tool_choice"]["function"]["name"] == "lookup_weather"
+        assert captured["temperature"] == 0.2
+        assert captured["response_format"] == {"type": "json_object"}
+        assert captured["max_completion_tokens"] == 64
+        mock_run.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_non_raw_model_still_uses_server_agent_path(self, adapter, monkeypatch):
+        def fail_resolve(*args, **kwargs):  # pragma: no cover - only runs on regression
+            raise AssertionError("non-raw requests must not resolve raw provider clients")
+
+        monkeypatch.setattr("agent.auxiliary_client.resolve_provider_client", fail_resolve)
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            with patch.object(adapter, "_run_agent", new_callable=AsyncMock) as mock_run:
+                mock_run.return_value = (
+                    {"final_response": "server agent", "messages": [], "api_calls": 1},
+                    {"input_tokens": 1, "output_tokens": 2, "total_tokens": 3},
+                )
+                resp = await cli.post(
+                    "/v1/chat/completions",
+                    json={
+                        "model": "hermes-agent",
+                        "messages": [{"role": "user", "content": "Hello"}],
+                    },
+                )
+                assert resp.status == 200
+                data = await resp.json()
+        assert data["choices"][0]["message"]["content"] == "server agent"
+        mock_run.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_raw_model_missing_provider_or_model_returns_400_without_running_agent(self, adapter):
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            with patch.object(adapter, "_run_agent", new_callable=AsyncMock) as mock_run:
+                resp = await cli.post(
+                    "/v1/chat/completions",
+                    json={
+                        "model": "raw/openai-codex",
+                        "messages": [{"role": "user", "content": "Hello"}],
+                    },
+                )
+                assert resp.status == 400
+                data = await resp.json()
+        assert data["error"]["code"] == "raw_model_invalid"
+        mock_run.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_raw_model_unavailable_provider_returns_400_without_running_agent(self, adapter, monkeypatch):
+        def fake_resolve(provider, **kwargs):
+            assert provider == "not-a-provider"
+            assert kwargs["model"] == "model-x"
+            return None, None
+
+        monkeypatch.setattr("agent.auxiliary_client.resolve_provider_client", fake_resolve)
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            with patch.object(adapter, "_run_agent", new_callable=AsyncMock) as mock_run:
+                resp = await cli.post(
+                    "/v1/chat/completions",
+                    json={
+                        "model": "raw/not-a-provider/model-x",
+                        "messages": [{"role": "user", "content": "Hello"}],
+                    },
+                )
+                assert resp.status == 400
+                data = await resp.json()
+
+        assert data["error"]["code"] == "raw_provider_unavailable"
+        mock_run.assert_not_called()
 
     @pytest.mark.asyncio
     async def test_stream_true_returns_sse(self, adapter):

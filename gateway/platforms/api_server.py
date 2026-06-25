@@ -2,7 +2,7 @@
 OpenAI-compatible API server platform adapter.
 
 Exposes an HTTP server with endpoints:
-- POST /v1/chat/completions        — OpenAI Chat Completions format (stateless; opt-in session continuity via X-Hermes-Session-Id header; opt-in long-term memory scoping via X-Hermes-Session-Key header)
+- POST /v1/chat/completions        — OpenAI Chat Completions format (stateless server-agent mode, or raw/<provider>/<model> passthrough; opt-in session continuity via X-Hermes-Session-Id header; opt-in long-term memory scoping via X-Hermes-Session-Key header)
 - POST /v1/responses               — OpenAI Responses API format (stateful via previous_response_id; X-Hermes-Session-Key supported)
 - GET  /v1/responses/{response_id} — Retrieve a stored response
 - DELETE /v1/responses/{response_id} — Delete a stored response
@@ -685,6 +685,122 @@ def _make_request_fingerprint(body: Dict[str, Any], keys: List[str]) -> str:
     return sha256(repr(subset).encode("utf-8")).hexdigest()
 
 
+_RAW_MODEL_PREFIX = "raw/"
+_RAW_CHAT_COMPLETIONS_FORWARD_FIELDS = frozenset({
+    "messages",
+    "tools",
+    "tool_choice",
+    "temperature",
+    "response_format",
+    "max_tokens",
+    "max_completion_tokens",
+    "top_p",
+    "stop",
+    "presence_penalty",
+    "frequency_penalty",
+    "seed",
+    "logit_bias",
+    "user",
+    "n",
+    "stream",
+})
+
+
+def _parse_raw_model_name(model_name: Any) -> Optional[Dict[str, str]]:
+    """Return raw-provider routing info for ``raw/<provider>/<model>`` names.
+
+    Non-string and non-raw model names return ``None`` so callers can keep the
+    existing server-agent path.  Malformed raw names raise ``ValueError`` so a
+    caller that explicitly asked for raw mode never silently falls back to the
+    Hermes server-side AIAgent.
+    """
+    if not isinstance(model_name, str):
+        return None
+    raw_name = model_name.strip()
+    if not raw_name.startswith(_RAW_MODEL_PREFIX):
+        return None
+    suffix = raw_name[len(_RAW_MODEL_PREFIX):]
+    provider, sep, upstream_model = suffix.partition("/")
+    provider = provider.strip().lower()
+    upstream_model = upstream_model.strip()
+    if not sep or not provider or not upstream_model:
+        raise ValueError(
+            "Raw model names must use raw/<provider>/<model>, "
+            "for example raw/openai-codex/gpt-5.5."
+        )
+    return {
+        "raw_model": raw_name,
+        "provider": provider,
+        "model": upstream_model,
+    }
+
+
+def _jsonable_raw_value(value: Any) -> Any:
+    """Convert SDK response objects/SimpleNamespaces into JSON-safe values."""
+    if value is None or isinstance(value, (str, int, float, bool)):
+        return value
+    if isinstance(value, dict):
+        return {str(k): _jsonable_raw_value(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_jsonable_raw_value(v) for v in value]
+
+    for method_name in ("model_dump", "dict", "to_dict"):
+        method = getattr(value, method_name, None)
+        if callable(method):
+            try:
+                return _jsonable_raw_value(method(exclude_none=False))
+            except TypeError:
+                try:
+                    return _jsonable_raw_value(method())
+                except Exception:
+                    pass
+            except Exception:
+                pass
+
+    attrs = getattr(value, "__dict__", None)
+    if isinstance(attrs, dict):
+        return {
+            str(k): _jsonable_raw_value(v)
+            for k, v in attrs.items()
+            if not str(k).startswith("_")
+        }
+    return str(value)
+
+
+def _raw_chat_completion_payload(
+    raw_response: Any,
+    *,
+    completion_id: str,
+    created: int,
+    model: str,
+) -> Dict[str, Any]:
+    """Normalize a provider ChatCompletion-like object to an OpenAI JSON dict."""
+    payload = _jsonable_raw_value(raw_response)
+    if not isinstance(payload, dict):
+        raise TypeError("Raw provider response was not a JSON object")
+    payload.setdefault("id", completion_id)
+    payload.setdefault("object", "chat.completion")
+    payload.setdefault("created", created)
+    payload.setdefault("model", model)
+    choices = payload.get("choices")
+    if isinstance(choices, list):
+        for idx, choice in enumerate(choices):
+            if not isinstance(choice, dict):
+                continue
+            choice.setdefault("index", idx)
+            message = choice.get("message")
+            if isinstance(message, dict):
+                message.setdefault("role", "assistant")
+    return payload
+
+
+def _next_stream_item(iterator: Any) -> tuple[bool, Any]:
+    try:
+        return True, next(iterator)
+    except StopIteration:
+        return False, None
+
+
 def _derive_chat_session_id(
     system_prompt: Optional[str],
     first_user_message: str,
@@ -1239,9 +1355,24 @@ class APIServerAdapter(BasePlatformAdapter):
                     "explicit split-runtime mode is enabled."
                 ),
             },
+            "raw_model_proxy": {
+                "enabled": True,
+                "model_prefix": _RAW_MODEL_PREFIX,
+                "chat_completions": True,
+                "tool_execution": "client",
+                "model_format": "raw/<provider>/<model>",
+                "examples": ["raw/openai-codex/gpt-5.5"],
+                "description": (
+                    "Requests whose model begins with raw/ bypass the "
+                    "server-side Hermes AIAgent and are proxied to the named "
+                    "provider. Caller tools are forwarded upstream and returned "
+                    "tool_calls remain for the client to execute."
+                ),
+            },
             "features": {
                 "chat_completions": True,
                 "chat_completions_streaming": True,
+                "raw_model_proxy": True,
                 "responses_api": True,
                 "responses_streaming": True,
                 "run_submission": True,
@@ -1814,22 +1945,204 @@ class APIServerAdapter(BasePlatformAdapter):
             logger.debug("[api_server] session SSE stream error: %s", exc)
         return response
 
+    async def _handle_raw_chat_completions(
+        self,
+        request: "web.Request",
+        body: Dict[str, Any],
+        route: Dict[str, str],
+    ) -> "web.Response":
+        """Proxy ``raw/<provider>/<model>`` chat-completions to the provider.
+
+        This path intentionally does not construct an ``AIAgent``.  Caller
+        messages/tools remain caller-owned and returned tool calls are passed
+        back for the client to execute.
+        """
+        messages = body.get("messages")
+        if not messages or not isinstance(messages, list):
+            return web.json_response(
+                _openai_error("Missing or invalid 'messages' field"),
+                status=400,
+            )
+
+        provider = route["provider"]
+        upstream_model = route["model"]
+        completion_id = f"chatcmpl-{uuid.uuid4().hex[:29]}"
+        created = int(time.time())
+        stream = _coerce_request_bool(body.get("stream"), default=False)
+
+        try:
+            from agent.auxiliary_client import resolve_provider_client
+
+            client, resolved_model = await asyncio.to_thread(
+                resolve_provider_client,
+                provider,
+                model=upstream_model,
+            )
+        except Exception as exc:
+            logger.warning("Raw model proxy could not resolve provider %s: %s", provider, exc)
+            return web.json_response(
+                _openai_error(
+                    f"Raw model provider '{provider}' is unavailable: {exc}",
+                    err_type="server_error",
+                    code="raw_provider_unavailable",
+                    param="model",
+                ),
+                status=502,
+            )
+
+        if client is None or not resolved_model:
+            return web.json_response(
+                _openai_error(
+                    f"Raw model provider '{provider}' is unsupported or not configured.",
+                    code="raw_provider_unavailable",
+                    param="model",
+                ),
+                status=400,
+            )
+
+        try:
+            create_fn = client.chat.completions.create
+        except Exception:
+            return web.json_response(
+                _openai_error(
+                    f"Raw model provider '{provider}' does not expose chat completions.",
+                    code="raw_route_unsupported",
+                    param="model",
+                ),
+                status=400,
+            )
+
+        upstream_kwargs = {
+            key: body[key]
+            for key in _RAW_CHAT_COMPLETIONS_FORWARD_FIELDS
+            if key in body
+        }
+        upstream_kwargs["model"] = resolved_model
+        upstream_kwargs["messages"] = messages
+        upstream_kwargs["stream"] = stream
+
+        idempotency_key = request.headers.get("Idempotency-Key")
+        if idempotency_key:
+            extra_headers = upstream_kwargs.get("extra_headers")
+            if isinstance(extra_headers, dict):
+                extra_headers = dict(extra_headers)
+            else:
+                extra_headers = {}
+            extra_headers.setdefault("Idempotency-Key", idempotency_key)
+            upstream_kwargs["extra_headers"] = extra_headers
+
+        if stream:
+            return await self._write_raw_sse_chat_completion(
+                request,
+                create_fn,
+                upstream_kwargs,
+            )
+
+        try:
+            raw_response = await asyncio.to_thread(create_fn, **upstream_kwargs)
+            response_data = _raw_chat_completion_payload(
+                raw_response,
+                completion_id=completion_id,
+                created=created,
+                model=resolved_model,
+            )
+        except Exception as exc:
+            logger.warning("Raw model proxy chat completion failed: %s", exc)
+            return web.json_response(
+                _openai_error(
+                    f"Raw model proxy request failed: {exc}",
+                    err_type="server_error",
+                    code="raw_provider_error",
+                ),
+                status=502,
+            )
+
+        return web.json_response(response_data)
+
+    async def _write_raw_sse_chat_completion(
+        self,
+        request: "web.Request",
+        create_fn: Any,
+        upstream_kwargs: Dict[str, Any],
+    ) -> "web.StreamResponse":
+        """Forward provider ChatCompletion chunks as OpenAI SSE data lines."""
+        sse_headers = {
+            "Content-Type": "text/event-stream",
+            "Cache-Control": "no-cache",
+            "X-Accel-Buffering": "no",
+        }
+        origin = request.headers.get("Origin", "")
+        cors = self._cors_headers_for_origin(origin) if origin else None
+        if cors:
+            sse_headers.update(cors)
+        response = web.StreamResponse(status=200, headers=sse_headers)
+        await response.prepare(request)
+
+        try:
+            stream_obj = await asyncio.to_thread(create_fn, **upstream_kwargs)
+            if hasattr(stream_obj, "__aiter__"):
+                async for chunk in stream_obj:
+                    data = json.dumps(_jsonable_raw_value(chunk), ensure_ascii=False)
+                    await response.write(f"data: {data}\n\n".encode("utf-8"))
+            else:
+                try:
+                    iterator = iter(stream_obj)
+                except TypeError as exc:
+                    raise RuntimeError(
+                        "Raw provider did not return a streaming iterator"
+                    ) from exc
+                while True:
+                    has_item, chunk = await asyncio.to_thread(_next_stream_item, iterator)
+                    if not has_item:
+                        break
+                    data = json.dumps(_jsonable_raw_value(chunk), ensure_ascii=False)
+                    await response.write(f"data: {data}\n\n".encode("utf-8"))
+            await response.write(b"data: [DONE]\n\n")
+        except (ConnectionResetError, ConnectionAbortedError, BrokenPipeError, OSError):
+            logger.info("Raw model proxy SSE client disconnected")
+        except Exception as exc:
+            logger.warning("Raw model proxy SSE stream failed: %s", exc)
+            try:
+                error_chunk = _openai_error(
+                    f"Raw model proxy stream failed: {exc}",
+                    err_type="server_error",
+                    code="raw_provider_error",
+                )
+                await response.write(
+                    f"event: error\ndata: {json.dumps(error_chunk)}\n\n".encode("utf-8")
+                )
+                await response.write(b"data: [DONE]\n\n")
+            except Exception:
+                pass
+
+        return response
+
     async def _handle_chat_completions(self, request: "web.Request") -> "web.Response":
         """POST /v1/chat/completions — OpenAI Chat Completions format."""
         auth_err = self._check_auth(request)
         if auth_err:
             return auth_err
 
-        # Bound total in-flight agent runs (configurable; #7483).
-        limited = self._concurrency_limited_response()
-        if limited is not None:
-            return limited
-
         # Parse request body
         try:
             body = await request.json()
         except (json.JSONDecodeError, Exception):
             return web.json_response(_openai_error("Invalid JSON in request body"), status=400)
+
+        try:
+            raw_route = _parse_raw_model_name(body.get("model", self._model_name))
+        except ValueError as exc:
+            return web.json_response(
+                _openai_error(str(exc), code="raw_model_invalid", param="model"),
+                status=400,
+            )
+        if raw_route is not None:
+            return await self._handle_raw_chat_completions(request, body, raw_route)
+
+        # Bound total in-flight agent runs (configurable; #7483).
+        limited = self._concurrency_limited_response()
+        if limited is not None:
+            return limited
 
         messages = body.get("messages")
         if not messages or not isinstance(messages, list):

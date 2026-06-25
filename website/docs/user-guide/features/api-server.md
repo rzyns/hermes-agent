@@ -53,6 +53,39 @@ curl http://localhost:8642/v1/chat/completions \
 
 Or connect Open WebUI, LobeChat, or any other frontend — see the [Open WebUI integration guide](/user-guide/messaging/open-webui) for step-by-step instructions.
 
+## Runtime modes: Hermes agent vs raw model proxy
+
+The API server supports two intentionally different runtime modes:
+
+| Model name | Runtime | Tool execution | Use when |
+|---|---|---|---|
+| `hermes-agent` (or your profile model name) | Server-side Hermes `AIAgent` | Hermes executes tools on the API-server host | You want an OpenAI-compatible frontend to talk to Hermes itself, with terminal/file/web/skills/memory available through Hermes. |
+| `raw/<provider>/<model>` | Raw provider proxy | The client owns tools; Hermes only forwards schemas/results | Another application (for example DeepTutor) needs Hermes' configured provider/auth but must execute its own tools and receive native `tool_calls`. |
+
+Raw proxy mode is currently exposed on `POST /v1/chat/completions`. Hermes strips the `raw/` prefix, resolves the named provider through the same auth/config paths Hermes uses internally, forwards caller-owned fields such as `messages`, `tools`, `tool_choice`, `temperature`, `response_format`, `max_tokens` / `max_completion_tokens`, and returns the provider's OpenAI-compatible response. Hermes does **not** construct an `AIAgent` and does **not** execute returned tool calls in this mode.
+
+Examples:
+
+```json
+{"model": "raw/openai-codex/gpt-5.5", "messages": [{"role": "user", "content": "Call a tool if needed"}], "tools": []}
+```
+
+Provider parsing uses the first path segment after `raw/` as the provider and preserves the rest as the upstream model ID. That means provider models containing slashes remain valid, for example `raw/openrouter/openai/gpt-4o` selects provider `openrouter` with upstream model `openai/gpt-4o`.
+
+### DeepTutor provider setup
+
+Use `model: hermes-agent` when DeepTutor should delegate to Hermes as an agent and let Hermes run server-side tools. Use a `raw/...` model when DeepTutor is the agent runtime and only wants Hermes to proxy model/auth access while DeepTutor keeps control of its own tool loop.
+
+For a DeepTutor raw-model configuration against a Hermes API server running on localhost:
+
+```text
+Base URL: http://localhost:8642/v1
+API key:  <API_SERVER_KEY>
+Model:    raw/openai-codex/gpt-5.5
+```
+
+Clients can discover support programmatically through `GET /v1/capabilities`: `runtime.mode` remains `server_agent` for normal requests, and the `raw_model_proxy` block advertises the `raw/` prefix plus client-side tool execution semantics.
+
 ## Endpoints
 
 ### POST /v1/chat/completions
@@ -208,8 +241,11 @@ Returns a machine-readable description of the API server's stable surface for ex
   "platform": "hermes-agent",
   "model": "hermes-agent",
   "auth": {"type": "bearer", "required": true},
+  "runtime": {"mode": "server_agent", "tool_execution": "server"},
+  "raw_model_proxy": {"enabled": true, "model_prefix": "raw/", "tool_execution": "client"},
   "features": {
     "chat_completions": true,
+    "raw_model_proxy": true,
     "responses_api": true,
     "run_submission": true,
     "run_status": true,
