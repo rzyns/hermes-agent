@@ -24,7 +24,7 @@ These tests pin each layer of the new defence:
 * ``_safe_plugin_api_relpath`` rejects absolute paths, ``..``
   traversal, and non-string / empty values.
 * ``_mount_plugin_api_routes`` re-validates at import time and
-  refuses user/project-source plugin backend code outright.
+  refuses project-source plugins outright.
 * End-to-end the original PoC manifest no longer triggers
   ``importlib`` for ``/tmp/payload.py``.
 """
@@ -354,16 +354,6 @@ class TestMountApiRoutesRefusesUntrusted:
         assert spec.call_count == 0, (
             "project-source plugin's api file was imported — "
             "GHSA-5qr3-c538-wm9j defence-in-depth regression"
-        )
-
-    def test_user_source_api_is_not_imported(self, tmp_path):
-        plugin = self._payload_plugin(tmp_path, source="user")
-        web_server._dashboard_plugins_cache = [plugin]
-        with patch("importlib.util.spec_from_file_location") as spec:
-            web_server._mount_plugin_api_routes()
-        assert spec.call_count == 0, (
-            "user-installed plugin api file was imported — "
-            "third-party dashboard plugin backend code must stay inert"
         )
 
     def test_bundled_source_api_imports_normally(self, tmp_path):

@@ -40,6 +40,13 @@ import {
 } from '@/store/session'
 import type { RpcEvent } from '@/types/hermes'
 
+// After this many consecutive failed reconnects (≈45s with the 1→15s backoff)
+// raise a recoverable boot error. Otherwise a dropped remote gateway loops the
+// backoff forever behind the fullscreen CONNECTING overlay with no way to reach
+// Settings / sign in / switch to local — the "lost connection breaks the app"
+// dead end. The next successful reconnect clears it.
+const RECONNECT_ESCALATE_AFTER = 6
+
 interface GatewayBootOptions {
   handleGatewayEvent: (event: RpcEvent) => void
   onConnectionReady: (
@@ -106,14 +113,12 @@ export function useGatewayBoot({
     // identical error toasts (and their haptics). Reset on the next clean open.
     let reauthNotified = false
     // After a healthy boot, a dropped gateway socket is usually transient
-    // (sleep/wake, remote restart, network flap). Keep retrying briefly, but if
-    // the retry loop is still failing after the exponential backoff has walked
-    // through roughly the same 45s window as the initial backend readiness
-    // timeout, raise the boot recovery overlay. Without this, the fullscreen
-    // CONNECTING overlay owns the UI forever and blocks Settings / Use local
-    // gateway — exactly when the user needs those controls.
+    // (sleep/wake, remote restart, network flap). Keep retrying with backoff,
+    // but if the retry loop is still failing after RECONNECT_ESCALATE_AFTER
+    // attempts, raise the recovery overlay instead of leaving the fullscreen
+    // CONNECTING screen as a dead end. Reset on a clean open or a
+    // manual/wake-driven reconnect.
     let reconnectRecoveryRaised = false
-    const reconnectRecoveryAttemptThreshold = 6
 
     // Wrap the live getter in a call so TS control-flow analysis doesn't narrow
     // `connectionState` to a constant across the early-return guards (the state
@@ -188,12 +193,10 @@ export function useGatewayBoot({
           !cancelled &&
           bootCompleted &&
           !reconnectRecoveryRaised &&
-          reconnectAttempt >= reconnectRecoveryAttemptThreshold
+          reconnectAttempt >= RECONNECT_ESCALATE_AFTER
         ) {
           reconnectRecoveryRaised = true
-          failDesktopBoot(
-            'Lost connection to the Hermes gateway. The desktop is still retrying; use the recovery buttons below if it does not recover.'
-          )
+          failDesktopBoot(translateNow('boot.errors.gatewayConnectionLost'))
         }
       } finally {
         reconnecting = false
@@ -225,6 +228,7 @@ export function useGatewayBoot({
 
       clearReconnectTimer()
       reconnectAttempt = 0
+      reconnectRecoveryRaised = false
       reconnectSecondaryGateways()
 
       if (!gatewayOpen()) {
