@@ -7,6 +7,36 @@
 
 export type Locale = 'en' | 'zh' | 'zh-hant' | 'ja'
 
+export type ToolTitleKey =
+  | 'browser_click'
+  | 'browser_fill'
+  | 'browser_navigate'
+  | 'browser_snapshot'
+  | 'browser_take_screenshot'
+  | 'browser_type'
+  | 'clarify'
+  | 'cronjob'
+  | 'edit_file'
+  | 'execute_code'
+  | 'image_generate'
+  | 'list_files'
+  | 'patch'
+  | 'read_file'
+  | 'search_files'
+  | 'session_search_recall'
+  | 'terminal'
+  | 'todo'
+  | 'vision_analyze'
+  | 'web_extract'
+  | 'web_search'
+  | 'write_file'
+
+interface ToolTitleCopy {
+  done: string
+  pending: string
+  pendingAction: string
+}
+
 interface ModeOptionCopy {
   label: string
   description: string
@@ -681,6 +711,10 @@ export interface Translations {
       namePlaceholder: string
       staleBackend: string
       backgroundHint: string
+      slowProviderHint: string
+      remix: string
+      remixConfirmTitle: string
+      remixConfirmBody: string
       genericError: string
       referenceImageTooLarge: string
       referenceImageInvalid: string
@@ -1542,6 +1576,31 @@ export interface Translations {
       statusError: string
       statusRecovered: string
       statusDone: string
+      actions: {
+        read: string
+        reading: string
+        opened: string
+        opening: string
+        searched: string
+        searching: string
+        ran: string
+        running: string
+        ranCode: string
+        runningCode: string
+      }
+      prefixes: {
+        browser: string
+        web: string
+      }
+      titleTemplates: {
+        actionCommand: (action: string, command: string) => string
+        actionQuoted: (action: string, value: string) => string
+        actionTarget: (action: string, target: string) => string
+        prefixedDone: (prefix: string, action: string) => string
+        runningPrefixedTool: (prefix: string, action: string) => string
+        runningTool: (action: string) => string
+      }
+      titles: Record<ToolTitleKey, ToolTitleCopy>
     }
   }
 

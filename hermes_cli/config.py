@@ -979,6 +979,11 @@ DEFAULT_CONFIG = {
         #   "on"             — force the prompt posture everywhere.
         #   "off"            — disable entirely.
         "coding_context": "auto",
+        # Verification closure: after the agent edits files in a code workspace,
+        # do not accept a final answer until fresh verification evidence exists
+        # or the agent explains why it cannot run checks. The loop is bounded
+        # and uses the passive verification ledger. Set false to disable.
+        "verify_on_stop": True,
         # Staged inactivity warning: send a warning to the user at this
         # threshold before escalating to a full timeout.  The warning fires
         # once per run and does not interrupt the agent.  0 = disable warning.
@@ -2381,6 +2386,27 @@ DEFAULT_CONFIG = {
         # Wrap delivered cron responses with a header (task name) and footer
         # ("The agent cannot see this message").  Set to false for clean output.
         "wrap_response": True,
+        # Make cron deliveries CONTINUABLE: a user can reply to a cron brief
+        # and the agent has it in context (no "what is Task #2?" amnesia).
+        # Default False preserves the historical isolation guarantee (cron
+        # deliveries live only in the cron job's own session). Per-job
+        # `attach_to_session` overrides this for a single job.
+        #
+        # Behaviour is THREAD-PREFERRED, scoped to the job's origin chat:
+        #   - Thread-capable platforms (Telegram forum/DM topics, Discord
+        #     threads, Slack threads): a dedicated thread is opened for the job
+        #     via the adapter's create_handoff_thread, the brief is delivered
+        #     into it, and that thread's session is seeded so the user's reply
+        #     in-thread continues with full context. Each continuable job gets
+        #     its own scrollback, isolated from the parent channel.
+        #   - DM-only platforms (WhatsApp / Signal / SMS): no threads exist, so
+        #     the brief is mirrored into the origin DM session instead — the
+        #     DM itself is the continuation surface.
+        # Both paths ride the shipped gateway.mirror.mirror_to_session and are
+        # alternation- and cache-safe (appended at a turn boundary, never
+        # mid-loop, never mutating the cached system prompt). Only the origin
+        # chat is ever touched — fan-out / broadcast targets are never mirrored.
+        "mirror_delivery": False,
         # Maximum number of due jobs to run in parallel per tick.
         # null/0 = unbounded (limited only by thread count).
         # 1 = serial (pre-v0.9 behaviour).
