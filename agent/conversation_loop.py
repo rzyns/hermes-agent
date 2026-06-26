@@ -2097,9 +2097,21 @@ def run_conversation(
                         agent.thinking_callback("")
                     api_elapsed = time.time() - api_start_time
                     agent._vprint(f"{agent.log_prefix}⚡ Interrupted during API call.", force=True)
-                    agent._persist_session(messages, conversation_history)
                     interrupted = True
-                    final_response = f"{INTERRUPT_WAITING_FOR_MODEL_PREFIX}{api_elapsed:.1f}s elapsed)."
+                    # Preserve any assistant text already streamed to the user
+                    # before the stop landed. Dropping it leaves history with no
+                    # record of the half-finished reply on screen, so the next turn
+                    # the model "forgets" what it just said — exactly what users hit
+                    # when they stop to redirect mid-response.
+                    _partial = agent._strip_think_blocks(
+                        getattr(agent, "_current_streamed_assistant_text", "") or ""
+                    ).strip()
+                    if _partial:
+                        messages.append({"role": "assistant", "content": _partial})
+                        final_response = _partial
+                    else:
+                        final_response = f"{INTERRUPT_WAITING_FOR_MODEL_PREFIX}{api_elapsed:.1f}s elapsed)."
+                    agent._persist_session(messages, conversation_history)
                     break
 
                 except Exception as api_error:
@@ -2448,6 +2460,7 @@ def run_conversation(
                                 "image-shrink recovery: no data-URL image parts found "
                                 "or shrink didn't reduce size; surfacing original error."
                             )
+
 
                     # Multimodal-tool-content recovery: providers that follow
                     # the OpenAI spec strictly (tool message content must be a

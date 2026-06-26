@@ -275,7 +275,7 @@ class MattermostAdapter(BasePlatformAdapter):
     # Required overrides
     # ------------------------------------------------------------------
 
-    async def connect(self) -> bool:
+    async def connect(self, *, is_reconnect: bool = False) -> bool:
         """Connect to Mattermost and start the WebSocket listener."""
         import aiohttp
 
