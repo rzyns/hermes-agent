@@ -12,6 +12,7 @@ import { Archive, ArchiveOff, FolderOpen, Loader2, SlidersHorizontal, Trash2 } f
 import { sessionSourceLabel } from '@/lib/session-source'
 import { SIDEBAR_LOCAL_CHAT_SOURCE_IDS, SIDEBAR_SOURCE_OPTION_IDS } from '@/lib/sidebar-session-sources'
 import { notify, notifyError } from '@/store/notifications'
+import { untombstoneSessions } from '@/store/projects'
 import {
   $sidebarSessionSourceIds,
   applyConfiguredDefaultProjectDir,
@@ -70,21 +71,21 @@ export function SessionsSettings() {
     async (session: SessionInfo) => {
       setBusyId(session.id)
 
-      try {
-        await setSessionArchived(session.id, false, session.profile)
-        setLocalSessions(prev => prev.filter(s => s.id !== session.id))
-        // Surface it again in the sidebar without waiting for a full refresh.
-        setSessions(prev => [{ ...session, archived: false }, ...prev.filter(s => s.id !== session.id)])
-        triggerHaptic('selection')
-        notify({ durationMs: 2_000, kind: 'success', message: s.restored })
-      } catch (err) {
-        notifyError(err, s.unarchiveFailed)
-      } finally {
-        setBusyId(null)
-      }
-    },
-    [s]
-  )
+    try {
+      await setSessionArchived(session.id, false, session.profile)
+      setLocalSessions(prev => prev.filter(s => s.id !== session.id))
+      // Surface it again in the sidebar without waiting for a full refresh, and
+      // lift any optimistic eviction so the grouped tree shows it again too.
+      untombstoneSessions([session.id, session._lineage_root_id])
+      setSessions(prev => [{ ...session, archived: false }, ...prev.filter(s => s.id !== session.id)])
+      triggerHaptic('selection')
+      notify({ durationMs: 2_000, kind: 'success', message: s.restored })
+    } catch (err) {
+      notifyError(err, s.unarchiveFailed)
+    } finally {
+      setBusyId(null)
+    }
+  }, [s])
 
   const remove = useCallback(
     async (session: SessionInfo) => {

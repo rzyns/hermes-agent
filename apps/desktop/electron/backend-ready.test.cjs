@@ -13,12 +13,16 @@
 
 const test = require('node:test')
 const assert = require('node:assert/strict')
-const fs = require('node:fs')
-const path = require('node:path')
 const { EventEmitter } = require('node:events')
+const fs = require('node:fs')
+const os = require('node:os')
+const path = require('node:path')
 
 const {
+  readDashboardReadyFile,
   waitForDashboardPort,
+  waitForDashboardPortAnnouncement,
+  waitForDashboardReadyFile,
   resolvePortAnnounceTimeoutMs,
   DEFAULT_PORT_ANNOUNCE_TIMEOUT_MS,
   MIN_PORT_ANNOUNCE_TIMEOUT_MS,
@@ -135,13 +139,85 @@ test('primary desktop backend arms the port watcher before boot progress can yie
   const primarySpawn = source.indexOf('hermesProcess = spawn(')
   assert.notEqual(primarySpawn, -1, 'primary backend spawn block should exist')
 
-  const watcher = source.indexOf('waitForDashboardPort(hermesProcess)', primarySpawn)
+  const watcher = source.indexOf('waitForDashboardPortAnnouncement(hermesProcess, { readyFile })', primarySpawn)
   const yieldingProgress = source.indexOf("await advanceBootProgress('backend.port'", primarySpawn)
 
-  assert.notEqual(watcher, -1, 'primary backend must create a waitForDashboardPort watcher')
+  assert.notEqual(watcher, -1, 'primary backend must create a waitForDashboardPortAnnouncement watcher')
   assert.notEqual(yieldingProgress, -1, 'primary backend must update backend.port boot progress')
   assert.ok(
     watcher < yieldingProgress,
     'port watcher must be armed before the awaited backend.port progress update; otherwise a warm backend can print READY while only rememberLog is listening'
   )
+})
+
+// ---------------------------------------------------------------------------
+// ready-file port announcement
+// ---------------------------------------------------------------------------
+
+function mkTmpReadyFile() {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'hermes-ready-test-'))
+  return {
+    dir,
+    file: path.join(dir, 'ready.json'),
+    cleanup: () => fs.rmSync(dir, { recursive: true, force: true })
+  }
+}
+
+test('readDashboardReadyFile returns a valid port from JSON', () => {
+  const tmp = mkTmpReadyFile()
+  try {
+    fs.writeFileSync(tmp.file, JSON.stringify({ port: 4567 }))
+    assert.equal(readDashboardReadyFile(tmp.file), 4567)
+  } finally {
+    tmp.cleanup()
+  }
+})
+
+test('readDashboardReadyFile ignores missing, malformed, or invalid files', () => {
+  const tmp = mkTmpReadyFile()
+  try {
+    assert.equal(readDashboardReadyFile(tmp.file), null)
+    fs.writeFileSync(tmp.file, '{')
+    assert.equal(readDashboardReadyFile(tmp.file), null)
+    fs.writeFileSync(tmp.file, JSON.stringify({ port: 0 }))
+    assert.equal(readDashboardReadyFile(tmp.file), null)
+  } finally {
+    tmp.cleanup()
+  }
+})
+
+test('waitForDashboardReadyFile resolves when the ready file appears', async () => {
+  const tmp = mkTmpReadyFile()
+  const child = makeFakeChild()
+  try {
+    const p = waitForDashboardReadyFile(tmp.file, child, 1000)
+    setTimeout(() => fs.writeFileSync(tmp.file, JSON.stringify({ port: 8765 })), 20)
+    assert.equal(await p, 8765)
+  } finally {
+    tmp.cleanup()
+  }
+})
+
+test('waitForDashboardPortAnnouncement uses ready file when provided', async () => {
+  const tmp = mkTmpReadyFile()
+  const child = makeFakeChild()
+  try {
+    const p = waitForDashboardPortAnnouncement(child, { readyFile: tmp.file, timeoutMs: 1000 })
+    setTimeout(() => fs.writeFileSync(tmp.file, JSON.stringify({ port: 9876 })), 20)
+    assert.equal(await p, 9876)
+  } finally {
+    tmp.cleanup()
+  }
+})
+
+test('waitForDashboardReadyFile rejects when the child exits before file readiness', async () => {
+  const tmp = mkTmpReadyFile()
+  const child = makeFakeChild()
+  try {
+    const p = waitForDashboardReadyFile(tmp.file, child, 1000)
+    child.emit('exit', 1, null)
+    await assert.rejects(p, /exited before port announcement/)
+  } finally {
+    tmp.cleanup()
+  }
 })
