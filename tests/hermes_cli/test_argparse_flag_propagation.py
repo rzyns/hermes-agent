@@ -205,3 +205,9 @@ class TestAcceptHooksOnAgentSubparsers:
             f"stderr: {result.stderr[:300]}"
         )
         assert "unrecognized arguments" not in result.stderr
+
+    def test_mcp_serve_is_not_pre_agent_startup_subcommand(self):
+        """``hermes mcp serve`` must speak MCP on stdout immediately."""
+        import hermes_cli.main as main_mod
+
+        assert "mcp" not in main_mod._AGENT_SUBCOMMANDS

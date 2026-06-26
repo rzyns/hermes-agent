@@ -11799,7 +11799,6 @@ _AGENT_COMMANDS = {None, "chat", "acp", "rl"}
 _AGENT_SUBCOMMANDS = {
     "cron": ("cron_command", {"run", "tick"}),
     "gateway": ("gateway_command", {"run"}),
-    "mcp": ("mcp_action", {"serve"}),
 }
 
 
