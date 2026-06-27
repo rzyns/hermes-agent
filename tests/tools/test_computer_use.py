@@ -1858,6 +1858,41 @@ class TestCaptureAppFilterNoMatch:
         assert backend._active_window_id == 204972
         assert cap.app == "Codex.exe"
 
+    def test_wsl_windows_driver_uses_host_platform_for_z_order(self, monkeypatch):
+        """WSL reports Python as linux even when cua-driver controls Windows HWNDs."""
+        from tools.computer_use import cua_backend
+
+        windows = [
+            {"app_name": "ApCent.exe", "pid": 19432, "window_id": 131840,
+             "is_on_screen": True, "title": "APP Center",
+             "bounds": {"x": 0, "y": 1044, "width": 160, "height": 28},
+             "z_index": 0},
+            {"app_name": "msedge.exe", "pid": 19148, "window_id": 2298712,
+             "is_on_screen": True, "title": "Parked Edge",
+             "bounds": {"x": -31993, "y": -32000, "width": 146, "height": 21},
+             "z_index": 3},
+            {"app_name": "msedge.exe", "pid": 19148, "window_id": 132576,
+             "is_on_screen": True, "title": "Hermes — Microsoft Edge Dev",
+             "bounds": {"x": 0, "y": 0, "width": 3508, "height": 1392},
+             "z_index": 24},
+        ]
+        backend = _make_cua_backend_with_windows(windows)
+        backend._session.call_tool.side_effect = [
+            {"data": "", "images": [], "isError": False,
+             "structuredContent": {"windows": windows}},
+            {"data": '✅ msedge.exe — 48 elements\n', "images": [], "isError": False,
+             "structuredContent": {"elements": []}},
+        ]
+
+        monkeypatch.setattr(cua_backend.sys, "platform", "linux")
+        monkeypatch.setenv("HERMES_CUA_HOST_PLATFORM", "win32")
+
+        cap = backend.capture(mode="ax", app=None)
+
+        assert backend._active_pid == 19148
+        assert backend._active_window_id == 132576
+        assert cap.app == "msedge.exe"
+
 
 class TestFocusAppFilterNoMatch:
     """focus_app(app=X) must return ok=False when X matches nothing —

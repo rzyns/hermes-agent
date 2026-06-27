@@ -209,8 +209,34 @@ _ELEMENT_LINE_RE = re.compile(
 # Helpers
 # ---------------------------------------------------------------------------
 
+def _cua_host_platform() -> str:
+    """Return the platform whose window semantics cua-driver is exposing.
+
+    Usually this is the same as Python's platform, but WSL is an important
+    exception: Hermes runs as Linux while the configured cua-driver wrapper can
+    enumerate and target Windows HWNDs. Window z-order and parked-window
+    semantics then need to follow the Windows host, not ``sys.platform``.
+    """
+    raw = os.environ.get("HERMES_CUA_HOST_PLATFORM", "").strip().lower()
+    aliases = {
+        "win": "win32",
+        "windows": "win32",
+        "win32": "win32",
+        "mac": "darwin",
+        "macos": "darwin",
+        "osx": "darwin",
+        "darwin": "darwin",
+        "linux": "linux",
+    }
+    return aliases.get(raw, raw or sys.platform)
+
+
 def _is_macos() -> bool:
-    return sys.platform == "darwin"
+    return _cua_host_platform() == "darwin"
+
+
+def _is_windows_cua_host() -> bool:
+    return _cua_host_platform().startswith("win")
 
 
 def cua_driver_binary_available() -> bool:
@@ -525,7 +551,7 @@ def _frontmost_sort_key(window: Dict[str, Any]) -> float:
         z_index = 0.0
     # cua-driver reports Windows z-order with larger values closer to the
     # foreground; macOS/Linux builds use lower values for the frontmost row.
-    return -z_index if sys.platform == "win32" else z_index
+    return -z_index if _is_windows_cua_host() else z_index
 
 
 def _image_dimensions_from_bytes(raw: bytes) -> Tuple[int, int]:
