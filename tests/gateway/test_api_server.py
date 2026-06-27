@@ -1106,6 +1106,95 @@ class TestChatCompletionsEndpoint:
         mock_run.assert_not_called()
 
     @pytest.mark.asyncio
+    async def test_raw_model_proxy_stream_wraps_non_stream_provider_response(self, adapter, monkeypatch):
+        captured = {}
+
+        class FakeCompletions:
+            def create(self, **kwargs):
+                captured.update(kwargs)
+                return SimpleNamespace(
+                    id="chatcmpl_raw_stream_fallback",
+                    object="chat.completion",
+                    created=123,
+                    model=kwargs["model"],
+                    choices=[
+                        SimpleNamespace(
+                            index=0,
+                            message=SimpleNamespace(
+                                role="assistant",
+                                content=None,
+                                tool_calls=[
+                                    SimpleNamespace(
+                                        id="call_lookup_weather",
+                                        type="function",
+                                        function=SimpleNamespace(
+                                            name="lookup_weather",
+                                            arguments='{"city":"Detroit"}',
+                                        ),
+                                    )
+                                ],
+                            ),
+                            finish_reason="tool_calls",
+                        )
+                    ],
+                )
+
+        fake_client = SimpleNamespace(chat=SimpleNamespace(completions=FakeCompletions()))
+
+        def fake_resolve(provider, **kwargs):
+            assert provider == "openai-codex"
+            return fake_client, kwargs["model"]
+
+        monkeypatch.setattr("agent.auxiliary_client.resolve_provider_client", fake_resolve)
+
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            with patch.object(adapter, "_run_agent", new_callable=AsyncMock) as mock_run:
+                resp = await cli.post(
+                    "/v1/chat/completions",
+                    json={
+                        "model": "raw/openai-codex/gpt-5.5",
+                        "messages": [{"role": "user", "content": "weather?"}],
+                        "tools": [
+                            {
+                                "type": "function",
+                                "function": {
+                                    "name": "lookup_weather",
+                                    "parameters": {"type": "object"},
+                                },
+                            }
+                        ],
+                        "tool_choice": {
+                            "type": "function",
+                            "function": {"name": "lookup_weather"},
+                        },
+                        "stream": True,
+                    },
+                )
+                assert resp.status == 200
+                body = await resp.text()
+
+        data_lines = [
+            line.removeprefix("data: ")
+            for line in body.splitlines()
+            if line.startswith("data: ") and line != "data: [DONE]"
+        ]
+        assert data_lines
+        chunk = json.loads(data_lines[0])
+        assert chunk["object"] == "chat.completion.chunk"
+        choice = chunk["choices"][0]
+        assert choice["finish_reason"] == "tool_calls"
+        tool_call = choice["delta"]["tool_calls"][0]
+        assert tool_call["index"] == 0
+        assert tool_call["id"] == "call_lookup_weather"
+        assert tool_call["function"] == {
+            "name": "lookup_weather",
+            "arguments": '{"city":"Detroit"}',
+        }
+        assert captured["stream"] is True
+        mock_run.assert_not_called()
+
+    @pytest.mark.asyncio
     async def test_non_raw_model_still_uses_server_agent_path(self, adapter, monkeypatch):
         def fail_resolve(*args, **kwargs):  # pragma: no cover - only runs on regression
             raise AssertionError("non-raw requests must not resolve raw provider clients")

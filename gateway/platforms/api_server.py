@@ -794,6 +794,54 @@ def _raw_chat_completion_payload(
     return payload
 
 
+def _raw_chat_completion_stream_chunk_from_final(raw_response: Any) -> Dict[str, Any]:
+    """Convert a non-stream ChatCompletion response into one SSE chunk.
+
+    Some provider adapters accept ``stream=True`` but still return a final
+    ChatCompletion object (for example OAuth-backed compatibility adapters that
+    synthesize the OpenAI surface).  Raw proxy clients such as DeepTutor consume
+    the streaming Chat Completions shape, so translate the final ``message`` into
+    a single ``delta`` chunk instead of failing the whole stream.
+    """
+    payload = _jsonable_raw_value(raw_response)
+    if not isinstance(payload, dict):
+        raise TypeError("Raw provider response was not a JSON object")
+    chunk: Dict[str, Any] = {
+        "id": payload.get("id") or f"chatcmpl-{uuid.uuid4().hex[:29]}",
+        "object": "chat.completion.chunk",
+        "created": payload.get("created") or int(time.time()),
+        "model": payload.get("model") or "",
+        "choices": [],
+    }
+    for choice_idx, choice in enumerate(payload.get("choices") or []):
+        if not isinstance(choice, dict):
+            continue
+        message = choice.get("message") if isinstance(choice.get("message"), dict) else {}
+        delta: Dict[str, Any] = {}
+        role = message.get("role")
+        if role:
+            delta["role"] = role
+        if message.get("content") is not None:
+            delta["content"] = message.get("content")
+        tool_calls = message.get("tool_calls")
+        if isinstance(tool_calls, list):
+            normalized_tool_calls: List[Dict[str, Any]] = []
+            for tool_idx, tool_call in enumerate(tool_calls):
+                if not isinstance(tool_call, dict):
+                    continue
+                normalized_tool_call = dict(tool_call)
+                normalized_tool_call.setdefault("index", tool_idx)
+                normalized_tool_calls.append(normalized_tool_call)
+            if normalized_tool_calls:
+                delta["tool_calls"] = normalized_tool_calls
+        chunk["choices"].append({
+            "index": choice.get("index", choice_idx),
+            "delta": delta,
+            "finish_reason": choice.get("finish_reason"),
+        })
+    return chunk
+
+
 def _next_stream_item(iterator: Any) -> tuple[bool, Any]:
     try:
         return True, next(iterator)
@@ -2087,16 +2135,19 @@ class APIServerAdapter(BasePlatformAdapter):
             else:
                 try:
                     iterator = iter(stream_obj)
-                except TypeError as exc:
-                    raise RuntimeError(
-                        "Raw provider did not return a streaming iterator"
-                    ) from exc
-                while True:
-                    has_item, chunk = await asyncio.to_thread(_next_stream_item, iterator)
-                    if not has_item:
-                        break
-                    data = json.dumps(_jsonable_raw_value(chunk), ensure_ascii=False)
+                except TypeError:
+                    data = json.dumps(
+                        _raw_chat_completion_stream_chunk_from_final(stream_obj),
+                        ensure_ascii=False,
+                    )
                     await response.write(f"data: {data}\n\n".encode("utf-8"))
+                else:
+                    while True:
+                        has_item, chunk = await asyncio.to_thread(_next_stream_item, iterator)
+                        if not has_item:
+                            break
+                        data = json.dumps(_jsonable_raw_value(chunk), ensure_ascii=False)
+                        await response.write(f"data: {data}\n\n".encode("utf-8"))
             await response.write(b"data: [DONE]\n\n")
         except (ConnectionResetError, ConnectionAbortedError, BrokenPipeError, OSError):
             logger.info("Raw model proxy SSE client disconnected")
