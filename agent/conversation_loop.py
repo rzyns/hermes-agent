@@ -4761,6 +4761,10 @@ def run_conversation(
                         })
                         agent._session_messages = messages
                         agent._emit_status("↻ Verification required before finishing")
+                        logger.debug(
+                            "verification stop-loop nudge issued (attempt %d)",
+                            agent._verification_stop_nudges,
+                        )
                         continue
 
                     messages.append(final_msg)
