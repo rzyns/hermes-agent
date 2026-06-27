@@ -240,6 +240,28 @@ class TestPasswordLoginRoute:
         assert SESSION_AT_COOKIE in set_cookie
         assert SESSION_RT_COOKIE in set_cookie
 
+    def test_valid_credentials_with_prefix_scope_session_cookies(
+        self, gated_app
+    ):
+        resp = gated_app.post(
+            "/auth/password-login",
+            headers={"x-forwarded-prefix": "/hermes-dashboard"},
+            json={
+                "provider": "testpw",
+                "username": "admin",
+                "password": "hunter2",
+                "next": "/sessions",
+            },
+        )
+        assert resp.status_code == 200
+        # The JSON contract stays backend-relative; the login-page JS prefixes
+        # client-side because reverse proxies cannot rewrite JSON bodies.
+        assert resp.json() == {"ok": True, "next": "/sessions"}
+        set_cookie = resp.headers.get("set-cookie", "")
+        assert "__Secure-hermes_session_at=" in set_cookie
+        assert "__Secure-hermes_session_rt=" in set_cookie
+        assert "Path=/hermes-dashboard" in set_cookie
+
     def test_session_cookie_then_grants_authenticated_access(self, gated_app):
         # Log in, then hit an auth-required endpoint with the cookie jar
         # the TestClient retains — proving the minted session is accepted
@@ -414,6 +436,20 @@ class TestLoginPageRender:
         finally:
             clear_providers()
 
+    def test_password_provider_login_page_respects_proxy_prefix(self):
+        clear_providers()
+        register_provider(PasswordProvider())
+        try:
+            html = render_login_html(
+                next_path="/sessions", prefix="/hermes-dashboard"
+            )
+            assert 'data-hermes-base-path="/hermes-dashboard"' in html
+            assert "fetch(withBase('/auth/password-login')" in html
+            assert "publicNext((data && data.next) || '/')" in html
+            assert "url('/hermes-dashboard/fonts/Collapse-Regular.woff2')" in html
+        finally:
+            clear_providers()
+
     def test_oauth_only_page_stays_script_free(self):
         clear_providers()
         register_provider(StubAuthProvider())
@@ -439,5 +475,16 @@ class TestLoginPageRender:
             assert "/auth/login?provider=stub" in html
             assert 'data-provider="testpw"' in html
             assert "<script>" in html
+        finally:
+            clear_providers()
+
+    def test_mixed_providers_prefix_oauth_button(self):
+        clear_providers()
+        register_provider(StubAuthProvider())
+        register_provider(PasswordProvider())
+        try:
+            html = render_login_html(prefix="/hermes-dashboard")
+            assert "/hermes-dashboard/auth/login?provider=stub" in html
+            assert 'data-provider="testpw"' in html
         finally:
             clear_providers()
