@@ -977,6 +977,26 @@ class TestToolsetsEndpoint:
 # ---------------------------------------------------------------------------
 
 
+_RAW_PROXY_SECRET_MARKER = "SYNTHETIC_AUTH_MARKER_NOT_SECRET_123"
+_RAW_PROXY_AUTH_PATH = "C:/Users/John.Dziurzynski/.hermes/auth.json"
+_RAW_PROXY_TOKEN_VALUE = "SYNTHETIC_PROVIDER_TOKEN_VALUE_NOT_SECRET_456"
+
+
+def _raw_proxy_sensitive_error(operation: str) -> RuntimeError:
+    return RuntimeError(
+        f"{operation} leaked credential diagnostics: token={_RAW_PROXY_TOKEN_VALUE} "
+        f"marker={_RAW_PROXY_SECRET_MARKER} auth_file={_RAW_PROXY_AUTH_PATH}"
+    )
+
+
+def _assert_raw_proxy_error_sanitized(serialized_error: str, *, code: str) -> None:
+    assert code in serialized_error
+    assert _RAW_PROXY_SECRET_MARKER not in serialized_error
+    assert _RAW_PROXY_AUTH_PATH not in serialized_error
+    assert _RAW_PROXY_TOKEN_VALUE not in serialized_error
+    assert "credential diagnostics" not in serialized_error
+
+
 class TestChatCompletionsEndpoint:
     @pytest.mark.asyncio
     async def test_invalid_json_returns_400(self, adapter):
@@ -1192,6 +1212,114 @@ class TestChatCompletionsEndpoint:
             "arguments": '{"city":"Detroit"}',
         }
         assert captured["stream"] is True
+        mock_run.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_raw_model_proxy_provider_resolution_error_is_sanitized(self, adapter, monkeypatch):
+        def fake_resolve(provider, **kwargs):
+            assert provider == "openai-codex"
+            assert kwargs["model"] == "gpt-5.5"
+            raise _raw_proxy_sensitive_error("resolver")
+
+        monkeypatch.setattr("agent.auxiliary_client.resolve_provider_client", fake_resolve)
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            with patch.object(adapter, "_run_agent", new_callable=AsyncMock) as mock_run:
+                resp = await cli.post(
+                    "/v1/chat/completions",
+                    json={
+                        "model": "raw/openai-codex/gpt-5.5",
+                        "messages": [{"role": "user", "content": "Hello"}],
+                    },
+                )
+                assert resp.status == 502
+                data = await resp.json()
+
+        assert data["error"]["code"] == "raw_provider_unavailable"
+        assert data["error"]["message"] == "Raw model provider is unavailable."
+        _assert_raw_proxy_error_sanitized(json.dumps(data), code="raw_provider_unavailable")
+        mock_run.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_raw_model_proxy_non_stream_provider_error_is_sanitized(self, adapter, monkeypatch):
+        class FailingCompletions:
+            def create(self, **kwargs):
+                raise _raw_proxy_sensitive_error("create")
+
+        fake_client = SimpleNamespace(chat=SimpleNamespace(completions=FailingCompletions()))
+
+        def fake_resolve(provider, **kwargs):
+            assert provider == "openai-codex"
+            return fake_client, kwargs["model"]
+
+        monkeypatch.setattr("agent.auxiliary_client.resolve_provider_client", fake_resolve)
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            with patch.object(adapter, "_run_agent", new_callable=AsyncMock) as mock_run:
+                resp = await cli.post(
+                    "/v1/chat/completions",
+                    json={
+                        "model": "raw/openai-codex/gpt-5.5",
+                        "messages": [{"role": "user", "content": "Hello"}],
+                    },
+                )
+                assert resp.status == 502
+                data = await resp.json()
+
+        assert data["error"]["code"] == "raw_provider_error"
+        assert data["error"]["message"] == "Raw model provider request failed."
+        _assert_raw_proxy_error_sanitized(json.dumps(data), code="raw_provider_error")
+        mock_run.assert_not_called()
+
+    @pytest.mark.parametrize(
+        "failure_mode",
+        ["create", "create_oserror", "iterate", "iterate_oserror"],
+    )
+    @pytest.mark.asyncio
+    async def test_raw_model_proxy_stream_provider_error_is_sanitized(
+        self, adapter, monkeypatch, failure_mode
+    ):
+        class FailingIterator:
+            def __iter__(self):
+                return self
+
+            def __next__(self):
+                if failure_mode == "iterate_oserror":
+                    raise OSError(str(_raw_proxy_sensitive_error("iterate_oserror")))
+                raise _raw_proxy_sensitive_error("iterate")
+
+        class FailingCompletions:
+            def create(self, **kwargs):
+                if failure_mode == "create_oserror":
+                    raise OSError(str(_raw_proxy_sensitive_error("create_oserror")))
+                if failure_mode == "create":
+                    raise _raw_proxy_sensitive_error("create")
+                return FailingIterator()
+
+        fake_client = SimpleNamespace(chat=SimpleNamespace(completions=FailingCompletions()))
+
+        def fake_resolve(provider, **kwargs):
+            assert provider == "openai-codex"
+            return fake_client, kwargs["model"]
+
+        monkeypatch.setattr("agent.auxiliary_client.resolve_provider_client", fake_resolve)
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            with patch.object(adapter, "_run_agent", new_callable=AsyncMock) as mock_run:
+                resp = await cli.post(
+                    "/v1/chat/completions",
+                    json={
+                        "model": "raw/openai-codex/gpt-5.5",
+                        "messages": [{"role": "user", "content": "Hello"}],
+                        "stream": True,
+                    },
+                )
+                assert resp.status == 200
+                body = await resp.text()
+
+        assert "event: error" in body
+        _assert_raw_proxy_error_sanitized(body, code="raw_provider_error")
+        assert "data: [DONE]" in body
         mock_run.assert_not_called()
 
     @pytest.mark.asyncio

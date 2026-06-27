@@ -592,6 +592,32 @@ def _openai_error(message: str, err_type: str = "invalid_request_error", param: 
     }
 
 
+_RAW_PROVIDER_UNAVAILABLE_MESSAGE = "Raw model provider is unavailable."
+_RAW_PROVIDER_UNSUPPORTED_MESSAGE = "Raw model provider is unsupported or not configured."
+_RAW_PROVIDER_ROUTE_UNSUPPORTED_MESSAGE = "Raw model provider does not expose chat completions."
+_RAW_PROVIDER_ERROR_MESSAGE = "Raw model provider request failed."
+
+
+def _raw_provider_exception_for_log(exc: BaseException) -> str:
+    """Return provider exception text safe enough for server-side logs only.
+
+    Raw proxy errors cross an auth boundary: callers authenticate to Hermes, but
+    provider-resolution failures can contain credentials, auth file paths, and
+    internal diagnostics.  Client responses therefore use stable generic error
+    messages; logs may keep redacted details for operators.
+    """
+    try:
+        text = str(exc)
+    except Exception:
+        text = f"{type(exc).__name__} (stringification failed)"
+    try:
+        from agent.redact import redact_sensitive_text
+
+        return redact_sensitive_text(text, force=True)
+    except Exception:
+        return f"{type(exc).__name__} (details unavailable)"
+
+
 if AIOHTTP_AVAILABLE:
     @web.middleware
     async def body_limit_middleware(request, handler):
@@ -2027,10 +2053,14 @@ class APIServerAdapter(BasePlatformAdapter):
                 model=upstream_model,
             )
         except Exception as exc:
-            logger.warning("Raw model proxy could not resolve provider %s: %s", provider, exc)
+            logger.warning(
+                "Raw model proxy could not resolve provider %s: %s",
+                provider,
+                _raw_provider_exception_for_log(exc),
+            )
             return web.json_response(
                 _openai_error(
-                    f"Raw model provider '{provider}' is unavailable: {exc}",
+                    _RAW_PROVIDER_UNAVAILABLE_MESSAGE,
                     err_type="server_error",
                     code="raw_provider_unavailable",
                     param="model",
@@ -2041,7 +2071,7 @@ class APIServerAdapter(BasePlatformAdapter):
         if client is None or not resolved_model:
             return web.json_response(
                 _openai_error(
-                    f"Raw model provider '{provider}' is unsupported or not configured.",
+                    _RAW_PROVIDER_UNSUPPORTED_MESSAGE,
                     code="raw_provider_unavailable",
                     param="model",
                 ),
@@ -2053,7 +2083,7 @@ class APIServerAdapter(BasePlatformAdapter):
         except Exception:
             return web.json_response(
                 _openai_error(
-                    f"Raw model provider '{provider}' does not expose chat completions.",
+                    _RAW_PROVIDER_ROUTE_UNSUPPORTED_MESSAGE,
                     code="raw_route_unsupported",
                     param="model",
                 ),
@@ -2095,10 +2125,13 @@ class APIServerAdapter(BasePlatformAdapter):
                 model=resolved_model,
             )
         except Exception as exc:
-            logger.warning("Raw model proxy chat completion failed: %s", exc)
+            logger.warning(
+                "Raw model proxy chat completion failed: %s",
+                _raw_provider_exception_for_log(exc),
+            )
             return web.json_response(
                 _openai_error(
-                    f"Raw model proxy request failed: {exc}",
+                    _RAW_PROVIDER_ERROR_MESSAGE,
                     err_type="server_error",
                     code="raw_provider_error",
                 ),
@@ -2149,13 +2182,16 @@ class APIServerAdapter(BasePlatformAdapter):
                         data = json.dumps(_jsonable_raw_value(chunk), ensure_ascii=False)
                         await response.write(f"data: {data}\n\n".encode("utf-8"))
             await response.write(b"data: [DONE]\n\n")
-        except (ConnectionResetError, ConnectionAbortedError, BrokenPipeError, OSError):
+        except (ConnectionResetError, ConnectionAbortedError, BrokenPipeError):
             logger.info("Raw model proxy SSE client disconnected")
         except Exception as exc:
-            logger.warning("Raw model proxy SSE stream failed: %s", exc)
+            logger.warning(
+                "Raw model proxy SSE stream failed: %s",
+                _raw_provider_exception_for_log(exc),
+            )
             try:
                 error_chunk = _openai_error(
-                    f"Raw model proxy stream failed: {exc}",
+                    _RAW_PROVIDER_ERROR_MESSAGE,
                     err_type="server_error",
                     code="raw_provider_error",
                 )
