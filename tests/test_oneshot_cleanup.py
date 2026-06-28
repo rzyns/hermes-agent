@@ -50,8 +50,8 @@ def test_run_agent_shuts_down_memory_provider_after_success(monkeypatch):
             self.close_calls = 0
             instances.append(self)
 
-        def chat(self, prompt):
-            return "OK"
+        def run_conversation(self, prompt):
+            return {"final_response": "OK"}
 
         def shutdown_memory_provider(self, messages=None):
             self.shutdown_calls.append(messages)
@@ -61,7 +61,7 @@ def test_run_agent_shuts_down_memory_provider_after_success(monkeypatch):
 
     _install_oneshot_import_fakes(monkeypatch, FakeAgent)
 
-    assert oneshot._run_agent("hello", model="fake-model", provider="fake", use_config_toolsets=False) == "OK"
+    assert oneshot._run_agent("hello", model="fake-model", provider="fake", use_config_toolsets=False) == ("OK", {"final_response": "OK"})
 
     assert len(instances) == 1
     assert instances[0].shutdown_calls == [[{"role": "user", "content": "hello"}]]
@@ -75,8 +75,8 @@ def test_run_agent_shuts_down_global_cached_clients(monkeypatch):
         def __init__(self, **kwargs):
             instances.append(self)
 
-        def chat(self, prompt):
-            return "OK"
+        def run_conversation(self, prompt):
+            return {"final_response": "OK"}
 
     instances = []
     _install_oneshot_import_fakes(monkeypatch, FakeAgent)
@@ -91,7 +91,7 @@ def test_run_agent_shuts_down_global_cached_clients(monkeypatch):
         types.SimpleNamespace(shutdown_mcp_servers=lambda: calls.append("mcp")),
     )
 
-    assert oneshot._run_agent("hello", model="fake-model", provider="fake", use_config_toolsets=False) == "OK"
+    assert oneshot._run_agent("hello", model="fake-model", provider="fake", use_config_toolsets=False) == ("OK", {"final_response": "OK"})
 
     assert calls == ["mcp", "aux"]
 
@@ -107,7 +107,7 @@ def test_run_agent_shuts_down_memory_provider_after_chat_error(monkeypatch):
             self.close_calls = 0
             instances.append(self)
 
-        def chat(self, prompt):
+        def run_conversation(self, prompt):
             raise RuntimeError("boom")
 
         def shutdown_memory_provider(self, messages=None):
