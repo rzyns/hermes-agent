@@ -201,6 +201,28 @@ class TestBuildAnthropicClient:
             betas = kwargs["default_headers"]["anthropic-beta"]
             assert "context-1m-2025-08-07" in betas
 
+    def test_disables_sdk_retries_for_api_key(self):
+        """#26293: the SDK's default max_retries=2 ignores Retry-After and
+        double-retries inside hermes's outer loop. We delegate retry entirely
+        to the outer loop, so the client must be built with max_retries=0."""
+        with patch("agent.anthropic_adapter._anthropic_sdk") as mock_sdk:
+            build_anthropic_client("sk-ant-api03-something")
+            kwargs = mock_sdk.Anthropic.call_args[1]
+            assert kwargs["max_retries"] == 0
+
+    def test_disables_sdk_retries_for_oauth_token(self):
+        with patch("agent.anthropic_adapter._anthropic_sdk") as mock_sdk:
+            build_anthropic_client("sk-ant-oat01-" + "x" * 60)
+            kwargs = mock_sdk.Anthropic.call_args[1]
+            assert kwargs["max_retries"] == 0
+
+    def test_bedrock_disables_sdk_retries(self):
+        with patch("agent.anthropic_adapter._anthropic_sdk") as mock_sdk:
+            mock_sdk.AnthropicBedrock = MagicMock()
+            build_anthropic_bedrock_client("us-east-1")
+            kwargs = mock_sdk.AnthropicBedrock.call_args[1]
+            assert kwargs["max_retries"] == 0
+
 
 class TestReadClaudeCodeCredentials:
     @pytest.fixture(autouse=True)
@@ -485,7 +507,12 @@ class TestResolveAnthropicToken:
 
 
 class TestRefreshOauthToken:
-    def test_returns_none_without_refresh_token(self):
+    def test_returns_none_without_refresh_token(self, monkeypatch):
+        # Isolate this unit test from real Claude Code credentials in the
+        # developer's home directory. _refresh_oauth_token may adopt a freshly
+        # rotated live token before POSTing, but this case specifically covers
+        # the no-refresh-token path when no live replacement exists.
+        monkeypatch.setattr("agent.anthropic_adapter.read_claude_code_credentials", lambda: None)
         creds = {"accessToken": "expired", "refreshToken": "", "expiresAt": 0}
         assert _refresh_oauth_token(creds) is None
 
@@ -522,7 +549,10 @@ class TestRefreshOauthToken:
         assert written["claudeAiOauth"]["accessToken"] == "new-token-abc"
         assert written["claudeAiOauth"]["refreshToken"] == "new-refresh-456"
 
-    def test_failed_refresh_returns_none(self):
+    def test_failed_refresh_returns_none(self, monkeypatch):
+        # Avoid adopting a real, already-refreshed Claude Code token from the
+        # developer's home; this test covers the network-refresh failure path.
+        monkeypatch.setattr("agent.anthropic_adapter.read_claude_code_credentials", lambda: None)
         creds = {
             "accessToken": "old",
             "refreshToken": "refresh-123",
