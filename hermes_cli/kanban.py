@@ -368,6 +368,27 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
     p_swarm.add_argument("--priority", type=int, default=0, help="Priority tiebreaker")
     p_swarm.add_argument("--created-by", default=None, help="Creator/anchor profile")
     p_swarm.add_argument("--idempotency-key", default=None, help="Dedup key for the root card")
+    p_swarm.add_argument(
+        "--self-heal-policy",
+        default=None,
+        choices=["fail", "drop", "repair", "warn"],
+        help=(
+            "Preflight skill resolution policy for worker specs. "
+            "fail=abort (default), drop=remove missing skills, "
+            "repair=create a repair card, warn=log and continue."
+        ),
+    )
+    p_swarm.add_argument(
+        "--self-heal-profile",
+        default="default",
+        help="Profile assigned to self-healing repair cards (default: default)",
+    )
+    p_swarm.add_argument(
+        "--self-heal-max-repairs",
+        type=int,
+        default=4,
+        help="Maximum repair cards created per swarm (default: 4)",
+    )
     p_swarm.add_argument("--json", action="store_true", help="Emit JSON output")
 
     # --- list ---
@@ -1336,6 +1357,13 @@ def _cmd_swarm(args: argparse.Namespace) -> int:
         print("kanban swarm: at least one --worker is required", file=sys.stderr)
         return 2
     with kb.connect() as conn:
+        policy = None
+        if args.self_heal_policy:
+            policy = ks.SelfHealPolicy(
+                mode=args.self_heal_policy,
+                healer_profile=args.self_heal_profile,
+                max_repairs_per_swarm=args.self_heal_max_repairs,
+            )
         created = ks.create_swarm(
             conn,
             goal=args.goal,
@@ -1346,6 +1374,7 @@ def _cmd_swarm(args: argparse.Namespace) -> int:
             created_by=args.created_by or _profile_author(),
             priority=args.priority,
             idempotency_key=getattr(args, "idempotency_key", None),
+            self_heal=policy,
         )
     if getattr(args, "json", False):
         print(json.dumps(created.as_dict(), indent=2, ensure_ascii=False))

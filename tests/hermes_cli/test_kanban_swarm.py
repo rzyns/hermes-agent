@@ -1,7 +1,10 @@
 import json
 
+import pytest
+
 from hermes_cli import kanban_db as kb
 from hermes_cli.kanban_swarm import (
+    SelfHealPolicy,
     SwarmWorkerSpec,
     create_swarm,
     latest_blackboard,
@@ -116,3 +119,120 @@ def test_swarm_verifier_and_synthesis_are_dependency_gated(tmp_path):
         assert kb.get_task(conn, created.synthesizer_id).status == "ready"
     finally:
         conn.close()
+
+
+def test_preflight_fail_raises_on_missing_skill(tmp_path, monkeypatch):
+    """When policy=fail, create_swarm aborts before cards exist."""
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes"))
+    skills = tmp_path / "hermes" / "skills" / "devops" / "kanban-worker"
+    skills.mkdir(parents=True)
+    (skills / "SKILL.md").write_text("---\nname: kanban-worker\n---\n")
+
+    conn = kb.connect(tmp_path / "kanban.db")
+    try:
+        with pytest.raises(ValueError) as exc_info:
+            create_swarm(
+                conn,
+                goal="Test fail-fast.",
+                workers=[
+                    SwarmWorkerSpec(
+                        profile="fake-profile",
+                        title="Worker",
+                        body="Do work",
+                        skills=["definitely-missing-skill"],
+                    ),
+                ],
+                verifier_assignee="reviewer",
+                synthesizer_assignee="writer",
+                self_heal=SelfHealPolicy(mode="fail"),
+            )
+        assert "definitely-missing-skill" in str(exc_info.value)
+        # No swarm root should have been created.
+        assert len(kb.list_tasks(conn)) == 0
+    finally:
+        conn.close()
+
+
+def test_preflight_drop_removes_missing_skills(tmp_path, monkeypatch):
+    """When policy=drop, unavailable skills are stripped and the worker is created."""
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes"))
+    skills = tmp_path / "hermes" / "skills" / "devops" / "kanban-worker"
+    skills.mkdir(parents=True)
+    (skills / "SKILL.md").write_text("---\nname: kanban-worker\n---\n")
+    available = tmp_path / "hermes" / "skills" / "research" / "available-skill"
+    available.mkdir(parents=True)
+    (available / "SKILL.md").write_text("---\nname: available-skill\n---\n")
+
+    conn = kb.connect(tmp_path / "kanban.db")
+    try:
+        created = create_swarm(
+            conn,
+            goal="Test drop.",
+            workers=[
+                SwarmWorkerSpec(
+                    profile="fake-profile",
+                    title="Worker",
+                    body="Do work",
+                    skills=["available-skill", "missing-skill"],
+                ),
+            ],
+            verifier_assignee="reviewer",
+            synthesizer_assignee="writer",
+            self_heal=SelfHealPolicy(mode="drop"),
+        )
+        worker = kb.get_task(conn, created.worker_ids[0])
+        assert worker.skills == ["available-skill"]
+        board = latest_blackboard(conn, created.root_id)
+        assert board["preflight_skill_check"][0]["missing_skills"] == ["missing-skill"]
+    finally:
+        conn.close()
+
+
+def test_preflight_repair_creates_repair_card(tmp_path, monkeypatch):
+    """When policy=repair, a missing skill produces a blocked repair card."""
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes"))
+    skills = tmp_path / "hermes" / "skills" / "devops" / "kanban-worker"
+    skills.mkdir(parents=True)
+    (skills / "SKILL.md").write_text("---\nname: kanban-worker\n---\n")
+
+    conn = kb.connect(tmp_path / "kanban.db")
+    try:
+        created = create_swarm(
+            conn,
+            goal="Test repair.",
+            workers=[
+                SwarmWorkerSpec(
+                    profile="fake-profile",
+                    title="Worker",
+                    body="Do work",
+                    skills=["missing-skill"],
+                ),
+            ],
+            verifier_assignee="reviewer",
+            synthesizer_assignee="writer",
+            self_heal=SelfHealPolicy(mode="repair", healer_profile="ops"),
+        )
+        assert len(created.worker_ids) == 0
+        assert len(created.repair_ids) == 1
+        repair = kb.get_task(conn, created.repair_ids[0])
+        assert repair.assignee == "ops"
+        assert repair.status == "blocked"
+        assert "missing-skill" in (repair.body or "")
+        # Verifier still depends on root, since no workers were created.
+        assert kb.parent_ids(conn, created.verifier_id) == []
+    finally:
+        conn.close()
+
+
+def test_classify_worker_log_failure_detects_missing_skill():
+    result = kb.classify_worker_log_failure(
+        "Warning: Unknown toolsets: memory_wiki, messaging\n"
+        "Error: Unknown skill(s): oss-substrate-audit, kanban-evidence-audit\n"
+    )
+    assert result is not None
+    assert result["kind"] == "missing_skill"
+    assert result["missing_skills"] == ["oss-substrate-audit", "kanban-evidence-audit"]
+
+
+def test_classify_worker_log_failure_returns_none_for_unmatched_log():
+    assert kb.classify_worker_log_failure("Some random worker output") is None
