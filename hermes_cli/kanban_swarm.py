@@ -159,24 +159,30 @@ def preflight_worker_skills(
 ) -> tuple[list[str], list[str]]:
     """Return (available, missing) forced skills for a worker spec.
 
-    ``hermes_home`` defaults to the profile's resolved HERMES_HOME.  The
-    ``kanban-worker`` skill is treated as a built-in dispatcher injection
-    and is excluded from the check.
+    ``hermes_home`` defaults to the active ``HERMES_HOME`` environment value
+    (falling back to ``~/.hermes``).  This is the skill tree the spawned
+    worker CLI will actually see, because workers are launched from the
+    board owner's environment with ``-p <profile>``.  The ``kanban-worker``
+    skill is treated as a built-in dispatcher injection and is excluded from
+    the check.
     """
 
-    home = hermes_home or _profile_hermes_home(spec.profile)
+    home = hermes_home or os.environ.get("HERMES_HOME") or str(Path.home() / ".hermes")
     forced = [s for s in (spec.skills or []) if s and s != "kanban-worker"]
     available = [s for s in forced if _skill_resolves(s, home)]
     missing = [s for s in forced if s not in available]
     return available, missing
 
 
-def _fail_fast_preflight(workers: list[SwarmWorkerSpec]) -> None:
+def _fail_fast_preflight(
+    workers: list[SwarmWorkerSpec],
+    hermes_home: Optional[str] = None,
+) -> None:
     """Raise before creating any task when any forced skill is missing."""
 
     failures: list[str] = []
     for spec in workers:
-        _, missing = preflight_worker_skills(spec)
+        _, missing = preflight_worker_skills(spec, hermes_home=hermes_home)
         if missing:
             failures.append(
                 f"{spec.profile}/{spec.title}: missing {', '.join(missing)}"
@@ -200,6 +206,7 @@ def _apply_preflight_policy(
     workspace_path: Optional[str] = None,
     priority: int = 0,
     goal: str = "",
+    hermes_home: Optional[str] = None,
 ) -> tuple[list[SwarmWorkerSpec], list[str]]:
     """Validate worker skills and either drop, warn, or create repair cards.
 
@@ -207,10 +214,10 @@ def _apply_preflight_policy(
     created normally, plus a list of repair/replacement task ids created.
     """
 
-    # Run cheap skill resolution per worker.
+    # Run cheap skill resolution per worker under the active HERMES_HOME.
     checks: list[tuple[SwarmWorkerSpec, list[str]]] = []
     for spec in workers:
-        _, missing = preflight_worker_skills(spec)
+        _, missing = preflight_worker_skills(spec, hermes_home=hermes_home)
         checks.append((spec, missing))
 
     any_missing = any(missing for _, missing in checks)
@@ -371,13 +378,14 @@ def create_swarm(
     """Create a durable Kanban swarm graph.
 
     The returned graph is immediately dispatchable: the planning root is marked
-    ``done`` with topology metadata, parallel workers are ``ready``, the verifier
+    ``done`` with parallel workers are ``ready``, the verifier
     waits for every worker, and the synthesizer waits for the verifier.
 
-    ``self_heal`` enables preflight skill/profile checks. When a worker's
-    forced skills cannot be resolved under the assigned profile's
-    HERMES_HOME, the policy decides whether to fail fast (default),
-    drop the unavailable skills, create a repair card, or just warn.
+    ``self_heal`` enables preflight skill checks. When a worker's forced
+    skills cannot be resolved under the active ``HERMES_HOME`` (the skill
+    tree the spawned worker CLI will see), the policy decides whether to
+    fail fast (default), drop the unavailable skills, create a repair card,
+    or just warn.
     """
 
     goal = _require_text(goal, "goal")
@@ -390,10 +398,12 @@ def create_swarm(
         _require_text(spec.profile, f"workers[{i}].profile")
         _require_text(spec.title, f"workers[{i}].title")
 
+    active_home = os.environ.get("HERMES_HOME") or str(Path.home() / ".hermes")
+
     # Fail-fast preflight: when policy is 'fail', validate all forced skills
     # before touching the DB so we never create a half-baked swarm root.
     if self_heal is not None and self_heal.mode == "fail":
-        _fail_fast_preflight(worker_specs)
+        _fail_fast_preflight(worker_specs, hermes_home=active_home)
 
     root = kb.create_task(
         conn,
@@ -455,6 +465,7 @@ def create_swarm(
             workspace_path=workspace_path,
             priority=priority,
             goal=goal,
+            hermes_home=active_home,
         )
 
     context_suffix = _swarm_context(root, goal)
