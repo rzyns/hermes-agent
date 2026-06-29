@@ -53,6 +53,72 @@ def test_init_db_is_idempotent(kanban_home):
     assert tasks[0].title == "persisted"
 
 
+def test_connect_migrates_existing_db_missing_session_id(tmp_path):
+    """Legacy board DBs missing session_id must migrate without data loss.
+
+    Regression coverage for the dashboard-wide 500 where SCHEMA_SQL tried to
+    create idx_tasks_session_id before the additive migration had added the
+    column on existing board databases.
+    """
+    db_path = tmp_path / "legacy-kanban.db"
+    con = sqlite3.connect(db_path)
+    con.executescript(
+        """
+        CREATE TABLE tasks (
+            id TEXT PRIMARY KEY,
+            title TEXT NOT NULL,
+            body TEXT,
+            status TEXT NOT NULL,
+            assignee TEXT,
+            tenant TEXT,
+            priority INTEGER NOT NULL DEFAULT 0,
+            created_at INTEGER NOT NULL,
+            updated_at INTEGER NOT NULL,
+            started_at INTEGER,
+            completed_at INTEGER,
+            result TEXT,
+            block_reason TEXT,
+            workspace_kind TEXT NOT NULL DEFAULT 'scratch',
+            workspace_path TEXT,
+            branch_name TEXT,
+            created_by TEXT,
+            idempotency_key TEXT,
+            claim_lock TEXT,
+            claim_expires INTEGER,
+            consecutive_failures INTEGER NOT NULL DEFAULT 0,
+            worker_pid INTEGER,
+            last_failure_error TEXT,
+            max_runtime_seconds INTEGER,
+            last_heartbeat_at INTEGER,
+            current_run_id INTEGER,
+            workflow_template_id TEXT,
+            current_step_key TEXT,
+            skills TEXT,
+            model_override TEXT,
+            max_retries INTEGER
+        );
+        INSERT INTO tasks (id, title, status, created_at, updated_at)
+        VALUES ('t_legacy', 'preserve me', 'todo', 1, 1);
+        CREATE TABLE task_links (parent_id TEXT NOT NULL, child_id TEXT NOT NULL, PRIMARY KEY (parent_id, child_id));
+        CREATE TABLE task_comments (id INTEGER PRIMARY KEY AUTOINCREMENT, task_id TEXT NOT NULL, author TEXT NOT NULL, body TEXT NOT NULL, created_at INTEGER NOT NULL);
+        CREATE TABLE task_events (id INTEGER PRIMARY KEY AUTOINCREMENT, task_id TEXT NOT NULL, run_id INTEGER, kind TEXT NOT NULL, payload TEXT, created_at INTEGER NOT NULL);
+        CREATE TABLE task_runs (id INTEGER PRIMARY KEY AUTOINCREMENT, task_id TEXT NOT NULL, profile TEXT, step_key TEXT, status TEXT NOT NULL, claim_lock TEXT, claim_expires INTEGER, worker_pid INTEGER, max_runtime_seconds INTEGER, last_heartbeat_at INTEGER, started_at INTEGER NOT NULL, ended_at INTEGER, outcome TEXT, summary TEXT, metadata TEXT, error TEXT);
+        CREATE TABLE kanban_notify_subs (id INTEGER PRIMARY KEY AUTOINCREMENT, task_id TEXT NOT NULL, discord_channel_id TEXT NOT NULL, discord_thread_id TEXT, created_by TEXT, created_at INTEGER NOT NULL, active INTEGER NOT NULL DEFAULT 1);
+        """
+    )
+    con.close()
+
+    kb._INITIALIZED_PATHS.discard(str(db_path.resolve()))
+    with kb.connect(db_path) as conn:
+        cols = {row["name"] for row in conn.execute("PRAGMA table_info(tasks)")}
+        indexes = {row["name"] for row in conn.execute("PRAGMA index_list(tasks)")}
+        title = conn.execute("SELECT title FROM tasks WHERE id='t_legacy'").fetchone()["title"]
+
+    assert "session_id" in cols
+    assert "idx_tasks_session_id" in indexes
+    assert title == "preserve me"
+
+
 def test_init_creates_expected_tables(kanban_home):
     with kb.connect() as conn:
         rows = conn.execute(
@@ -125,6 +191,175 @@ def test_connect_rejects_tls_record_in_sqlite_header(tmp_path, monkeypatch):
     assert "file is not a database" in msg
     assert "TLS record header detected at byte offset 5" in msg
     assert "53 51 4c 69 74 17 03 03 00 13" in msg
+
+
+def test_integrity_guard_treats_short_read_rows_as_transient(tmp_path, monkeypatch):
+    """Transient SQLite short-read rows must not poison the corrupt-DB cache."""
+    db_path = tmp_path / "kanban.db"
+    db_path.write_bytes(kb._SQLITE_HEADER + b"healthy bytes with transient read failure")
+    resolved = str(db_path.resolve())
+    kb._INITIALIZED_PATHS.discard(resolved)
+    kb._INITIALIZED_PATH_FINGERPRINTS.pop(resolved, None)
+    kb._CORRUPT_DB_BACKUPS.pop(resolved, None)
+
+    integrity_results = [
+        "*** in database main ***\nTree 8 page 2837: unable to get the page. error code=522",
+        "ok",
+    ]
+
+    class FakeProbe:
+        def __init__(self, integrity_result: str):
+            self.integrity_result = integrity_result
+
+        def execute(self, sql):
+            class FakeCursor:
+                def __init__(self, value: str):
+                    self.value = value
+
+                def fetchone(self):
+                    return (self.value,)
+
+            if "integrity_check" in sql:
+                return FakeCursor(self.integrity_result)
+            return FakeCursor("ok")
+
+        def close(self):
+            pass
+
+    backups: list[Path] = []
+
+    def fake_connect(*_args, **_kwargs):
+        return FakeProbe(integrity_results.pop(0))
+
+    def fake_backup(path: Path) -> Path:
+        backup = path.with_name(f"{path.name}.corrupt.{len(backups)}.bak")
+        backups.append(backup)
+        return backup
+
+    monkeypatch.setattr(kb.sqlite3, "connect", fake_connect)
+    monkeypatch.setattr(kb, "_backup_corrupt_db", fake_backup)
+
+    with pytest.raises(sqlite3.OperationalError, match="unable to get the page"):
+        kb._guard_existing_db_is_healthy(db_path)
+
+    assert backups == []
+    assert resolved not in kb._CORRUPT_DB_BACKUPS
+    assert resolved not in kb._INITIALIZED_PATH_FINGERPRINTS
+
+    kb._guard_existing_db_is_healthy(db_path)
+
+    assert backups == []
+    assert resolved not in kb._CORRUPT_DB_BACKUPS
+    assert kb._INITIALIZED_PATH_FINGERPRINTS[resolved] == (
+        db_path.stat().st_mtime_ns,
+        db_path.stat().st_size,
+    )
+
+
+def test_integrity_guard_reuses_backup_for_unchanged_corrupt_db(tmp_path, monkeypatch):
+    """Repeated opens of one unchanged corrupt DB should not create backups forever."""
+    db_path = tmp_path / "kanban.db"
+    db_path.write_bytes(kb._SQLITE_HEADER + b"x" * 128)
+    resolved = str(db_path.resolve())
+    kb._INITIALIZED_PATHS.discard(resolved)
+    kb._CORRUPT_DB_BACKUPS.pop(resolved, None)
+
+    class FakeProbe:
+        def execute(self, _sql):
+            class FakeCursor:
+                def fetchone(self):
+                    return ("bad btree",)
+            return FakeCursor()
+
+        def close(self):
+            pass
+
+    backups: list[Path] = []
+
+    def fake_connect(*_args, **_kwargs):
+        return FakeProbe()
+
+    def fake_backup(path: Path) -> Path:
+        backup = path.with_name(f"{path.name}.corrupt.{len(backups)}.bak")
+        backups.append(backup)
+        return backup
+
+    monkeypatch.setattr(kb.sqlite3, "connect", fake_connect)
+    monkeypatch.setattr(kb, "_backup_corrupt_db", fake_backup)
+
+    with pytest.raises(kb.KanbanDbCorruptError) as first:
+        kb._guard_existing_db_is_healthy(db_path)
+    with pytest.raises(kb.KanbanDbCorruptError) as second:
+        kb._guard_existing_db_is_healthy(db_path)
+
+    assert backups == [first.value.backup_path]
+    assert second.value.backup_path == first.value.backup_path
+
+    db_path.write_bytes(kb._SQLITE_HEADER + b"y" * 256)
+    with pytest.raises(kb.KanbanDbCorruptError) as third:
+        kb._guard_existing_db_is_healthy(db_path)
+
+    assert len(backups) == 2
+    assert third.value.backup_path != first.value.backup_path
+    kb._CORRUPT_DB_BACKUPS.pop(resolved, None)
+
+
+def test_integrity_guard_rechecks_initialized_path_when_file_changes(
+    tmp_path, monkeypatch
+):
+    """A path cached healthy must be re-probed if the on-disk DB changes later."""
+    db_path = tmp_path / "kanban.db"
+    db_path.write_bytes(kb._SQLITE_HEADER + b"initial healthy fingerprint")
+    resolved = str(db_path.resolve())
+    initial = db_path.stat()
+    kb._INITIALIZED_PATHS.add(resolved)
+    kb._INITIALIZED_PATH_FINGERPRINTS[resolved] = (initial.st_mtime_ns, initial.st_size)
+    kb._CORRUPT_DB_BACKUPS.pop(resolved, None)
+
+    db_path.write_bytes(kb._SQLITE_HEADER + b"changed bytes now require a fresh probe")
+
+    class FakeProbe:
+        def execute(self, _sql):
+            class FakeCursor:
+                def fetchone(self):
+                    return ("bad btree",)
+            return FakeCursor()
+
+        def close(self):
+            pass
+
+    probes = []
+
+    def fake_connect(*_args, **_kwargs):
+        probes.append(True)
+        return FakeProbe()
+
+    monkeypatch.setattr(kb.sqlite3, "connect", fake_connect)
+    monkeypatch.setattr(kb, "_backup_corrupt_db", lambda path: path.with_suffix(".bak"))
+
+    with pytest.raises(kb.KanbanDbCorruptError) as exc_info:
+        kb._guard_existing_db_is_healthy(db_path)
+
+    assert probes == [True]
+    assert "integrity_check returned 'bad btree'" in str(exc_info.value)
+    assert resolved not in kb._INITIALIZED_PATHS
+    kb._INITIALIZED_PATH_FINGERPRINTS.pop(resolved, None)
+    kb._CORRUPT_DB_BACKUPS.pop(resolved, None)
+
+
+def test_backup_corrupt_db_reuses_existing_identical_backup(tmp_path):
+    db_path = tmp_path / "kanban.db"
+    db_bytes = kb._SQLITE_HEADER + b"same corrupt bytes"
+    db_path.write_bytes(db_bytes)
+    representative = tmp_path / "kanban.db.corrupt.20260524_120000.bak"
+    representative.write_bytes(db_bytes)
+
+    backup = kb._backup_corrupt_db(db_path)
+
+    assert backup == representative
+    assert sorted(p.name for p in tmp_path.glob("kanban.db.corrupt.*.bak")) == [
+        representative.name
+    ]
 
 
 def test_connect_migrates_legacy_db_before_optional_column_indexes(tmp_path):

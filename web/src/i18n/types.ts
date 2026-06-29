@@ -819,5 +819,15 @@ export interface Translations {
     workspacePathOptional: string;
     logTruncated: string;
     logAt: string;
+    degradedBoard: string;
+    degradedReason: string;
+    degradedBackupPath: string;
+    switchToHealthyBoard: string;
+    viewRepairGuidance: string;
+    boardHealthHealthy: string;
+    boardHealthDegraded: string;
+    boardHealthMissing: string;
+    boardHealthUnreachable: string;
+    selectHealthyBoard: string;
   };
 }

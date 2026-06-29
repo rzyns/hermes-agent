@@ -85,6 +85,7 @@ Routes define how different webhook sources are handled. Each route is a named e
 | `deliver` | No | Where to send the response: `github_comment`, `telegram`, `discord`, `slack`, `signal`, `sms`, `whatsapp`, `matrix`, `mattermost`, `homeassistant`, `email`, `dingtalk`, `feishu`, `wecom`, `weixin`, `bluebubbles`, `qqbot`, or `log` (default). |
 | `deliver_extra` | No | Additional delivery config — keys depend on `deliver` type (e.g. `repo`, `pr_number`, `chat_id`). Values support the same `{dot.notation}` templates as `prompt`. |
 | `deliver_only` | No | If `true`, skip the agent entirely — the rendered `prompt` template becomes the literal message that gets delivered. Zero LLM cost, sub-second delivery. See [Direct Delivery Mode](#direct-delivery-mode) for use cases. Requires `deliver` to be a real target (not `log`). |
+| `action` | No | Built-in deterministic no-agent action to run instead of an agent prompt. Currently supports `kanban_intake_links` for Attention Intake link ingestion. Mutually exclusive with `deliver_only`. |
 
 ### Full example
 
@@ -327,6 +328,65 @@ hermes webhook subscribe antenna-matches \
 
 ---
 
+## Deterministic Actions {#deterministic-actions}
+
+Some webhook routes perform a built-in local action instead of rendering a prompt or starting an agent. Set `action` on the route, or pass `--action` when creating a dynamic subscription. These routes still use the same HMAC auth, rate limiting, idempotency, and body-size limits as agent-backed routes.
+
+### `kanban_intake_links`
+
+`kanban_intake_links` ingests one-or-more links into the `attention-intake` Kanban board using the same helper as the dashboard **Drop Link** button. It never calls the agent and returns synchronously after the link-drop tasks are created or de-duplicated.
+
+Accepted request bodies:
+
+- plain text containing one link;
+- plain text with newline-delimited links;
+- a JSON string containing one link or newline-delimited links;
+- a JSON array of strings.
+
+Create a dynamic subscription:
+
+```bash
+hermes webhook subscribe attention-intake-links \
+  --action kanban_intake_links \
+  --description "Deterministically ingest links into Attention Intake"
+```
+
+POST examples:
+
+```bash
+# Single plain-text link
+curl -X POST "$WEBHOOK_URL" \
+  -H "X-Webhook-Signature: $HMAC_SHA256_HEX" \
+  --data-binary 'https://example.com/article'
+
+# JSON array
+curl -X POST "$WEBHOOK_URL" \
+  -H "Content-Type: application/json" \
+  -H "X-Webhook-Signature: $HMAC_SHA256_HEX" \
+  --data-binary '["https://example.com/a", "https://example.com/b"]'
+```
+
+Successful response:
+
+```json
+{
+  "status": "ingested",
+  "route": "attention-intake-links",
+  "action": "kanban_intake_links",
+  "board": "attention-intake",
+  "count": 2,
+  "delivery_id": "...",
+  "tasks": [
+    {"url": "https://example.com/a", "task_id": "t_..."},
+    {"url": "https://example.com/b", "task_id": "t_..."}
+  ]
+}
+```
+
+`action` and `deliver_only` are mutually exclusive no-agent modes. `skills` are rejected for deterministic action subscriptions because no agent run occurs.
+
+---
+
 ## Dynamic Subscriptions (CLI) {#dynamic-subscriptions}
 
 In addition to static routes in `config.yaml`, you can create webhook subscriptions dynamically using the `hermes webhook` CLI command. This is especially useful when the agent itself needs to set up event-driven triggers.
@@ -368,7 +428,7 @@ hermes webhook test github-issues --payload '{"issue": {"number": 42, "title": "
 - Subscriptions are stored in `~/.hermes/webhook_subscriptions.json`
 - The webhook adapter hot-reloads this file on each incoming request (mtime-gated, negligible overhead)
 - Static routes from `config.yaml` always take precedence over dynamic ones with the same name
-- Dynamic subscriptions use the same route format and capabilities as static routes (events, prompt templates, skills, delivery)
+- Dynamic subscriptions use the same route format and capabilities as static routes (events, prompt templates, skills, delivery, deliver-only mode, and deterministic actions)
 - No gateway restart required — subscribe and it's immediately live
 
 ### Agent-driven subscriptions

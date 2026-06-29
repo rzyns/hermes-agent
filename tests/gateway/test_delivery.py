@@ -419,5 +419,3 @@ async def test_save_failure_during_truncation_raises_for_non_chunking_adapter(tm
     # retry (footer needs the path) re-raises.
     with pytest.raises(OSError, match="No space left on device"):
         await router._deliver_to_platform(target, long_content, metadata={"job_id": "job7"})
-
-

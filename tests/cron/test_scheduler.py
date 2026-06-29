@@ -542,6 +542,14 @@ class TestRoutingIntents:
         """'ALL' / 'All' / 'all' are all recognized."""
         from cron.scheduler import _resolve_delivery_targets
 
+        for var in ("TELEGRAM_HOME_CHANNEL", "DISCORD_HOME_CHANNEL", "SLACK_HOME_CHANNEL",
+                    "SIGNAL_HOME_CHANNEL", "MATRIX_HOME_ROOM", "MATRIX_HOME_CHANNEL",
+                    "MATTERMOST_HOME_CHANNEL", "SMS_HOME_CHANNEL", "EMAIL_HOME_ADDRESS",
+                    "DINGTALK_HOME_CHANNEL", "FEISHU_HOME_CHANNEL", "WECOM_HOME_CHANNEL",
+                    "WEIXIN_HOME_CHANNEL", "BLUEBUBBLES_HOME_CHANNEL", "QQBOT_HOME_CHANNEL",
+                    "QQ_HOME_CHANNEL", "WHATSAPP_HOME_CHANNEL"):
+            monkeypatch.delenv(var, raising=False)
+
         monkeypatch.setenv("TELEGRAM_HOME_CHANNEL", "-111")
         monkeypatch.setenv("DISCORD_HOME_CHANNEL", "-222")
 
@@ -591,6 +599,32 @@ class TestDeliverResultWrapping:
         assert "-------------" in sent_content
         assert "Here is today's summary." in sent_content
         assert "To stop or manage this job" in sent_content
+
+    def test_delivery_does_not_wrap_no_agent_script_output(self):
+        """no_agent script output is delivered verbatim, without cron header/footer."""
+        from gateway.config import Platform
+
+        pconfig = MagicMock()
+        pconfig.enabled = True
+        mock_cfg = MagicMock()
+        mock_cfg.platforms = {Platform.TELEGRAM: pconfig}
+
+        with patch("gateway.config.load_gateway_config", return_value=mock_cfg), \
+             patch("tools.send_message_tool._send_to_platform", new=AsyncMock(return_value={"success": True})) as send_mock:
+            job = {
+                "id": "watchdog-job",
+                "name": "intake-register-drift-watchdog",
+                "deliver": "origin",
+                "origin": {"platform": "telegram", "chat_id": "123"},
+                "no_agent": True,
+            }
+            _deliver_result(job, "Intake register drift detected: 10 alert-worthy errors")
+
+        send_mock.assert_called_once()
+        sent_content = send_mock.call_args.kwargs.get("content") or send_mock.call_args[0][-1]
+        assert sent_content == "Intake register drift detected: 10 alert-worthy errors"
+        assert "Cronjob Response" not in sent_content
+        assert "To stop or manage this job" not in sent_content
 
     def test_delivery_uses_job_id_when_no_name(self):
         """When a job has no name, the wrapper should fall back to job id."""
@@ -1703,7 +1737,7 @@ class TestRunJobConfigLogging:
         }
 
         # Mock heavy post-yaml work so the test only exercises the warning
-        # path. Without these mocks, run_job continues into provider
+        # path. Without these mocks, _run_job_impl continues into provider
         # resolution and MCP discovery, both of which can spawn subprocesses
         # / hit the network and have caused this test to time out on CI
         # (>30s wall clock) under load. See PR #33661 follow-up.

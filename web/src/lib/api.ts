@@ -1663,6 +1663,9 @@ export interface SessionInfo {
   source: string | null;
   model: string | null;
   title: string | null;
+  title_source?: string | null;
+  title_updated_at?: number | null;
+  title_revision_count?: number;
   started_at: number;
   ended_at: number | null;
   last_active: number;

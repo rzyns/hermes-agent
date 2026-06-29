@@ -55,6 +55,13 @@ def build_webhook_parser(subparsers, *, cmd_webhook: Callable) -> None:
         "message. Zero LLM cost. Requires --deliver to be a real target "
         "(not 'log').",
     )
+    wh_sub.add_argument(
+        "--action",
+        default="",
+        help="Run a built-in deterministic action instead of starting an agent. "
+        "Currently supported: kanban_intake_links (aliases: intake-links, "
+        "kanban-intake-links).",
+    )
 
     webhook_subparsers.add_parser(
         "list", aliases=["ls"], help="List all dynamic subscriptions"

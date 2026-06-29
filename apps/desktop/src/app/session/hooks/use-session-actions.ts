@@ -90,6 +90,8 @@ interface SessionActionsOptions {
   ) => ClientSessionState
 }
 
+const DESKTOP_SESSION_SOURCE = 'desktop'
+
 function withAppendedText(message: ChatMessage, suffix: string): ChatMessage {
   let appended = false
 
@@ -231,7 +233,7 @@ function upsertOptimisticSession(
     parent_session_id: parentSessionId,
     preview,
     profile: profileKey,
-    source: 'tui',
+    source: DESKTOP_SESSION_SOURCE,
     started_at: now,
     title,
     tool_call_count: 0
@@ -501,6 +503,7 @@ export function useSessionActions({
 
         const created = await requestGateway<SessionCreateResponse>('session.create', {
           cols: 96,
+          source: DESKTOP_SESSION_SOURCE,
           ...(cwd && { cwd }),
           ...(newChatProfile ? { profile: newChatProfile } : {}),
           ...(uiModel ? { model: uiModel, ...(uiProvider ? { provider: uiProvider } : {}) } : {}),
@@ -962,6 +965,7 @@ export function useSessionActions({
         // No title: the backend auto-names the branch from its parent's lineage.
         const branched = await requestGateway<SessionCreateResponse>('session.create', {
           cols: 96,
+          source: DESKTOP_SESSION_SOURCE,
           ...(cwd && { cwd }),
           messages: branchMessages.map(({ content, role }) => ({ content, role })),
           ...(parentStoredId && { parent_session_id: parentStoredId })

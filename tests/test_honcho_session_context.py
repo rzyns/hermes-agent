@@ -2,7 +2,9 @@
 
 from types import SimpleNamespace
 
-from plugins.memory.honcho.session import HonchoSession, HonchoSessionManager
+import pytest
+
+from plugins.memory.honcho.session import _ASYNC_SHUTDOWN, HonchoSession, HonchoSessionManager
 
 
 class _FakeSummary:
@@ -93,3 +95,35 @@ def test_session_context_user_alias_uses_user_self_observer_when_ai_cannot_obser
             "peer_perspective": "chris",
         }
     ]
+
+
+def test_shutdown_signals_async_writer_even_when_flush_fails(monkeypatch):
+    cfg = SimpleNamespace(
+        write_frequency="turn",
+        dialectic_reasoning_level="low",
+        dialectic_dynamic=True,
+        dialectic_max_chars=600,
+        observation_mode="directional",
+        user_observe_me=True,
+        user_observe_others=True,
+        ai_observe_me=True,
+        ai_observe_others=True,
+        message_max_chars=25000,
+        dialectic_max_input_chars=10000,
+    )
+    mgr = HonchoSessionManager(honcho=SimpleNamespace(), config=cfg)
+    queued = []
+    joined = []
+    mgr._async_queue = SimpleNamespace(put=lambda item: queued.append(item))
+    mgr._async_thread = SimpleNamespace(join=lambda timeout=None: joined.append(timeout))
+
+    def fail_flush():
+        raise RuntimeError("flush failed")
+
+    monkeypatch.setattr(mgr, "flush_all", fail_flush)
+
+    with pytest.raises(RuntimeError, match="flush failed"):
+        mgr.shutdown()
+
+    assert queued == [_ASYNC_SHUTDOWN]
+    assert joined == [10]

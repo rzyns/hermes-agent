@@ -305,7 +305,7 @@ export const en: Translations = {
       keysTools: 'Tools',
       keysSettings: 'Settings',
       mcp: 'MCP',
-      archivedChats: 'Archived Chats',
+      archivedChats: 'Sessions',
       about: 'About',
       notifications: 'Notifications'
     },
@@ -363,7 +363,7 @@ export const en: Translations = {
       gateway: 'Gateway connection...',
       keys: 'Search API keys...',
       mcp: 'Search MCP servers...',
-      sessions: 'Search archived sessions...'
+      sessions: 'Search sessions...'
     },
     modeOptions: {
       light: { label: 'Light', description: 'Bright desktop surfaces' },
@@ -677,6 +677,17 @@ export const en: Translations = {
         'New sessions start in this folder unless you pick another. Leave it unset to use your home directory.',
       defaultDirUpdated: 'Default project directory updated — start a new chat (Ctrl/⌘+N) for it to take effect',
       defaultsTo: label => `Defaults to ${label}.`,
+      sidebarSourcesTitle: 'Sidebar sources',
+      sidebarSourcesDesc:
+        'Choose which session sources appear in the main sidebar recents list. Default keeps Hermes’ built-in cron and messaging grouping; selecting sources shows only those sources.',
+      sidebarSourcesDefaultMode: 'Built-in sidebar grouping',
+      sidebarSourcesDefaultSummary:
+        'Main recents exclude cron, tools, subagents, and messaging platforms; those sources stay in their own sections.',
+      sidebarSourcesCustomMode: 'Selected sources only',
+      sidebarSourcesSelectedSummary: sources => `Main recents show only: ${sources}.`,
+      sidebarSourcesPresetLocal: 'CLI + TUI + WebUI',
+      sidebarSourcesUseDefault: 'Use default',
+      sidebarSourcesToggle: source => `Show ${source} sessions in the sidebar`,
       change: 'Change',
       choose: 'Choose',
       clear: 'Clear',

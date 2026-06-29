@@ -507,7 +507,12 @@ class TestResolveAnthropicToken:
 
 
 class TestRefreshOauthToken:
-    def test_returns_none_without_refresh_token(self):
+    def test_returns_none_without_refresh_token(self, monkeypatch):
+        # Isolate this unit test from real Claude Code credentials in the
+        # developer's home directory. _refresh_oauth_token may adopt a freshly
+        # rotated live token before POSTing, but this case specifically covers
+        # the no-refresh-token path when no live replacement exists.
+        monkeypatch.setattr("agent.anthropic_adapter.read_claude_code_credentials", lambda: None)
         creds = {"accessToken": "expired", "refreshToken": "", "expiresAt": 0}
         assert _refresh_oauth_token(creds) is None
 
@@ -544,7 +549,10 @@ class TestRefreshOauthToken:
         assert written["claudeAiOauth"]["accessToken"] == "new-token-abc"
         assert written["claudeAiOauth"]["refreshToken"] == "new-refresh-456"
 
-    def test_failed_refresh_returns_none(self):
+    def test_failed_refresh_returns_none(self, monkeypatch):
+        # Avoid adopting a real, already-refreshed Claude Code token from the
+        # developer's home; this test covers the network-refresh failure path.
+        monkeypatch.setattr("agent.anthropic_adapter.read_claude_code_credentials", lambda: None)
         creds = {
             "accessToken": "old",
             "refreshToken": "refresh-123",

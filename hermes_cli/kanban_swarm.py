@@ -18,8 +18,12 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 import json
+import os
 import sqlite3
-from typing import Any, Iterable, Optional
+from pathlib import Path
+from typing import Any, Iterable, Literal, Optional
+
+import yaml
 
 from hermes_cli import kanban_db as kb
 
@@ -39,6 +43,33 @@ class SwarmWorkerSpec:
 
 
 @dataclass(frozen=True)
+class SelfHealPolicy:
+    """Policy for handling operational wiring failures in a swarm.
+
+    Attributes:
+        mode: How to react to preflight skill/profile failures.
+            - ``fail``: raise before creating any card (default).
+            - ``drop``: drop unavailable forced skills; keep task body guidance.
+            - ``repair``: create a repair card assigned to ``healer_profile``.
+            - ``warn``: create the worker anyway, but log a blackboard warning.
+        healer_profile: Profile that receives self-healing repair cards.
+        max_repairs_per_swarm: Hard cap on repair cards created per swarm.
+        max_repairs_per_task: Hard cap on repair cards per original task.
+    """
+
+    mode: Literal["fail", "drop", "repair", "warn"] = "fail"
+    healer_profile: str = "default"
+    max_repairs_per_swarm: int = 4
+    max_repairs_per_task: int = 1
+
+    def __post_init__(self):
+        if self.mode not in ("fail", "drop", "repair", "warn"):
+            raise ValueError(f"unknown self-heal mode {self.mode!r}")
+        if self.max_repairs_per_swarm < 0 or self.max_repairs_per_task < 0:
+            raise ValueError("repair caps must be non-negative")
+
+
+@dataclass(frozen=True)
 class SwarmCreated:
     """IDs produced by :func:`create_swarm`."""
 
@@ -46,6 +77,7 @@ class SwarmCreated:
     worker_ids: list[str]
     verifier_id: str
     synthesizer_id: str
+    repair_ids: list[str] = field(default_factory=list)
 
     def as_dict(self) -> dict[str, Any]:
         return {
@@ -53,6 +85,7 @@ class SwarmCreated:
             "worker_ids": list(self.worker_ids),
             "verifier_id": self.verifier_id,
             "synthesizer_id": self.synthesizer_id,
+            "repair_ids": list(self.repair_ids),
         }
 
 
@@ -61,6 +94,256 @@ def _require_text(value: str, field_name: str) -> str:
     if not text:
         raise ValueError(f"{field_name} is required")
     return text
+
+
+def _profile_hermes_home(profile: str) -> str:
+    """Resolve a profile name to its HERMES_HOME directory string."""
+
+    from hermes_cli.profiles import resolve_profile_env, normalize_profile_name
+
+    try:
+        return resolve_profile_env(normalize_profile_name(profile))
+    except FileNotFoundError:
+        # For tests with fake profiles, fall back to the active HERMES_HOME.
+        return os.environ.get("HERMES_HOME", str(Path.home() / ".hermes"))
+
+
+def _external_skill_dirs(hermes_home: str) -> list[Path]:
+    """Return configured external_skill_dirs for a HERMES_HOME."""
+
+    cfg_path = Path(hermes_home) / "config.yaml"
+    if not cfg_path.is_file():
+        return []
+    try:
+        cfg = yaml.safe_load(cfg_path.read_text(encoding="utf-8")) or {}
+        skill_cfg = cfg.get("skills") or {}
+        dirs = skill_cfg.get("external_skill_dirs") or []
+        return [Path(d).expanduser() for d in dirs if d]
+    except Exception:
+        return []
+
+
+def _skill_resolves(skill_name: str, hermes_home: str) -> bool:
+    """Check whether a skill identifier resolves under a HERMES_HOME.
+
+    Mirrors the profile-scoped skill discovery the worker CLI will use:
+    first local ``<home>/skills/**/<name>/SKILL.md``, then configured
+    external skill dirs.  No YAML parsing or prompt building is done,
+    so this is cheap enough to run once per worker at swarm creation.
+    """
+
+    if not skill_name or not skill_name.strip():
+        return False
+    name = skill_name.strip()
+    roots: list[Path] = [Path(hermes_home) / "skills"]
+    roots.extend(_external_skill_dirs(hermes_home))
+    for root in roots:
+        if not root.is_dir():
+            continue
+        # Fast path: skill_view-style names may be ``devops/kanban-worker``.
+        if (root / name / "SKILL.md").is_file():
+            return True
+        # Also allow the leaf anywhere under the skill root (bundled layout).
+        try:
+            for skill_md in root.rglob(f"{name}/SKILL.md"):
+                if skill_md.is_file():
+                    return True
+        except OSError:
+            pass
+    return False
+
+
+def preflight_worker_skills(
+    spec: SwarmWorkerSpec,
+    hermes_home: Optional[str] = None,
+) -> tuple[list[str], list[str]]:
+    """Return (available, missing) forced skills for a worker spec.
+
+    ``hermes_home`` defaults to the active ``HERMES_HOME`` environment value
+    (falling back to ``~/.hermes``).  This is the skill tree the spawned
+    worker CLI will actually see, because workers are launched from the
+    board owner's environment with ``-p <profile>``.  The ``kanban-worker``
+    skill is treated as a built-in dispatcher injection and is excluded from
+    the check.
+    """
+
+    home = hermes_home or os.environ.get("HERMES_HOME") or str(Path.home() / ".hermes")
+    forced = [s for s in (spec.skills or []) if s and s != "kanban-worker"]
+    available = [s for s in forced if _skill_resolves(s, home)]
+    missing = [s for s in forced if s not in available]
+    return available, missing
+
+
+def _fail_fast_preflight(
+    workers: list[SwarmWorkerSpec],
+    hermes_home: Optional[str] = None,
+) -> None:
+    """Raise before creating any task when any forced skill is missing."""
+
+    failures: list[str] = []
+    for spec in workers:
+        _, missing = preflight_worker_skills(spec, hermes_home=hermes_home)
+        if missing:
+            failures.append(
+                f"{spec.profile}/{spec.title}: missing {', '.join(missing)}"
+            )
+    if failures:
+        raise ValueError(
+            "swarm preflight failed: profile cannot resolve forced skill(s). "
+            "Use --self-heal-policy drop|repair|warn, or remove the skills. "
+            + "; ".join(failures)
+        )
+
+def _apply_preflight_policy(
+    conn: sqlite3.Connection,
+    root_id: str,
+    workers: list[SwarmWorkerSpec],
+    policy: SelfHealPolicy,
+    created_by: str,
+    *,
+    tenant: Optional[str] = None,
+    workspace_kind: str = "scratch",
+    workspace_path: Optional[str] = None,
+    priority: int = 0,
+    goal: str = "",
+    hermes_home: Optional[str] = None,
+) -> tuple[list[SwarmWorkerSpec], list[str]]:
+    """Validate worker skills and either drop, warn, or create repair cards.
+
+    Returns the (possibly mutated) list of worker specs that should be
+    created normally, plus a list of repair/replacement task ids created.
+    """
+
+    # Run cheap skill resolution per worker under the active HERMES_HOME.
+    checks: list[tuple[SwarmWorkerSpec, list[str]]] = []
+    for spec in workers:
+        _, missing = preflight_worker_skills(spec, hermes_home=hermes_home)
+        checks.append((spec, missing))
+
+    any_missing = any(missing for _, missing in checks)
+    if not any_missing:
+        return workers, []
+
+    # Build a manifest for the blackboard regardless of mode.
+    manifest = []
+    for spec, missing in checks:
+        if missing:
+            manifest.append(
+                {
+                    "profile": spec.profile,
+                    "title": spec.title,
+                    "missing_skills": missing,
+                    "action": policy.mode,
+                }
+            )
+
+    post_blackboard_update(
+        conn,
+        root_id,
+        author=created_by,
+        key="preflight_skill_check",
+        value=manifest,
+    )
+
+    if policy.mode == "warn":
+        return workers, []
+
+    repaired: list[str] = []
+    kept: list[SwarmWorkerSpec] = []
+    for spec, missing in checks:
+        if not missing:
+            kept.append(spec)
+            continue
+
+        if policy.mode == "drop":
+            # Keep the worker but remove only the unavailable forced skills.
+            # Task body still carries the substantive instructions.
+            kept.append(
+                SwarmWorkerSpec(
+                    profile=spec.profile,
+                    title=spec.title,
+                    body=spec.body,
+                    skills=[s for s in spec.skills if s not in missing],
+                    priority=spec.priority,
+                    max_runtime_seconds=spec.max_runtime_seconds,
+                )
+            )
+            continue
+
+        if policy.mode == "repair":
+            if len(repaired) >= policy.max_repairs_per_swarm:
+                # Cap reached: fall back to creating a blocked worker card
+                # with no forced skills so the swarm is not silently stunted.
+                kept.append(
+                    SwarmWorkerSpec(
+                        profile=spec.profile,
+                        title=spec.title,
+                        body=spec.body,
+                        skills=[],
+                        priority=spec.priority,
+                        max_runtime_seconds=spec.max_runtime_seconds,
+                    )
+                )
+                continue
+
+            repair_body = (
+                f"Operational repair for swarm worker `{spec.title}` "
+                f"(profile `{spec.profile}`).\n\n"
+                f"Swarm root: `{root_id}`\n"
+                f"Original worker scope: {spec.body or spec.title}\n"
+                f"Missing forced skills: {', '.join(missing)}\n"
+                f"Swarm goal: {goal}\n\n"
+                "Repair actions you may perform:\n"
+                "1. Inspect the profile's skill surface and install/sync "
+                "the missing skills if that is safe and intended.\n"
+                "2. Create a replacement worker card assigned to a profile "
+                "that resolves the required skills; link it as a parent "
+                "of the verifier.\n"
+                "3. Preserve this blocked original card as evidence; do "
+                "not archive it until replacements are linked.\n"
+                "4. Carry forward every non-authorization from the root blackboard."
+            )
+            repair_id = kb.create_task(
+                conn,
+                title=f"Repair: {spec.title}",
+                body=repair_body,
+                assignee=policy.healer_profile,
+                created_by=created_by,
+                parents=[root_id],
+                tenant=tenant,
+                priority=priority + 1,
+                workspace_kind=workspace_kind,
+                workspace_path=workspace_path,
+                skills=["kanban-worker"],
+                initial_status="blocked",
+            )
+            kb.add_comment(
+                conn,
+                repair_id,
+                author=created_by,
+                body=(
+                    f"Self-healing repair card created because profile "
+                    f"`{spec.profile}` cannot resolve forced skills "
+                    f"{', '.join(missing)}. Original worker spec was dropped "
+                    f"from the swarm graph; this card replaces it."
+                ),
+            )
+            repaired.append(repair_id)
+            # The original worker is NOT created; the repair card is the
+            # placeholder. Downstream verifier is gated until the repair is
+            # completed by the healer profile.
+            continue
+
+    if repaired:
+        post_blackboard_update(
+            conn,
+            root_id,
+            author=created_by,
+            key="self_heal_repairs",
+            value=repaired,
+        )
+
+    return kept, repaired
 
 
 def _swarm_context(root_id: str, goal: str) -> str:
@@ -90,12 +373,19 @@ def create_swarm(
     workspace_path: Optional[str] = None,
     priority: int = 0,
     idempotency_key: Optional[str] = None,
+    self_heal: Optional[SelfHealPolicy] = None,
 ) -> SwarmCreated:
     """Create a durable Kanban swarm graph.
 
     The returned graph is immediately dispatchable: the planning root is marked
-    ``done`` with topology metadata, parallel workers are ``ready``, the verifier
+    ``done`` with parallel workers are ``ready``, the verifier
     waits for every worker, and the synthesizer waits for the verifier.
+
+    ``self_heal`` enables preflight skill checks. When a worker's forced
+    skills cannot be resolved under the active ``HERMES_HOME`` (the skill
+    tree the spawned worker CLI will see), the policy decides whether to
+    fail fast (default), drop the unavailable skills, create a repair card,
+    or just warn.
     """
 
     goal = _require_text(goal, "goal")
@@ -107,6 +397,13 @@ def create_swarm(
     for i, spec in enumerate(worker_specs, start=1):
         _require_text(spec.profile, f"workers[{i}].profile")
         _require_text(spec.title, f"workers[{i}].title")
+
+    active_home = os.environ.get("HERMES_HOME") or str(Path.home() / ".hermes")
+
+    # Fail-fast preflight: when policy is 'fail', validate all forced skills
+    # before touching the DB so we never create a half-baked swarm root.
+    if self_heal is not None and self_heal.mode == "fail":
+        _fail_fast_preflight(worker_specs, hermes_home=active_home)
 
     root = kb.create_task(
         conn,
@@ -153,8 +450,26 @@ def create_swarm(
         },
     )
 
+    # Self-healing preflight: resolve forced skills under each worker's
+    # profile HERMES_HOME before creating the worker cards.
+    repair_ids: list[str] = []
+    if self_heal is not None:
+        worker_specs, repair_ids = _apply_preflight_policy(
+            conn,
+            root,
+            worker_specs,
+            self_heal,
+            created_by,
+            tenant=tenant,
+            workspace_kind=workspace_kind,
+            workspace_path=workspace_path,
+            priority=priority,
+            goal=goal,
+            hermes_home=active_home,
+        )
+
     context_suffix = _swarm_context(root, goal)
-    worker_ids: list[str] = []
+    worker_ids = []
     for spec in worker_specs:
         worker_id = kb.create_task(
             conn,
@@ -172,6 +487,11 @@ def create_swarm(
         )
         worker_ids.append(worker_id)
 
+    # Any self-healing repair cards are evidence-only siblings; they do
+    # NOT gate the verifier (the replacement workers produced by the repair
+    # policy already do).  Include them in the topology for traceability.
+    verifier_parents = list(worker_ids)
+
     verifier_body = (
         "Review every worker handoff and blackboard update. Gate the swarm: "
         "complete only with metadata {\"gate\": \"pass\"} when evidence is "
@@ -184,7 +504,7 @@ def create_swarm(
         body=verifier_body,
         assignee=verifier_assignee,
         created_by=created_by,
-        parents=worker_ids,
+        parents=verifier_parents,
         tenant=tenant,
         priority=priority,
         workspace_kind=workspace_kind,
@@ -211,7 +531,7 @@ def create_swarm(
         skills=["humanizer"],
     )
 
-    created = SwarmCreated(root, worker_ids, verifier, synthesizer)
+    created = SwarmCreated(root, worker_ids, verifier, synthesizer, repair_ids=repair_ids)
     post_blackboard_update(
         conn,
         root,

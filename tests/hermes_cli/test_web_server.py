@@ -37,24 +37,13 @@ _EXAMPLE_PLUGIN_FIXTURE = (
 
 @pytest.fixture
 def _install_example_plugin(_isolate_hermes_home):
-    """Drop the example-dashboard fixture into the per-test HERMES_HOME
-    user-plugins directory and force the web_server's dashboard plugin
-    cache + API mount to rediscover it.
+    """Install the test-only example dashboard fixture as a user plugin.
 
-    The plugin used to live under ``<repo>/plugins/example-dashboard/``
-    and was loaded for every install, putting an "Example" tab in every
-    user's sidebar. It is now a tests-only fixture: any test that needs
-    ``/api/plugins/example/hello`` or ``/dashboard-plugins/example/...``
-    requests this fixture so the plugin appears only for that test's
-    isolated ``HERMES_HOME``.
-
-    The user-plugin source is preferred over a transient
-    ``HERMES_BUNDLED_PLUGINS`` override because the bundled dir is
-    resolved per-call (other tests in the suite implicitly rely on the
-    real bundled plugins — kanban, hermes-achievements, model providers
-    — being available, and globally swapping that root would yank them
-    all). User plugins are first in the discovery search order, so
-    laying down the fixture here is enough.
+    Stock installs no longer ship the dummy "Example" sidebar tab, so tests
+    that need ``/dashboard-plugins/example/...`` static assets opt in to this
+    fixture. Because user-installed dashboard plugins are untrusted for backend
+    Python, the fixture intentionally does **not** mount ``plugin_api.py``;
+    non-bundled plugin APIs are covered by the GHSA regression tests.
     """
     from hermes_constants import get_hermes_home
     from hermes_cli import web_server
@@ -66,48 +55,11 @@ def _install_example_plugin(_isolate_hermes_home):
         shutil.rmtree(dst)
     shutil.copytree(_EXAMPLE_PLUGIN_FIXTURE, dst)
 
-    # Snapshot the existing routes BEFORE mounting so we can:
-    #   1. Identify the routes the mount call appends.
-    #   2. Restore the original list on teardown — otherwise leftover
-    #      ``/api/plugins/example/*`` routes leak into subsequent tests
-    #      and start serving requests against a torn-down HERMES_HOME.
-    app = web_server.app
-    original_routes = list(app.router.routes)
-
-    # Bust the module-level cache and re-discover so the example plugin
-    # shows up in `_get_dashboard_plugins()`. `_mount_plugin_api_routes`
-    # imports the plugin's `plugin_api.py` and ``include_router``s its
-    # FastAPI router under ``/api/plugins/example/*``. The static-asset
-    # route at ``/dashboard-plugins/<name>/<path>`` reads the plugins
-    # list dynamically per request, so the rescan alone is enough for
-    # the static-asset tests; the API auth tests additionally need the
-    # route reorder below.
     web_server._dashboard_plugins_cache = None
     web_server._get_dashboard_plugins(force_rescan=True)
-    web_server._mount_plugin_api_routes()
-
-    # ``include_router`` appends the new routes to the END of
-    # ``app.router.routes``. That works fine at import time — the SPA
-    # catch-all ``mount_spa(app)`` registers AFTER the initial mount
-    # call — but when we mount mid-flight the catch-all is already in
-    # place, so the new ``/api/plugins/example/*`` route loses the
-    # match-order race and we get a 404. Move the newly-appended routes
-    # to the front of the list so FastAPI matches them first. They're
-    # path-prefixed to ``/api/plugins/example/`` and can't shadow
-    # anything else.
-    new_routes = [r for r in app.router.routes if r not in original_routes]
-    for route in new_routes:
-        app.router.routes.remove(route)
-    for offset, route in enumerate(new_routes):
-        app.router.routes.insert(offset, route)
-
     try:
         yield
     finally:
-        # Restore the original route list — drops the example plugin's
-        # routes so the next test sees a clean app — and clear the
-        # cache for the same reason.
-        app.router.routes[:] = original_routes
         web_server._dashboard_plugins_cache = None
 
 
@@ -602,6 +554,77 @@ class TestWebServerEndpoints:
         rows = resp.json()["sessions"]
         row = next(s for s in rows if s["id"] == "session-no-cwd")
         assert row["cwd"] is None
+
+    def test_get_sessions_exposes_title_provenance(self):
+        """Session rows include provenance needed for safe auto-retitle UX."""
+        from hermes_state import SessionDB
+
+        db = SessionDB()
+        try:
+            db.create_session(session_id="title-provenance", source="cli")
+            db.set_session_title(
+                "title-provenance", "Specific Auto Title", title_source="auto"
+            )
+        finally:
+            db.close()
+
+        resp = self.client.get("/api/sessions?limit=20&offset=0")
+        assert resp.status_code == 200
+        rows = resp.json()["sessions"]
+        row = next(s for s in rows if s["id"] == "title-provenance")
+        assert row["title"] == "Specific Auto Title"
+        assert row["title_source"] == "auto"
+        assert row["title_updated_at"] is not None
+        assert row["title_revision_count"] == 1
+
+    def test_get_sessions_omits_prompt_and_model_config_payloads(self):
+        """Session list rows must stay lightweight for desktop cold-start fanout."""
+        from hermes_state import SessionDB
+
+        db = SessionDB()
+        try:
+            db.create_session(
+                session_id="heavy-list-row",
+                source="webui",
+                model_config={"max_iterations": 256, "nested": {"value": "kept-in-db"}},
+                system_prompt="heavy prompt " * 1000,
+            )
+        finally:
+            db.close()
+
+        resp = self.client.get("/api/sessions?limit=20&offset=0")
+        assert resp.status_code == 200
+        rows = resp.json()["sessions"]
+        row = next(s for s in rows if s["id"] == "heavy-list-row")
+        assert "system_prompt" not in row
+        assert "model_config" not in row
+        assert row["source"] == "webui"
+        assert row["model"] is None
+
+    def test_get_profiles_sessions_omits_prompt_and_model_config_payloads(self):
+        """Cross-profile session rows must not ship prompt/config blobs to desktop."""
+        from hermes_state import SessionDB
+
+        db = SessionDB()
+        try:
+            db.create_session(
+                session_id="heavy-profile-list-row",
+                source="webui",
+                model_config={"max_iterations": 256, "nested": {"value": "kept-in-db"}},
+                system_prompt="heavy prompt " * 1000,
+            )
+        finally:
+            db.close()
+
+        resp = self.client.get("/api/profiles/sessions?limit=20&offset=0&profile=all")
+        assert resp.status_code == 200
+        rows = resp.json()["sessions"]
+        row = next(s for s in rows if s["id"] == "heavy-profile-list-row")
+        assert "system_prompt" not in row
+        assert "model_config" not in row
+        assert row["source"] == "webui"
+        assert row["model"] is None
+        assert row["profile"] == "default"
 
     def test_get_sessions_forwards_min_messages(self, monkeypatch):
         """The ?min_messages= filter must reach SessionDB.
@@ -5497,14 +5520,8 @@ class TestPluginAPIAuth:
     """Tests that plugin API routes require the session token (issue #19533)."""
 
     @pytest.fixture(autouse=True)
-    def _setup_test_client(self, monkeypatch, _isolate_hermes_home, _install_example_plugin):
-        """Create a TestClient without the session token header.
-
-        Pulls in ``_install_example_plugin`` so ``test_plugin_route_allows_auth``
-        has the ``/api/plugins/example/hello`` endpoint available — the
-        example plugin is no longer a bundled plugin, so the fixture
-        installs it into the per-test ``HERMES_HOME``.
-        """
+    def _setup_test_client(self, monkeypatch, _isolate_hermes_home):
+        """Create TestClients with and without the session token header."""
         try:
             from starlette.testclient import TestClient
         except ImportError:
@@ -5529,20 +5546,28 @@ class TestPluginAPIAuth:
     def test_plugin_route_allows_auth(self):
         """Plugin API routes should work with a valid session token.
 
-        Uses ``/api/plugins/example/hello`` from the example-dashboard
-        test fixture (installed into HERMES_HOME by the class-level
-        ``_install_example_plugin`` fixture) — a stable, side-effect-free
-        GET that's only loaded for tests. With a valid token the handler
-        should run (200); without one the middleware should 401 before
-        the handler is reached.
+        Uses a bundled plugin route so the test covers authenticated plugin
+        API access without relying on user-installed plugin backend imports.
         """
         # Without auth: middleware blocks before reaching the handler.
-        resp = self.client.get("/api/plugins/example/hello")
+        resp = self.client.get("/api/plugins/kanban/board")
         assert resp.status_code == 401
 
         # With auth: handler runs.
-        resp = self.auth_client.get("/api/plugins/example/hello")
+        resp = self.auth_client.get("/api/plugins/kanban/board")
         assert resp.status_code == 200
+
+    def test_example_dashboard_fixture_static_bundle_exists(self, _install_example_plugin):
+        """The test-only example dashboard fixture must not publish a dead JS URL.
+
+        The dashboard eagerly loads every manifest returned by
+        /api/dashboard/plugins, so the example plugin's declared entry must be
+        present when the static-asset fixture is installed.
+        """
+        resp = self.client.get("/dashboard-plugins/example/dist/index.js")
+        assert resp.status_code == 200
+        assert "application/javascript" in resp.headers["content-type"]
+        assert "registry.register(\"example\"" in resp.text
 
     def test_plugin_post_requires_auth(self):
         """Plugin POST routes should return 401 without a valid session token."""
@@ -5723,6 +5748,63 @@ class TestDashboardPluginManifestExtensions:
             "cron:bottom",
             "chat:top",
         ]
+
+    def test_rescan_mounts_late_bundled_dashboard_plugin_api_before_spa(self, tmp_path, monkeypatch):
+        """Dashboard rescan should make late bundled plugin APIs reachable.
+
+        Backend Python APIs are only trusted for bundled plugins, but a bundled
+        plugin can still appear after the dashboard process has mounted its SPA
+        fallback (for example after a dev-link or packaged plugin refresh). A
+        rescan must mount the plugin API before that catch-all; otherwise an
+        authenticated plugin API request returns the SPA fallback instead of
+        JSON.
+        """
+        from starlette.testclient import TestClient
+        from hermes_cli import web_server
+
+        hermes_home = tmp_path / "home"
+        hermes_home.mkdir()
+        monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+        bundled_root = tmp_path / "bundled"
+        monkeypatch.setenv("HERMES_BUNDLED_PLUGINS", str(bundled_root))
+
+        plugin_dir = bundled_root / "late-api-plugin" / "dashboard"
+        plugin_dir.mkdir(parents=True)
+        (plugin_dir / "manifest.json").write_text(json.dumps({
+            "name": "late-api-plugin",
+            "label": "Late API Plugin",
+            "tab": {"path": "/late-api-plugin", "hidden": True},
+            "entry": "dist/index.js",
+            "api": "plugin_api.py",
+        }), encoding="utf-8")
+        (plugin_dir / "plugin_api.py").write_text(
+            "from fastapi import APIRouter\n"
+            "router = APIRouter()\n"
+            "@router.get('/ping')\n"
+            "async def ping():\n"
+            "    return {'ok': True}\n",
+            encoding="utf-8",
+        )
+
+        original_routes = list(web_server.app.router.routes)
+        original_mounted_plugin_apis = set(web_server._mounted_dashboard_plugin_apis)
+        try:
+            web_server._dashboard_plugins_cache = None
+            web_server._mounted_dashboard_plugin_apis.discard("late-api-plugin")
+            client = TestClient(web_server.app)
+            client.headers[web_server._SESSION_HEADER_NAME] = web_server._SESSION_TOKEN
+
+            rescan = client.get("/api/dashboard/plugins/rescan")
+            assert rescan.status_code == 200
+            resp = client.get("/api/plugins/late-api-plugin/ping")
+            assert resp.status_code == 200
+            assert resp.headers["content-type"].startswith("application/json")
+            assert resp.json() == {"ok": True}
+        finally:
+            web_server.app.router.routes[:] = original_routes
+            web_server._mounted_dashboard_plugin_apis.clear()
+            web_server._mounted_dashboard_plugin_apis.update(original_mounted_plugin_apis)
+            web_server._dashboard_plugins_cache = None
 
 
 # ---------------------------------------------------------------------------

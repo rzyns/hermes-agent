@@ -112,10 +112,13 @@ export function useGatewayBoot({
     // tick — a stale OAuth ticket fails every attempt and would otherwise stack
     // identical error toasts (and their haptics). Reset on the next clean open.
     let reauthNotified = false
-    // Raised once the reconnect loop crosses RECONNECT_ESCALATE_AFTER so the
-    // recovery overlay replaces the dead-end CONNECTING screen. Reset on a clean
-    // open or a manual/wake-driven reconnect.
-    let escalated = false
+    // After a healthy boot, a dropped gateway socket is usually transient
+    // (sleep/wake, remote restart, network flap). Keep retrying with backoff,
+    // but if the retry loop is still failing after RECONNECT_ESCALATE_AFTER
+    // attempts, raise the recovery overlay instead of leaving the fullscreen
+    // CONNECTING screen as a dead end. Reset on a clean open or a
+    // manual/wake-driven reconnect.
+    let reconnectRecoveryRaised = false
 
     // Wrap the live getter in a call so TS control-flow analysis doesn't narrow
     // `connectionState` to a constant across the early-return guards (the state
@@ -166,6 +169,13 @@ export function useGatewayBoot({
         }
 
         reconnectAttempt = 0
+        reauthNotified = false
+        reconnectRecoveryRaised = false
+
+        if (bootCompleted) {
+          completeDesktopBoot()
+        }
+
         // Resync state that may have moved on the backend while we were asleep.
         await callbacksRef.current.refreshHermesConfig().catch(() => undefined)
         await callbacksRef.current.refreshSessions().catch(() => undefined)
@@ -178,15 +188,20 @@ export function useGatewayBoot({
           reauthNotified = true
           notifyError(err, translateNow('boot.errors.gatewaySignInRequired'))
         }
+
+        if (
+          !cancelled &&
+          bootCompleted &&
+          !reconnectRecoveryRaised &&
+          reconnectAttempt >= RECONNECT_ESCALATE_AFTER
+        ) {
+          reconnectRecoveryRaised = true
+          failDesktopBoot(translateNow('boot.errors.gatewayConnectionLost'))
+        }
       } finally {
         reconnecting = false
 
         if (!cancelled && !gatewayOpen()) {
-          if (reconnectAttempt >= RECONNECT_ESCALATE_AFTER && !escalated) {
-            escalated = true
-            failDesktopBoot(translateNow('boot.errors.gatewayConnectionLost'))
-          }
-
           scheduleReconnect()
         }
       }
@@ -213,7 +228,7 @@ export function useGatewayBoot({
 
       clearReconnectTimer()
       reconnectAttempt = 0
-      escalated = false
+      reconnectRecoveryRaised = false
       reconnectSecondaryGateways()
 
       if (!gatewayOpen()) {
@@ -247,14 +262,12 @@ export function useGatewayBoot({
       if (st === 'open') {
         reconnectAttempt = 0
         reauthNotified = false
-        escalated = false
+        reconnectRecoveryRaised = false
         clearReconnectTimer()
 
-        // A revalidate-driven reconnect can rebuild the backend in place when the
-        // cached remote was found dead, which re-drives the boot-progress overlay.
-        // Unlike the initial boot, nothing calls completeDesktopBoot() afterwards,
-        // so dismiss it here once we're open again — otherwise the overlay sticks
-        // at ~94%. A no-op on a normal (non-rebuild) reconnect.
+        // A clean reopen resolves either recovery path: our prolonged-reconnect
+        // error overlay, or upstream's revalidate-driven boot-progress overlay
+        // that can otherwise stick at ~94% after rebuilding the backend in place.
         if (bootCompleted) {
           completeDesktopBoot()
         }

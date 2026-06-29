@@ -201,7 +201,7 @@ class TestBuildWebUISkipsWhenFresh:
         assert result is True
         args, kwargs = mock_run.call_args
         assert "--workspace" not in args[0]
-        assert args[0] == ["/usr/bin/npm", "ci", "--silent"]
+        assert args[0] == ["/usr/bin/npm", "ci", "--include=dev", "--silent"]
         assert kwargs["cwd"] == web_dir
 
     def test_web_build_uses_idle_timeout_helper(self, tmp_path):
@@ -245,6 +245,7 @@ class TestBuildWebUISkipsWhenFresh:
         assert args[0] == [
             "/usr/bin/npm",
             "ci",
+            "--include=dev",
             "--workspace",
             "web",
             "--include-workspace-root=false",
@@ -269,7 +270,14 @@ class TestBuildWebUISkipsWhenFresh:
 
         assert result is True
         args, kwargs = mock_run.call_args
-        assert args[0] == ["/usr/bin/npm", "ci", "--workspace", "web", "--silent"]
+        assert args[0] == [
+            "/usr/bin/npm",
+            "ci",
+            "--include=dev",
+            "--workspace",
+            "web",
+            "--silent",
+        ]
         assert kwargs["cwd"] == tmp_path
 
 

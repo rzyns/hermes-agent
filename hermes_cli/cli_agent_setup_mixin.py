@@ -5,18 +5,51 @@ Extracted from ``cli.py`` as part of the god-file decomposition campaign
 the agent lifecycle/setup cluster: runtime-credential resolution, per-turn agent
 config, first-use agent construction, and resumed-session preload + history recap.
 
-Behavior-neutral: every method is lifted verbatim from ``HermesCLI``. ``self.*``
+Behavior-neutral: every method is lifted verbatim from ``cli.py``. ``self.*``
 calls resolve unchanged via the MRO. Neutral dependencies are imported at module
-top level; ``cli.py``-internal helpers/constants are imported lazily inside each
-method (``from cli import ...`` resolves at call time, when ``cli`` is fully
-loaded) so this module never imports ``cli`` at import time -> no import cycle.
+top level; ``cli.py``-internal helpers/constants are resolved lazily from the
+actual module that owns the live ``HermesCLI`` class. This avoids a bare
+``from cli import ...`` at call time: profile plugin directories can precede the
+Hermes root on ``sys.path`` and may contain their own ``cli.py``.
 """
 
 from __future__ import annotations
 
+import importlib.util
 import sys
+from pathlib import Path
 
 from rich.markup import escape as _escape
+
+
+def _core_cli_symbols(instance, *names: str):
+    """Resolve symbols from the real root ``cli.py`` module for ``instance``.
+
+    ``hermes_cli.main`` loads root ``cli.py`` by file path because profile
+    plugins can shadow a bare ``import cli``. These mixin methods need the same
+    discipline when they lazily reach back to root-CLI helpers.
+    """
+
+    module = sys.modules.get(instance.__class__.__module__)
+    if module is None or not all(hasattr(module, name) for name in names):
+        cli_path = Path(__file__).resolve().parents[1] / "cli.py"
+        module_name = "hermes_agent_root_cli_for_mixins"
+        module = sys.modules.get(module_name)
+        if module is None or Path(getattr(module, "__file__", "")).resolve() != cli_path:
+            spec = importlib.util.spec_from_file_location(module_name, cli_path)
+            if spec is None or spec.loader is None:
+                raise RuntimeError(f"Unable to load Hermes CLI entrypoint from {cli_path}")
+            module = importlib.util.module_from_spec(spec)
+            sys.modules[module_name] = module
+            spec.loader.exec_module(module)
+    missing = [name for name in names if not hasattr(module, name)]
+    if missing:
+        raise ImportError(
+            f"Root Hermes CLI module {getattr(module, '__file__', module)!r} "
+            f"does not expose expected symbol(s): {', '.join(missing)}"
+        )
+    values = tuple(getattr(module, name) for name in names)
+    return values[0] if len(values) == 1 else values
 
 
 class CLIAgentSetupMixin:
@@ -29,7 +62,7 @@ class CLIAgentSetupMixin:
         are picked up without restarting the CLI.
         Returns True if credentials are ready, False on auth failure.
         """
-        from cli import ChatConsole, _cprint, logger
+        ChatConsole, _cprint, logger = _core_cli_symbols(self, "ChatConsole", "_cprint", "logger")
         from hermes_cli.runtime_provider import (
             resolve_runtime_provider,
             format_runtime_provider_error,
@@ -223,7 +256,26 @@ class CLIAgentSetupMixin:
         Returns:
             bool: True if successful, False otherwise
         """
-        from cli import AIAgent, ChatConsole, _DIM, _RST, _accent_hex, _cprint, _prepare_deferred_agent_startup, logger
+        (
+            AIAgent,
+            ChatConsole,
+            _DIM,
+            _RST,
+            _accent_hex,
+            _cprint,
+            _prepare_deferred_agent_startup,
+            logger,
+        ) = _core_cli_symbols(
+            self,
+            "AIAgent",
+            "ChatConsole",
+            "_DIM",
+            "_RST",
+            "_accent_hex",
+            "_cprint",
+            "_prepare_deferred_agent_startup",
+            "logger",
+        )
         if self.agent is not None:
             return True
 
@@ -452,7 +504,7 @@ class CLIAgentSetupMixin:
         The corresponding block in ``_init_agent()`` checks whether history is
         already populated and skips the DB round-trip.
         """
-        from cli import _accent_hex
+        _accent_hex = _core_cli_symbols(self, "_accent_hex")
         if not self._resumed or not self._session_db:
             return False
 
@@ -528,7 +580,18 @@ class CLIAgentSetupMixin:
         last ``MAX_DISPLAY_EXCHANGES`` user/assistant exchanges and shows
         an indicator for earlier hidden messages.
         """
-        from cli import CLI_CONFIG, _record_output_history_entry, _strip_reasoning_tags, _suspend_output_history
+        (
+            CLI_CONFIG,
+            _record_output_history_entry,
+            _strip_reasoning_tags,
+            _suspend_output_history,
+        ) = _core_cli_symbols(
+            self,
+            "CLI_CONFIG",
+            "_record_output_history_entry",
+            "_strip_reasoning_tags",
+            "_suspend_output_history",
+        )
         if not self.conversation_history:
             return
 

@@ -27,6 +27,60 @@ import os
 from agent.codex_responses_adapter import _summarize_user_message_for_log
 
 
+def notify_session_end_once(
+    agent,
+    *,
+    effective_task_id,
+    turn_id,
+    completed=False,
+    interrupted=False,
+):
+    """Emit the plugin ``on_session_end`` hook at most once per turn.
+
+    ``run_conversation`` has several terminal early-return paths that bypass the
+    normal ``finalize_turn`` tail. Observability plugins such as Langfuse open
+    per-turn context managers in ``pre_llm_call`` and depend on ``on_session_end``
+    to close them. Keep this hook idempotent so a broad safety-net ``finally`` can
+    run alongside the normal finalizer without double-closing plugin state.
+    """
+    from agent.conversation_loop import logger
+
+    session_id = getattr(agent, "session_id", None) or ""
+    task_id = effective_task_id or getattr(agent, "_current_task_id", "") or ""
+    turn = turn_id or getattr(agent, "_current_turn_id", "") or ""
+    key = (session_id, task_id, turn)
+
+    seen = getattr(agent, "_session_end_hook_emitted_turns", None)
+    if seen is None:
+        seen = set()
+        try:
+            setattr(agent, "_session_end_hook_emitted_turns", seen)
+        except Exception:
+            # Extremely defensive: if the agent disallows dynamic attrs, keep
+            # going fail-open; duplicate prevention is best-effort in that case.
+            seen = set()
+    if key in seen:
+        return False
+    seen.add(key)
+
+    try:
+        from hermes_cli.plugins import invoke_hook as _invoke_hook
+        _invoke_hook(
+            "on_session_end",
+            session_id=session_id,
+            task_id=task_id,
+            turn_id=turn,
+            completed=completed,
+            interrupted=interrupted,
+            model=getattr(agent, "model", None),
+            platform=getattr(agent, "platform", None) or "",
+        )
+        return True
+    except Exception as exc:
+        logger.warning("on_session_end hook failed: %s", exc)
+        return False
+
+
 def finalize_turn(
     agent,
     *,
@@ -355,6 +409,7 @@ def finalize_turn(
                 assistant_response=final_response,
                 conversation_history=list(messages),
                 model=agent.model,
+                provider=agent.provider,
                 platform=getattr(agent, "platform", None) or "",
             )
         except Exception as exc:
@@ -470,19 +525,12 @@ def finalize_turn(
     # Plugin hook: on_session_end
     # Fired at the very end of every run_conversation call.
     # Plugins can use this for cleanup, flushing buffers, etc.
-    try:
-        from hermes_cli.plugins import invoke_hook as _invoke_hook
-        _invoke_hook(
-            "on_session_end",
-            session_id=agent.session_id,
-            task_id=effective_task_id,
-            turn_id=turn_id,
-            completed=completed,
-            interrupted=interrupted,
-            model=agent.model,
-            platform=getattr(agent, "platform", None) or "",
-        )
-    except Exception as exc:
-        logger.warning("on_session_end hook failed: %s", exc)
+    notify_session_end_once(
+        agent,
+        effective_task_id=effective_task_id,
+        turn_id=turn_id,
+        completed=completed,
+        interrupted=interrupted,
+    )
 
     return result

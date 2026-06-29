@@ -134,16 +134,28 @@ def _repair_schema(node: Any, is_schema: bool = True) -> Any:
 
 
 def _fill_missing_type(node: Dict[str, Any]) -> Dict[str, Any]:
-    """Infer a reasonable ``type`` if this schema node has none."""
-    node_type = node.get("type")
-    if isinstance(node_type, list):
-        concrete = next(
-            (t for t in node_type if isinstance(t, str) and t not in {"", "null"}),
-            "string",
-        )
-        return {**node, "type": concrete}
-    if "type" in node and node_type not in {None, ""}:
-        return node
+    """Infer a reasonable scalar ``type`` if this schema node has none.
+
+    Standard JSON Schema allows ``type`` to be an array such as
+    ``["string", "null"]``. Moonshot's flavored schema does not accept that
+    shape in tool parameters, and a naive membership check also crashes because
+    lists are unhashable. Collapse nullable/union type arrays to the first
+    non-null concrete type. If the array contains no usable concrete type, fall
+    through to the existing heuristic inference rather than blindly preserving a
+    null-only/empty union.
+    """
+    if "type" in node:
+        node_type = node["type"]
+        if isinstance(node_type, list):
+            concrete_types = [
+                t for t in node_type
+                if isinstance(t, str) and t not in {"", "null"}
+            ]
+            if concrete_types:
+                return {**node, "type": concrete_types[0]}
+            # No usable concrete type remains; fall through to heuristic inference.
+        elif node_type not in {None, ""}:
+            return node
 
     # Heuristic: presence of ``properties`` → object, ``items`` → array, ``enum``
     # → type of first enum value, else fall back to ``string`` (safest scalar).

@@ -2,8 +2,8 @@
  * AuthWidget — sidebar "Logged in as …" affordance for the dashboard
  * OAuth gate (Phase 7 of .hermes/plans/2026-05-21-dashboard-oauth-auth.md).
  *
- * Renders nothing in loopback / --insecure mode. In gated mode, fetches
- * /api/auth/me on mount and surfaces:
+ * Renders nothing in loopback / --insecure mode without probing the
+ * auth endpoint. In gated mode, fetches /api/auth/me on mount and surfaces:
  *
  *   - the user_id (truncated to 14 chars + ellipsis) since the Nous Portal
  *     contract V1 doesn't emit email/display_name claims (Contract Anchor
@@ -15,10 +15,11 @@
  *     /login (the dashboard becomes inaccessible again)
  *
  * Failure modes:
- *   - 401 from /api/auth/me means we're not gated (or the gate is on but
- *     we have no cookie — in that case the gate's middleware would have
- *     redirected us before App.tsx renders, so we won't see this). The
- *     widget renders nothing.
+ *   - Loopback / --insecure mode: the widget returns null without making
+ *     an auth request.
+ *   - 401/403 from /api/auth/me in gated mode: the widget renders nothing;
+ *     the gate normally redirects before App.tsx renders when there is no
+ *     cookie, so this is just a defensive fallback.
  *   - Network error: shows a minimal "auth status unavailable" message
  *     so the user knows the widget tried.
  */
@@ -41,11 +42,17 @@ function truncateUserId(id: string): string {
 }
 
 export function AuthWidget({ className }: AuthWidgetProps) {
+  const authRequired =
+    typeof window !== "undefined" && window.__HERMES_AUTH_REQUIRED__ === true;
   const [me, setMe] = useState<AuthMeResponse | null>(null);
-  const [hidden, setHidden] = useState(false);
+  const [hidden, setHidden] = useState(!authRequired);
   const [error, setError] = useState<string | null>(null);
 
   useEffect(() => {
+    if (!authRequired) {
+      return;
+    }
+
     let cancelled = false;
     api
       .getAuthMe()
@@ -55,11 +62,9 @@ export function AuthWidget({ className }: AuthWidgetProps) {
       })
       .catch((err: unknown) => {
         if (cancelled) return;
-        // 401 from /api/auth/me means the gate isn't engaged in this
-        // process (loopback mode) — render nothing. fetchJSON throws an
-        // Error with the status code as a prefix; the global 401
-        // handler only redirects on the structured envelope, so a plain
-        // 401 from /api/auth/me with no envelope bubbles up here.
+        // A 401/403 here is only a defensive gated-mode fallback. In
+        // loopback / --insecure mode the widget skips the auth probe
+        // entirely, so the expected loopback 401 is not generated.
         const msg = err instanceof Error ? err.message : String(err);
         if (msg.startsWith("401:") || msg.startsWith("403:")) {
           setHidden(true);
@@ -70,7 +75,7 @@ export function AuthWidget({ className }: AuthWidgetProps) {
     return () => {
       cancelled = true;
     };
-  }, []);
+  }, [authRequired]);
 
   if (hidden) return null;
 

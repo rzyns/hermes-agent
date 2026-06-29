@@ -575,6 +575,15 @@ export interface Translations {
       defaultDirDesc: string
       defaultDirUpdated: string
       defaultsTo: (label: string) => string
+      sidebarSourcesTitle: string
+      sidebarSourcesDesc: string
+      sidebarSourcesDefaultMode: string
+      sidebarSourcesDefaultSummary: string
+      sidebarSourcesCustomMode: string
+      sidebarSourcesSelectedSummary: (sources: string) => string
+      sidebarSourcesPresetLocal: string
+      sidebarSourcesUseDefault: string
+      sidebarSourcesToggle: (source: string) => string
       change: string
       choose: string
       clear: string

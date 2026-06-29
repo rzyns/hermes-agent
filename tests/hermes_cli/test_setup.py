@@ -539,4 +539,3 @@ def test_prompt_yes_no_keyboard_interrupt_still_exits(monkeypatch):
 
     with pytest.raises(SystemExit):
         setup_mod.prompt_yes_no("Install it now?", True)
-

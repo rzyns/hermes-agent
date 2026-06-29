@@ -1410,6 +1410,44 @@ def enabled_mcp_server_names(config: dict) -> Set[str]:
     }
 
 
+def _static_toolset_tools(
+    name: str,
+    toolsets: Optional[Dict[str, dict]] = None,
+    visited: Optional[Set[str]] = None,
+) -> Set[str]:
+    """Resolve a static ``TOOLSETS`` entry without registry-provided extras.
+
+    ``toolsets.get_toolset()`` merges tools that plugins register into an
+    existing static toolset (for example profile-delegate under
+    ``delegation`` or GUI-only helpers under ``terminal``).  That is correct
+    when producing schemas for an already-enabled toolset, but it is too
+    strict for reverse-inference from a platform composite: ``hermes-cli``
+    should still imply the base ``delegation``/``terminal`` toggles even when
+    optional registry tools have been attached to those buckets.
+    """
+    if visited is None:
+        visited = set()
+    if name in visited:
+        return set()
+    visited.add(name)
+
+    if toolsets is None:
+        from toolsets import TOOLSETS as _TOOLSETS  # type: ignore[import-not-found]
+
+        toolsets_map = _TOOLSETS
+    else:
+        toolsets_map = toolsets
+
+    ts_def = toolsets_map.get(name)
+    if not isinstance(ts_def, dict):
+        return set()
+
+    tools = {str(tool) for tool in (ts_def.get("tools") or [])}
+    for included_name in ts_def.get("includes") or []:
+        tools.update(_static_toolset_tools(str(included_name), toolsets_map, visited))
+    return tools
+
+
 def _get_platform_tools(
     config: dict,
     platform: str,
@@ -1463,15 +1501,16 @@ def _get_platform_tools(
             if ts_name in configurable_keys or ts_name in plugin_ts_keys:
                 continue
             if ts_name not in TOOLSETS:
+                composite_tools.update(resolve_toolset(ts_name))
                 continue
-            composite_tools.update(resolve_toolset(ts_name))
+            composite_tools.update(_static_toolset_tools(ts_name, TOOLSETS))
 
         if composite_tools:
             expanded = set()
             for ts_key, _, _ in CONFIGURABLE_TOOLSETS:
                 if not _toolset_allowed_for_platform(ts_key, platform):
                     continue
-                ts_tools = set(resolve_toolset(ts_key))
+                ts_tools = _static_toolset_tools(ts_key, TOOLSETS)
                 if ts_tools and ts_tools.issubset(composite_tools):
                     expanded.add(ts_key)
 
@@ -1488,13 +1527,16 @@ def _get_platform_tools(
         # (e.g. "hermes-cli") to individual tool names and reverse-mapping.
         all_tool_names = set()
         for ts_name in toolset_names:
-            all_tool_names.update(resolve_toolset(ts_name))
+            if ts_name in TOOLSETS:
+                all_tool_names.update(_static_toolset_tools(ts_name, TOOLSETS))
+            else:
+                all_tool_names.update(resolve_toolset(ts_name))
 
         enabled_toolsets = set()
         for ts_key, _, _ in CONFIGURABLE_TOOLSETS:
             if not _toolset_allowed_for_platform(ts_key, platform):
                 continue
-            ts_tools = set(resolve_toolset(ts_key))
+            ts_tools = _static_toolset_tools(ts_key, TOOLSETS)
             if ts_tools and ts_tools.issubset(all_tool_names):
                 enabled_toolsets.add(ts_key)
 

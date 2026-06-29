@@ -6,6 +6,7 @@ import pytest
 from unittest.mock import MagicMock, patch, AsyncMock
 
 from gateway.config import Platform, PlatformConfig
+from gateway.platforms.base import MessageEvent, ProcessingOutcome
 from gateway.run import (
     _resolve_gateway_display_bool,
     _resolve_progress_thread_id,
@@ -181,6 +182,15 @@ class TestMattermostConfigLoading:
 
         assert Platform.MATTERMOST in config.platforms
         assert config.platforms[Platform.MATTERMOST].extra.get("url") == ""
+
+    def test_apply_yaml_config_sets_reactions_env(self, monkeypatch):
+        """mattermost.reactions should bridge to MATTERMOST_REACTIONS."""
+        monkeypatch.delenv("MATTERMOST_REACTIONS", raising=False)
+        from plugins.platforms.mattermost.adapter import _apply_yaml_config
+
+        assert _apply_yaml_config({}, {"reactions": False}) is None
+
+        assert os.environ["MATTERMOST_REACTIONS"] == "false"
 
 
 # ---------------------------------------------------------------------------
@@ -474,6 +484,133 @@ class TestMattermostSend:
         result = await self.adapter.send("channel_1", "Hello!")
 
         assert result.success is False
+
+
+# ---------------------------------------------------------------------------
+# Typing and reactions
+# ---------------------------------------------------------------------------
+
+class TestMattermostTypingAndReactions:
+    def setup_method(self):
+        self.adapter = _make_adapter()
+        self.adapter._session = MagicMock()
+        self.adapter._bot_user_id = "bot_user_id"
+
+    @pytest.mark.asyncio
+    async def test_send_typing_posts_channel_id(self):
+        """send_typing() should publish a Mattermost typing event for the bot."""
+        mock_resp = AsyncMock()
+        mock_resp.status = 200
+        mock_resp.json = AsyncMock(return_value={"status": "OK"})
+        mock_resp.text = AsyncMock(return_value="")
+        mock_resp.__aenter__ = AsyncMock(return_value=mock_resp)
+        mock_resp.__aexit__ = AsyncMock(return_value=False)
+        self.adapter._session.post = MagicMock(return_value=mock_resp)
+
+        await self.adapter.send_typing("channel_1")
+
+        call_args = self.adapter._session.post.call_args
+        assert "/api/v4/users/bot_user_id/typing" in call_args[0][0]
+        assert call_args[1]["json"] == {"channel_id": "channel_1"}
+
+    @pytest.mark.asyncio
+    async def test_send_typing_includes_thread_parent_id(self):
+        """Thread metadata should route Mattermost typing to the thread root."""
+        mock_resp = AsyncMock()
+        mock_resp.status = 200
+        mock_resp.json = AsyncMock(return_value={"status": "OK"})
+        mock_resp.text = AsyncMock(return_value="")
+        mock_resp.__aenter__ = AsyncMock(return_value=mock_resp)
+        mock_resp.__aexit__ = AsyncMock(return_value=False)
+        self.adapter._session.post = MagicMock(return_value=mock_resp)
+
+        await self.adapter.send_typing("channel_1", metadata={"thread_id": "root_post"})
+
+        payload = self.adapter._session.post.call_args[1]["json"]
+        assert payload == {"channel_id": "channel_1", "parent_id": "root_post"}
+
+    @pytest.mark.asyncio
+    async def test_processing_start_adds_eyes_reaction(self, monkeypatch):
+        """Mattermost processing start should add an in-progress reaction."""
+        monkeypatch.delenv("MATTERMOST_REACTIONS", raising=False)
+        self.adapter._add_reaction = AsyncMock(return_value=True)
+        event = MessageEvent(text="hi", message_id="post_1")
+
+        await self.adapter.on_processing_start(event)
+
+        self.adapter._add_reaction.assert_awaited_once_with("post_1", "eyes")
+
+    @pytest.mark.asyncio
+    async def test_processing_success_swaps_reactions(self, monkeypatch):
+        """Mattermost processing success should replace eyes with a check mark."""
+        monkeypatch.delenv("MATTERMOST_REACTIONS", raising=False)
+        self.adapter._remove_reaction = AsyncMock(return_value=True)
+        self.adapter._add_reaction = AsyncMock(return_value=True)
+        event = MessageEvent(text="hi", message_id="post_1")
+
+        await self.adapter.on_processing_complete(event, ProcessingOutcome.SUCCESS)
+
+        self.adapter._remove_reaction.assert_awaited_once_with("post_1", "eyes")
+        self.adapter._add_reaction.assert_awaited_once_with("post_1", "white_check_mark")
+
+    @pytest.mark.asyncio
+    async def test_processing_failure_swaps_reactions(self, monkeypatch):
+        """Mattermost processing failure should replace eyes with an x reaction."""
+        monkeypatch.delenv("MATTERMOST_REACTIONS", raising=False)
+        self.adapter._remove_reaction = AsyncMock(return_value=True)
+        self.adapter._add_reaction = AsyncMock(return_value=True)
+        event = MessageEvent(text="hi", message_id="post_1")
+
+        await self.adapter.on_processing_complete(event, ProcessingOutcome.FAILURE)
+
+        self.adapter._remove_reaction.assert_awaited_once_with("post_1", "eyes")
+        self.adapter._add_reaction.assert_awaited_once_with("post_1", "x")
+
+    @pytest.mark.asyncio
+    async def test_reactions_can_be_disabled(self, monkeypatch):
+        """MATTERMOST_REACTIONS=false should disable lifecycle reactions."""
+        monkeypatch.setenv("MATTERMOST_REACTIONS", " false ")
+        self.adapter._remove_reaction = AsyncMock(return_value=True)
+        self.adapter._add_reaction = AsyncMock(return_value=True)
+        event = MessageEvent(text="hi", message_id="post_1")
+
+        await self.adapter.on_processing_start(event)
+        await self.adapter.on_processing_complete(event, ProcessingOutcome.SUCCESS)
+
+        self.adapter._remove_reaction.assert_not_awaited()
+        self.adapter._add_reaction.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_add_reaction_posts_mattermost_reaction_payload(self):
+        """_add_reaction() should use Mattermost emoji names and bot user ID."""
+        mock_resp = AsyncMock()
+        mock_resp.status = 200
+        mock_resp.json = AsyncMock(return_value={"user_id": "bot_user_id", "post_id": "post_1", "emoji_name": "eyes"})
+        mock_resp.text = AsyncMock(return_value="")
+        mock_resp.__aenter__ = AsyncMock(return_value=mock_resp)
+        mock_resp.__aexit__ = AsyncMock(return_value=False)
+        self.adapter._session.post = MagicMock(return_value=mock_resp)
+
+        assert await self.adapter._add_reaction("post_1", "eyes") is True
+
+        call_args = self.adapter._session.post.call_args
+        assert "/api/v4/reactions" in call_args[0][0]
+        assert call_args[1]["json"] == {"user_id": "bot_user_id", "post_id": "post_1", "emoji_name": "eyes"}
+
+    @pytest.mark.asyncio
+    async def test_remove_reaction_deletes_bot_reaction(self):
+        """_remove_reaction() should delete the bot's own Mattermost reaction."""
+        mock_resp = AsyncMock()
+        mock_resp.status = 200
+        mock_resp.text = AsyncMock(return_value='{"status":"OK"}')
+        mock_resp.__aenter__ = AsyncMock(return_value=mock_resp)
+        mock_resp.__aexit__ = AsyncMock(return_value=False)
+        self.adapter._session.delete = MagicMock(return_value=mock_resp)
+
+        assert await self.adapter._remove_reaction("post_1", "eyes") is True
+
+        call_args = self.adapter._session.delete.call_args
+        assert "/api/v4/users/bot_user_id/posts/post_1/reactions/eyes" in call_args[0][0]
 
 
 # ---------------------------------------------------------------------------

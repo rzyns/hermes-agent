@@ -50,8 +50,29 @@ from pydantic import BaseModel, Field
 
 from hermes_cli import kanban_db
 from hermes_cli import kanban_diagnostics as kd
+from hermes_constants import get_default_hermes_root
+
+# Soft import of the cross-board deps plugin so the kanban dashboard can
+# surface canonical edges even if the plugin is not enabled.  The import
+# is deferred to router-handler time so the plugin's optional status never
+# breaks dashboard startup.
+try:
+    from plugins.kanban_cross_deps.store import CrossBoardRegistry
+    from plugins.kanban_cross_deps.diagnostics import CrossBoardDiagnostics
+    _CROSS_BOARD_AVAILABLE = True
+except Exception:
+    _CROSS_BOARD_AVAILABLE = False
+    CrossBoardRegistry = None  # type: ignore[misc,assignment]
+    CrossBoardDiagnostics = None  # type: ignore[misc,assignment]
 
 log = logging.getLogger(__name__)
+
+# Lazily resolve the kanban dependency-provider module so tests that
+# re-import hermes_cli modules still see the current provider registry.
+# Same pattern as hermes_cli/kanban_db.py.
+def _kanban_dependencies():
+    from hermes_cli import kanban_dependencies as _kd
+    return _kd
 
 router = APIRouter()
 
@@ -133,6 +154,72 @@ def _conn(board: Optional[str] = None):
     except Exception as exc:
         log.warning("kanban init_db failed: %s", exc)
     return kanban_db.connect(board=board)
+
+
+def _effective_board(board: Optional[str]) -> str:
+    """Return the concrete board slug a request is mutating."""
+    return board or kanban_db.get_current_board()
+
+
+def _materialize_only_route_guard(board: Optional[str], task_id: str) -> Optional[dict[str, Any]]:
+    """Return route metadata when ``task_id`` is a guarded materialize-only target.
+
+    Attention Intake route repairs intentionally create Agent Research follow-up
+    cards as blocked ``materialize_only`` targets unless a separate human gate
+    authorizes dispatch. The normal dashboard ``blocked -> ready`` path calls
+    ``unblock_task`` directly, which is correct for ordinary cards but bypasses
+    the route register's authority boundary. Keep this guard narrow and
+    data-driven: it only applies to rows in the durable Attention register whose
+    active ``route_materialization.mode`` is exactly ``materialize_only``.
+    """
+    if _effective_board(board) != "agent-research-intake":
+        return None
+    register = get_default_hermes_root() / "artifacts" / "attention-intake" / "register.jsonl"
+    if not register.exists():
+        return None
+    try:
+        lines = register.read_text(encoding="utf-8").splitlines()
+    except OSError:
+        log.warning("could not read attention-intake register for route guard", exc_info=True)
+        return None
+    for line in lines:
+        if not line.strip() or task_id not in line:
+            continue
+        try:
+            row = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        routed = str(row.get("routed_to_task") or "")
+        target_board = str(row.get("routed_to_board") or row.get("routed_to_board_requested") or "")
+        target_task = routed
+        if "/" in routed:
+            target_board, target_task = routed.split("/", 1)
+        if target_board != "agent-research-intake" or target_task != task_id:
+            continue
+        materialization = row.get("route_materialization")
+        if isinstance(materialization, dict) and materialization.get("mode") == "materialize_only":
+            return {
+                "source_task": row.get("source_task") or row.get("task_id"),
+                "url": row.get("url") or row.get("source_url"),
+                "mode": materialization.get("mode"),
+            }
+    return None
+
+
+def _raise_materialize_only_route_guard(board: Optional[str], task_id: str) -> None:
+    guarded = _materialize_only_route_guard(board, task_id)
+    if not guarded:
+        return
+    raise HTTPException(
+        status_code=409,
+        detail=(
+            "Cannot move materialize_only routed target to ready from the dashboard. "
+            f"Target {task_id} is still registered as a blocked Attention Intake route "
+            f"from {guarded.get('source_task') or 'unknown source'} "
+            f"({guarded.get('url') or 'unknown URL'}). Record explicit route authorization "
+            "and update route_materialization.mode before dispatching this follow-up."
+        ),
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -371,9 +458,66 @@ def _links_for(conn: sqlite3.Connection, task_id: str) -> dict[str, list[str]]:
     return {"parents": parents, "children": children}
 
 
+def _cross_board_edges_for(task_id: str, board: Optional[str]) -> dict[str, Any]:
+    """Return canonical cross-board edges where *task_id* participates.
+
+    The result is split by direction and provenance so the UI can render
+    canonical registry facts separately from inferred candidates:
+
+        {
+          "upstream":    [edge_dict, ...],   # task is child
+          "downstream":  [edge_dict, ...],   # task is parent
+          "diagnostics": {...} or None,
+        }
+
+    If the cross-board deps plugin is not available, returns empty lists
+    and ``None`` for diagnostics.
+    """
+    if not _CROSS_BOARD_AVAILABLE or CrossBoardRegistry is None:
+        return {"upstream": [], "downstream": [], "diagnostics": None}
+
+    board = board or kanban_db.get_current_board()
+
+    try:
+        registry = CrossBoardRegistry()  # type: ignore[reportOptionalCall]
+        upstream = registry.list_edges(child_board=board, child_id=task_id)
+        downstream = registry.list_edges(parent_board=board, parent_id=task_id)
+        diag_engine = CrossBoardDiagnostics(registry=registry)  # type: ignore[reportOptionalCall]
+        diagnostics = diag_engine.run()
+        return {
+            "upstream": [e.to_dict() for e in upstream],
+            "downstream": [e.to_dict() for e in downstream],
+            "diagnostics": diagnostics,
+        }
+    except Exception as exc:
+        log.warning("Cross-board edge lookup failed for %s: %s", task_id, exc)
+        return {"upstream": [], "downstream": [], "diagnostics": None}
+
+
 # ---------------------------------------------------------------------------
 # GET /board
 # ---------------------------------------------------------------------------
+
+def _degraded_board_payload(
+    board: Optional[str],
+    reason: str,
+    *,
+    backup_path: Optional[Path] = None,
+) -> dict[str, Any]:
+    """Return the safe dashboard payload for a board that cannot be opened."""
+    return {
+        "degraded": True,
+        "board_slug": board or kanban_db.get_current_board(),
+        "reason": reason,
+        "corrupt_backup_path": str(backup_path) if backup_path else None,
+        "repair_candidate_available": bool(backup_path),
+        "columns": [],
+        "tenants": [],
+        "assignees": [],
+        "latest_event_id": 0,
+        "now": int(time.time()),
+    }
+
 
 @router.get("/board")
 def get_board(
@@ -397,7 +541,19 @@ def get_board(
     ``current`` pointer → ``default``).
     """
     board = _resolve_board(board)
-    conn = _conn(board=board)
+    try:
+        conn = _conn(board=board)
+    except kanban_db.KanbanDbCorruptError as exc:
+        log.warning("Kanban board degraded: %s", exc.reason)
+        return _degraded_board_payload(board, exc.reason, backup_path=exc.backup_path)
+    except sqlite3.DatabaseError as exc:
+        # Some guard paths (for example invalid SQLite headers) surface as a
+        # sqlite DatabaseError before kanban_db can attach backup metadata.
+        # Keep the dashboard fail-closed and actionable instead of returning a
+        # generic 500 or silently recreating an empty board.
+        reason = str(exc)
+        log.warning("Kanban board degraded: %s", reason)
+        return _degraded_board_payload(board, reason)
     try:
         tasks = kanban_db.list_tasks(
             conn,
@@ -559,6 +715,7 @@ def get_task(
             "events": [_event_dict(e) for e in kanban_db.list_events(conn, task_id)],
             "attachments": [_attachment_dict(a) for a in kanban_db.list_attachments(conn, task_id)],
             "links": _links_for(conn, task_id),
+            "cross_board": _cross_board_edges_for(task_id, board),
             "runs": [
                 _run_dict(r)
                 for r in kanban_db.list_runs(
@@ -632,6 +789,63 @@ def create_task(payload: CreateTaskBody, board: Optional[str] = Query(None)):
                     body["warning"] = message
             except Exception:
                 # Probe failure must never block the create itself.
+                pass
+        return body
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    finally:
+        conn.close()
+
+
+# ---------------------------------------------------------------------------
+# POST /intake-links
+# ---------------------------------------------------------------------------
+
+class CreateIntakeLinkBody(BaseModel):
+    url: str
+    context: Optional[str] = None
+    note: Optional[str] = None
+    board: str = "attention-intake"
+    assignee: str = "link-analyst"
+    triage: bool = True
+    priority: int = 0
+    idempotency_key: Optional[str] = None
+    skills: Optional[list[str]] = None
+    max_runtime_seconds: Optional[int] = None
+
+
+@router.post("/intake-links")
+def create_intake_link(
+    payload: CreateIntakeLinkBody,
+):
+    # Always target attention-intake; do not let query-string board redirect.
+    effective_board = _resolve_board("attention-intake")
+    conn = _conn(board=effective_board)
+    try:
+        from hermes_cli import kanban_intake_link as kil
+        task_id = kil.create_intake_link(
+            conn,
+            url=payload.url,
+            context=payload.context,
+            note=payload.note,
+            board=effective_board,
+            assignee=payload.assignee,
+            triage=payload.triage,
+            priority=payload.priority,
+            skills=payload.skills,
+            max_runtime_seconds=payload.max_runtime_seconds,
+            idempotency_key=payload.idempotency_key,
+            source="dashboard",
+        )
+        task = kanban_db.get_task(conn, task_id)
+        body: dict[str, Any] = {"task": _task_dict(task) if task else None}
+        if task and task.status == "ready" and task.assignee:
+            try:
+                from hermes_cli.kanban import _check_dispatcher_presence
+                running, message = _check_dispatcher_presence()
+                if not running and message:
+                    body["warning"] = message
+            except Exception:
                 pass
         return body
     except ValueError as e:
@@ -800,6 +1014,49 @@ def remove_attachment(attachment_id: int, board: Optional[str] = Query(None)):
 
 
 # ---------------------------------------------------------------------------
+# GET /intake-links/health (task or board)
+# ---------------------------------------------------------------------------
+
+@router.get("/intake-links/health")
+def get_intake_link_health(
+    task_id: Optional[str] = Query(None, description="Inspect single task id (omit to scan board)"),
+    board: Optional[str] = Query(None, description="Board slug (default: attention-intake)"),
+):
+    """Return register-health for Attention Intake link-drop cards.
+
+    Single-task mode when ``task_id`` is provided; board-scan mode
+    otherwise.  Read-only — no register writes.
+    """
+    from hermes_cli import kanban_intake_link_health as kih
+
+    board_resolved = board or "attention-intake"
+    conn = _conn(board=board_resolved)
+    try:
+        if task_id:
+            row = conn.execute(
+                "SELECT body FROM tasks WHERE id = ?",
+                (task_id,),
+            ).fetchone()
+            if not row:
+                raise HTTPException(status_code=404, detail=f"task {task_id!r} not found")
+            result = kih.check_register_for_task(
+                task_id, row[0] or "", hermes_home=get_default_hermes_root()
+            )
+        else:
+            result = kih.scan_board_for_health(
+                conn, board=board_resolved, hermes_home=get_default_hermes_root()
+            )
+        return result
+    except HTTPException:
+        raise
+    except Exception as exc:
+        log.exception("intake-link-health error")
+        raise HTTPException(status_code=500, detail=str(exc))
+    finally:
+        conn.close()
+
+
+# ---------------------------------------------------------------------------
 # PATCH /tasks/:id  (status / assignee / priority / title / body)
 # ---------------------------------------------------------------------------
 
@@ -826,6 +1083,13 @@ def update_task(task_id: str, payload: UpdateTaskBody, board: Optional[str] = Qu
         task = kanban_db.get_task(conn, task_id)
         if task is None:
             raise HTTPException(status_code=404, detail=f"task {task_id} not found")
+
+        if payload.status == "ready" and task.status in ("blocked", "scheduled"):
+            # Validate authorization-bound unblock attempts before applying
+            # any other requested field changes. Dashboard PATCHes can bundle
+            # assignee + status; a refused unblock must not leave a partial
+            # assignment on materialize_only route targets.
+            _raise_materialize_only_route_guard(board, task_id)
 
         # --- assignee ----------------------------------------------------
         if payload.assignee is not None:
@@ -857,10 +1121,17 @@ def update_task(task_id: str, payload: UpdateTaskBody, board: Optional[str] = Qu
                 # Re-open a blocked/scheduled task, or just an explicit status set.
                 current = kanban_db.get_task(conn, task_id)
                 if current and current.status in ("blocked", "scheduled"):
-                    ok = kanban_db.unblock_task(conn, task_id)
+                    _raise_materialize_only_route_guard(board, task_id)
+                    # Guard: unblock must not promote an externally blocked task
+                    # to ready.  Mirror the guard in _set_status_direct.
+                    external = _external_blockers_for_ready(task_id, board=board)
+                    if external:
+                        ok = False
+                    else:
+                        ok = kanban_db.unblock_task(conn, task_id)
                 else:
                     # Direct status write for drag-drop (todo -> ready etc).
-                    ok = _set_status_direct(conn, task_id, "ready")
+                    ok = _set_status_direct(conn, task_id, "ready", board=board)
             elif s == "archived":
                 ok = kanban_db.archive_task(conn, task_id)
             elif s == "running":
@@ -878,16 +1149,27 @@ def update_task(task_id: str, payload: UpdateTaskBody, board: Optional[str] = Qu
                 # See #26744.
                 if s == "ready":
                     blockers = _parents_blocking_ready(conn, task_id)
-                    if blockers:
-                        names = ", ".join(
-                            f"{p['title']!r} ({p['id']}, status={p['status']})"
-                            for p in blockers
-                        )
+                    external = _external_blockers_for_ready(task_id, board=board)
+                    if blockers or external:
+                        msgs: list[str] = []
+                        if blockers:
+                            names = ", ".join(
+                                f"{p['title']!r} ({p['id']}, status={p['status']})"
+                                for p in blockers
+                            )
+                            msgs.append(f"local parent(s) not done — {names}")
+                        if external:
+                            ext_names = ", ".join(
+                                f"{e['parent_board']}/{e['parent_id']}"
+                                + (f" (status={e['status']})" if e.get("status") else "")
+                                for e in external
+                            )
+                            msgs.append(f"external blocker(s) — {ext_names}")
                         raise HTTPException(
                             status_code=409,
                             detail=(
-                                f"Cannot move to 'ready': blocked by parent(s) "
-                                f"not done — {names}"
+                                "Cannot move to 'ready': blocked by "
+                                + "; ".join(msgs)
                             ),
                         )
                 raise HTTPException(
@@ -956,9 +1238,10 @@ def delete_task(task_id: str, board: Optional[str] = Query(None)):
 
 def _parents_blocking_ready(
     conn: sqlite3.Connection, task_id: str,
-) -> list:
-    """Return parent rows (``id``, ``title``, ``status``) that aren't ``done``
-    and therefore prevent ``task_id`` from being promoted to ``ready``.
+) -> list[dict[str, Any]]:
+    """Return board-local parent rows (``id``, ``title``, ``status``) that
+    aren't ``done`` and therefore prevent ``task_id`` from being promoted to
+    ``ready``.
 
     Used to enrich the 409 response from :func:`update_task` so the
     dashboard can show an actionable toast (#26744) instead of a silent
@@ -977,8 +1260,26 @@ def _parents_blocking_ready(
     ]
 
 
+def _external_blockers_for_ready(
+    task_id: str, board: Optional[str] = None,
+) -> list[dict[str, Any]]:
+    """Return unsatisfied external blockers for *task_id* as plain dicts.
+
+    Mirrors the guard inside :func:`_set_status_direct` so that 409
+    responses can name cross-board blockers alongside local parents.
+    ``board`` is the resolved request board slug (not the process current
+    board) so that ``?board=alt`` queries query the correct registry.
+    """
+    blockers = _kanban_dependencies().unsatisfied_blockers_for(
+        board=(board or "default"),
+        task_id=task_id,
+    )
+    return [b.to_dict() for b in blockers]
+
+
 def _set_status_direct(
     conn: sqlite3.Connection, task_id: str, new_status: str,
+    board: Optional[str] = None,
 ) -> bool:
     """Direct status write for drag-drop moves that aren't covered by the
     structured complete/block/unblock/archive verbs (e.g. todo<->ready,
@@ -1012,6 +1313,16 @@ def _set_status_direct(
             if parent_statuses and not all(
                 p["status"] == "done" for p in parent_statuses
             ):
+                return False
+
+            # Cross-board external blocker guard (mirrors recompute_ready seam).
+            # Use the resolved request board, not the process current board,
+            # so ?board=alt mutations query the correct registry.
+            external_blockers = _kanban_dependencies().unsatisfied_blockers_for(
+                board=(board or "default"),
+                task_id=task_id,
+            )
+            if external_blockers:
                 return False
 
         was_running = prev["status"] == "running"
@@ -1197,9 +1508,41 @@ def bulk_update(payload: BulkTaskBody, board: Optional[str] = Query(None)):
                     elif s == "ready":
                         cur = kanban_db.get_task(conn, tid)
                         if cur and cur.status in ("blocked", "scheduled"):
+                            _raise_materialize_only_route_guard(board, tid)
+                            external = _external_blockers_for_ready(tid, board=board)
+                            if external:
+                                entry.update(ok=False, error="external blocker(s) — " + "; ".join(
+                                    f"{e['parent_board']}/{e['parent_id']}"
+                                    for e in external
+                                ))
+                                results.append(entry)
+                                continue
                             ok = kanban_db.unblock_task(conn, tid)
                         else:
-                            ok = _set_status_direct(conn, tid, "ready")
+                            ok = _set_status_direct(conn, tid, "ready", board=board)
+                            if not ok:
+                                # Enrich with blocker details so the UI can show
+                                # actionable toasts per id in a bulk operation.
+                                local_blockers = _parents_blocking_ready(conn, tid)
+                                external_blockers = _external_blockers_for_ready(tid, board=board)
+                                reasons: list[str] = []
+                                if local_blockers:
+                                    names = ", ".join(
+                                        f"{p['title']!r} ({p['id']}, status={p['status']})"
+                                        for p in local_blockers
+                                    )
+                                    reasons.append(f"local parent(s) not done — {names}")
+                                if external_blockers:
+                                    ext_names = ", ".join(
+                                        f"{e['parent_board']}/{e['parent_id']}"
+                                        + (f" (status={e['status']})" if e.get("status") else "")
+                                        for e in external_blockers
+                                    )
+                                    reasons.append(f"external blocker(s) — {ext_names}")
+                                if reasons:
+                                    entry.update(ok=False, error="; ".join(reasons))
+                                    results.append(entry)
+                                    continue
                     elif s == "running":
                         entry.update(
                             ok=False,
@@ -1337,6 +1680,82 @@ def list_diagnostics(
     finally:
         conn.close()
 
+
+# ---------------------------------------------------------------------------
+# Cross-board dependency diagnostics
+# ---------------------------------------------------------------------------
+
+@router.get("/cross-board-diagnostics")
+def list_cross_board_diagnostics(
+    board: Optional[str] = Query(None, description="Kanban board slug (omit for current)"),
+    task_id: Optional[str] = Query(None, description="Filter to a single task id"),
+):
+    """Return cross-board dependency diagnostics from the canonical registry.
+
+    If *task_id* is provided, only edges where that task participates are
+    included.  Otherwise diagnostics are computed for all boards.
+
+    The result surface is read-only and mirrors the CLI
+    ``kanban-cross-deps diagnostics`` output so the UI can render board-
+    level health rows and per-task blocker panels.
+    """
+    board = _resolve_board(board)
+
+    if not _CROSS_BOARD_AVAILABLE or CrossBoardDiagnostics is None:
+        return {
+            "available": False,
+            "diagnostics": {},
+            "count": 0,
+        }
+
+    try:
+        from plugins.kanban_cross_deps.store import CrossBoardRegistry
+        from hermes_cli import kanban_dependencies as kd
+
+        registry = CrossBoardRegistry()  # type: ignore[reportOptionalCall]
+        diag_engine = CrossBoardDiagnostics(registry=registry)
+
+        # Compute availability / provenance surface split so callers can
+        # distinguish importable/readable from enabled/registered/enforced.
+        plugin_enabled = False
+        provider_registered = False
+        try:
+            from hermes_cli.plugins import _get_enabled_plugins
+            enabled = _get_enabled_plugins()
+            plugin_enabled = enabled is not None and "kanban_cross_deps" in enabled
+        except Exception:
+            pass
+        try:
+            for p in kd._providers:
+                if kd._provider_name(p) == "kanban_cross_deps":
+                    provider_registered = True
+                    break
+        except Exception:
+            pass
+
+        if task_id:
+            _task_board = board or "default"
+            report = diag_engine.run(task_filter=(_task_board, task_id))
+        else:
+            report = diag_engine.run()
+
+        return {
+            "available": True,
+            "registry_importable": True,
+            "registry_readable": True,
+            "plugin_enabled": plugin_enabled,
+            "provider_registered": provider_registered,
+            "enforcement_active": plugin_enabled and provider_registered,
+            "diagnostics": report,
+            "count": sum(
+                len(v) if isinstance(v, list) else 0
+                for sec in report.values()
+                for v in (sec.values() if isinstance(sec, dict) else [])
+            ),
+        }
+    except Exception as exc:
+        log.warning("Cross-board diagnostics failed: %s", exc)
+        raise HTTPException(status_code=500, detail=f"cross-board diagnostics error: {exc}")
 
 
 # ---------------------------------------------------------------------------
@@ -1992,6 +2411,162 @@ class RenameBoardBody(BaseModel):
     color: Optional[str] = None
 
 
+# Simple in-memory health cache: {slug: (timestamp, health_dict)}
+_BOARD_HEALTH_CACHE: dict[str, tuple[float, dict[str, Any]]] = {}
+_BOARD_HEALTH_CACHE_TTL = 30.0  # seconds
+
+
+def _probe_board_health(slug: str) -> dict[str, Any]:
+    """Return health metadata for a single board without caching.
+
+    The probe opens a short-lived connection and runs:
+    - ``PRAGMA integrity_check`` (with a 5-second timeout guard).
+    - ``PRAGMA foreign_key_check`` on success.
+    - WAL presence/size and task count.
+
+    On corruption, extracts the backup path from the raised
+    :class:`KanbanDbCorruptError`.  On any other failure, returns
+    ``status: unreachable`` with the exception text.
+    """
+    path = kanban_db.kanban_db_path(board=slug)
+    if not path.exists():
+        return {
+            "status": "missing",
+            "integrity_check": "skipped",
+            "foreign_key_check": "skipped",
+            "wal_present": False,
+            "wal_size_bytes": None,
+            "last_modified": None,
+            "task_count": None,
+        }
+
+    # Try a lightweight integrity check first.
+    integrity_ok = False
+    integrity_detail: Optional[str] = None
+    corrupt_backup: Optional[str] = None
+    try:
+        # Use a raw sqlite3 connection with a short timeout so a badly
+        # corrupt file can't hang the /boards endpoint.
+        probe = sqlite3.connect(
+            f"file:{path.resolve()}?mode=ro",
+            uri=True,
+            timeout=5.0,
+            detect_types=0,
+            isolation_level=None,
+        )
+        probe.row_factory = sqlite3.Row
+        try:
+            row = probe.execute("PRAGMA integrity_check").fetchone()
+            if row and (row[0] or "").lower() == "ok":
+                integrity_ok = True
+            else:
+                integrity_detail = row[0] if row else "<no row>"
+        finally:
+            probe.close()
+    except kanban_db.KanbanDbCorruptError as exc:
+        integrity_detail = exc.reason
+        corrupt_backup = str(exc.backup_path) if exc.backup_path else None
+    except sqlite3.DatabaseError as exc:
+        integrity_detail = str(exc)
+    except Exception as exc:
+        return {
+            "status": "unreachable",
+            "integrity_check": "skipped",
+            "foreign_key_check": "skipped",
+            "wal_present": False,
+            "wal_size_bytes": None,
+            "last_modified": None,
+            "task_count": None,
+            "detail": str(exc),
+        }
+
+    if not integrity_ok:
+        return {
+            "status": "degraded",
+            "integrity_check": "failed",
+            "integrity_detail": integrity_detail,
+            "foreign_key_check": "skipped",
+            "wal_present": False,
+            "wal_size_bytes": None,
+            "last_modified": None,
+            "task_count": None,
+            "corrupt_backup_path": corrupt_backup,
+            "repair_candidate_available": bool(corrupt_backup),
+        }
+
+    # Healthy path: stay read-only.  Do not call kanban_db.connect() from the
+    # health probe; connect() may run WAL/schema/migration setup, while the
+    # dashboard board-list health badge must be safe to render during incident
+    # triage.
+    try:
+        conn = sqlite3.connect(
+            f"file:{path.resolve()}?mode=ro",
+            uri=True,
+            timeout=5.0,
+            detect_types=0,
+            isolation_level=None,
+        )
+        conn.row_factory = sqlite3.Row
+        try:
+            fk_rows = conn.execute("PRAGMA foreign_key_check").fetchall()
+            fk_ok = "ok" if not fk_rows else f"{len(fk_rows)} violations"
+            task_count = conn.execute(
+                "SELECT COUNT(*) AS n FROM tasks"
+            ).fetchone()["n"]
+        finally:
+            conn.close()
+    except Exception as exc:
+        return {
+            "status": "unreachable",
+            "integrity_check": "ok",
+            "foreign_key_check": "skipped",
+            "wal_present": False,
+            "wal_size_bytes": None,
+            "last_modified": None,
+            "task_count": None,
+            "detail": str(exc),
+        }
+
+    wal_present = False
+    wal_size = None
+    for suffix in ("-wal", "-shm"):
+        wal_path = path.parent / f"{path.name}{suffix}"
+        if wal_path.exists():
+            wal_present = True
+            if suffix == "-wal":
+                try:
+                    wal_size = wal_path.stat().st_size
+                except OSError:
+                    pass
+            break
+
+    try:
+        mtime = path.stat().st_mtime
+    except OSError:
+        mtime = None
+
+    return {
+        "status": "healthy",
+        "integrity_check": "ok",
+        "foreign_key_check": fk_ok,
+        "wal_present": wal_present,
+        "wal_size_bytes": wal_size,
+        "last_modified": int(mtime) if mtime is not None else None,
+        "task_count": task_count,
+    }
+
+
+def _board_health(slug: str) -> dict[str, Any]:
+    """Return cached or fresh health metadata for *slug*."""
+    now = time.time()
+    cached = _BOARD_HEALTH_CACHE.get(slug)
+    if cached and (now - cached[0]) < _BOARD_HEALTH_CACHE_TTL:
+        return cached[1]
+    health = _probe_board_health(slug)
+    _BOARD_HEALTH_CACHE[slug] = (now, health)
+    return health
+
+
 def _board_counts(slug: str) -> dict[str, int]:
     """Return ``{status: count}`` for a board. Safe on an empty DB."""
     try:
@@ -2012,12 +2587,20 @@ def _board_counts(slug: str) -> dict[str, int]:
 
 @router.get("/boards")
 def list_boards(include_archived: bool = Query(False)):
-    """Return every board on disk with task counts and the active slug."""
+    """Return every board on disk with task counts, health, and the active slug."""
     boards = kanban_db.list_boards(include_archived=include_archived)
     current = kanban_db.get_current_board()
     for b in boards:
         b["is_current"] = (b["slug"] == current)
-        b["counts"] = _board_counts(b["slug"])
+        health = _board_health(b["slug"])
+        b["health"] = health
+        if health.get("status") == "healthy":
+            b["counts"] = _board_counts(b["slug"])
+        else:
+            # Avoid opening corrupt/missing boards through the normal
+            # kanban_db.connect() path just to count tasks; the health payload is
+            # the actionable signal and keeps incident triage read-mostly.
+            b["counts"] = {}
         b["total"] = sum(b["counts"].values())
     return {"boards": boards, "current": current}
 
@@ -2403,6 +2986,33 @@ async def stream_events(ws: WebSocket):
             ws_board = kanban_db._normalize_board_slug(ws_board_raw) if ws_board_raw else None
         except ValueError:
             ws_board = None
+
+        # --- degraded-board handshake ----------------------------------------
+        # Detect corrupt boards before entering the tail loop so the browser
+        # doesn't spin a tight reconnect.
+        try:
+            # A lightweight probe: the connect() path raises
+            # KanbanDbCorruptError for integrity failures. Invalid-header guard
+            # failures can surface as sqlite3.DatabaseError before backup
+            # metadata exists; those are still surfaced as degraded to the UI.
+            probe_conn = kanban_db.connect(board=ws_board)
+            probe_conn.close()
+        except kanban_db.KanbanDbCorruptError as exc:
+            log.warning("Kanban WS degraded handshake: %s", exc.reason)
+            await ws.send_json(_degraded_board_payload(
+                ws_board,
+                exc.reason,
+                backup_path=exc.backup_path,
+            ))
+            await ws.close(code=http_status.WS_1011_INTERNAL_ERROR)
+            return
+        except sqlite3.DatabaseError as exc:
+            reason = str(exc)
+            log.warning("Kanban WS degraded handshake: %s", reason)
+            await ws.send_json(_degraded_board_payload(ws_board, reason))
+            await ws.close(code=http_status.WS_1011_INTERNAL_ERROR)
+            return
+        # ------------------------------------------------------------------
 
         def _fetch_new(cursor_val: int) -> tuple[int, list[dict]]:
             conn = kanban_db.connect(board=ws_board)

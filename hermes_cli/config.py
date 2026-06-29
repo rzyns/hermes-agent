@@ -377,7 +377,7 @@ def detect_install_method(project_root: Optional[Path] = None) -> str:
        backward compatibility, but a ``docker`` value is IGNORED when we are
        not actually running inside a container (see below).
     3. HERMES_MANAGED env / .managed marker (NixOS, Homebrew)
-    4. .git directory presence -> 'git'
+    4. .git path presence (directory or worktree file) -> 'git'
     5. Fallback -> 'pip'
 
     Why the stamp is code-scoped, not home-scoped (issue: shared ``~/.hermes``)
@@ -439,7 +439,7 @@ def detect_install_method(project_root: Optional[Path] = None) -> str:
     managed = get_managed_system()
     if managed:
         return managed.lower().replace(" ", "-")
-    if (root / ".git").is_dir():
+    if (root / ".git").exists():
         return "git"
     return "pip"
 
@@ -2517,6 +2517,15 @@ DEFAULT_CONFIG = {
         # Seconds between dispatcher ticks (idle or not). Lower = snappier
         # pickup of newly-ready tasks; higher = less SQL pressure.
         "dispatch_interval_seconds": 60,
+        # Emergency/maintenance brake. When true, gateway/CLI dispatchers skip
+        # claiming or spawning work while leaving read-only list/status commands
+        # available. Use per-board metadata (``hermes kanban boards maintenance``)
+        # to pause only one board.
+        "maintenance_mode": False,
+        # SQLite durability for kanban.db connections. Default ``full`` maps to
+        # PRAGMA synchronous=FULL. The only supported opt-down is ``normal``;
+        # invalid/unsafe values fail closed to FULL at runtime.
+        "durability": "full",
         # Auto-block after this many consecutive non-success attempts for the
         # same task/profile (spawn_failed, timed_out, or crashed). Reassignment
         # resets the streak for the new profile.
@@ -2560,6 +2569,17 @@ DEFAULT_CONFIG = {
         # worker process (if still running host-locally) is terminated
         # before the reclaim.  0 disables stale detection entirely.
         "dispatch_stale_timeout_seconds": 14400,
+        # Append-only JSONL semantic event sidecar — disabled by default.
+        # See hermes_cli/kanban_sidecar.py for implementation.
+        "sidecar": {
+            "enabled": False,
+            "max_bytes": 104857600,
+            "rotate_daily": True,
+            "sync_mode": "O_DSYNC",
+            "retention_days": 90,
+            "archive_path": None,
+            "hash_verification": True,
+        },
     },
 
     # execute_code settings — controls the tool used for programmatic tool calls.
@@ -4904,8 +4924,15 @@ def warn_deprecated_cwd_env_vars(config: Optional[Dict[str, Any]] = None) -> Non
     if config is None:
         try:
             config = load_config()
-        except Exception:
-            return
+        except Exception as _exc:
+            # Config load failure shouldn't silence the deprecation warning entirely —
+            # the warning may be the only signal the user has about a stale .env.
+            logger.warning(
+                "Could not load config while checking deprecated CWD env vars: %s",
+                _exc,
+                exc_info=logger.isEnabledFor(logging.DEBUG),
+            )
+            config = {}
 
     terminal_cfg = config.get("terminal", {})
     config_cwd = terminal_cfg.get("cwd", ".") if isinstance(terminal_cfg, dict) else "."

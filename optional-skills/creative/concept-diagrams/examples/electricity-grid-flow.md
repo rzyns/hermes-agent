@@ -128,7 +128,7 @@ A left-to-right flow diagram showing electricity from multiple generation source
 
 ```xml
 <defs>
-  <marker id="flow-arrow" viewBox="0 0 10 10" refX="9" refY="5" 
+  <marker id="flow-arrow" viewBox="0 0 10 10" refX="9" refY="5"
           markerWidth="6" markerHeight="6" orient="auto">
     <path d="M0,0 L10,5 L0,10 Z" fill="#EF9F27"/>
   </marker>

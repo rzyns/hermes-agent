@@ -372,6 +372,7 @@ def _make_adapter():
         extra={
             "homeserver": "https://matrix.example.org",
             "user_id": "@bot:example.org",
+            "allowed_rooms": [],
         },
     )
     adapter = MatrixAdapter(config)
@@ -4126,6 +4127,7 @@ class TestMatrixRequireMention:
             extra={
                 "homeserver": "https://matrix.example.org",
                 "user_id": "@bot:example.org",
+                "allowed_rooms": [],
                 "require_mention": False,
             },
         )

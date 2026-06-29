@@ -31,6 +31,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import subprocess
 from typing import Any, Optional
 
 from agent.redact import redact_sensitive_text
@@ -160,6 +161,81 @@ def _enforce_worker_task_ownership(tid: str) -> Optional[str]:
             f"{tid}. Use kanban_comment to hand off information to other "
             f"tasks, or kanban_create to spawn follow-up work."
         )
+    return None
+
+
+def _git_status_porcelain_for_worker(task_id: str) -> Optional[str]:
+    """Return git porcelain status for this worker's workspace, if any.
+
+    The guard is intentionally worker-only. Orchestrator profiles may close
+    bookkeeping tasks from outside a repo, while dispatcher-spawned workers have
+    a concrete ``$HERMES_KANBAN_WORKSPACE`` that represents their handoff scope.
+    """
+    if os.environ.get("HERMES_KANBAN_TASK") != task_id:
+        return None
+    workspace = os.environ.get("HERMES_KANBAN_WORKSPACE")
+    if not workspace or not os.path.isdir(workspace):
+        return None
+    try:
+        inside = subprocess.run(
+            ["git", "-C", workspace, "rev-parse", "--is-inside-work-tree"],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=2,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    if inside.returncode != 0 or inside.stdout.strip() != "true":
+        return None
+    try:
+        status = subprocess.run(
+            ["git", "-C", workspace, "status", "--porcelain"],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    if status.returncode != 0:
+        return None
+    return status.stdout.strip()
+
+
+def _guard_git_handoff(
+    task_id: str,
+    *,
+    metadata: Optional[dict] = None,
+    reason: Optional[str] = None,
+    action: str,
+) -> Optional[str]:
+    """Fail closed when a worker hands off a dirty git workspace silently."""
+    dirty = _git_status_porcelain_for_worker(task_id)
+    if not dirty:
+        return None
+
+    if action == "complete":
+        if isinstance(metadata, dict) and metadata.get("no_commit_reason"):
+            return None
+        return tool_error(
+            "git workspace still has uncommitted changes. Commit intended "
+            "repo changes before kanban_complete, or retry with "
+            "metadata.no_commit_reason explaining why the dirty state must be "
+            "left uncommitted."
+        )
+
+    if action == "block":
+        text = str(reason or "").lower()
+        if "no_commit_reason" in text:
+            return None
+        return tool_error(
+            "git workspace still has uncommitted changes. Commit intended "
+            "repo changes before kanban_block, or include "
+            "`no_commit_reason: ...` in the block reason after leaving a "
+            "comment with the dirty-state context."
+        )
+
     return None
 
 
@@ -562,6 +638,11 @@ def _handle_complete(args: dict, **kw) -> str:
         return tool_error(
             f"metadata must be an object/dict, got {type(metadata).__name__}"
         )
+    git_guard = _guard_git_handoff(
+        tid, metadata=metadata, action="complete"
+    )
+    if git_guard:
+        return git_guard
     metadata = _stamp_worker_session_metadata(tid, metadata)
     board = args.get("board")
     try:
@@ -623,6 +704,11 @@ def _handle_block(args: dict, **kw) -> str:
     if not reason or not str(reason).strip():
         return tool_error("reason is required — explain what input you need")
     reason = redact_sensitive_text(str(reason), force=True)
+    git_guard = _guard_git_handoff(
+        tid, reason=reason, action="block"
+    )
+    if git_guard:
+        return git_guard
     kind = args.get("kind")
     board = args.get("board")
     try:
@@ -868,6 +954,67 @@ def _handle_create(args: dict, **kw) -> str:
     except Exception as e:
         logger.exception("kanban_create failed")
         return tool_error(f"kanban_create: {e}")
+
+
+def _handle_create_intake_link(args: dict, **kw) -> str:
+    """Create an Attention Intake link-analysis card with register contract from birth.
+
+    Thin wrapper around the shared helper in hermes_cli.kanban_intake_link.
+    """
+    url = args.get("url")
+    if not url or not str(url).strip():
+        return tool_error("url is required")
+    board = args.get("board")
+    try:
+        from hermes_cli import kanban_intake_link as kil
+        from hermes_cli import kanban_db as kb
+        conn = kb.connect(board=board)
+    except Exception as exc:
+        logger.exception("kanban_create_intake_link connect failed")
+        return tool_error(f"kanban_create_intake_link: {exc}")
+    try:
+        context = args.get("context")
+        note = args.get("note")
+        assignee = args.get("assignee") or kil.DEFAULT_ASSIGNEE
+        triage, bool_error = _parse_bool_arg(args, "triage", default=kil.DEFAULT_TRIAGE)
+        if bool_error:
+            return tool_error(bool_error)
+        priority = args.get("priority")
+        skills = args.get("skills")
+        if isinstance(skills, str):
+            skills = [skills]
+        max_runtime_seconds = args.get("max_runtime_seconds")
+        idempotency_key = args.get("idempotency_key")
+        task_id = kil.create_intake_link(
+            conn,
+            url=str(url).strip(),
+            context=context,
+            note=note,
+            board=board or kil.DEFAULT_BOARD,
+            assignee=assignee,
+            triage=triage,
+            priority=int(priority) if priority is not None else kil.DEFAULT_PRIORITY,
+            skills=skills,
+            max_runtime_seconds=(
+                int(max_runtime_seconds)
+                if max_runtime_seconds is not None else None
+            ),
+            idempotency_key=idempotency_key,
+            source="tool",
+        )
+        task = kb.get_task(conn, task_id)
+        return _ok(
+            task_id=task_id,
+            status=task.status if task else None,
+            workspace_path=task.workspace_path if task else None,
+        )
+    except ValueError as e:
+        return tool_error(f"kanban_create_intake_link: {e}")
+    except Exception as e:
+        logger.exception("kanban_create_intake_link failed")
+        return tool_error(f"kanban_create_intake_link: {e}")
+    finally:
+        conn.close()
 
 
 def _maybe_auto_subscribe(conn: Any, task_id: str) -> bool:
@@ -1123,9 +1270,13 @@ KANBAN_COMPLETE_SCHEMA = {
         "tasks via ``kanban_create`` during this run, list their ids "
         "in ``created_cards`` — the kernel verifies them so phantom "
         "references are caught before they leak into downstream "
-        "automation. If you produced deliverable files (charts, PDFs, "
+        "automation. Task ids are board-local: use ``board/task_id`` "
+        "for cross-board refs in prose and mirror important refs in "
+        "metadata. If you produced deliverable files (charts, PDFs, "
         "spreadsheets, generated images), list their absolute paths "
-        "in ``artifacts`` — the gateway notifier will upload them as "
+        "in ``artifacts`` and include ``metadata.artifact_manifest`` "
+        "or a path to an ``artifact-manifest.json`` under the task "
+        "workspace. The gateway notifier will upload artifact paths as "
         "native attachments to the human who subscribed to the task, "
         "so the deliverable lands in their chat alongside the summary "
         "instead of being a path they have to fetch by hand."
@@ -1150,8 +1301,13 @@ KANBAN_COMPLETE_SCHEMA = {
                 "description": (
                     "Free-form dict of structured facts about this "
                     "attempt — {\"changed_files\": [...], \"tests_run\": 12, "
-                    "\"findings\": [...]}. Surfaced to downstream "
-                    "workers alongside ``summary``."
+                    "\"findings\": [...], \"source_ref\": \"board/t_id\"}. "
+                    "Use board-qualified refs for cross-board tasks. If "
+                    "deliverable files were produced, include "
+                    "artifact_manifest (or artifact_manifest_path) so "
+                    "downstream workers can find durable outputs without "
+                    "parsing prose. Surfaced to downstream workers "
+                    "alongside ``summary``."
                 ),
             },
             "result": {
@@ -1186,16 +1342,18 @@ KANBAN_COMPLETE_SCHEMA = {
                     "Optional list of absolute paths to deliverable "
                     "files you produced during this run — generated "
                     "charts, PDFs, spreadsheets, images, archives. "
-                    "Examples: [\"/tmp/q3-revenue.png\", "
-                    "\"/tmp/report.pdf\"]. The gateway notifier "
-                    "uploads each path as a native attachment to the "
-                    "subscribed chat (images embed inline, everything "
-                    "else uploads as a file) so the deliverable "
+                    "Keep deliverables under $HERMES_KANBAN_WORKSPACE "
+                    "or another explicit durable task workspace, and "
+                    "include an artifact-manifest.json path or manifest "
+                    "object in metadata. Examples: "
+                    "[\"/home/me/.hermes/artifacts/agent-research-intake/t_x/report.pdf\"]. "
+                    "The gateway notifier uploads each path as a native "
+                    "attachment to the subscribed chat (images embed inline, "
+                    "everything else uploads as a file) so the deliverable "
                     "lands with the completion notification. Skip "
-                    "intermediate scratch files and references that "
-                    "are not the deliverable. The path must exist "
-                    "on disk when the notifier runs; missing files "
-                    "are silently skipped."
+                    "intermediate scratch files and references that are not "
+                    "the deliverable. The path must exist on disk when the "
+                    "notifier runs; missing files are silently skipped."
                 ),
             },
             "board": _board_schema_prop(),
@@ -1502,6 +1660,60 @@ KANBAN_LINK_SCHEMA = {
     },
 }
 
+
+KANBAN_CREATE_INTAKE_LINK_SCHEMA = {
+    "name": "kanban_create_intake_link",
+    "description": (
+        "Create an Attention Intake link-analysis card with the link-drop "
+        "contract from birth. Returns the task id. Uses canonical URL hash "
+        "as default idempotency key. Re-dropping the same URL returns the "
+        "existing task id."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "url": {
+                "type": "string",
+                "description": "The URL to analyse and register.",
+            },
+            "context": {
+                "type": "string",
+                "description": "Optional human context for why the link was dropped.",
+            },
+            "note": {
+                "type": "string",
+                "description": "Optional operator note.",
+            },
+            "board": _board_schema_prop(),
+            "assignee": {
+                "type": "string",
+                "description": "Profile name (default: link-analyst).",
+            },
+            "triage": {
+                "type": "boolean",
+                "description": "Park in triage for specifier review (default: true).",
+            },
+            "priority": {
+                "type": "integer",
+                "description": "Dispatcher tiebreaker. Higher = picked sooner.",
+            },
+            "skills": {
+                "type": "array",
+                "items": {"type": "string"},
+                "description": "Skill names to force-load into the dispatched worker.",
+            },
+            "max_runtime_seconds": {
+                "type": "integer",
+                "description": "Per-task runtime cap in seconds.",
+            },
+            "idempotency_key": {
+                "type": "string",
+                "description": "Override canonical URL hash dedup key.",
+            },
+        },
+        "required": ["url"],
+    },
+}
 
 # ---------------------------------------------------------------------------
 # Registration

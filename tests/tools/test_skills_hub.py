@@ -29,7 +29,63 @@ from tools.skills_hub import (
     append_audit_log,
     _skill_meta_to_dict,
     quarantine_bundle,
+    install_from_quarantine,
 )
+from tools.skills_guard import ScanResult
+
+
+# ---------------------------------------------------------------------------
+# install_from_quarantine
+# ---------------------------------------------------------------------------
+
+
+def test_install_from_quarantine_replaces_existing_skill_symlink(monkeypatch, tmp_path):
+    import tools.skills_hub as hub
+
+    skills_dir = tmp_path / "skills"
+    hub_dir = skills_dir / ".hub"
+    monkeypatch.setattr(hub, "SKILLS_DIR", skills_dir)
+    monkeypatch.setattr(hub, "HUB_DIR", hub_dir)
+    monkeypatch.setattr(hub, "LOCK_FILE", hub_dir / "lock.json")
+    monkeypatch.setattr(hub, "QUARANTINE_DIR", hub_dir / "quarantine")
+    monkeypatch.setattr(hub, "AUDIT_LOG", hub_dir / "audit.log")
+    monkeypatch.setattr(hub, "TAPS_FILE", hub_dir / "taps.json")
+    monkeypatch.setattr(hub, "INDEX_CACHE_DIR", hub_dir / "index-cache")
+    monkeypatch.setattr(hub, "HubLockFile", lambda: HubLockFile(hub.LOCK_FILE))
+
+    hub.ensure_hub_dirs()
+    source_skill = tmp_path / "source" / "plan"
+    source_skill.mkdir(parents=True)
+    (source_skill / "SKILL.md").write_text("# old dev-linked plan\n", encoding="utf-8")
+    existing_link = skills_dir / "plan"
+    existing_link.symlink_to(source_skill, target_is_directory=True)
+
+    bundle = SkillBundle(
+        name="plan",
+        files={"SKILL.md": "---\nname: plan\n---\n# new plan\n"},
+        source="github",
+        identifier="https://github.com/rzyns/hermes-stuff/tree/main/skills/plan",
+        trust_level="community",
+        metadata={"repo": "rzyns/hermes-stuff", "path": "skills/plan", "ref": "main"},
+    )
+    quarantine_path = quarantine_bundle(bundle)
+
+    install_dir = install_from_quarantine(
+        quarantine_path,
+        "plan",
+        "",
+        bundle,
+        ScanResult(skill_name="plan", source="github", trust_level="community", verdict="safe"),
+    )
+
+    assert install_dir == skills_dir / "plan"
+    assert install_dir.is_dir()
+    assert not install_dir.is_symlink()
+    assert (source_skill / "SKILL.md").read_text(encoding="utf-8") == "# old dev-linked plan\n"
+    assert "# new plan" in (install_dir / "SKILL.md").read_text(encoding="utf-8")
+    entry = HubLockFile(hub.LOCK_FILE).get_installed("plan")
+    assert entry["identifier"] == "https://github.com/rzyns/hermes-stuff/tree/main/skills/plan"
+    assert entry["metadata"] == {"repo": "rzyns/hermes-stuff", "path": "skills/plan", "ref": "main"}
 
 
 # ---------------------------------------------------------------------------
@@ -1630,7 +1686,7 @@ class TestGithubProviderLabeling:
             "---\nname: accelerated-computing-cudf\n"
             "description: NVIDIA cuDF GPU DataFrames.\n---\n# body\n"
         )
-        gs._fetch_file_content = lambda repo, path: skill_md
+        gs._fetch_file_content = lambda repo, path, ref=None: skill_md
         meta = gs.inspect("NVIDIA/skills/skills/accelerated-computing-cudf")
         assert meta is not None
         # source stays "github" (no churn to dedup/floor/skip logic) ...
@@ -1640,7 +1696,7 @@ class TestGithubProviderLabeling:
 
     def test_inspect_no_provider_for_untapped_repo(self):
         gs = GitHubSource(auth=GitHubAuth())
-        gs._fetch_file_content = lambda repo, path: (
+        gs._fetch_file_content = lambda repo, path, ref=None: (
             "---\nname: foo\ndescription: bar.\n---\n# b\n"
         )
         meta = gs.inspect("someuser/somerepo/skills/foo")
@@ -1949,6 +2005,223 @@ class TestQuarantineBundleBinaryAssets:
 
 
 # ---------------------------------------------------------------------------
+# GitHubSource custom tap source-qualified identifiers
+# ---------------------------------------------------------------------------
+
+
+class TestGitHubSourceCustomTapIdentifiers:
+    def _source(self):
+        auth = MagicMock(spec=GitHubAuth)
+        auth.get_headers.return_value = {}
+        return GitHubSource(auth=auth, extra_taps=[{"repo": "rzyns/hermes-stuff", "path": "skills/"}])
+
+    @patch.object(GitHubSource, "_download_directory")
+    def test_fetch_resolves_owner_repo_skill_through_matching_tap_path(self, mock_download):
+        mock_download.side_effect = lambda repo, path, ref=None: (
+            {"SKILL.md": "---\nname: plan\n---\n", "references/kanban-artifact-planning.md": "# ref"}
+            if (repo, path) == ("rzyns/hermes-stuff", "skills/plan")
+            else {}
+        )
+
+        bundle = self._source().fetch("rzyns/hermes-stuff/plan")
+
+        assert bundle is not None
+        assert bundle.name == "plan"
+        assert bundle.identifier == "rzyns/hermes-stuff/skills/plan"
+        assert "references/kanban-artifact-planning.md" in bundle.files
+        assert mock_download.call_args_list[0] == (("rzyns/hermes-stuff", "skills/plan"), {"ref": None})
+
+    @patch.object(GitHubSource, "_fetch_file_content")
+    def test_inspect_resolves_owner_repo_skill_through_matching_tap_path(self, mock_fetch):
+        mock_fetch.side_effect = lambda repo, path, ref=None: (
+            "---\nname: plan\ndescription: Repo plan skill\n---\n"
+            if (repo, path) == ("rzyns/hermes-stuff", "skills/plan/SKILL.md")
+            else None
+        )
+
+        meta = self._source().inspect("rzyns/hermes-stuff/plan")
+
+        assert meta is not None
+        assert meta.name == "plan"
+        assert meta.description == "Repo plan skill"
+        assert meta.identifier == "rzyns/hermes-stuff/skills/plan"
+        assert meta.repo == "rzyns/hermes-stuff"
+        assert meta.path == "skills/plan"
+        assert mock_fetch.call_args_list[0] == (("rzyns/hermes-stuff", "skills/plan/SKILL.md"), {"ref": None})
+
+    def test_github_tree_url_is_source_qualified_identifier(self):
+        src = self._source()
+
+        candidates = src._identifier_candidates("https://github.com/rzyns/hermes-stuff/tree/main/skills/plan")
+
+        assert len(candidates) == 1
+        assert candidates[0].repo == "rzyns/hermes-stuff"
+        assert candidates[0].path == "skills/plan"
+        assert candidates[0].ref == "main"
+        assert candidates[0].identifier == "https://github.com/rzyns/hermes-stuff/tree/main/skills/plan"
+
+    @patch.object(GitHubSource, "_download_directory")
+    def test_fetch_tree_url_carries_ref_and_preserves_provenance(self, mock_download):
+        mock_download.return_value = {"SKILL.md": "---\nname: plan\n---\n"}
+
+        bundle = self._source().fetch("https://github.com/rzyns/hermes-stuff/tree/main/skills/plan")
+
+        assert bundle is not None
+        assert bundle.identifier == "https://github.com/rzyns/hermes-stuff/tree/main/skills/plan"
+        assert bundle.metadata == {"repo": "rzyns/hermes-stuff", "path": "skills/plan", "ref": "main"}
+        mock_download.assert_called_once_with("rzyns/hermes-stuff", "skills/plan", ref="main")
+
+    @patch.object(GitHubSource, "_fetch_file_content")
+    def test_inspect_tree_url_carries_ref_and_preserves_provenance(self, mock_fetch):
+        mock_fetch.return_value = "---\nname: plan\ndescription: Repo plan skill\n---\n"
+
+        meta = self._source().inspect("https://github.com/rzyns/hermes-stuff/tree/main/skills/plan")
+
+        assert meta is not None
+        assert meta.identifier == "https://github.com/rzyns/hermes-stuff/tree/main/skills/plan"
+        assert meta.extra == {"ref": "main"}
+        mock_fetch.assert_called_once_with("rzyns/hermes-stuff", "skills/plan/SKILL.md", ref="main")
+
+    def test_github_tree_url_non_main_ref_fails_closed(self):
+        src = self._source()
+
+        assert src._identifier_candidates("https://github.com/rzyns/hermes-stuff/tree/feature/skills/plan") == []
+
+    def test_github_blob_url_fails_closed(self):
+        src = self._source()
+
+        assert src._identifier_candidates("https://github.com/rzyns/hermes-stuff/blob/main/skills/plan/SKILL.md") == []
+
+    def test_github_tree_url_encoded_traversal_fails_closed(self):
+        src = self._source()
+
+        assert src._identifier_candidates("https://github.com/rzyns/hermes-stuff/tree/main/skills/%2e%2e/evil") == []
+
+    @pytest.mark.parametrize("suffix", ["?tab=readme", "#readme"])
+    def test_github_tree_url_query_and_fragment_fail_closed(self, suffix):
+        src = self._source()
+
+        assert src._identifier_candidates(f"https://github.com/rzyns/hermes-stuff/tree/main/skills/plan{suffix}") == []
+
+    @pytest.mark.parametrize(
+        "identifier",
+        [
+            "../repo/skills/evil",
+            "owner/repo/../evil",
+            "owner/repo/../../../other/repo/contents/skills/evil",
+            "owner/repo//",
+            "owner/repo/--stdin",
+            "owner/repo/skills/--stdin",
+            "owner/repo/skills\\evil",
+            "owner/repo/skills/evil\x00path",
+            "owner/repo/skills/evil\x7fpath",
+            "owner/repo/skills/evil\x85path",
+            "owner/repo/skills/*/evil",
+            "owner/repo/skills/[abc]/evil",
+            "owner/repo/skills/!evil",
+            "owner/repo/skills/%2e%2e/evil",
+            "owner/repo/skills/%2d%2dstdin",
+        ],
+    )
+    def test_raw_github_identifier_unsafe_paths_fail_closed(self, identifier):
+        src = self._source()
+
+        assert src._identifier_candidates(identifier) == []
+
+    @patch.object(GitHubSource, "_download_directory_via_git")
+    @patch.object(GitHubSource, "_download_directory_recursive", return_value={})
+    @patch.object(GitHubSource, "_download_directory_via_tree", return_value=None)
+    def test_download_directory_falls_back_to_git_cli_when_github_api_unavailable(
+        self, mock_tree, mock_recursive, mock_git
+    ):
+        mock_git.return_value = {
+            "SKILL.md": "---\nname: plan\n---\n",
+            "references/kanban-artifact-planning.md": "# ref",
+        }
+
+        files = self._source()._download_directory("rzyns/hermes-stuff", "skills/plan")
+
+        assert "SKILL.md" in files
+        assert "references/kanban-artifact-planning.md" in files
+        mock_tree.assert_called_once_with("rzyns/hermes-stuff", "skills/plan", ref=None)
+        mock_recursive.assert_called_once_with("rzyns/hermes-stuff", "skills/plan", ref=None)
+        mock_git.assert_called_once_with("rzyns/hermes-stuff", "skills/plan", ref=None)
+
+    @patch.object(GitHubSource, "_download_directory_via_git")
+    @patch("tools.skills_hub.httpx.get")
+    def test_fetch_file_content_falls_back_to_git_cli(self, mock_get, mock_git):
+        mock_get.return_value = MagicMock(status_code=404)
+        mock_git.return_value = {"SKILL.md": "---\nname: plan\n---\n"}
+
+        content = self._source()._fetch_file_content("rzyns/hermes-stuff", "skills/plan/SKILL.md")
+
+        assert content == "---\nname: plan\n---\n"
+        mock_git.assert_called_once_with("rzyns/hermes-stuff", "skills/plan", ref=None)
+
+    def test_git_fallback_rejects_option_like_paths(self):
+        src = self._source()
+
+        assert src._download_directory_via_git("rzyns/hermes-stuff", "--stdin") == {}
+        assert src._download_directory_via_git("rzyns/hermes-stuff", "skills/--stdin") == {}
+        assert src._fetch_file_content_via_git("rzyns/hermes-stuff", "skills/--stdin/SKILL.md") is None
+
+    @patch("tools.skills_hub.subprocess.run")
+    def test_git_fallback_uses_explicit_ref_and_disables_terminal_prompt(self, mock_run):
+        src = self._source()
+        mock_run.return_value = MagicMock(returncode=1)
+
+        assert src._download_directory_via_git("rzyns/hermes-stuff", "skills/plan", ref="main") == {}
+
+        clone_call = mock_run.call_args_list[0]
+        assert clone_call.args[0][:7] == [
+            "git", "clone", "--depth", "1", "--filter=blob:none", "--sparse", "--branch"
+        ]
+        assert clone_call.args[0][7] == "main"
+        assert clone_call.kwargs["env"]["GIT_TERMINAL_PROMPT"] == "0"
+
+    @patch("tools.skills_hub.httpx.get")
+    def test_tree_url_fetch_uses_requested_ref_not_repo_default_branch(self, mock_get):
+        src = self._source()
+
+        tree_resp = MagicMock(status_code=200, json=lambda: {
+            "truncated": False,
+            "tree": [
+                {"type": "blob", "path": "skills/plan/SKILL.md"},
+            ],
+        })
+        raw_resp = MagicMock(status_code=200, text="# plan from main")
+        mock_get.side_effect = [tree_resp, raw_resp]
+
+        files = src._download_directory("rzyns/hermes-stuff", "skills/plan", ref="main")
+
+        assert files == {"SKILL.md": "# plan from main"}
+        requested_urls = [call.args[0] for call in mock_get.call_args_list]
+        assert "https://api.github.com/repos/rzyns/hermes-stuff" not in requested_urls
+        assert requested_urls[0] == "https://api.github.com/repos/rzyns/hermes-stuff/git/trees/main"
+        assert mock_get.call_args_list[1].kwargs["params"] == {"ref": "main"}
+
+    @patch("tools.skills_hub.httpx.get")
+    @patch.object(GitHubSource, "_fetch_file_content")
+    def test_tree_url_fallback_contents_api_keeps_requested_ref(self, mock_fetch, mock_get):
+        src = self._source()
+
+        tree_resp = MagicMock(status_code=200, json=lambda: {"truncated": True, "tree": []})
+        contents_resp = MagicMock(status_code=200, json=lambda: [
+            {"name": "SKILL.md", "type": "file", "path": "skills/plan/SKILL.md"},
+        ])
+        mock_get.side_effect = [tree_resp, contents_resp]
+        mock_fetch.return_value = "# plan from contents fallback"
+
+        files = src._download_directory("rzyns/hermes-stuff", "skills/plan", ref="main")
+
+        assert files == {"SKILL.md": "# plan from contents fallback"}
+        assert mock_get.call_args_list[0].args[0] == "https://api.github.com/repos/rzyns/hermes-stuff/git/trees/main"
+        assert mock_get.call_args_list[1].args[0] == "https://api.github.com/repos/rzyns/hermes-stuff/contents/skills/plan"
+        assert mock_get.call_args_list[1].kwargs["params"] == {"ref": "main"}
+        mock_fetch.assert_called_once_with("rzyns/hermes-stuff", "skills/plan/SKILL.md", ref="main")
+
+
+# ---------------------------------------------------------------------------
 # GitHubSource._download_directory — tree API + fallback (#2940)
 # ---------------------------------------------------------------------------
 
@@ -1977,7 +2250,7 @@ class TestDownloadDirectoryViaTree:
             ],
         })
         mock_get.side_effect = [repo_resp, tree_resp]
-        mock_fetch.side_effect = lambda repo, path: f"content-of-{path}"
+        mock_fetch.side_effect = lambda repo, path, ref=None: f"content-of-{path}"
 
         src = self._source()
         files = src._download_directory("owner/repo", "skills/my-skill")
@@ -2000,7 +2273,7 @@ class TestDownloadDirectoryViaTree:
         files = src._download_directory("owner/repo", "skills/my-skill")
 
         assert files == {"SKILL.md": "# ok"}
-        mock_fallback.assert_called_once_with("owner/repo", "skills/my-skill")
+        mock_fallback.assert_called_once_with("owner/repo", "skills/my-skill", ref=None)
 
     @patch.object(GitHubSource, "_download_directory_recursive", return_value={"SKILL.md": "# ok"})
     @patch("tools.skills_hub.httpx.get")
@@ -2027,7 +2300,7 @@ class TestDownloadDirectoryViaTree:
             ],
         })
         mock_get.side_effect = [repo_resp, tree_resp]
-        mock_fetch.side_effect = lambda repo, path: (
+        mock_fetch.side_effect = lambda repo, path, ref=None: (
             "# Skill" if path.endswith("SKILL.md") else None
         )
 
@@ -2069,7 +2342,7 @@ class TestDownloadDirectoryRecursive:
             {"name": "run.py", "type": "file", "path": "skill/scripts/run.py"},
         ])
         mock_get.side_effect = [root_resp, sub_resp]
-        mock_fetch.side_effect = lambda repo, path: f"content-of-{path}"
+        mock_fetch.side_effect = lambda repo, path, ref=None: f"content-of-{path}"
 
         src = self._source()
         files = src._download_directory_recursive("owner/repo", "skill")
@@ -2327,6 +2600,45 @@ class TestInstallPathSafety:
         assert ok is False
         assert victim.exists()
         assert (victim / "important").read_text() == "don't delete me"
+
+    def test_install_from_quarantine_rejects_category_symlink_redirect(self, tmp_path):
+        """Install may replace a final skill symlink, but must not follow a
+        symlinked category/parent directory outside ``SKILLS_DIR``."""
+        import tools.skills_hub as hub
+        from tools.skills_guard import ScanResult
+
+        skills_dir = tmp_path / "skills"
+        quarantine_root = skills_dir / ".hub" / "quarantine"
+        quarantine_root.mkdir(parents=True)
+        outside = tmp_path / "outside-category-target"
+        outside.mkdir()
+        category_link = skills_dir / "category"
+        try:
+            category_link.symlink_to(outside, target_is_directory=True)
+        except (OSError, NotImplementedError):
+            pytest.skip("symlink creation unsupported on this platform")
+
+        bundle = hub.SkillBundle(
+            name="plan",
+            files={"SKILL.md": "---\nname: plan\n---\n"},
+            source="community",
+            identifier="x",
+            trust_level="community",
+        )
+        scan_result = ScanResult(
+            skill_name="plan",
+            source="community",
+            trust_level="community",
+            verdict="safe",
+        )
+
+        with patch.object(hub, "SKILLS_DIR", skills_dir), \
+             patch.object(hub, "QUARANTINE_DIR", quarantine_root):
+            q_dir = hub.quarantine_bundle(bundle)
+            with pytest.raises(ValueError, match="Unsafe install path"):
+                hub.install_from_quarantine(q_dir, "plan", "category", bundle, scan_result)
+
+        assert not (outside / "plan").exists()
 
     def test_install_from_quarantine_rejects_symlinks(self, tmp_path):
         """Skill install must not follow symlinks that leak file contents

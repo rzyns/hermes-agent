@@ -172,3 +172,24 @@ class TestDynamicRouteSecretValidation:
         adapter._reload_dynamic_routes()
         assert "good" in adapter._routes
         assert "bad" not in adapter._routes
+
+    def test_deterministic_action_alias_normalized(self, tmp_path):
+        (tmp_path / _DYNAMIC_ROUTES_FILENAME).write_text(
+            json.dumps({
+                "links": {"secret": "s", "action": "kanban-intake-links"},
+            })
+        )
+        adapter = _make_adapter()
+        adapter._reload_dynamic_routes()
+        assert adapter._routes["links"]["action"] == "kanban_intake_links"
+
+    def test_unknown_deterministic_action_rejected(self, tmp_path):
+        (tmp_path / _DYNAMIC_ROUTES_FILENAME).write_text(
+            json.dumps({
+                "bad-action": {"secret": "s", "action": "not-real"},
+            })
+        )
+        adapter = _make_adapter()
+        adapter._reload_dynamic_routes()
+        assert "bad-action" not in adapter._routes
+        assert "bad-action" not in adapter._dynamic_routes

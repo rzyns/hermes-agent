@@ -133,4 +133,3 @@ class TestPortBindingHardError:
         for p in ("webhook", "api_server", "msgraph_webhook", "feishu",
                   "wecom_callback", "bluebubbles", "sms"):
             assert p in _PORT_BINDING_PLATFORM_VALUES
-

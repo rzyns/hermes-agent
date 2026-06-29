@@ -8,6 +8,7 @@ REST surface without spinning up the whole dashboard.
 from __future__ import annotations
 
 import importlib.util
+import json
 import os
 import sys
 import time
@@ -48,6 +49,11 @@ def kanban_home(tmp_path, monkeypatch):
     home.mkdir()
     monkeypatch.setenv("HERMES_HOME", str(home))
     monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    # Prevent leaked kanban overrides from affecting board/registry resolution
+    monkeypatch.setenv("HERMES_KANBAN_HOME", str(home / "kanban"))
+    monkeypatch.delenv("HERMES_KANBAN_DB", raising=False)
+    monkeypatch.delenv("HERMES_KANBAN_BOARD", raising=False)
+    monkeypatch.delenv("HERMES_KANBAN_WORKSPACES_ROOT", raising=False)
     kb.init_db()
     return home
 
@@ -211,6 +217,37 @@ def test_dashboard_select_filters_use_sdk_value_change_handler():
     assert "selectChangeHandler(props.setAssigneeFilter)" in js
 
 
+def test_dashboard_exposes_kanban_page_plugin_slots():
+    """The bundled Kanban dashboard plugin must expose stable page slots.
+
+    These hooks let slot-only dashboard plugins augment /kanban without
+    replacing the built-in Kanban route or changing behavior when no plugin
+    registers for the slot.
+    """
+
+    repo_root = Path(__file__).resolve().parents[2]
+    bundle = repo_root / "plugins" / "kanban" / "dashboard" / "dist" / "index.js"
+    js = bundle.read_text()
+
+    assert "Card, CardContent, PluginSlot," in js
+    assert 'h(PluginSlot, { name: "kanban:top" })' in js
+    assert 'h(PluginSlot, { name: "kanban:bottom" })' in js
+
+
+def test_dashboard_slot_catalog_documents_kanban_slots():
+    repo_root = Path(__file__).resolve().parents[2]
+    slots_ts = repo_root / "web" / "src" / "plugins" / "slots.ts"
+    docs_md = repo_root / "website" / "docs" / "user-guide" / "features" / "extending-the-dashboard.md"
+
+    slots = slots_ts.read_text()
+    docs = docs_md.read_text()
+
+    assert '"kanban:top"' in slots
+    assert '"kanban:bottom"' in slots
+    assert "`kanban:top` / `kanban:bottom`" in docs
+    assert "bundled Kanban dashboard plugin" in docs
+
+
 def test_dashboard_client_side_filtering_includes_tenant_filter():
     """The rendered board must also filter by tenant.
 
@@ -226,6 +263,39 @@ def test_dashboard_client_side_filtering_includes_tenant_filter():
 
     assert "if (tenantFilter && t.tenant !== tenantFilter) return false;" in js
     assert "[boardData, tenantFilter, assigneeFilter, search]" in js
+
+
+def test_dashboard_column_header_uses_current_label_helper():
+    """Column rendering must not reference the removed COLUMN_LABEL constant.
+
+    The bundle now routes labels through getColumnLabel(t, status) so i18n and
+    English fallbacks share one path. A stale COLUMN_LABEL reference crashes the
+    whole Kanban tab at render time.
+    """
+
+    repo_root = Path(__file__).resolve().parents[2]
+    bundle = repo_root / "plugins" / "kanban" / "dashboard" / "dist" / "index.js"
+    js = bundle.read_text()
+
+    assert "const FALLBACK_COLUMN_LABEL" in js
+    assert "const COLUMN_LABEL" not in js
+    assert "aria-label\": `Select all tasks in ${colLabel || props.column.name}`" in js
+
+
+def test_dashboard_blocked_card_event_opens_existing_task_drawer():
+    """Slot plugins can ask the bundled Kanban page to open its native drawer."""
+
+    repo_root = Path(__file__).resolve().parents[2]
+    bundle = repo_root / "plugins" / "kanban" / "dashboard" / "dist" / "index.js"
+    js = bundle.read_text()
+
+    assert 'const OPEN_TASK_EVENT = "hermes-kanban:open-task";' in js
+    assert "window.addEventListener(OPEN_TASK_EVENT, onOpenTask);" in js
+    assert "window.removeEventListener(OPEN_TASK_EVENT, onOpenTask);" in js
+    assert "const taskId = detail.taskId || detail.task_id || detail.id;" in js
+    assert "const nextBoard = detail.boardSlug || detail.board || detail.board_slug;" in js
+    assert "if (nextBoard && nextBoard !== board) switchBoard(nextBoard);" in js
+    assert "setSelectedTaskId(taskId);" in js
 
 
 def test_dashboard_initial_board_uses_backend_current_when_unpinned():
@@ -332,6 +402,97 @@ def test_patch_block_then_unblock(client):
     )
     assert r.status_code == 200
     assert r.json()["task"]["status"] == "ready"
+
+
+def test_dashboard_refuses_ready_for_materialize_only_route_target(client):
+    kb.init_db(board="attention-intake")
+    kb.init_db(board="agent-research-intake")
+    conn = kb.connect(board="agent-research-intake")
+    try:
+        target_id = kb.create_task(conn, title="guarded route target", assignee=None)
+        assert kb.block_task(conn, target_id, reason="materialize_only route target")
+    finally:
+        conn.close()
+
+    home = Path(os.environ["HERMES_HOME"])
+    register = home / "artifacts" / "attention-intake" / "register.jsonl"
+    register.parent.mkdir(parents=True, exist_ok=True)
+    register.write_text(
+        json.dumps(
+            {
+                "event": "intake_link_assessed",
+                "source_task": "t_source",
+                "url": "https://example.test/paper",
+                "verdict": "route_elsewhere",
+                "routed_to_board": "agent-research-intake",
+                "routed_to_task": target_id,
+                "route_materialization": {"mode": "materialize_only"},
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    r = client.patch(
+        f"/api/plugins/kanban/tasks/{target_id}?board=agent-research-intake",
+        json={"status": "ready"},
+    )
+
+    assert r.status_code == 409
+    assert "materialize_only routed target" in r.json()["detail"]
+    conn = kb.connect(board="agent-research-intake")
+    try:
+        after = kb.get_task(conn, target_id)
+    finally:
+        conn.close()
+    assert after is not None
+    assert after.status == "blocked"
+
+
+def test_dashboard_refuses_materialize_only_ready_before_partial_assignee_mutation(client):
+    kb.init_db(board="attention-intake")
+    kb.init_db(board="agent-research-intake")
+    conn = kb.connect(board="agent-research-intake")
+    try:
+        target_id = kb.create_task(conn, title="guarded route target", assignee=None)
+        assert kb.block_task(conn, target_id, reason="materialize_only route target")
+    finally:
+        conn.close()
+
+    home = Path(os.environ["HERMES_HOME"])
+    register = home / "artifacts" / "attention-intake" / "register.jsonl"
+    register.parent.mkdir(parents=True, exist_ok=True)
+    register.write_text(
+        json.dumps(
+            {
+                "event": "intake_link_assessed",
+                "source_task": "t_source",
+                "url": "https://example.test/paper",
+                "verdict": "route_elsewhere",
+                "routed_to_board": "agent-research-intake",
+                "routed_to_task": target_id,
+                "route_materialization": {"mode": "materialize_only"},
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    r = client.patch(
+        f"/api/plugins/kanban/tasks/{target_id}?board=agent-research-intake",
+        json={"status": "ready", "assignee": "orchestrator"},
+    )
+
+    assert r.status_code == 409
+    assert "materialize_only routed target" in r.json()["detail"]
+    conn = kb.connect(board="agent-research-intake")
+    try:
+        after = kb.get_task(conn, target_id)
+    finally:
+        conn.close()
+    assert after is not None
+    assert after.status == "blocked"
+    assert after.assignee is None
 
 
 def test_patch_schedule_then_unblock(client):
@@ -2265,3 +2426,350 @@ def test_dashboard_failed_card_highlight_class_exists():
     assert "hermes-kanban-card--failed" in js
     assert "hermes-kanban-card--failed" in css
     assert "failedIds" in js
+
+
+# ---------------------------------------------------------------------------
+# Cross-board dependency integration — soft-import graceful degradation
+# ---------------------------------------------------------------------------
+
+def test_get_task_includes_cross_board_field(client):
+    """GET /tasks/:id must always include a ``cross_board`` blob, even when
+    the cross-board deps plugin is unavailable.  This keeps the drawer
+    contract stable so the UI never has to guard the key's existence."""
+    r = client.post("/api/plugins/kanban/tasks", json={"title": "cross-board test"})
+    task = r.json()["task"]
+
+    r = client.get(f"/api/plugins/kanban/tasks/{task['id']}")
+    assert r.status_code == 200
+    data = r.json()
+    assert "cross_board" in data
+    assert isinstance(data["cross_board"]["upstream"], list)
+    assert isinstance(data["cross_board"]["downstream"], list)
+    # diagnostics is either None (plugin absent) or a dict (plugin present)
+    assert data["cross_board"]["diagnostics"] is None or isinstance(
+        data["cross_board"]["diagnostics"], dict
+    )
+
+
+def test_cross_board_diagnostics_shape(client):
+    """GET /cross-board-diagnostics must return 200 with a stable shape
+    whether the plugin is available or not."""
+    r = client.get("/api/plugins/kanban/cross-board-diagnostics")
+    assert r.status_code == 200
+    data = r.json()
+    assert "available" in data
+    assert "diagnostics" in data
+    assert "count" in data
+
+
+def test_cross_board_section_renders_in_dist():
+    """The built dashboard JS must contain the CrossBoardDepsSection component
+    and its associated CSS classes so the drawer surfaces canonical edges."""
+    repo_root = Path(__file__).resolve().parents[2]
+    js = (repo_root / "plugins" / "kanban" / "dashboard" / "dist" / "index.js").read_text()
+    css = (repo_root / "plugins" / "kanban" / "dashboard" / "dist" / "style.css").read_text()
+
+    assert "function CrossBoardDepsSection" in js
+    assert "hermes-kanban-cbd-row" in css
+    assert "hermes-kanban-cbd-dot" in css
+    assert "hermes-kanban-cbd-dot--blocking" in css
+    assert "hermes-kanban-cbd-board" in css
+    assert "hermes-kanban-cbd-id" in css
+    assert "hermes-kanban-cbd-kind" in css
+    assert "hermes-kanban-cbd-source" in css
+
+
+# ---------------------------------------------------------------------------
+# Fixture-backed cross-board edge + blocker tests
+# ---------------------------------------------------------------------------
+
+def _make_cross_board_fixture(client, monkeypatch, tmp_path):
+    """Return a helper that wires a temp CrossBoardRegistry under the test DB
+    and registers its provider with the global dependency seam."""
+    from hermes_cli import kanban_dependencies as kd
+    from plugins.kanban_cross_deps.store import CrossBoardRegistry
+    from plugins.kanban_cross_deps.provider import CrossBoardDependencyProvider
+    reg = CrossBoardRegistry()
+    # Ensure the registry DB is under the temp home
+    assert reg.path.resolve().is_relative_to(tmp_path.resolve())
+    provider = CrossBoardDependencyProvider(registry=reg)
+    token = kd.register_dependency_provider(provider)
+
+    def add_edge(parent_board, parent_id, child_board, child_id, kind="blocks", blocking=True, source="canonical"):
+        return reg.add(
+            parent_board=parent_board, parent_id=parent_id,
+            child_board=child_board, child_id=child_id,
+            kind=kind, blocking=blocking, source=source,
+        )
+
+    def cleanup():
+        kd.unregister_dependency_provider(token)
+    return add_edge, reg, cleanup
+
+
+def test_task_detail_shows_canonical_edge_provenance(client, monkeypatch, tmp_path):
+    """GET /tasks/:id cross_board blob must expose blocking and source fields."""
+    from hermes_cli import kanban_db as kb
+    from plugins.kanban_cross_deps.store import CrossBoardRegistry
+
+    add_edge, reg, _cleanup = _make_cross_board_fixture(client, monkeypatch, tmp_path)
+
+    # Create parent task on a sibling board and child task on default board
+    p_conn = kb.connect(board="other")
+    c_conn = kb.connect(board="default")
+    try:
+        pid = kb.create_task(p_conn, title="parent", assignee="worker")
+        cid = kb.create_task(c_conn, title="child", assignee="worker")
+    finally:
+        p_conn.close()
+        c_conn.close()
+
+    edge = add_edge("other", pid, "default", cid, kind="informed_by", blocking=False, source="promoted")
+
+    r = client.get(f"/api/plugins/kanban/tasks/{cid}")
+    assert r.status_code == 200
+    data = r.json()
+    assert "cross_board" in data
+    upstream = data["cross_board"]["upstream"]
+    assert len(upstream) == 1
+    u = upstream[0]
+    assert u["blocking"] is False
+    assert u["source"] == "promoted"
+    assert u["kind"] == "informed_by"
+
+
+def test_ready_transition_409_includes_external_blocker(client, monkeypatch, tmp_path):
+    """PATCH status ready must 409 and name the external blocker, not silently refuse."""
+    from hermes_cli import kanban_db as kb
+    from plugins.kanban_cross_deps.store import CrossBoardRegistry
+
+    add_edge, reg, _cleanup = _make_cross_board_fixture(client, monkeypatch, tmp_path)
+
+    p_conn = kb.connect(board="other")
+    c_conn = kb.connect(board="default")
+    try:
+        pid = kb.create_task(p_conn, title="parent", assignee="worker")
+        # Create child in todo (not ready) so the ready transition is real.
+        local_parent = kb.create_task(c_conn, title="local parent", assignee="worker")
+        cid = kb.create_task(c_conn, title="child", assignee="worker", parents=[local_parent])
+    finally:
+        p_conn.close()
+        c_conn.close()
+
+    add_edge("other", pid, "default", cid, kind="blocks", blocking=True)
+
+    r = client.patch(f"/api/plugins/kanban/tasks/{cid}", json={"status": "ready"})
+    assert r.status_code == 409
+    detail = r.json()["detail"]
+    assert "external blocker" in detail
+    assert "other" in detail
+    assert pid in detail
+
+
+def test_bulk_ready_includes_external_blocker_per_id(client, monkeypatch, tmp_path):
+    """Bulk POST ready must return per-id error strings naming external blockers."""
+    from hermes_cli import kanban_db as kb
+    from plugins.kanban_cross_deps.store import CrossBoardRegistry
+
+    add_edge, reg, _cleanup = _make_cross_board_fixture(client, monkeypatch, tmp_path)
+
+    p_conn = kb.connect(board="other")
+    c_conn = kb.connect(board="default")
+    try:
+        pid = kb.create_task(p_conn, title="parent", assignee="worker")
+        local_parent = kb.create_task(c_conn, title="local parent", assignee="worker")
+        cid = kb.create_task(c_conn, title="child", assignee="worker", parents=[local_parent])
+    finally:
+        p_conn.close()
+        c_conn.close()
+
+    add_edge("other", pid, "default", cid, kind="blocks", blocking=True)
+
+    r = client.post("/api/plugins/kanban/tasks/bulk", json={"ids": [cid], "status": "ready"})
+    assert r.status_code == 200
+    results = r.json()["results"]
+    assert len(results) == 1
+    entry = results[0]
+    assert entry["ok"] is False
+    assert "external blocker" in entry["error"]
+
+
+def test_ready_transition_409_uses_request_board_not_current(client, monkeypatch, tmp_path):
+    """PATCH ?board=alt must use alt board's external blockers, not current/default.
+
+    Creates a cross-board edge for alt/<child> only; default/<child> is free.
+    The request ?board=alt must 409 because the alt board edge blocks it.
+    """
+    from hermes_cli import kanban_db as kb
+
+    add_edge, reg, _cleanup = _make_cross_board_fixture(client, monkeypatch, tmp_path)
+
+    # Create parent on "other" board and child on "alt" board.
+    p_conn = kb.connect(board="other")
+    c_conn = kb.connect(board="alt")
+    try:
+        pid = kb.create_task(p_conn, title="parent", assignee="worker")
+        cid = kb.create_task(c_conn, title="child", assignee="worker")
+    finally:
+        p_conn.close()
+        c_conn.close()
+
+    add_edge("other", pid, "alt", cid, kind="blocks", blocking=True)
+
+    # Request board=alt; the edge lives on alt/<child>.
+    r = client.patch(f"/api/plugins/kanban/tasks/{cid}?board=alt", json={"status": "ready"})
+    assert r.status_code == 409
+    detail = r.json()["detail"]
+    assert "external blocker" in detail
+    assert "other" in detail
+
+
+def test_bulk_ready_uses_request_board_not_current(client, monkeypatch, tmp_path):
+    """Bulk POST ?board=alt must use alt board blockers per-id.
+
+    Creates a cross-board edge for alt/<child> only; default/<child> is free.
+    The bulk request ?board=alt must produce per-id errors.
+    """
+    from hermes_cli import kanban_db as kb
+
+    add_edge, reg, _cleanup = _make_cross_board_fixture(client, monkeypatch, tmp_path)
+
+    p_conn = kb.connect(board="other")
+    c_conn = kb.connect(board="alt")
+    try:
+        pid = kb.create_task(p_conn, title="parent", assignee="worker")
+        cid = kb.create_task(c_conn, title="child", assignee="worker")
+    finally:
+        p_conn.close()
+        c_conn.close()
+
+    add_edge("other", pid, "alt", cid, kind="blocks", blocking=True)
+
+    r = client.post("/api/plugins/kanban/tasks/bulk?board=alt", json={"ids": [cid], "status": "ready"})
+    assert r.status_code == 200
+    results = r.json()["results"]
+    assert len(results) == 1
+    assert results[0]["ok"] is False
+    assert "external blocker" in results[0]["error"]
+
+
+def test_cross_board_diagnostics_task_filter_scopes_all_sections(client, monkeypatch, tmp_path):
+    """GET /cross-board-diagnostics?task_id=... must scope all sections and recompute counts."""
+    from hermes_cli import kanban_db as kb
+    from plugins.kanban_cross_deps.store import CrossBoardRegistry
+
+    add_edge, reg, _cleanup = _make_cross_board_fixture(client, monkeypatch, tmp_path)
+
+    p_conn = kb.connect(board="other")
+    c_conn = kb.connect(board="default")
+    try:
+        pid = kb.create_task(p_conn, title="parent", assignee="worker")
+        cid = kb.create_task(c_conn, title="child", assignee="worker")
+    finally:
+        p_conn.close()
+        c_conn.close()
+
+    add_edge("other", pid, "default", cid, kind="blocks", blocking=True)
+
+    r = client.get(f"/api/plugins/kanban/cross-board-diagnostics?task_id={cid}")
+    assert r.status_code == 200
+    data = r.json()
+    assert data["available"] is True
+    # The scoped report should only contain edges touching t_child
+    report = data["diagnostics"]
+    # Cycles, dangling, contradictions, provider_failures are scoped
+    assert "summary" in report
+    summary = report["summary"]
+    # Counts should be <= 1 for each category because only one edge exists
+    assert summary["dangling"] <= 1
+    assert summary["contradictions"] <= 1
+    assert summary["provider_failures"] <= 1
+    # The overall count field must match recomputed sum
+    computed_count = sum(
+        len(v) if isinstance(v, list) else 0
+        for sec in report.values()
+        for v in (sec.values() if isinstance(sec, dict) else [])
+    )
+    assert data["count"] == computed_count
+
+
+def test_cross_board_diagnostics_provenance_surface(client, monkeypatch, tmp_path):
+    """Diagnostics endpoint must expose registry_importable / plugin_enabled / provider_registered / enforcement_active."""
+    r = client.get("/api/plugins/kanban/cross-board-diagnostics")
+    assert r.status_code == 200
+    data = r.json()
+    assert "registry_importable" in data
+    assert "registry_readable" in data
+    assert "plugin_enabled" in data
+    assert "provider_registered" in data
+    assert "enforcement_active" in data
+    # enforcement_active = plugin_enabled and provider_registered
+    assert data["enforcement_active"] == (data["plugin_enabled"] and data["provider_registered"])
+
+# ---------------------------------------------------------------------------
+# Degraded-board safety / health surfacing (HP-KDB-08)
+# ---------------------------------------------------------------------------
+
+
+def _assert_test_kanban_path_is_sandboxed(path: Path, tmp_root: Path) -> None:
+    resolved = path.expanduser().resolve()
+    expected = tmp_root.expanduser().resolve()
+    live_root = Path("/home/openclaw/.hermes/kanban").resolve()
+    assert str(resolved).startswith(str(expected)), (resolved, expected)
+    assert not str(resolved).startswith(str(live_root)), resolved
+
+
+def test_board_endpoint_returns_degraded_payload_for_corrupt_guard(client, monkeypatch, tmp_path):
+    backup = tmp_path / "kanban.db.corrupt.test.bak"
+    err = kb.KanbanDbCorruptError(tmp_path / "kanban.db", backup, "integrity_check failed")
+
+    def _raise_connect(*_args, **_kwargs):
+        raise err
+
+    monkeypatch.setattr(kb, "connect", _raise_connect)
+    r = client.get("/api/plugins/kanban/board")
+    assert r.status_code == 200, r.text
+    payload = r.json()
+    assert payload["degraded"] is True
+    assert payload["reason"] == "integrity_check failed"
+    assert payload["corrupt_backup_path"] == str(backup)
+    assert payload["repair_candidate_available"] is True
+    assert payload["columns"] == []
+    assert payload["tenants"] == []
+    assert payload["assignees"] == []
+
+
+def test_boards_endpoint_health_marks_invalid_sqlite_header_degraded(client, kanban_home, monkeypatch):
+    kb.create_board("broken")
+    db_path = kb.kanban_db_path("broken")
+    _assert_test_kanban_path_is_sandboxed(db_path, kanban_home)
+    db_path.write_bytes(b"not a sqlite database")
+
+    plugin_mod = sys.modules["hermes_dashboard_plugin_kanban_test"]
+    original_counts = plugin_mod._board_counts
+
+    def _counts_guard(slug):
+        if slug == "broken":
+            raise AssertionError("degraded board counts must not open kanban.db")
+        return original_counts(slug)
+
+    monkeypatch.setattr(plugin_mod, "_board_counts", _counts_guard)
+
+    r = client.get("/api/plugins/kanban/boards")
+    assert r.status_code == 200, r.text
+    boards = {b["slug"]: b for b in r.json()["boards"]}
+    health = boards["broken"]["health"]
+    assert health["status"] == "degraded"
+    assert health["integrity_check"] == "failed"
+    assert health["foreign_key_check"] == "skipped"
+    assert health["repair_candidate_available"] is False
+
+
+def test_dashboard_bundle_contains_degraded_board_ui(repo_root=None):
+    root = Path(__file__).resolve().parents[2]
+    js = (root / "plugins" / "kanban" / "dashboard" / "dist" / "index.js").read_text()
+    css = (root / "plugins" / "kanban" / "dashboard" / "dist" / "style.css").read_text()
+    assert "DegradedBoardNotice" in js
+    assert "boardHealthStatus" in js
+    assert "hermes-kanban-degraded" in css
+    assert "hermes-kanban-board-health" in css

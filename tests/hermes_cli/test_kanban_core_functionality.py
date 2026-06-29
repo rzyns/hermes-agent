@@ -34,6 +34,10 @@ def kanban_home(tmp_path, monkeypatch):
     home = tmp_path / ".hermes"
     home.mkdir()
     monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.delenv("HERMES_KANBAN_HOME", raising=False)
+    monkeypatch.delenv("HERMES_KANBAN_DB", raising=False)
+    monkeypatch.delenv("HERMES_KANBAN_BOARD", raising=False)
+    monkeypatch.delenv("HERMES_KANBAN_WORKSPACES_ROOT", raising=False)
     # Existing crash-detection tests pre-date the grace window; pin to 0
     # so they keep their immediate-reclaim semantics.
     monkeypatch.setenv("HERMES_KANBAN_CRASH_GRACE_SECONDS", "0")
@@ -85,6 +89,87 @@ def test_no_idempotency_key_never_collides(kanban_home):
         a = kb.create_task(conn, title="a")
         b = kb.create_task(conn, title="b")
         assert a != b
+    finally:
+        conn.close()
+
+
+# ---------------------------------------------------------------------------
+# Cross-board dependency provider seam
+# ---------------------------------------------------------------------------
+
+def test_claim_task_rejects_unsatisfied_external_blocker(kanban_home):
+    """External dependency providers participate in the hard claim gate.
+
+    Even if a child task is already marked ``ready``, a provider-reported
+    unsatisfied external blocker must prevent ``ready -> running`` and demote
+    the child back to ``todo`` so the dispatcher cannot spawn it accidentally.
+    """
+    from hermes_cli import kanban_dependencies as kd
+
+    class BlockingProvider:
+        def blockers_for(self, *, board, task_id):
+            return [
+                kd.ExternalBlocker(
+                    parent_board="research-decision-queue",
+                    parent_id="t_parent",
+                    status="todo",
+                    kind="depends_on_decision",
+                    reason="waiting on research decision",
+                    satisfied=False,
+                    provenance={"source": "test"},
+                )
+            ]
+
+    conn = kb.connect(board="default")
+    try:
+        tid = kb.create_task(conn, title="downstream", assignee="worker")
+
+        with kd.scoped_dependency_provider(BlockingProvider()):
+            claimed = kb.claim_task(conn, tid, board="default")
+
+        assert claimed is None
+        task = kb.get_task(conn, tid)
+        assert task.status == "todo"
+        events = kb.list_events(conn, tid)
+        rejected = [e for e in events if e.kind == "claim_rejected"]
+        assert rejected
+        assert rejected[-1].payload["reason"] == "external_blockers"
+        assert rejected[-1].payload["blockers"][0]["parent_board"] == "research-decision-queue"
+        assert rejected[-1].payload["blockers"][0]["parent_id"] == "t_parent"
+    finally:
+        conn.close()
+
+
+def test_recompute_ready_does_not_promote_unsatisfied_external_blocker(kanban_home):
+    """External blockers participate in the normal todo -> ready promotion gate."""
+    from hermes_cli import kanban_dependencies as kd
+
+    class BlockingProvider:
+        def blockers_for(self, *, board, task_id):
+            return [
+                kd.ExternalBlocker(
+                    parent_board="research-decision-queue",
+                    parent_id="t_parent",
+                    status="running",
+                    kind="depends_on_decision",
+                    reason="waiting on research decision",
+                    satisfied=False,
+                    provenance={"source": "test"},
+                )
+            ]
+
+    conn = kb.connect(board="default")
+    try:
+        tid = kb.create_task(conn, title="downstream", assignee="worker")
+        with kb.write_txn(conn):
+            conn.execute("UPDATE tasks SET status = 'todo' WHERE id = ?", (tid,))
+
+        with kd.scoped_dependency_provider(BlockingProvider()):
+            promoted = kb.recompute_ready(conn, board="default")
+
+        assert promoted == 0
+        task = kb.get_task(conn, tid)
+        assert task.status == "todo"
     finally:
         conn.close()
 
@@ -3754,13 +3839,11 @@ def test_gateway_dispatcher_disables_corrupt_board_without_traceback(
     assert sum("not a valid SQLite database" in msg for msg in messages) == 1
     assert not any("tick failed on board" in msg for msg in messages)
     assert not any(record.exc_info for record in caplog.records)
-    # First tick connect (dispatch) + two probes per `_has_ready_work` call
-    # (ready then review, both via _kb.connect). The second dispatch tick
-    # skips the dispatch connect because the corrupt board fingerprint is
-    # disabled, but the ready/review probes still each connect. PR f55d94a1e
-    # added the review-column probe alongside the existing ready-column
-    # probe, bumping this from 3 → 5.
-    assert calls["connect"] == 5
+    # First tick connect from auto-decompose plus first dispatch connect.
+    # Once the dispatcher identifies the corrupt board fingerprint, both
+    # later dispatch ticks and health probes skip it until the file changes
+    # or the quarantine timer expires, preventing per-tick probe churn.
+    assert calls["connect"] == 2
 
 
 def test_gateway_dispatcher_retries_corrupt_board_after_quarantine(
@@ -4591,3 +4674,126 @@ def test_dispatch_once_stale_disabled_when_timeout_zero(kanban_home, monkeypatch
         )
         assert res.stale == [], "stale_timeout_seconds=0 should disable detection"
         assert kb.get_task(conn, t).status == "running"
+
+
+# ---------------------------------------------------------------------------
+# Maintenance mode / durability / WAL hygiene (HP-KDB-09)
+# ---------------------------------------------------------------------------
+
+
+def _assert_sandboxed_kanban_db_path(board: str, expected_root: Path) -> Path:
+    resolved = kb.kanban_db_path(board).expanduser().resolve()
+    expected = expected_root.expanduser().resolve()
+    live_root = Path("/home/openclaw/.hermes/kanban").resolve()
+    assert str(resolved).startswith(str(expected)), (resolved, expected)
+    assert not str(resolved).startswith(str(live_root)), resolved
+    return resolved
+
+
+def test_kanban_durability_defaults_full_and_rejects_unsafe_values():
+    assert kb._resolve_kanban_durability(None) == "FULL"
+    assert kb._resolve_kanban_durability("") == "FULL"
+    assert kb._resolve_kanban_durability("full") == "FULL"
+    assert kb._resolve_kanban_durability("normal") == "NORMAL"
+    assert kb._resolve_kanban_durability("off") == "FULL"
+    assert kb._resolve_kanban_durability("unsafe") == "FULL"
+
+
+def test_kanban_wal_sidecars_are_confined_to_tmp_root(kanban_home):
+    db_path = _assert_sandboxed_kanban_db_path("wal-hygiene", kanban_home)
+    with kb.connect_closing(board="wal-hygiene") as conn:
+        mode = conn.execute("PRAGMA journal_mode").fetchone()[0].lower()
+        synchronous = conn.execute("PRAGMA synchronous").fetchone()[0]
+    assert mode in {"wal", "delete"}
+    assert synchronous in {1, 2}  # NORMAL or FULL depending on config/fs fallback
+    for suffix in ("-wal", "-shm"):
+        sidecar = Path(str(db_path) + suffix)
+        if sidecar.exists():
+            _assert_sandboxed_kanban_db_path("wal-hygiene", kanban_home)
+            assert str(sidecar.resolve()).startswith(str(kanban_home.resolve()))
+
+
+def test_board_maintenance_metadata_does_not_open_sqlite(kanban_home, monkeypatch):
+    kb.create_board("maint")
+    db_path = _assert_sandboxed_kanban_db_path("maint", kanban_home)
+    before_mtime = db_path.stat().st_mtime_ns
+
+    def _forbidden_connect(*_args, **_kwargs):
+        raise AssertionError("maintenance metadata toggle must not open kanban.db")
+
+    monkeypatch.setattr(kb, "connect", _forbidden_connect)
+    meta = kb.set_board_maintenance("maint", True)
+    assert meta["maintenance"] is True
+    assert kb.board_in_maintenance(meta) is True
+    assert db_path.stat().st_mtime_ns == before_mtime
+
+
+def test_cli_dispatch_global_maintenance_skips_without_db_open(monkeypatch, capsys):
+    from hermes_cli import kanban as kanban_cli
+    import hermes_cli.config as config_mod
+
+    monkeypatch.setattr(config_mod, "load_config", lambda: {"kanban": {"maintenance_mode": True}})
+
+    def _forbidden_connect_closing(*_args, **_kwargs):
+        raise AssertionError("dispatch must not open kanban.db during maintenance")
+
+    monkeypatch.setattr(kanban_cli.kb, "connect_closing", _forbidden_connect_closing)
+    args = argparse.Namespace(
+        board="sandbox",
+        json=True,
+        dry_run=True,
+        max=None,
+        failure_limit=kb.DEFAULT_SPAWN_FAILURE_LIMIT,
+    )
+    assert kanban_cli._cmd_dispatch(args) == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["maintenance_mode"] is True
+    assert payload["spawned"] == []
+    assert payload["promoted"] == 0
+
+
+
+def test_run_slash_dispatch_global_maintenance_skips_before_init_db(kanban_home, monkeypatch):
+    import hermes_cli.config as config_mod
+
+    monkeypatch.setattr(config_mod, "load_config", lambda: {"kanban": {"maintenance_mode": True}})
+
+    def _forbidden_init(*_args, **_kwargs):
+        raise AssertionError("top-level dispatch must not init/open DB during maintenance")
+
+    monkeypatch.setattr(kb, "init_db", _forbidden_init)
+    out = run_slash("dispatch --json")
+    payload = json.loads(out)
+    assert payload["maintenance_mode"] is True
+    assert payload["spawned"] == []
+
+
+def test_run_slash_dispatch_current_board_maintenance_skips_db_open(kanban_home, monkeypatch):
+    kb.create_board("maint-current")
+    kb.set_current_board("maint-current")
+    kb.set_board_maintenance("maint-current", True)
+    assert kb.board_in_maintenance(None) is True
+
+    def _forbidden_connect_closing(*_args, **_kwargs):
+        raise AssertionError("dispatch must not open DB for a maintenance current board")
+
+    monkeypatch.setattr(kb, "connect_closing", _forbidden_connect_closing)
+    out = run_slash("dispatch --json")
+    payload = json.loads(out)
+    assert payload["maintenance_mode"] is True
+    assert payload["board"] == "maint-current"
+    assert payload["spawned"] == []
+
+
+
+def test_run_slash_daemon_force_current_board_maintenance_skips_init_db(kanban_home, monkeypatch):
+    kb.create_board("maint-daemon")
+    kb.set_current_board("maint-daemon")
+    kb.set_board_maintenance("maint-daemon", True)
+
+    def _forbidden_init(*_args, **_kwargs):
+        raise AssertionError("daemon --force must not init/open DB for a maintenance board")
+
+    monkeypatch.setattr(kb, "init_db", _forbidden_init)
+    out = run_slash("daemon --force")
+    assert "maintenance mode" in out.lower()

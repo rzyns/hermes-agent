@@ -11,9 +11,11 @@ Covers:
 
 import json
 import time
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 
+from plugins.memory.honcho import HonchoMemoryProvider
 from plugins.memory.honcho.client import HonchoClientConfig
 from plugins.memory.honcho.session import (
     HonchoSession,
@@ -44,6 +46,36 @@ def _make_manager(write_frequency="turn") -> HonchoSessionManager:
     mgr = HonchoSessionManager(config=cfg)
     mgr._honcho = MagicMock()
     return mgr
+
+
+class _FakePeer:
+    def __init__(self, peer_id: str):
+        self.peer_id = peer_id
+
+    def message(self, content: str):
+        return SimpleNamespace(peer_id=self.peer_id, content=content)
+
+
+def _make_manager_with_flush_fakes(message_noise_filters=None):
+    cfg = HonchoClientConfig(
+        write_frequency="turn",
+        api_key="test-key",
+        enabled=True,
+        message_noise_filters=message_noise_filters or [],
+    )
+    mgr = HonchoSessionManager(config=cfg)
+    session = _make_session(
+        key="cli:test",
+        user_peer_id="eri",
+        assistant_peer_id="hermes",
+        honcho_session_id="cli-test",
+    )
+    mgr._cache[session.key] = session
+    mgr._peers_cache[session.user_peer_id] = _FakePeer(session.user_peer_id)
+    mgr._peers_cache[session.assistant_peer_id] = _FakePeer(session.assistant_peer_id)
+    honcho_session = MagicMock()
+    mgr._sessions_cache[session.honcho_session_id] = honcho_session
+    return mgr, session, honcho_session
 
 
 # ---------------------------------------------------------------------------
@@ -90,6 +122,33 @@ class TestWriteFrequencyParsing:
         }))
         cfg = HonchoClientConfig.from_global_config(config_path=cfg_file)
         assert cfg.write_frequency == "session"
+
+    def test_message_noise_filters_parse_root_strings_and_objects(self, tmp_path):
+        cfg_file = tmp_path / "config.json"
+        cfg_file.write_text(json.dumps({
+            "apiKey": "k",
+            "messageNoiseFilters": [
+                "startup smoke",
+                {"name": "task id", "pattern": "^t_[0-9a-f]{8}$"},
+                {"regex": "^proc_.*$"},
+            ],
+        }))
+        cfg = HonchoClientConfig.from_global_config(config_path=cfg_file)
+        assert cfg.message_noise_filters == [
+            "startup smoke",
+            "^t_[0-9a-f]{8}$",
+            "^proc_.*$",
+        ]
+
+    def test_message_noise_filters_host_block_overrides_root(self, tmp_path):
+        cfg_file = tmp_path / "config.json"
+        cfg_file.write_text(json.dumps({
+            "apiKey": "k",
+            "messageNoiseFilters": ["root-filter"],
+            "hosts": {"hermes": {"messageNoiseFilters": ["host-filter"]}},
+        }))
+        cfg = HonchoClientConfig.from_global_config(config_path=cfg_file)
+        assert cfg.message_noise_filters == ["host-filter"]
 
     def test_defaults_to_async(self, tmp_path):
         cfg_file = tmp_path / "config.json"
@@ -175,11 +234,86 @@ class TestResolveSessionNameTitle:
         result = cfg.resolve_session_name("/some/dir", session_title="my-title", session_id="20260309_175514_9797dd")
         assert result == "my-title"
 
-    def test_gateway_key_beats_per_session_id(self):
-        # Gateways keep per-chat isolation even in per-session.
+    def test_gateway_key_beats_title_for_gateway_sessions(self):
         cfg = HonchoClientConfig(session_strategy="per-session")
-        result = cfg.resolve_session_name("/some/dir", gateway_session_key="agent:main:telegram:dm:42", session_id="20260309_175514_9797dd")
-        assert result == "agent-main-telegram-dm-42"
+        result = cfg.resolve_session_name(
+            "/some/dir",
+            session_title="pretty title",
+            session_id="20260309_175514_9797dd",
+            gateway_session_key="webui:session:abc123",
+        )
+        assert result == "webui-session-abc123"
+
+    def test_gateway_key_with_peer_prefix(self):
+        cfg = HonchoClientConfig(
+            session_strategy="per-session",
+            peer_name="eri",
+            session_peer_prefix=True,
+        )
+        result = cfg.resolve_session_name(
+            "/some/dir",
+            session_title="pretty title",
+            session_id="20260309_175514_9797dd",
+            gateway_session_key="webui:session:abc123",
+        )
+        assert result == "eri-webui-session-abc123"
+
+    def test_gateway_key_beats_manual_map_and_title(self):
+        cfg = HonchoClientConfig(
+            session_strategy="per-session",
+            sessions={"/some/dir": "manual-name"},
+        )
+        result = cfg.resolve_session_name(
+            "/some/dir",
+            session_title="pretty title",
+            session_id="20260309_175514_9797dd",
+            gateway_session_key="webui:session:abc123",
+        )
+        assert result == "webui-session-abc123"
+
+    def test_invalid_gateway_key_falls_back_to_per_session_id(self):
+        cfg = HonchoClientConfig(session_strategy="per-session")
+        result = cfg.resolve_session_name(
+            "/some/dir",
+            session_title="pretty title",
+            session_id="20260309_175514_9797dd",
+            gateway_session_key="!!! ###",
+        )
+        assert result == "20260309_175514_9797dd"
+
+    def test_invalid_gateway_key_falls_back_to_title_for_non_per_session(self):
+        cfg = HonchoClientConfig(session_strategy="per-directory")
+        result = cfg.resolve_session_name(
+            "/some/dir",
+            session_title="pretty title",
+            gateway_session_key="!!! ###",
+        )
+        assert result == "pretty-title"
+
+    def test_overlong_gateway_key_with_peer_prefix_is_limited(self):
+        cfg = HonchoClientConfig(
+            session_strategy="per-session",
+            peer_name="eri",
+            session_peer_prefix=True,
+        )
+        result = cfg.resolve_session_name(
+            "/some/dir",
+            gateway_session_key="webui:" + "x" * 180,
+        )
+        assert result.startswith("eri-webui-")
+        assert len(result) <= cfg._HONCHO_SESSION_ID_MAX_LEN
+
+    def test_session_name_candidates_include_gateway_primary_and_legacy_title(self):
+        cfg = HonchoClientConfig(session_strategy="per-session")
+        candidates = cfg.resolve_session_name_candidates(
+            "/some/dir",
+            session_title="pretty title",
+            session_id="20260309_175514_9797dd",
+            gateway_session_key="webui:session:abc123",
+        )
+        assert candidates[0] == ("gateway_session_key", "webui-session-abc123")
+        assert ("session_title", "pretty-title") in candidates
+        assert ("session_id", "20260309_175514_9797dd") in candidates
 
     def test_global_strategy_returns_workspace(self):
         cfg = HonchoClientConfig(session_strategy="global", workspace_id="my-workspace")
@@ -242,6 +376,135 @@ class TestSaveRouting:
             assert mock_flush.call_count == 0
             mgr.save(sess)  # turn 5
             assert mock_flush.call_count == 1
+
+
+class _CaptureSyncManager:
+    def __init__(self):
+        self.requested_session_keys = []
+        self.flushed_session_keys = []
+        self.sessions = {}
+
+    def get_or_create(self, session_key: str):
+        self.requested_session_keys.append(session_key)
+        if session_key not in self.sessions:
+            self.sessions[session_key] = _make_session(
+                key=session_key,
+                honcho_session_id=session_key,
+            )
+        return self.sessions[session_key]
+
+    def _flush_session(self, session):
+        self.flushed_session_keys.append(session.key)
+        return True
+
+
+class TestHonchoProviderSessionSwitch:
+    def _make_ready_provider(self) -> tuple[HonchoMemoryProvider, _CaptureSyncManager]:
+        provider = HonchoMemoryProvider()
+        provider._config = HonchoClientConfig(
+            session_strategy="per-session",
+            write_frequency="turn",
+            enabled=True,
+            api_key="test-key",
+        )
+        manager = _CaptureSyncManager()
+        provider._manager = manager
+        provider._session_initialized = True
+        provider._session_key = provider._resolve_session_key(provider._config, "old-session")
+        return provider, manager
+
+    def test_session_switch_updates_cached_key_for_later_sync_turns(self):
+        provider, manager = self._make_ready_provider()
+
+        provider.sync_turn("before", "old response")
+        provider._sync_thread.join(timeout=2)
+
+        provider.on_session_switch(
+            "new-session",
+            parent_session_id="old-session",
+            reset=False,
+        )
+        provider.sync_turn("after", "new response")
+        provider._sync_thread.join(timeout=2)
+
+        assert manager.requested_session_keys == ["old-session", "new-session"]
+        assert manager.flushed_session_keys == ["old-session", "new-session"]
+        assert provider._session_key == "new-session"
+
+    def test_session_switch_prefers_gateway_key_over_title(self):
+        provider, manager = self._make_ready_provider()
+
+        provider.on_session_switch(
+            "new-session",
+            parent_session_id="old-session",
+            session_title="pretty title",
+            gateway_session_key="webui:session:abc123",
+            reset=False,
+        )
+        provider.sync_turn("after", "new response")
+        provider._sync_thread.join(timeout=2)
+
+        assert manager.requested_session_keys == ["webui-session-abc123"]
+        assert manager.flushed_session_keys == ["webui-session-abc123"]
+        assert provider._session_key == "webui-session-abc123"
+
+
+class TestMessageNoiseFilters:
+    FILTERS = [
+        r"\bstartup smoke\b",
+        r"\brespond\s+OK\s+only\b",
+        r"^\s*t_[0-9a-f]{8}\s*$",
+        r"^\s*proc_[A-Za-z0-9_:-]+\s*$",
+        r"\bmessage sent at timestamp\b",
+        r"\bone[- ]off command[- ]format instruction\b",
+    ]
+
+    def test_flush_filters_transient_noise_and_keeps_durable_message(self):
+        mgr, session, honcho_session = _make_manager_with_flush_fakes(self.FILTERS)
+        session.add_message("user", "startup smoke: respond OK only")
+        session.add_message("user", "t_e7f0d4a8")
+        session.add_message("assistant", "proc_7c69a48298f2")
+        session.add_message("assistant", "message sent at timestamp 2026-06-21T10:00:00Z")
+        session.add_message("user", "one-off command-format instruction: reply CSV for this command")
+        session.add_message("user", "Janusz prefers rigorous review before memory cleanup.")
+
+        assert mgr._flush_session(session) is True
+
+        honcho_session.add_messages.assert_called_once()
+        sent = honcho_session.add_messages.call_args.args[0]
+        assert [message.content for message in sent] == [
+            "Janusz prefers rigorous review before memory cleanup."
+        ]
+        assert all(message.get("_synced") for message in session.messages)
+        assert [message.get("_filtered", False) for message in session.messages] == [
+            True,
+            True,
+            True,
+            True,
+            True,
+            False,
+        ]
+
+    def test_flush_marks_all_filtered_messages_synced_without_add_messages(self):
+        mgr, session, honcho_session = _make_manager_with_flush_fakes(self.FILTERS)
+        session.add_message("user", "respond OK only")
+        session.add_message("assistant", "t_03c8f3d0")
+
+        assert mgr._flush_session(session) is True
+
+        honcho_session.add_messages.assert_not_called()
+        assert all(message.get("_synced") for message in session.messages)
+        assert all(message.get("_filtered") for message in session.messages)
+
+    def test_invalid_noise_filter_is_ignored_fail_open(self):
+        mgr, session, honcho_session = _make_manager_with_flush_fakes(["["])
+        session.add_message("user", "startup smoke: respond OK only")
+
+        assert mgr._flush_session(session) is True
+
+        honcho_session.add_messages.assert_called_once()
+        sent = honcho_session.add_messages.call_args.args[0]
+        assert [message.content for message in sent] == ["startup smoke: respond OK only"]
 
 
 # ---------------------------------------------------------------------------

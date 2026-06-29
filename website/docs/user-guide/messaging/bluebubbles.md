@@ -38,6 +38,8 @@ BLUEBUBBLES_SERVER_URL=http://192.168.1.10:1234
 BLUEBUBBLES_PASSWORD=your-server-password
 ```
 
+If the BlueBubbles Server runs on a different machine than Hermes, set `BLUEBUBBLES_WEBHOOK_HOST` to an address that the Mac can reach. The value is both the webhook listener bind host and the host advertised to BlueBubbles when Hermes registers its webhook. If the Mac cannot connect directly to Hermes (for example, WSL/Windows firewall blocks the port), keep `BLUEBUBBLES_WEBHOOK_HOST=127.0.0.1` and provide a reverse tunnel on the Mac, such as `ssh -N -R 127.0.0.1:8645:127.0.0.1:8645 mac-host`, so `localhost:8645` on the Mac forwards to Hermes.
+
 #### Optional: Require mentions in group chats
 
 By default, Hermes responds to every authorized BlueBubbles/iMessage DM or group message. To make group chats opt-in, enable mention gating:

@@ -1839,6 +1839,8 @@ def invoke_tool(agent, function_name: str, function_args: dict, effective_task_i
     if not isinstance(function_args, dict):
         function_args = {}
 
+    turn_id = getattr(agent, "_current_turn_id", "") or ""
+    api_request_id = getattr(agent, "_current_api_request_id", "") or ""
     _tool_middleware_trace = list(tool_request_middleware_trace or [])
     try:
         from hermes_cli.middleware import apply_tool_request_middleware
@@ -1850,8 +1852,8 @@ def invoke_tool(agent, function_name: str, function_args: dict, effective_task_i
                 task_id=effective_task_id or "",
                 session_id=getattr(agent, "session_id", "") or "",
                 tool_call_id=tool_call_id or "",
-                turn_id=getattr(agent, "_current_turn_id", "") or "",
-                api_request_id=getattr(agent, "_current_api_request_id", "") or "",
+                turn_id=turn_id,
+                api_request_id=api_request_id,
             )
             function_args = _tool_request_mw.payload
             _tool_middleware_trace = _tool_request_mw.trace
@@ -1869,8 +1871,8 @@ def invoke_tool(agent, function_name: str, function_args: dict, effective_task_i
                 task_id=effective_task_id or "",
                 session_id=getattr(agent, "session_id", "") or "",
                 tool_call_id=tool_call_id or "",
-                turn_id=getattr(agent, "_current_turn_id", "") or "",
-                api_request_id=getattr(agent, "_current_api_request_id", "") or "",
+                turn_id=turn_id,
+                api_request_id=api_request_id,
                 middleware_trace=list(_tool_middleware_trace),
             )
         except Exception:
@@ -1886,8 +1888,8 @@ def invoke_tool(agent, function_name: str, function_args: dict, effective_task_i
                 task_id=effective_task_id or "",
                 session_id=getattr(agent, "session_id", "") or "",
                 tool_call_id=tool_call_id or "",
-                turn_id=getattr(agent, "_current_turn_id", "") or "",
-                api_request_id=getattr(agent, "_current_api_request_id", "") or "",
+                turn_id=turn_id,
+                api_request_id=api_request_id,
                 status="blocked",
                 error_type="plugin_block",
                 error_message=block_message,
@@ -1901,6 +1903,7 @@ def invoke_tool(agent, function_name: str, function_args: dict, effective_task_i
 
     def _finish_agent_tool(result: Any, observed_args: Optional[dict] = None) -> Any:
         hook_args = observed_args if isinstance(observed_args, dict) else function_args
+        duration_ms = int((time.monotonic() - tool_start_time) * 1000)
         try:
             from model_tools import _emit_post_tool_call_hook
             _emit_post_tool_call_hook(
@@ -1910,13 +1913,39 @@ def invoke_tool(agent, function_name: str, function_args: dict, effective_task_i
                 task_id=effective_task_id or "",
                 session_id=getattr(agent, "session_id", "") or "",
                 tool_call_id=tool_call_id or "",
-                turn_id=getattr(agent, "_current_turn_id", "") or "",
-                api_request_id=getattr(agent, "_current_api_request_id", "") or "",
-                duration_ms=int((time.monotonic() - tool_start_time) * 1000),
+                turn_id=turn_id,
+                api_request_id=api_request_id,
+                duration_ms=duration_ms,
                 middleware_trace=list(_tool_middleware_trace),
             )
         except Exception:
             pass
+
+        try:
+            from hermes_cli.plugins import has_hook, invoke_hook
+            from model_tools import _tool_result_observer_fields
+            if has_hook("transform_tool_result"):
+                status, error_type, error_message = _tool_result_observer_fields(result)
+                hook_results = invoke_hook(
+                    "transform_tool_result",
+                    tool_name=function_name,
+                    args=hook_args,
+                    result=result,
+                    task_id=effective_task_id or "",
+                    session_id=getattr(agent, "session_id", "") or "",
+                    tool_call_id=tool_call_id or "",
+                    turn_id=turn_id,
+                    api_request_id=api_request_id,
+                    duration_ms=duration_ms,
+                    status=status,
+                    error_type=error_type,
+                    error_message=error_message,
+                )
+                for hook_result in hook_results:
+                    if isinstance(hook_result, str):
+                        return hook_result
+        except Exception as _hook_err:
+            logger.debug("transform_tool_result hook error: %s", _hook_err)
         return result
 
     if function_name == "todo":
@@ -2011,8 +2040,8 @@ def invoke_tool(agent, function_name: str, function_args: dict, effective_task_i
                 function_name, next_args, effective_task_id,
                 tool_call_id=tool_call_id,
                 session_id=agent.session_id or "",
-                turn_id=getattr(agent, "_current_turn_id", "") or "",
-                api_request_id=getattr(agent, "_current_api_request_id", "") or "",
+                turn_id=turn_id,
+                api_request_id=api_request_id,
                 enabled_tools=list(agent.valid_tool_names) if agent.valid_tool_names else None,
                 skip_pre_tool_call_hook=True,
                 skip_tool_request_middleware=True,
@@ -2031,8 +2060,8 @@ def invoke_tool(agent, function_name: str, function_args: dict, effective_task_i
         task_id=effective_task_id or "",
         session_id=getattr(agent, "session_id", "") or "",
         tool_call_id=tool_call_id or "",
-        turn_id=getattr(agent, "_current_turn_id", "") or "",
-        api_request_id=getattr(agent, "_current_api_request_id", "") or "",
+        turn_id=turn_id,
+        api_request_id=api_request_id,
     )
 
 

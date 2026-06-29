@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import sys
 from pathlib import Path
 
 import pytest
@@ -166,7 +167,7 @@ def test_promote_blocked_task_works(conn):
 
 
 def _promote_ns(task_id, *, ids=None, reason=None, force=False,
-                dry_run=False, as_json=False):
+                dry_run=False, as_json=False, board=None):
     return argparse.Namespace(
         task_id=task_id,
         reason=list(reason or []),
@@ -174,7 +175,21 @@ def _promote_ns(task_id, *, ids=None, reason=None, force=False,
         force=force,
         dry_run=dry_run,
         json=as_json,
+        board=board,
     )
+
+
+def _clear_kanban_cross_deps_discovery_cache(monkeypatch):
+    import hermes_cli.plugins as plugins_mod
+
+    monkeypatch.setattr(plugins_mod, "_plugin_manager", None)
+    for key in list(sys.modules):
+        if (
+            key.startswith("hermes_plugins.")
+            or key == "plugins.kanban_cross_deps"
+            or key.startswith("plugins.kanban_cross_deps.")
+        ):
+            del sys.modules[key]
 
 
 def test_cli_promote_bulk_ids_promotes_all(kanban_home, capsys):
@@ -235,6 +250,54 @@ def test_cli_promote_single_json_stays_flat_object(kanban_home, capsys):
     payload = json.loads(capsys.readouterr().out)
     assert isinstance(payload, dict)
     assert payload["task_id"] == child and payload["promoted"] is True
+
+
+def test_cli_promote_loads_enabled_external_dependency_provider(
+    kanban_home, capsys, monkeypatch
+):
+    """Built-in `kanban promote` must honor providers from enabled plugins.
+
+    Top-level CLI startup skips plugin discovery for built-in commands such as
+    `kanban`; this regression test verifies the promote path still loads enabled
+    Kanban dependency providers before deciding a task is promotable.
+    """
+    from hermes_cli import kanban_dependencies as kd
+    from plugins.kanban_cross_deps.store import CrossBoardRegistry
+
+    (kanban_home / "config.yaml").write_text(
+        "plugins:\n  enabled:\n    - kanban-cross-deps\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(kd, "_providers", [])
+    _clear_kanban_cross_deps_discovery_cache(monkeypatch)
+
+    with kb.connect(board="other") as parent_conn:
+        parent = kb.create_task(parent_conn, title="external parent")
+        parent_conn.execute("UPDATE tasks SET status='blocked' WHERE id=?", (parent,))
+    with kb.connect(board="default") as child_conn:
+        child = kb.create_task(child_conn, title="child")
+        child_conn.execute("UPDATE tasks SET status='todo' WHERE id=?", (child,))
+
+    CrossBoardRegistry().add(
+        parent_board="other",
+        parent_id=parent,
+        child_board="default",
+        child_id=child,
+        kind="blocks",
+        blocking=True,
+        source="test",
+    )
+
+    rc = kb_cli._cmd_promote(_promote_ns(child, dry_run=True, as_json=True, board="default"))
+    assert rc == 1
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["task_id"] == child
+    assert payload["promoted"] is False
+    assert "blocked by external dependencies" in payload["error"]
+    assert f"other/{parent}" in payload["error"]
+
+    with kb.connect(board="default") as conn:
+        assert kb.get_task(conn, child).status == "todo"
 
 
 def test_cli_promote_dedupes_duplicate_ids(kanban_home, capsys):

@@ -74,6 +74,23 @@ DEFAULT_PORT = 8644
 _INSECURE_NO_AUTH = "INSECURE_NO_AUTH"
 _DYNAMIC_ROUTES_FILENAME = "webhook_subscriptions.json"
 _RATE_WINDOW_SECONDS = 60.0
+_WEBHOOK_ACTION_ALIASES = {
+    "kanban_intake_links": "kanban_intake_links",
+    "kanban-intake-links": "kanban_intake_links",
+    "kanban_intake_link": "kanban_intake_links",
+    "kanban-intake-link": "kanban_intake_links",
+    "intake-links": "kanban_intake_links",
+    "intake_link": "kanban_intake_links",
+    "intake-link": "kanban_intake_links",
+}
+
+
+def _normalize_webhook_action(action: Any) -> Optional[str]:
+    """Return canonical deterministic action name, or None when invalid."""
+    action = str(action or "").strip().lower()
+    if not action:
+        return ""
+    return _WEBHOOK_ACTION_ALIASES.get(action)
 
 # Hostnames/IP literals that only serve connections originating on the same
 # machine. Anything else is treated as a public bind for safety-rail purposes.
@@ -191,6 +208,20 @@ class WebhookAdapter(BasePlatformAdapter):
                         f"real target (telegram, discord, slack, github_comment, etc.)."
                     )
 
+            action = _normalize_webhook_action(route.get("action", ""))
+            if route.get("action") and action is None:
+                raise ValueError(
+                    f"[webhook] Route '{name}' has unknown deterministic action "
+                    f"'{route.get('action')}'. Supported action: kanban_intake_links."
+                )
+            if action:
+                if route.get("deliver_only"):
+                    raise ValueError(
+                        f"[webhook] Route '{name}' combines deterministic action "
+                        "with deliver_only=true. These no-agent modes are mutually exclusive."
+                    )
+                route["action"] = action
+
         app = web.Application()
         app.router.add_get("/health", self._handle_health)
         app.router.add_post("/webhooks/{route_name}", self._handle_webhook)
@@ -261,6 +292,9 @@ class WebhookAdapter(BasePlatformAdapter):
 
         if deliver_type == "github_comment":
             return await self._deliver_github_comment(content, delivery)
+
+        if deliver_type == "origin":
+            return await self._deliver_origin(content, delivery)
 
         # Cross-platform delivery — any platform with a gateway adapter.
         # Check both built-in names and plugin-registered platforms.
@@ -343,6 +377,139 @@ class WebhookAdapter(BasePlatformAdapter):
     async def get_chat_info(self, chat_id: str) -> Dict[str, Any]:
         return {"name": chat_id, "type": "webhook"}
 
+    def _delivery_id_from_request(self, request: "web.Request") -> str:
+        """Resolve provider delivery/request id used for webhook idempotency."""
+        return request.headers.get(
+            "X-GitHub-Delivery",
+            request.headers.get(
+                "svix-id",
+                request.headers.get("X-Request-ID", str(int(time.time() * 1000))),
+            ),
+        )
+
+    def _event_type_from_payload(
+        self, request: "web.Request", payload: Any = None
+    ) -> str:
+        """Resolve event type from headers, then dict payload fields."""
+        event_type = (
+            request.headers.get("X-GitHub-Event", "")
+            or request.headers.get("X-GitLab-Event", "")
+        )
+        if event_type:
+            return event_type
+        if isinstance(payload, dict):
+            return payload.get("event_type", "") or payload.get("type", "") or "unknown"
+        return "unknown"
+
+    def _split_link_lines(self, text: str) -> List[str]:
+        links = [line.strip() for line in text.splitlines() if line.strip()]
+        if not links and text.strip():
+            links = [text.strip()]
+        return links
+
+    def _links_from_json_value(self, value: Any) -> List[str]:
+        if isinstance(value, str):
+            return self._split_link_lines(value)
+        if isinstance(value, list):
+            links: List[str] = []
+            for idx, item in enumerate(value):
+                if not isinstance(item, str):
+                    raise ValueError(
+                        f"JSON array items must be strings; item {idx} is {type(item).__name__}"
+                    )
+                links.extend(self._split_link_lines(item))
+            return links
+        if isinstance(value, dict):
+            for key in ("links", "urls", "link", "url"):
+                if key in value:
+                    return self._links_from_json_value(value[key])
+            raise ValueError(
+                "JSON object payloads must contain a string 'url'/'link' or "
+                "string-array 'urls'/'links' field"
+            )
+        raise ValueError("Payload must be plain text, a JSON string, or a JSON array of strings")
+
+    def _extract_intake_links(self, raw_body: bytes) -> List[str]:
+        try:
+            text = raw_body.decode("utf-8-sig")
+        except UnicodeDecodeError as exc:
+            raise ValueError("Payload must be UTF-8 text or JSON") from exc
+        if not text.strip():
+            raise ValueError("At least one link is required")
+        try:
+            parsed = json.loads(text)
+        except json.JSONDecodeError:
+            links = self._split_link_lines(text)
+        else:
+            links = self._links_from_json_value(parsed)
+        if not links:
+            raise ValueError("At least one link is required")
+        return links
+
+    async def _handle_kanban_intake_links_action(
+        self,
+        *,
+        route_name: str,
+        raw_body: bytes,
+        delivery_id: str,
+    ) -> "web.Response":
+        """Deterministically ingest one-or-more URLs into Attention Intake."""
+        try:
+            links = self._extract_intake_links(raw_body)
+        except ValueError as exc:
+            return web.json_response({"error": str(exc)}, status=400)
+
+        try:
+            from hermes_cli import kanban_db as kb
+            from hermes_cli import kanban_intake_link as kil
+
+            board = kil.DEFAULT_BOARD
+            results: List[Dict[str, str]] = []
+            conn = kb.connect(board=board)
+            try:
+                for link in links:
+                    task_id = kil.create_intake_link(
+                        conn,
+                        url=link,
+                        board=board,
+                        assignee=kil.DEFAULT_ASSIGNEE,
+                        triage=kil.DEFAULT_TRIAGE,
+                        priority=kil.DEFAULT_PRIORITY,
+                        source="webhook",
+                    )
+                    results.append({"url": link, "task_id": task_id})
+            finally:
+                conn.close()
+        except Exception:
+            logger.exception(
+                "[webhook] kanban_intake_links action failed route=%s delivery=%s",
+                route_name,
+                delivery_id,
+            )
+            return web.json_response(
+                {"status": "error", "error": "Kanban intake-link ingestion failed", "delivery_id": delivery_id},
+                status=500,
+            )
+
+        logger.info(
+            "[webhook] kanban_intake_links route=%s count=%d delivery=%s",
+            route_name,
+            len(results),
+            delivery_id,
+        )
+        return web.json_response(
+            {
+                "status": "ingested",
+                "route": route_name,
+                "action": "kanban_intake_links",
+                "board": "attention-intake",
+                "count": len(results),
+                "delivery_id": delivery_id,
+                "tasks": results,
+            },
+            status=200,
+        )
+
     # ------------------------------------------------------------------
     # HTTP handlers
     # ------------------------------------------------------------------
@@ -377,6 +544,12 @@ class WebhookAdapter(BasePlatformAdapter):
             for k, v in data.items():
                 if k in self._static_routes:
                     continue
+                if not isinstance(v, dict):
+                    logger.warning(
+                        "[webhook] Dynamic route '%s' skipped: route config must be an object.",
+                        k,
+                    )
+                    continue
                 effective_secret = v.get("secret", self._global_secret)
                 if not effective_secret:
                     logger.warning(
@@ -398,6 +571,24 @@ class WebhookAdapter(BasePlatformAdapter):
                         self._host,
                     )
                     continue
+                action = _normalize_webhook_action(v.get("action", ""))
+                if v.get("action") and action is None:
+                    logger.warning(
+                        "[webhook] Dynamic route '%s' skipped: unknown deterministic action '%s'.",
+                        k,
+                        v.get("action"),
+                    )
+                    continue
+                if action and v.get("deliver_only"):
+                    logger.warning(
+                        "[webhook] Dynamic route '%s' skipped: deterministic action and "
+                        "deliver_only are mutually exclusive.",
+                        k,
+                    )
+                    continue
+                if action:
+                    v = dict(v)
+                    v["action"] = action
                 new_dynamic[k] = v
             self._dynamic_routes = new_dynamic
             self._routes = {**self._dynamic_routes, **self._static_routes}
@@ -513,6 +704,54 @@ class WebhookAdapter(BasePlatformAdapter):
                 {"error": "Rate limit exceeded"}, status=429
             )
 
+        action = _normalize_webhook_action(route_config.get("action", ""))
+        if route_config.get("action") and action is None:
+            logger.error(
+                "[webhook] Route %s has unsupported deterministic action %s",
+                route_name,
+                route_config.get("action"),
+            )
+            return web.json_response(
+                {"error": "Unsupported deterministic webhook action"}, status=500
+            )
+        if action:
+            event_type = self._event_type_from_payload(request)
+            allowed_events = route_config.get("events", [])
+            if allowed_events and event_type not in allowed_events:
+                logger.debug(
+                    "[webhook] Ignoring event %s for route %s (allowed: %s)",
+                    event_type,
+                    route_name,
+                    allowed_events,
+                )
+                return web.json_response(
+                    {"status": "ignored", "event": event_type}
+                )
+
+            delivery_id = self._delivery_id_from_request(request)
+            if not self._record_delivery_id(delivery_id, now):
+                logger.info(
+                    "[webhook] Skipping duplicate delivery %s", delivery_id
+                )
+                return web.json_response(
+                    {"status": "duplicate", "delivery_id": delivery_id},
+                    status=200,
+                )
+            if action == "kanban_intake_links":
+                return await self._handle_kanban_intake_links_action(
+                    route_name=route_name,
+                    raw_body=raw_body,
+                    delivery_id=delivery_id,
+                )
+            logger.error(
+                "[webhook] Route %s has unsupported deterministic action %s",
+                route_name,
+                route_config.get("action"),
+            )
+            return web.json_response(
+                {"error": "Unsupported deterministic webhook action"}, status=500
+            )
+
         # Parse payload
         try:
             payload = json.loads(raw_body)
@@ -528,15 +767,11 @@ class WebhookAdapter(BasePlatformAdapter):
                 return web.json_response(
                     {"error": "Cannot parse body"}, status=400
                 )
+        if not isinstance(payload, dict):
+            payload = {"payload": payload}
 
         # Check event type filter
-        event_type = (
-            request.headers.get("X-GitHub-Event", "")
-            or request.headers.get("X-GitLab-Event", "")
-            or payload.get("event_type", "")
-            or payload.get("type", "")
-            or "unknown"
-        )
+        event_type = self._event_type_from_payload(request, payload)
         allowed_events = route_config.get("events", [])
         if allowed_events and event_type not in allowed_events:
             logger.debug(
@@ -585,17 +820,10 @@ class WebhookAdapter(BasePlatformAdapter):
                 logger.warning("[webhook] Skill loading failed: %s", e)
 
         # Build a unique delivery ID
-        delivery_id = request.headers.get(
-            "X-GitHub-Delivery",
-            request.headers.get(
-                "svix-id",
-                request.headers.get("X-Request-ID", str(int(time.time() * 1000))),
-            ),
-        )
+        delivery_id = self._delivery_id_from_request(request)
 
         # ── Idempotency ─────────────────────────────────────────
         # Skip duplicate deliveries (webhook retries).
-        now = time.time()
         if not self._record_delivery_id(delivery_id, now):
             logger.info(
                 "[webhook] Skipping duplicate delivery %s", delivery_id
@@ -916,11 +1144,56 @@ class WebhookAdapter(BasePlatformAdapter):
         if deliver_type == "github_comment":
             return await self._deliver_github_comment(content, delivery)
 
+        if deliver_type == "origin":
+            return await self._deliver_origin(content, delivery)
+
         # Fall through to the cross-platform dispatcher, which validates the
         # target name and routes via the gateway runner.
         return await self._deliver_cross_platform(
             deliver_type, content, delivery
         )
+
+    async def _deliver_origin(self, content: str, delivery: dict) -> SendResult:
+        """Deliver to the configured origin/home channel.
+
+        Dynamic webhook subscriptions can be created from non-gateway contexts
+        (for example the CLI), so ``deliver=origin`` may not have a concrete
+        chat id captured at subscribe time.  Match cron's origin semantics:
+        prefer an explicit origin if the route supplied one, otherwise fall
+        back to the first connected gateway platform with a home channel.
+        """
+        origin = delivery.get("origin") or delivery.get("deliver_extra", {}).get("origin")
+        if isinstance(origin, dict) and origin.get("platform") and origin.get("chat_id"):
+            platform_name = str(origin["platform"])
+            resolved = {
+                "deliver_extra": {
+                    "chat_id": str(origin["chat_id"]),
+                }
+            }
+            thread_id = origin.get("thread_id") or origin.get("message_thread_id")
+            if thread_id:
+                resolved["deliver_extra"]["thread_id"] = str(thread_id)
+            return await self._deliver_cross_platform(platform_name, content, resolved)
+
+        if not self.gateway_runner:
+            return SendResult(success=False, error="No gateway runner for origin delivery")
+
+        for target_platform in getattr(self.gateway_runner, "adapters", {}):
+            if target_platform == Platform.WEBHOOK:
+                continue
+            home = self.gateway_runner.config.get_home_channel(target_platform)
+            if not home:
+                continue
+            resolved = {
+                "deliver_extra": {
+                    "chat_id": str(home.chat_id),
+                }
+            }
+            if home.thread_id:
+                resolved["deliver_extra"]["thread_id"] = str(home.thread_id)
+            return await self._deliver_cross_platform(target_platform.value, content, resolved)
+
+        return SendResult(success=False, error="No origin or home channel for webhook delivery")
 
     async def _deliver_github_comment(
         self, content: str, delivery: dict

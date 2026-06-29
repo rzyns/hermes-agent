@@ -34,7 +34,7 @@ from hermes_cli.dashboard_auth import list_session_providers
 # are doubled (``{{`` / ``}}``).
 _LOGIN_HTML_TEMPLATE = """\
 <!doctype html>
-<html lang="en">
+<html lang="en" data-hermes-base-path="{base_path}">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
@@ -402,7 +402,7 @@ auth gate (not recommended on untrusted networks).</p>
 
 
 # Inline script that wires every password provider form to POST JSON to
-# ``/auth/password-login`` and navigate on success. Emitted ONLY when at
+# ``<prefix>/auth/password-login`` and navigate on success. Emitted ONLY when at
 # least one ``supports_password`` provider is listed (OAuth-only login
 # pages stay script-free, preserving the no-JS contract for that case).
 #
@@ -412,6 +412,16 @@ auth gate (not recommended on untrusted networks).</p>
 _PASSWORD_FORM_SCRIPT = """\
 <script>
 (function () {
+  var basePath = document.documentElement.getAttribute('data-hermes-base-path') || '';
+  function withBase(path) {
+    return basePath ? basePath + path : path;
+  }
+  function publicNext(path) {
+    var target = path || '/';
+    if (!basePath || target.charAt(0) !== '/') { return target; }
+    if (target === basePath || target.indexOf(basePath + '/') === 0) { return target; }
+    return basePath + (target === '/' ? '/' : target);
+  }
   function handle(form) {
     form.addEventListener('submit', function (ev) {
       ev.preventDefault();
@@ -425,7 +435,7 @@ _PASSWORD_FORM_SCRIPT = """\
         password: (form.querySelector('input[name=password]') || {}).value || '',
         next: (form.querySelector('input[name=next]') || {}).value || ''
       };
-      fetch('/auth/password-login', {
+      fetch(withBase('/auth/password-login'), {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(body),
@@ -433,7 +443,7 @@ _PASSWORD_FORM_SCRIPT = """\
       }).then(function (resp) {
         if (resp.ok) {
           return resp.json().then(function (data) {
-            window.location.assign((data && data.next) || '/');
+            window.location.assign(publicNext((data && data.next) || '/'));
           });
         }
         var msg = resp.status === 429
@@ -455,7 +465,7 @@ _PASSWORD_FORM_SCRIPT = """\
 """
 
 
-def render_login_html(*, next_path: str = "") -> str:
+def render_login_html(*, next_path: str = "", prefix: str = "") -> str:
     """Return the full HTML for ``GET /login``.
 
     ``next_path`` — when set, the post-login landing path the user
@@ -464,7 +474,15 @@ def render_login_html(*, next_path: str = "") -> str:
     end-to-end. The caller (``routes.login_page``) is responsible for
     validating ``next_path`` against the same-origin rules before we
     emit it; we still HTML-escape it as defence in depth.
+
+    ``prefix`` — normalised path prefix advertised by a reverse proxy via
+    ``X-Forwarded-Prefix``. Password login is handled by browser JS, so
+    the page must render prefixed fetch/navigation URLs itself; Caddy can
+    rewrite ``Location:`` headers but not JSON bodies or inline scripts.
     """
+    from hermes_cli.dashboard_auth.prefix import normalise_prefix
+
+    prefix = normalise_prefix(prefix)
     providers = list_session_providers()
     if not providers:
         return _EMPTY_HTML
@@ -488,14 +506,20 @@ def render_login_html(*, next_path: str = "") -> str:
         else:
             buttons.append(
                 f'      <a class="provider-btn" '
-                f'href="/auth/login?provider={html.escape(p.name, quote=True)}{next_qs}">'
+                f'href="{prefix}/auth/login?provider={html.escape(p.name, quote=True)}{next_qs}">'
                 f'Sign in with {html.escape(p.display_name)}</a>'
             )
     script = _PASSWORD_FORM_SCRIPT if needs_password_script else ""
-    return _LOGIN_HTML_TEMPLATE.format(
+    page = _LOGIN_HTML_TEMPLATE.format(
+        base_path=html.escape(prefix, quote=True),
         provider_buttons="\n".join(buttons),
         password_script=script,
     )
+    if prefix:
+        # The login page is server-rendered and intentionally does not load
+        # the SPA bootstrap, so rewrite its root-relative font URLs here too.
+        page = page.replace("url('/fonts/", f"url('{prefix}/fonts/")
+    return page
 
 
 def _render_password_form(provider, next_path: str) -> str:

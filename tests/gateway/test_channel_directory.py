@@ -83,6 +83,32 @@ class TestBuildChannelDirectoryWrites:
 
         assert result == previous
 
+    def test_connected_home_channel_is_listed_for_address_platform(self, tmp_path):
+        from gateway.config import Platform
+
+        cache_file = tmp_path / "channel_directory.json"
+        fake_config = SimpleNamespace(
+            get_home_channel=lambda platform: SimpleNamespace(
+                chat_id="+15551234567",
+                name="Home",
+                thread_id=None,
+            )
+            if platform == Platform.BLUEBUBBLES
+            else None
+        )
+
+        with patch.dict(os.environ, {"HERMES_HOME": str(tmp_path)}), \
+             patch("gateway.channel_directory.DIRECTORY_PATH", cache_file), \
+             patch("gateway.config.load_gateway_config", return_value=fake_config):
+            directory = asyncio.run(build_channel_directory({Platform.BLUEBUBBLES: object()}))
+            display = format_directory_for_display()
+
+        assert directory["platforms"]["bluebubbles"] == [
+            {"id": "+15551234567", "name": "Home", "type": "home"}
+        ]
+        assert "Bluebubbles:" in display
+        assert "bluebubbles:Home" in display
+
 
 class TestResolveChannelName:
     def _setup(self, tmp_path, platforms):

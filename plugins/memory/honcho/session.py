@@ -24,6 +24,17 @@ _PEER_ID_HASH_LEN = 8
 _PEER_ID_HASH_ESCALATION_LENGTHS = (_PEER_ID_HASH_LEN, 12, 16, 24, 32, 64)
 
 
+def _compile_message_noise_filters(patterns: list[str] | None) -> list[re.Pattern[str]]:
+    """Compile configured regexes used to skip transient Honcho messages."""
+    compiled: list[re.Pattern[str]] = []
+    for raw_pattern in patterns or []:
+        try:
+            compiled.append(re.compile(str(raw_pattern), re.IGNORECASE | re.MULTILINE))
+        except re.error as exc:
+            logger.warning("Ignoring invalid Honcho messageNoiseFilters regex: %s", exc)
+    return compiled
+
+
 @dataclass
 class HonchoSession:
     """
@@ -135,6 +146,9 @@ class HonchoSessionManager:
         self._ai_observe_others: bool = config.ai_observe_others if config else True
         self._message_max_chars: int = (
             config.message_max_chars if config else 25000
+        )
+        self._message_noise_filters = _compile_message_noise_filters(
+            getattr(config, "message_noise_filters", []) if config else []
         )
         self._dialectic_max_input_chars: int = (
             config.dialectic_max_input_chars if config else 10000
@@ -419,6 +433,13 @@ class HonchoSessionManager:
             self._cache[key] = session
         return session
 
+    def _should_skip_message_for_honcho(self, content: str) -> bool:
+        """Return True when a message is transient noise and should not be derived."""
+        text = (content or "").strip()
+        if not text:
+            return True
+        return any(pattern.search(text) for pattern in self._message_noise_filters)
+
     def _flush_session(self, session: HonchoSession) -> bool:
         """Internal: write unsynced messages to Honcho synchronously."""
         if not session.messages:
@@ -438,20 +459,45 @@ class HonchoSessionManager:
             return True
 
         honcho_messages = []
+        filtered_messages = []
+        sent_messages = []
         for msg in new_messages:
+            if self._should_skip_message_for_honcho(msg.get("content", "")):
+                msg["_synced"] = True
+                msg["_filtered"] = True
+                filtered_messages.append(msg)
+                continue
             peer = user_peer if msg["role"] == "user" else assistant_peer
             honcho_messages.append(peer.message(msg["content"]))
+            sent_messages.append(msg)
+
+        if not honcho_messages:
+            if filtered_messages:
+                logger.debug(
+                    "Skipped %d transient Honcho message(s) for %s",
+                    len(filtered_messages),
+                    session.key,
+                )
+            with self._cache_lock:
+                self._cache[session.key] = session
+            return True
 
         try:
             honcho_session.add_messages(honcho_messages)
-            for msg in new_messages:
+            for msg in sent_messages:
                 msg["_synced"] = True
             logger.debug("Synced %d messages to Honcho for %s", len(honcho_messages), session.key)
+            if filtered_messages:
+                logger.debug(
+                    "Skipped %d transient Honcho message(s) for %s",
+                    len(filtered_messages),
+                    session.key,
+                )
             with self._cache_lock:
                 self._cache[session.key] = session
             return True
         except Exception as e:
-            for msg in new_messages:
+            for msg in sent_messages:
                 msg["_synced"] = False
             logger.error("Failed to sync messages to Honcho: %s", e)
             with self._cache_lock:
@@ -548,9 +594,11 @@ class HonchoSessionManager:
     def shutdown(self) -> None:
         """Gracefully shut down the async writer thread."""
         if self._async_queue is not None and self._async_thread is not None:
-            self.flush_all()
-            self._async_queue.put(_ASYNC_SHUTDOWN)
-            self._async_thread.join(timeout=10)
+            try:
+                self.flush_all()
+            finally:
+                self._async_queue.put(_ASYNC_SHUTDOWN)
+                self._async_thread.join(timeout=10)
 
     def delete(self, key: str) -> bool:
         """Delete a session from local cache."""

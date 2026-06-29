@@ -93,6 +93,7 @@ try:
     from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, Response
     from fastapi.staticfiles import StaticFiles
     from pydantic import BaseModel
+    from starlette.concurrency import run_in_threadpool
 except ImportError:
     # First try lazy-installing the dashboard extras. Only the user actually
     # running `hermes dashboard` needs fastapi+uvicorn; lazy install keeps
@@ -108,6 +109,7 @@ except ImportError:
         from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, Response
         from fastapi.staticfiles import StaticFiles
         from pydantic import BaseModel
+        from starlette.concurrency import run_in_threadpool
     except Exception:
         raise SystemExit(
             "Web UI requires fastapi and uvicorn.\n"
@@ -3340,6 +3342,22 @@ async def get_action_status(name: str, lines: int = 200):
     }
 
 
+_SESSION_LIST_OMITTED_FIELDS = ("system_prompt", "model_config")
+
+
+def _compact_session_list_row(row: Dict[str, Any]) -> Dict[str, Any]:
+    """Remove heavyweight fields from session-list API rows.
+
+    ``SessionDB.list_sessions_rich()`` serves internal CLI/resume callers too, so
+    keep it full-fidelity there. The dashboard/desktop list endpoints are
+    high-fanout cold-start paths and should not ship per-session prompt/config
+    blobs that list UIs do not consume.
+    """
+    for field in _SESSION_LIST_OMITTED_FIELDS:
+        row.pop(field, None)
+    return row
+
+
 @app.get("/api/sessions")
 async def get_sessions(
     limit: int = 20,
@@ -3348,6 +3366,7 @@ async def get_sessions(
     archived: str = "exclude",
     order: str = "created",
     source: str = None,
+    sources: str = None,
     exclude_sources: str = None,
     cwd_prefix: str = None,
     profile: Optional[str] = None,
@@ -3384,12 +3403,17 @@ async def get_sessions(
             archived_only = archived == "only"
             include_archived = archived == "include"
             # Optional source scoping: ``source`` includes a single class,
+            # ``sources`` includes a comma-separated allowlist, and
             # ``exclude_sources`` (comma-separated) drops classes. The desktop
-            # uses these to split recents (exclude=cron) from the cron-jobs
-            # section (source=cron) into two independent lists.
-            exclude_list = [s for s in (exclude_sources or "").split(",") if s.strip()]
+            # uses these to split recents from scheduler/messaging slices and to
+            # support a user-selected sidebar allowlist without client-side page
+            # starvation.
+            source_filter = source or None
+            sources_list = [s.strip() for s in (sources or "").split(",") if s.strip()]
+            exclude_list = [s.strip() for s in (exclude_sources or "").split(",") if s.strip()]
             sessions = db.list_sessions_rich(
-                source=source or None,
+                source=source_filter,
+                sources=None if source_filter else (sources_list or None),
                 exclude_sources=exclude_list or None,
                 cwd_prefix=(cwd_prefix or None),
                 limit=limit,
@@ -3400,7 +3424,8 @@ async def get_sessions(
                 order_by_last_active=order == "recent",
             )
             total = db.session_count(
-                source=source or None,
+                source=source_filter,
+                sources=None if source_filter else (sources_list or None),
                 cwd_prefix=(cwd_prefix or None),
                 exclude_sources=exclude_list or None,
                 min_message_count=min_message_count,
@@ -3419,6 +3444,7 @@ async def get_sessions(
                     s["is_default_profile"] = profile_name == "default"
                 # SQLite stores the flag as 0/1; expose a real JSON boolean.
                 s["archived"] = bool(s.get("archived"))
+                _compact_session_list_row(s)
             return {"sessions": sessions, "total": total, "limit": limit, "offset": offset}
         finally:
             db.close()
@@ -3438,6 +3464,7 @@ def get_profiles_sessions(
     order: str = "recent",
     profile: str = "all",
     source: str = None,
+    sources: str = None,
     exclude_sources: str = None,
 ):
     """Unified, read-only session list aggregated across ALL profiles.
@@ -3475,10 +3502,12 @@ def get_profiles_sessions(
     archived_only = archived == "only"
     include_archived = archived == "include"
     # Source scoping (see /api/sessions): recents pass exclude_sources=cron,
-    # the cron-jobs section passes source=cron — two independent lists so
-    # newest cron sessions can't starve the recents page.
+    # the cron-jobs section passes source=cron, and Desktop settings can pass a
+    # multi-source allowlist — independent lists so newest cron/API sessions
+    # can't starve the local recents page.
     source_filter = source or None
-    exclude_list = [s for s in (exclude_sources or "").split(",") if s.strip()]
+    sources_list = [s.strip() for s in (sources or "").split(",") if s.strip()]
+    exclude_list = [s.strip() for s in (exclude_sources or "").split(",") if s.strip()]
     # Over-fetch per profile so the merged+sorted window is correct for the
     # requested page. Capped so a huge profile can't blow up the response.
     per_profile = min(max(limit + offset, limit), 500)
@@ -3503,6 +3532,7 @@ def get_profiles_sessions(
         try:
             rows = db.list_sessions_rich(
                 source=source_filter,
+                sources=None if source_filter else (sources_list or None),
                 exclude_sources=exclude_list or None,
                 limit=per_profile,
                 offset=0,
@@ -3513,6 +3543,7 @@ def get_profiles_sessions(
             )
             profile_total = db.session_count(
                 source=source_filter,
+                sources=None if source_filter else (sources_list or None),
                 exclude_sources=exclude_list or None,
                 min_message_count=min_message_count,
                 include_archived=include_archived,
@@ -3529,6 +3560,7 @@ def get_profiles_sessions(
                     and (now - s.get("last_active", s.get("started_at", 0))) < 300
                 )
                 s["archived"] = bool(s.get("archived"))
+                _compact_session_list_row(s)
                 merged.append(s)
         except Exception as exc:
             errors.append({"profile": name, "error": str(exc)})
@@ -8405,6 +8437,10 @@ def _find_cron_job_profile(job_id: str) -> Optional[str]:
 
 @app.get("/api/cron/jobs")
 async def list_cron_jobs(profile: str = "all"):
+    return await run_in_threadpool(_list_cron_jobs_sync, profile)
+
+
+def _list_cron_jobs_sync(profile: str = "all"):
     requested = (profile or "all").strip()
     if requested.lower() != "all":
         return _call_cron_for_profile(requested, "list_jobs", True)
@@ -10717,10 +10753,13 @@ def _disable_unselected_skills(profile_dir: Path, keep: List[str]) -> int:
 
 @app.get("/api/profiles")
 async def list_profiles_endpoint():
+    return await run_in_threadpool(_list_profiles_endpoint_sync)
+
+
+def _list_profiles_endpoint_sync():
     from hermes_cli import profiles as profiles_mod
     try:
-        loop = asyncio.get_running_loop()
-        profiles = await loop.run_in_executor(None, profiles_mod.list_profiles)
+        profiles = profiles_mod.list_profiles()
         return {"profiles": [_profile_to_dict(p) for p in profiles]}
     except Exception:
         _log.exception("GET /api/profiles failed; falling back to profile directory scan")
@@ -13261,12 +13300,81 @@ def _safe_plugin_api_relpath(api_field: Any, *, dashboard_dir: Path) -> Optional
     return api_field
 
 
+# Plugin sources whose Python backend (dashboard manifest `api` file) must NEVER
+# be auto-imported by the dashboard web server — only bundled plugins may. Shared
+# by the discovery-time scrub and the mount-time refuse guards so a typo in one
+# site cannot silently disable a security gate (GHSA-5qr3-c538-wm9j / #43719).
+_NON_BUNDLED_PLUGIN_SOURCES = frozenset({"user", "project"})
+_TRUSTED_DASHBOARD_PLUGIN_API_ROOTS_ENV = "HERMES_DASHBOARD_TRUSTED_PLUGIN_API_ROOTS"
+
+
+def _trusted_dashboard_plugin_api_roots() -> list[Path]:
+    """Return explicitly trusted non-bundled dashboard plugin API roots.
+
+    Dashboard backend plugin APIs are Python code imported into the dashboard
+    process, so non-bundled plugin APIs stay disabled by default.  Local
+    operators may opt specific controlled plugin/dashboard directories back in
+    with an absolute ``os.pathsep``-separated allowlist.  Paths are resolved so
+    live-dev symlinks under ``~/.hermes/plugins`` are matched by their real
+    source directory rather than by an attacker-controlled link spelling.
+    """
+    raw = os.getenv(_TRUSTED_DASHBOARD_PLUGIN_API_ROOTS_ENV, "")
+    roots: list[Path] = []
+    for part in raw.split(os.pathsep):
+        text = part.strip()
+        if not text:
+            continue
+        candidate = Path(text).expanduser()
+        if not candidate.is_absolute():
+            _log.warning(
+                "Ignoring non-absolute %s entry: %r",
+                _TRUSTED_DASHBOARD_PLUGIN_API_ROOTS_ENV,
+                text,
+            )
+            continue
+        try:
+            resolved = candidate.resolve()
+        except (OSError, RuntimeError) as exc:
+            _log.warning(
+                "Ignoring unresolved %s entry %r: %s",
+                _TRUSTED_DASHBOARD_PLUGIN_API_ROOTS_ENV,
+                text,
+                exc,
+            )
+            continue
+        if not resolved.is_dir():
+            _log.warning(
+                "Ignoring non-directory %s entry: %s",
+                _TRUSTED_DASHBOARD_PLUGIN_API_ROOTS_ENV,
+                resolved,
+            )
+            continue
+        roots.append(resolved)
+    return roots
+
+
+def _dashboard_plugin_api_root_is_trusted(*, dashboard_dir: Path) -> bool:
+    """Whether a plugin dashboard dir is under an explicit trusted API root."""
+    try:
+        resolved_dashboard = dashboard_dir.resolve()
+    except (OSError, RuntimeError):
+        return False
+    for trusted_root in _trusted_dashboard_plugin_api_roots():
+        try:
+            resolved_dashboard.relative_to(trusted_root)
+            return True
+        except ValueError:
+            continue
+    return False
+
+
 def _discover_dashboard_plugins() -> list:
     """Scan plugins/*/dashboard/manifest.json for dashboard extensions.
 
-    Checks three plugin sources (same as hermes_cli.plugins):
-    1. User plugins:    ~/.hermes/plugins/<name>/dashboard/manifest.json
-    2. Bundled plugins: <repo>/plugins/<name>/dashboard/manifest.json  (memory/, etc.)
+    Checks three plugin sources. Bundled dashboard plugins win name conflicts
+    so non-bundled plugins cannot shadow trusted backend-capable routes:
+    1. Bundled plugins: <repo>/plugins/<name>/dashboard/manifest.json  (memory/, etc.)
+    2. User plugins:    ~/.hermes/plugins/<name>/dashboard/manifest.json
     3. Project plugins: ./.hermes/plugins/  (only if HERMES_ENABLE_PROJECT_PLUGINS)
     """
     plugins = []
@@ -13275,9 +13383,9 @@ def _discover_dashboard_plugins() -> list:
     from hermes_cli.plugins import get_bundled_plugins_dir
     bundled_root = get_bundled_plugins_dir()
     search_dirs = [
-        (get_hermes_home() / "plugins", "user"),
         (bundled_root / "memory", "bundled"),
         (bundled_root, "bundled"),
+        (get_hermes_home() / "plugins", "user"),
     ]
     # GHSA-5qr3-c538-wm9j (#29156): the previous ``os.environ.get(...)``
     # check treated *any* non-empty string as truthy, so ``=0``, ``=false``,
@@ -13336,10 +13444,34 @@ def _discover_dashboard_plugins() -> list:
                 raw_api = data.get("api")
                 dashboard_dir = child / "dashboard"
                 safe_api = _safe_plugin_api_relpath(raw_api, dashboard_dir=dashboard_dir)
+                if source in _NON_BUNDLED_PLUGIN_SOURCES and safe_api:
+                    if _dashboard_plugin_api_root_is_trusted(dashboard_dir=dashboard_dir):
+                        _log.warning(
+                            "Plugin %s: allowing non-bundled dashboard backend "
+                            "api=%s because its dashboard directory is under "
+                            "an explicit %s root; only trust local plugin code "
+                            "you control",
+                            name,
+                            safe_api,
+                            _TRUSTED_DASHBOARD_PLUGIN_API_ROOTS_ENV,
+                        )
+                    else:
+                        _log.warning(
+                            "Plugin %s: refusing dashboard backend api=%s "
+                            "(only bundled plugins may auto-import Python "
+                            "backend routes by default; set %s to an absolute "
+                            "controlled plugin/dashboard directory to trust a "
+                            "specific local non-bundled backend)",
+                            name,
+                            safe_api,
+                            _TRUSTED_DASHBOARD_PLUGIN_API_ROOTS_ENV,
+                        )
+                        safe_api = None
+                        raw_api = None
                 if raw_api and safe_api is None:
                     _log.warning(
                         "Plugin %s: refusing unsafe api path %r (must be a "
-                        "relative file inside the plugin's dashboard/ "
+                        "relative file inside a bundled plugin's dashboard/ "
                         "directory); backend routes from this plugin will "
                         "not be mounted",
                         name, raw_api,
@@ -13367,6 +13499,7 @@ def _discover_dashboard_plugins() -> list:
 
 # Cache discovered plugins per-process (refresh on explicit re-scan).
 _dashboard_plugins_cache: Optional[list] = None
+_mounted_dashboard_plugin_apis: set[str] = set()
 
 
 def _get_dashboard_plugins(force_rescan: bool = False) -> list:
@@ -13396,8 +13529,9 @@ async def get_dashboard_plugins():
 
 @app.get("/api/dashboard/plugins/rescan")
 async def rescan_dashboard_plugins():
-    """Force re-scan of dashboard plugins."""
+    """Force re-scan of dashboard plugins and mount newly discovered APIs."""
     plugins = _get_dashboard_plugins(force_rescan=True)
+    _mount_plugin_api_routes()
     return {"ok": True, "count": len(plugins)}
 
 
@@ -13739,78 +13873,132 @@ async def serve_plugin_asset(plugin_name: str, file_path: str):
     )
 
 
+def _move_spa_catch_all_routes_to_end() -> list:
+    """Temporarily remove SPA catch-all routes so late API mounts stay reachable.
+
+    Starlette evaluates routes in insertion order. Dashboard plugin APIs are
+    normally mounted before ``mount_spa(app)`` at process start, but a plugin
+    added later via a dashboard rescan needs its API routes inserted before the
+    SPA ``/{full_path:path}`` fallback.  Return removed route objects so the
+    caller can append them after mounting plugin routes.
+    """
+    routes = app.router.routes
+    catch_all = [route for route in routes if getattr(route, "path", None) == "/{full_path:path}"]
+    if not catch_all:
+        return []
+    app.router.routes = [route for route in routes if route not in catch_all]
+    return catch_all
+
+
+def _restore_routes(routes: list) -> None:
+    if routes:
+        app.router.routes.extend(routes)
+
+
 def _mount_plugin_api_routes():
     """Import and mount backend API routes from plugins that declare them.
 
     Each plugin's ``api`` field points to a Python file that must expose
     a ``router`` (FastAPI APIRouter).  Routes are mounted under
-    ``/api/plugins/<name>/``.
+    ``/api/plugins/<name>/``.  The function is idempotent so dashboard
+    plugin rescans can mount APIs from plugins added after process start.
 
-    Backend import is restricted to ``bundled`` and ``user`` sources.
-    Project plugins (``./.hermes/plugins/``) ship with the CWD and are
-    therefore attacker-controlled in any threat model where the user
-    opens a malicious repo; they can extend the dashboard UI via
-    static JS/CSS but their Python ``api`` file is never auto-imported
-    by the web server.  See GHSA-5qr3-c538-wm9j (#29156).
+    Backend import is restricted to bundled plugins. User and project
+    plugins can extend the dashboard UI via static JS/CSS, but their
+    Python ``api`` file is never auto-imported by the web server.  See
+    GHSA-5qr3-c538-wm9j (#29156).
     """
-    for plugin in _get_dashboard_plugins():
-        api_file_name = plugin.get("_api_file")
-        if not api_file_name:
-            continue
-        if plugin.get("source") == "project":
-            _log.warning(
-                "Plugin %s: ignoring backend api=%s (project plugins may "
-                "not auto-import Python code; move the plugin to "
-                "~/.hermes/plugins/ if you trust it)",
-                plugin["name"], api_file_name,
-            )
-            continue
-        dashboard_dir = Path(plugin["_dir"])
-        api_path = dashboard_dir / api_file_name
-        try:
-            resolved_api = api_path.resolve()
-            resolved_base = dashboard_dir.resolve()
-            resolved_api.relative_to(resolved_base)
-        except (OSError, RuntimeError, ValueError):
-            # Discovery already filters this, but re-check here in case
-            # ``_dir`` was tampered with after caching or a future caller
-            # bypasses the validator.  Defence in depth keeps the import
-            # primitive contained even if the upstream check regresses.
-            _log.warning(
-                "Plugin %s: refusing to import api file outside its "
-                "dashboard directory (%s)", plugin["name"], api_path,
-            )
-            continue
-        if not api_path.exists():
-            _log.warning("Plugin %s declares api=%s but file not found", plugin["name"], api_file_name)
-            continue
-        try:
-            module_name = f"hermes_dashboard_plugin_{plugin['name']}"
-            spec = importlib.util.spec_from_file_location(module_name, api_path)
-            if spec is None or spec.loader is None:
+    spa_catch_all_routes = _move_spa_catch_all_routes_to_end()
+    try:
+        for plugin in _get_dashboard_plugins():
+            api_file_name = plugin.get("_api_file")
+            plugin_name = str(plugin["name"])
+            if plugin_name in _mounted_dashboard_plugin_apis:
                 continue
-            mod = importlib.util.module_from_spec(spec)
-            # Register in sys.modules BEFORE exec_module so pydantic/FastAPI
-            # can resolve forward references (e.g. models defined in a file
-            # that uses `from __future__ import annotations`). Without this,
-            # TypeAdapter lazy-build fails at first request with
-            # "is not fully defined" because the module namespace isn't
-            # reachable by name for string-annotation resolution.
-            sys.modules[module_name] = mod
+            if not api_file_name:
+                continue
+            source = plugin.get("source")
+            dashboard_dir = Path(plugin["_dir"])
+            if source in _NON_BUNDLED_PLUGIN_SOURCES and not _dashboard_plugin_api_root_is_trusted(
+                dashboard_dir=dashboard_dir
+            ):
+                # Backend Python auto-import is reserved for bundled plugins;
+                # user and project plugins extend the dashboard with static UI
+                # assets only (GHSA-5qr3-c538-wm9j / #43719). Defence-in-depth:
+                # discovery already nulls unsafe _api_file values, but
+                # re-refusing here — at the actual importlib call site — keeps
+                # the import primitive contained if a future caller or tampered
+                # cache entry slips a non-bundled plugin through.
+                _reason = {
+                    "user": "user-installed plugins may not auto-import Python code",
+                    "project": (
+                        "project plugins may not auto-import Python code; backend "
+                        "auto-import is reserved for bundled plugins"
+                    ),
+                }.get(source, "only bundled plugins may auto-import Python code")
+                _log.warning(
+                    "Plugin %s: ignoring backend api=%s (%s; set %s to an "
+                    "absolute controlled plugin/dashboard directory to trust "
+                    "a specific local non-bundled backend)",
+                    plugin_name,
+                    api_file_name,
+                    _reason,
+                    _TRUSTED_DASHBOARD_PLUGIN_API_ROOTS_ENV,
+                )
+                continue
+            api_path = dashboard_dir / api_file_name
             try:
-                spec.loader.exec_module(mod)
-            except Exception:
-                sys.modules.pop(module_name, None)
-                raise
-            router = getattr(mod, "router", None)
-            if router is None:
-                _log.warning("Plugin %s api file has no 'router' attribute", plugin["name"])
+                resolved_api = api_path.resolve()
+                resolved_base = dashboard_dir.resolve()
+                resolved_api.relative_to(resolved_base)
+            except (OSError, RuntimeError, ValueError):
+                # Discovery already filters this, but re-check here in case
+                # ``_dir`` was tampered with after caching or a future caller
+                # bypasses the validator. Defence in depth keeps the import
+                # primitive contained even if the upstream check regresses.
+                _log.warning(
+                    "Plugin %s: refusing to import api file outside its "
+                    "dashboard directory (%s)",
+                    plugin_name,
+                    api_path,
+                )
                 continue
-            app.include_router(router, prefix=f"/api/plugins/{plugin['name']}")
-            _log.info("Mounted plugin API routes: /api/plugins/%s/", plugin["name"])
-        except Exception as exc:
-            _log.warning("Failed to load plugin %s API routes: %s", plugin["name"], exc)
-
+            if not api_path.exists():
+                _log.warning(
+                    "Plugin %s declares api=%s but file not found",
+                    plugin_name,
+                    api_file_name,
+                )
+                continue
+            try:
+                module_name = f"hermes_dashboard_plugin_{plugin_name.replace('-', '_')}"
+                spec = importlib.util.spec_from_file_location(module_name, api_path)
+                if spec is None or spec.loader is None:
+                    continue
+                mod = importlib.util.module_from_spec(spec)
+                # Register in sys.modules BEFORE exec_module so pydantic/FastAPI
+                # can resolve forward references (e.g. models defined in a file
+                # that uses `from __future__ import annotations`). Without this,
+                # TypeAdapter lazy-build fails at first request with
+                # "is not fully defined" because the module namespace isn't
+                # reachable by name for string-annotation resolution.
+                sys.modules[module_name] = mod
+                try:
+                    spec.loader.exec_module(mod)
+                except Exception:
+                    sys.modules.pop(module_name, None)
+                    raise
+                router = getattr(mod, "router", None)
+                if router is None:
+                    _log.warning("Plugin %s api file has no 'router' attribute", plugin_name)
+                    continue
+                app.include_router(router, prefix=f"/api/plugins/{plugin_name}")
+                _mounted_dashboard_plugin_apis.add(plugin_name)
+                _log.info("Mounted plugin API routes: /api/plugins/%s/", plugin_name)
+            except Exception as exc:
+                _log.warning("Failed to load plugin %s API routes: %s", plugin_name, exc)
+    finally:
+        _restore_routes(spa_catch_all_routes)
 
 # Mount plugin API routes before the SPA catch-all.
 _mount_plugin_api_routes()

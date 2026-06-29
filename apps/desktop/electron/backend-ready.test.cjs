@@ -28,12 +28,13 @@ const {
   MIN_PORT_ANNOUNCE_TIMEOUT_MS
 } = require('./backend-ready.cjs')
 
-// A minimal stand-in for a spawned child process: an EventEmitter with a
-// stdout EventEmitter, matching the surface waitForDashboardPort consumes
-// (child.stdout.on('data'), child.on('exit'|'error') + the .off() teardown).
+// A minimal stand-in for a spawned child process: an EventEmitter with stdout
+// and stderr EventEmitters, matching the surface waitForDashboardPort consumes
+// (child.<stream>.on('data'), child.on('exit'|'error') + the .off() teardown).
 function makeFakeChild() {
   const child = new EventEmitter()
   child.stdout = new EventEmitter()
+  child.stderr = new EventEmitter()
   return child
 }
 
@@ -86,6 +87,13 @@ test('resolves with the announced port', async () => {
   assert.equal(await p, 54321)
 })
 
+test('resolves when the announcement arrives on stderr', async () => {
+  const child = makeFakeChild()
+  const p = waitForDashboardPort(child, 1000)
+  child.stderr.emit('data', 'HERMES_DASHBOARD_READY port=44787\n')
+  assert.equal(await p, 44787)
+})
+
 test('parses the port even when the line arrives split across chunks', async () => {
   const child = makeFakeChild()
   const p = waitForDashboardPort(child, 1000)
@@ -124,6 +132,22 @@ test('a late announcement after timeout does not throw (listeners torn down)', a
   assert.doesNotThrow(() => {
     child.stdout.emit('data', 'HERMES_DASHBOARD_READY port=9999\n')
   })
+})
+
+test('primary desktop backend arms the port watcher before boot progress can yield', () => {
+  const source = fs.readFileSync(path.join(__dirname, 'main.cjs'), 'utf8')
+  const primarySpawn = source.indexOf('hermesProcess = spawn(')
+  assert.notEqual(primarySpawn, -1, 'primary backend spawn block should exist')
+
+  const watcher = source.indexOf('waitForDashboardPortAnnouncement(hermesProcess, { readyFile })', primarySpawn)
+  const yieldingProgress = source.indexOf("await advanceBootProgress('backend.port'", primarySpawn)
+
+  assert.notEqual(watcher, -1, 'primary backend must create a waitForDashboardPortAnnouncement watcher')
+  assert.notEqual(yieldingProgress, -1, 'primary backend must update backend.port boot progress')
+  assert.ok(
+    watcher < yieldingProgress,
+    'port watcher must be armed before the awaited backend.port progress update; otherwise a warm backend can print READY while only rememberLog is listening'
+  )
 })
 
 // ---------------------------------------------------------------------------

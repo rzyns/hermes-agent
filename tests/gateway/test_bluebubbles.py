@@ -65,6 +65,17 @@ class TestBlueBubblesConfigLoading:
         assert Platform.BLUEBUBBLES not in config.get_connected_platforms()
 
 
+class TestBlueBubblesSendMessageTargetParsing:
+    def test_e164_phone_target_is_explicit(self):
+        from tools.send_message_tool import _parse_target_ref
+
+        assert _parse_target_ref("bluebubbles", "+15551234567") == (
+            "+15551234567",
+            None,
+            True,
+        )
+
+
 class TestBlueBubblesHelpers:
     def test_check_requirements(self, monkeypatch):
         monkeypatch.setenv("BLUEBUBBLES_SERVER_URL", "http://localhost:1234")
@@ -103,6 +114,51 @@ class TestBlueBubblesHelpers:
 
         assert result.success is True
         assert sent == ["first thought", "second thought"]
+
+    @pytest.mark.asyncio
+    async def test_send_uses_private_api_when_helper_connected(self, monkeypatch):
+        adapter = _make_adapter(monkeypatch)
+        adapter._private_api_enabled = True
+        adapter._helper_connected = True
+        payloads = []
+
+        async def fake_resolve_chat_guid(chat_id):
+            return "iMessage;-;user@example.com"
+
+        async def fake_api_post(path, payload):
+            payloads.append(payload)
+            return {"data": {"guid": "msg-1"}}
+
+        monkeypatch.setattr(adapter, "_resolve_chat_guid", fake_resolve_chat_guid)
+        monkeypatch.setattr(adapter, "_api_post", fake_api_post)
+
+        result = await adapter.send("user@example.com", "hello")
+
+        assert result.success is True
+        assert payloads[0]["method"] == "private-api"
+        assert "selectedMessageGuid" not in payloads[0]
+
+    @pytest.mark.asyncio
+    async def test_send_uses_applescript_default_when_helper_unavailable(self, monkeypatch):
+        adapter = _make_adapter(monkeypatch)
+        adapter._private_api_enabled = True
+        adapter._helper_connected = False
+        payloads = []
+
+        async def fake_resolve_chat_guid(chat_id):
+            return "iMessage;-;user@example.com"
+
+        async def fake_api_post(path, payload):
+            payloads.append(payload)
+            return {"data": {"guid": "msg-1"}}
+
+        monkeypatch.setattr(adapter, "_resolve_chat_guid", fake_resolve_chat_guid)
+        monkeypatch.setattr(adapter, "_api_post", fake_api_post)
+
+        result = await adapter.send("user@example.com", "hello")
+
+        assert result.success is True
+        assert "method" not in payloads[0]
 
     def test_format_message_strips_markdown(self, monkeypatch):
         adapter = _make_adapter(monkeypatch)
@@ -554,19 +610,26 @@ class TestBlueBubblesAttachmentDownload:
 
 
 class TestBlueBubblesWebhookUrl:
-    """_webhook_url property normalises local hosts to 'localhost'."""
+    """_webhook_url preserves explicit loopback hosts for registration."""
 
     def test_default_host(self, monkeypatch):
         adapter = _make_adapter(monkeypatch)
-        # Default webhook_host is 0.0.0.0 → normalized to localhost
-        assert "localhost" in adapter._webhook_url
+        # Default webhook_host is 127.0.0.1; preserve it instead of using
+        # localhost, which may resolve to IPv6 ::1 on macOS while a reverse
+        # SSH tunnel is bound only to IPv4 127.0.0.1.
+        assert adapter._webhook_url.startswith("http://127.0.0.1:")
         assert str(adapter.webhook_port) in adapter._webhook_url
         assert adapter.webhook_path in adapter._webhook_url
 
-    @pytest.mark.parametrize("host", ["0.0.0.0", "127.0.0.1", "localhost", "::"])
-    def test_local_hosts_normalized(self, monkeypatch, host):
+    @pytest.mark.parametrize("host", ["0.0.0.0", "::"])
+    def test_wildcard_hosts_normalized(self, monkeypatch, host):
         adapter = _make_adapter(monkeypatch, webhook_host=host)
         assert adapter._webhook_url.startswith("http://localhost:")
+
+    @pytest.mark.parametrize("host", ["127.0.0.1", "localhost"])
+    def test_explicit_loopback_hosts_preserved(self, monkeypatch, host):
+        adapter = _make_adapter(monkeypatch, webhook_host=host)
+        assert adapter._webhook_url.startswith(f"http://{host}:")
 
     def test_custom_host_preserved(self, monkeypatch):
         adapter = _make_adapter(monkeypatch, webhook_host="192.168.1.50")

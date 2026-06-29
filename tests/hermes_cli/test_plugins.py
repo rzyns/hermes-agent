@@ -103,6 +103,35 @@ class TestPluginDiscovery:
         assert "hello_plugin" in mgr._plugins
         assert mgr._plugins["hello_plugin"].enabled
 
+    def test_plugin_context_registers_kanban_dependency_provider(self):
+        from hermes_cli import kanban_dependencies as kd
+
+        manager = PluginManager()
+        manifest = PluginManifest(name="xdep-plugin")
+        ctx = PluginContext(manifest, manager)
+
+        class Provider:
+            def blockers_for(self, *, board, task_id):
+                return [
+                    kd.ExternalBlocker(
+                        parent_board="research-decision-queue",
+                        parent_id="t_parent",
+                        satisfied=False,
+                    )
+                ]
+
+        provider = Provider()
+        try:
+            ctx.register_kanban_dependency_provider(provider)
+            blockers = kd.unsatisfied_blockers_for(board="child-board", task_id="t_child")
+        finally:
+            kd.unregister_dependency_provider(provider)
+
+        assert blockers
+        assert blockers[0].parent_board == "research-decision-queue"
+        assert blockers[0].parent_id == "t_parent"
+        assert provider in manager._kanban_dependency_providers
+
     def test_plugin_can_register_and_invoke_middleware(self, tmp_path, monkeypatch):
         plugins_dir = tmp_path / "hermes_test" / "plugins"
         _make_plugin_dir(
@@ -337,6 +366,7 @@ class TestPluginDiscovery:
 
     def test_discover_project_plugins_skipped_by_default(self, tmp_path, monkeypatch):
         """Project plugins are not discovered unless explicitly enabled."""
+        monkeypatch.delenv("HERMES_ENABLE_PROJECT_PLUGINS", raising=False)
         project_dir = tmp_path / "project"
         project_dir.mkdir()
         monkeypatch.chdir(project_dir)
@@ -358,10 +388,10 @@ class TestPluginDiscovery:
         mgr.discover_and_load()
         mgr.discover_and_load()  # second call should no-op
 
-        # Filter out bundled plugins — they're always discovered.
+        # Filter out bundled and entrypoint plugins — they're always discovered.
         non_bundled = {
             n: p for n, p in mgr._plugins.items()
-            if p.manifest.source != "bundled"
+            if p.manifest.source not in {"bundled", "entrypoint"}
         }
         assert len(non_bundled) == 1
 
@@ -395,7 +425,7 @@ class TestPluginDiscovery:
         assert mgr._discovered is True
         non_bundled = {
             n: p for n, p in mgr._plugins.items()
-            if p.manifest.source != "bundled"
+            if p.manifest.source not in {"bundled", "entrypoint"}
         }
         assert len(non_bundled) == 1
 
@@ -408,10 +438,10 @@ class TestPluginDiscovery:
         mgr = PluginManager()
         mgr.discover_and_load()
 
-        # Filter out bundled plugins — they're always discovered.
+        # Filter out bundled and entrypoint plugins — they're always discovered.
         non_bundled = {
             n: p for n, p in mgr._plugins.items()
-            if p.manifest.source != "bundled"
+            if p.manifest.source not in {"bundled", "entrypoint"}
         }
         assert len(non_bundled) == 0
 
@@ -464,6 +494,7 @@ class TestPluginDiscovery:
         mgr._plugin_commands["cmd"] = {"plugin": "p"}
         mgr._plugin_skills["p:skill"] = {}
         mgr._aux_tasks["task"] = {"plugin": "p"}
+        mgr._kanban_dependency_providers.append(object())
         mgr._slack_action_handlers.append(("aid", lambda **_: None, "p"))
         mgr._discovered = True
 
@@ -481,6 +512,7 @@ class TestPluginDiscovery:
         assert mgr._plugin_commands == {}
         assert mgr._plugin_skills == {}
         assert mgr._aux_tasks == {}
+        assert mgr._kanban_dependency_providers == []
         assert mgr._slack_action_handlers == []
 
 

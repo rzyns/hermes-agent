@@ -500,14 +500,51 @@ def _find_skill(name: str) -> Optional[Dict[str, Any]]:
     Searches the local skills dir (~/.hermes/skills/) first, then any
     external dirs configured via skills.external_dirs.  Returns
     {"path": Path} or None.
+
+    Keep this write resolver aligned with ``skill_view`` for local skill
+    trees: Skill Garden uses symlinked category directories, and agents must
+    not be able to view a skill but fail to patch it just because the write
+    resolver did not follow directory symlinks.
     """
-    from agent.skill_utils import get_all_skills_dirs, is_excluded_skill_path
+    from agent.skill_utils import get_all_skills_dirs, is_excluded_skill_path, iter_skill_index_files
+    from tools.path_security import has_traversal_component
+
+    def _safe_relative_lookup(candidate: str) -> bool:
+        candidate_path = Path(candidate)
+        return not candidate_path.is_absolute() and not has_traversal_component(candidate)
+
+    local_category_name = None
+    if ":" in name:
+        namespace, bare = name.split(":", 1)
+        if namespace and bare:
+            local_category_name = f"{namespace}/{bare}"
+
     for skills_dir in get_all_skills_dirs():
         if not skills_dir.exists():
             continue
-        for skill_md in skills_dir.rglob("SKILL.md"):
-            if is_excluded_skill_path(skill_md):
+
+        # Direct relative-path lookup supports categorized calls such as
+        # ``devops/skill-garden-governance`` and also follows directory
+        # symlinks through Path.is_dir()/exists().  Namespace-style names are
+        # used by skill_view for plugin lookup first and local category
+        # fallback second; skill_manage cannot edit plugin registry skills, but
+        # it should honor the same local category fallback.
+        for direct_name in (name, local_category_name):
+            if not direct_name or not _safe_relative_lookup(direct_name):
                 continue
+            direct_path = skills_dir / direct_name
+            if is_excluded_skill_path(direct_path):
+                continue
+            if direct_path.is_dir() and (direct_path / "SKILL.md").exists():
+                return {"path": direct_path}
+
+        # Recursive lookup by directory basename supports the longstanding
+        # bare-name contract while following symlinked Skill Garden dev-links.
+        # Do not fall back to bare recursive matching for namespace-style
+        # names; ``category:skill`` should edit that category path or fail.
+        if local_category_name:
+            continue
+        for skill_md in iter_skill_index_files(skills_dir, "SKILL.md"):
             if skill_md.parent.name == name:
                 return {"path": skill_md.parent}
     return None
@@ -937,6 +974,19 @@ def _delete_skill(name: str, absorbed_into: Optional[str] = None) -> Dict[str, A
     if guard:
         return guard
 
+    skill_dir = existing["path"]
+
+    if skill_dir.is_symlink():
+        return {
+            "success": False,
+            "error": (
+                f"Skill '{name}' resolves to a symlinked skill directory ({skill_dir}). "
+                "Refusing delete through skill_manage so a Skill Garden/dev-link "
+                "is not removed accidentally. Use an explicit, reviewed file/profile "
+                "operation if unlinking the live skill link is intended."
+            ),
+        }
+
     # Fail closed on unverified deletes during the curator consolidation pass.
     # A bare prune (no absorbed_into) from the LLM umbrella pass is the
     # fail-open behavior reported in #29912 — refuse it; keep the skill active.
@@ -972,7 +1022,6 @@ def _delete_skill(name: str, absorbed_into: Optional[str] = None) -> Dict[str, A
                 ),
             }
 
-    skill_dir = existing["path"]
     skills_root = _containing_skills_root(skill_dir)
 
     # Defense-in-depth before the recursive delete (port of Kilo Code #11240).

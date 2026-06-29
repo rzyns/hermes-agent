@@ -890,7 +890,7 @@ def run_mcp_server(verbose: bool = False) -> None:
 
     server = create_mcp_server(event_bridge=bridge)
 
-    import asyncio
+    import anyio
 
     async def _run():
         try:
@@ -899,6 +899,6 @@ def run_mcp_server(verbose: bool = False) -> None:
             bridge.stop()
 
     try:
-        asyncio.run(_run())
+        anyio.run(_run)
     except KeyboardInterrupt:
         bridge.stop()

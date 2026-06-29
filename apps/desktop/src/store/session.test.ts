@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, it, vi } from 'vitest'
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
 import type { SessionInfo } from '@/types/hermes'
 
@@ -7,6 +7,7 @@ import {
   $attentionSessionIds,
   $connection,
   $currentCwd,
+  $sidebarSessionSourceIds,
   $workingSessionIds,
   applyConfiguredDefaultProjectDir,
   getRecentlySettledSessionIds,
@@ -15,8 +16,33 @@ import {
   setCurrentCwd,
   setSessionAttention,
   setSessionWorking,
+  setSidebarSessionSourceIds,
   workspaceCwdForNewSession
 } from './session'
+
+const SIDEBAR_SOURCE_KEY = 'hermes.desktop.sidebar.session-source-ids'
+
+const createLocalStorageMock = (): Storage => {
+  const values = new Map<string, string>()
+
+  return {
+    get length() {
+      return values.size
+    },
+    clear: () => values.clear(),
+    getItem: key => values.get(key) ?? null,
+    key: index => Array.from(values.keys())[index] ?? null,
+    removeItem: key => values.delete(key),
+    setItem: (key, value) => values.set(key, value)
+  }
+}
+
+beforeEach(() => {
+  Object.defineProperty(window, 'localStorage', {
+    configurable: true,
+    value: createLocalStorageMock()
+  })
+})
 
 const session = (over: Partial<SessionInfo>): SessionInfo => ({
   archived: false,
@@ -62,6 +88,26 @@ describe('setSessionAttention', () => {
     setSessionAttention('', true)
     setSessionAttention('missing', false)
     expect($attentionSessionIds.get()).toEqual([])
+  })
+})
+
+describe('setSidebarSessionSourceIds', () => {
+  afterEach(() => {
+    setSidebarSessionSourceIds([])
+    $sidebarSessionSourceIds.set([])
+    window.localStorage.removeItem(SIDEBAR_SOURCE_KEY)
+  })
+
+  it('normalizes, dedupes, persists, and clears the sidebar source allowlist', () => {
+    setSidebarSessionSourceIds([' CLI ', 'webui', 'cli'])
+
+    expect($sidebarSessionSourceIds.get()).toEqual(['cli', 'webui'])
+    expect(window.localStorage.getItem(SIDEBAR_SOURCE_KEY)).toBe(JSON.stringify(['cli', 'webui']))
+
+    setSidebarSessionSourceIds([])
+
+    expect($sidebarSessionSourceIds.get()).toEqual([])
+    expect(window.localStorage.getItem(SIDEBAR_SOURCE_KEY)).toBeNull()
   })
 })
 

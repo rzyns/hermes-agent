@@ -486,6 +486,67 @@ def remove_wrapper_script(name: str) -> bool:
     return False
 
 
+# Cap how much of a wrapper file we read when reverse-looking-up its profile.
+# Real wrappers are a few hundred bytes of shell; the needle (``hermes -p X``)
+# sits near the top. The wrapper dir (e.g. ``~/.local/bin``) commonly also holds
+# large unrelated binaries (ffmpeg, node, …) — reading those whole, N times, was
+# the dominant cost in ``list_profiles`` (~4.5s). Reading a small head slice and
+# skipping NUL-bearing (binary) content keeps the scan to a single cheap pass.
+_WRAPPER_READ_LIMIT = 8192
+
+
+def build_alias_map() -> dict[str, str]:
+    """Single-pass reverse map ``{canonical_profile -> alias_name}``.
+
+    Scans the wrapper dir ONCE (vs. :func:`find_alias_for_profile` per profile)
+    and reads only a small head slice of each candidate wrapper, skipping
+    binaries. A custom alias (file name != profile) wins over the profile-named
+    wrapper, matching ``find_alias_for_profile``'s preference; deterministic via
+    sorted iteration.
+    """
+    wrapper_dir = _get_wrapper_dir()
+    if not wrapper_dir.is_dir():
+        return {}
+
+    is_windows = sys.platform == "win32"
+    custom: dict[str, str] = {}
+    profile_named: dict[str, str] = {}
+    profile_ref_re = re.compile(r"\bhermes\s+-p\s+([a-z0-9][a-z0-9_-]{0,63})\b")
+
+    for entry in sorted(wrapper_dir.iterdir()):
+        if not entry.is_file():
+            continue
+        # Only wrappers are relevant: Windows wrappers are .bat files, POSIX
+        # wrappers have no suffix. This mirrors find_alias_for_profile().
+        if is_windows and entry.suffix != ".bat":
+            continue
+        if not is_windows and entry.suffix:
+            continue
+        try:
+            with open(entry, "r", encoding="utf-8", errors="strict") as f:
+                content = f.read(_WRAPPER_READ_LIMIT)
+        except (OSError, UnicodeDecodeError):
+            continue
+        match = profile_ref_re.search(content)
+        if not match:
+            continue
+        profile = normalize_profile_name(match.group(1))
+        alias = entry.stem if is_windows else entry.name
+        if alias == profile:
+            profile_named.setdefault(profile, alias)
+        else:
+            custom.setdefault(profile, alias)
+
+    aliases = dict(profile_named)
+    aliases.update(custom)
+    return aliases
+
+
+def _profile_alias_map() -> dict[str, str]:
+    """Backward-compatible private alias for :func:`build_alias_map`."""
+    return build_alias_map()
+
+
 def _migrate_profile_config_if_outdated(profile_dir: Path) -> None:
     """Bring a copied profile config.yaml up to the current schema.
 
@@ -536,64 +597,6 @@ def find_alias_for_profile(profile_name: str) -> Optional[str]:
     etc.) that meant multi-second ``list_profiles`` latency and desktop timeouts.
     """
     return build_alias_map().get(normalize_profile_name(profile_name))
-
-
-# Cap how much of a wrapper file we read when reverse-looking-up its profile.
-# Real wrappers are a few hundred bytes of shell; the needle (``hermes -p X``)
-# sits near the top. The wrapper dir (e.g. ``~/.local/bin``) commonly also holds
-# large unrelated binaries (ffmpeg, node, …) — reading those whole, N times, was
-# the dominant cost in ``list_profiles`` (~4.5s). Reading a small head slice and
-# skipping NUL-bearing (binary) content keeps the scan to a single cheap pass.
-_WRAPPER_READ_LIMIT = 8192
-
-
-def build_alias_map() -> dict[str, str]:
-    """Single-pass reverse map ``{canonical_profile -> alias_name}``.
-
-    Scans the wrapper dir ONCE (vs. :func:`find_alias_for_profile` per profile)
-    and reads only a small head slice of each candidate wrapper, skipping
-    binaries. A custom alias (file name != profile) wins over the profile-named
-    wrapper, matching ``find_alias_for_profile``'s preference; deterministic via
-    sorted iteration.
-    """
-    wrapper_dir = _get_wrapper_dir()
-    result: dict[str, str] = {}
-    if not wrapper_dir.is_dir():
-        return result
-    is_windows = sys.platform == "win32"
-    prefix = "hermes -p "
-
-    for entry in sorted(wrapper_dir.iterdir()):
-        if not entry.is_file():
-            continue
-        # Only our own wrappers are named with the alias and (on Windows) .bat.
-        if is_windows and entry.suffix != ".bat":
-            continue
-        if not is_windows and entry.suffix:
-            continue
-        try:
-            with open(entry, "r", encoding="utf-8", errors="strict") as f:
-                content = f.read(_WRAPPER_READ_LIMIT)
-        except (OSError, UnicodeDecodeError):
-            # UnicodeDecodeError = a binary on PATH (ffmpeg etc.) — not a wrapper.
-            continue
-        idx = content.find(prefix)
-        if idx == -1:
-            continue
-        rest = content[idx + len(prefix):]
-        # Profile id is the first whitespace-delimited token after the flag.
-        canon = rest.split(None, 1)[0].strip() if rest.strip() else ""
-        if not canon:
-            continue
-        canon = normalize_profile_name(canon)
-        alias = entry.stem if is_windows else entry.name
-        # Custom alias (name != profile) preferred; otherwise keep the
-        # profile-named wrapper. Don't overwrite a custom alias already found.
-        if alias == canon:
-            result.setdefault(canon, alias)
-        else:
-            result[canon] = alias
-    return result
 
 
 # ---------------------------------------------------------------------------
@@ -859,6 +862,7 @@ def list_profiles() -> List[ProfileInfo]:
     """Return info for all profiles, including the default."""
     profiles = []
     wrapper_dir = _get_wrapper_dir()
+    alias_by_profile = _profile_alias_map()
 
     # Default profile
     default_home = _get_default_hermes_home()
@@ -885,10 +889,6 @@ def list_profiles() -> List[ProfileInfo]:
     # Named profiles
     profiles_root = _get_profiles_root()
     if profiles_root.is_dir():
-        # Build the {profile -> alias} map ONCE here instead of calling
-        # find_alias_for_profile() per profile (which re-scanned the whole
-        # wrapper dir each time — O(N*M), the dominant cost in this function).
-        alias_map = build_alias_map()
         for entry in sorted(profiles_root.iterdir()):
             if not entry.is_dir():
                 continue
@@ -898,7 +898,7 @@ def list_profiles() -> List[ProfileInfo]:
             if not _PROFILE_ID_RE.match(name):
                 continue
             model, provider = _read_config_model(entry)
-            alias_name = alias_map.get(normalize_profile_name(name))
+            alias_name = alias_by_profile.get(normalize_profile_name(name))
             if alias_name:
                 is_windows = sys.platform == "win32"
                 alias_path = wrapper_dir / (f"{alias_name}.bat" if is_windows else alias_name)

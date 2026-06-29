@@ -205,7 +205,7 @@ export const zhHant = defineLocale({
       keysTools: '工具',
       keysSettings: '設定',
       mcp: 'MCP',
-      archivedChats: '已封存聊天',
+      archivedChats: '工作階段',
       about: '關於',
       notifications: '通知'
     },
@@ -262,7 +262,7 @@ export const zhHant = defineLocale({
       gateway: '閘道連線…',
       keys: '搜尋 API 金鑰…',
       mcp: '搜尋 MCP 伺服器…',
-      sessions: '搜尋已封存工作階段…'
+      sessions: '搜尋工作階段…'
     },
     modeOptions: {
       light: { label: '明亮', description: '明亮的桌面介面' },

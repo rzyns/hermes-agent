@@ -5545,6 +5545,18 @@ async function startHermes() {
     const backendStartFailed = new Promise((_resolve, reject) => {
       rejectBackendStart = reject
     })
+    // Arm the READY watcher before any awaited boot-progress update can yield
+    // back to Electron's event loop. Warm local backends can announce their
+    // ephemeral port almost immediately; if the listener is attached only after
+    // the progress await below, rememberLog can record the READY line while
+    // waitForDashboardPortAnnouncement misses it and later times out.
+    const backendPortReady = Promise.race([
+      waitForDashboardPortAnnouncement(hermesProcess, { readyFile }),
+      backendStartFailed
+    ])
+    // Mark the intentionally-later await as handled so an early spawn failure
+    // cannot surface as an unhandled rejection while the boot UI is updating.
+    void backendPortReady.catch(() => {})
     hermesProcess.once('error', error => {
       rememberLog(`Hermes backend failed to start: ${error.message}`)
       updateBootProgress(
@@ -5586,11 +5598,8 @@ async function startHermes() {
     })
 
     await advanceBootProgress('backend.port', 'Waiting for Hermes backend to launch', 86)
-    // Discover the ephemeral port the child bound to
-    const port = await Promise.race([
-      waitForDashboardPortAnnouncement(hermesProcess, { readyFile }),
-      backendStartFailed
-    ])
+    // Discover the ephemeral port the child bound to.
+    const port = await backendPortReady
     if (readyFile) {
       fs.unlink(readyFile, () => {})
     }

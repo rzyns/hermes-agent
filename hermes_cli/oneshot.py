@@ -369,8 +369,47 @@ def _run_agent(
     agent.stream_delta_callback = None
     agent.tool_gen_callback = None
 
-    result = agent.run_conversation(prompt)
-    return (result.get("final_response") or "", result)
+    try:
+        result = agent.run_conversation(prompt)
+        return (result.get("final_response") or "", result)
+    finally:
+        try:
+            session_messages = getattr(agent, "_session_messages", None)
+            if hasattr(agent, "shutdown_memory_provider"):
+                if isinstance(session_messages, list):
+                    agent.shutdown_memory_provider(session_messages)
+                else:
+                    agent.shutdown_memory_provider()
+        except Exception:
+            pass
+        try:
+            if hasattr(agent, "close"):
+                agent.close()
+        except Exception:
+            pass
+        _shutdown_global_oneshot_resources()
+
+
+def _shutdown_global_oneshot_resources() -> None:
+    """Release process-global resources that normal CLI cleanup would close.
+
+    Oneshot bypasses ``cli.py`` and therefore misses its ``_run_cleanup()``
+    atexit path. Keep this helper intentionally narrow and best-effort so
+    ``hermes -z`` remains quiet and non-interactive while still avoiding
+    interpreter-finalization races from cached clients/background servers.
+    """
+    try:
+        from tools.mcp_tool import shutdown_mcp_servers
+
+        shutdown_mcp_servers()
+    except Exception:
+        pass
+    try:
+        from agent.auxiliary_client import shutdown_cached_clients
+
+        shutdown_cached_clients()
+    except Exception:
+        pass
 
 
 def _oneshot_clarify_callback(question: str, choices=None) -> str:

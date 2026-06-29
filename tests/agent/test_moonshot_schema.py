@@ -113,6 +113,22 @@ class TestMissingTypeFilled:
         assert "type" not in out["properties"]["payload"]
         assert out["properties"]["payload"]["$ref"] == "#/$defs/Payload"
 
+    def test_json_schema_type_array_collapses_to_first_non_null_scalar(self):
+        """JSON Schema permits nullable/union type arrays; Moonshot needs scalar type."""
+        params = {
+            "type": "object",
+            "properties": {
+                "maybe_text": {
+                    "type": ["string", "null"],
+                    "enum": ["alpha", None, ""],
+                },
+            },
+        }
+        out = sanitize_moonshot_tool_parameters(params)
+        maybe_text = out["properties"]["maybe_text"]
+        assert maybe_text["type"] == "string"
+        assert maybe_text["enum"] == ["alpha"]
+
 
 class TestAnyOfParentType:
     """Rule 2: type must not appear at the anyOf parent level.
@@ -446,3 +462,19 @@ class TestUnionTypeList:
         assert sort["type"] == "string"
         assert sort["enum"] == ["asc", "desc"]
         assert params["properties"]["sort"]["type"] == ["string", "null"]
+
+    def test_null_only_union_falls_back_to_schema_shape_inference(self):
+        """A null-only type array should not block object/array inference."""
+        params = {
+            "type": "object",
+            "properties": {
+                "metadata": {
+                    "type": ["null"],
+                    "properties": {"source": {"type": "string"}},
+                },
+            },
+        }
+
+        out = sanitize_moonshot_tool_parameters(params)
+
+        assert out["properties"]["metadata"]["type"] == "object"

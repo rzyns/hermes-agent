@@ -297,6 +297,51 @@ def test_get_platform_tools_expands_composite_when_mixed_with_configurable():
     assert "spotify" in enabled
 
 
+def test_get_platform_tools_infers_static_core_when_registry_adds_toolset_extras():
+    """Registry-registered extras in a static toolset should not break
+    reverse-inference from a platform composite.
+
+    Plugin/builtin discovery can attach optional tools to an existing static
+    bucket (e.g. profile-delegate under ``delegation`` or GUI-only helpers under
+    ``terminal``). A saved ``hermes-cli`` composite only promises the static
+    core tools, so inference should use the static TOOLSETS shape and then let
+    the enabled toolset include any available registry extras later.
+    """
+    from tools.registry import registry
+
+    registry.register(
+        name="_test_optional_delegate_extra",
+        toolset="delegation",
+        schema={
+            "description": "test optional delegation extra",
+            "parameters": {"type": "object", "properties": {}},
+        },
+        handler=lambda _args, **_kwargs: None,
+    )
+    registry.register(
+        name="_test_optional_terminal_extra",
+        toolset="terminal",
+        schema={
+            "description": "test optional terminal extra",
+            "parameters": {"type": "object", "properties": {}},
+        },
+        handler=lambda _args, **_kwargs: None,
+    )
+    try:
+        config = {"platform_toolsets": {"cli": ["hermes-cli", "spotify"]}}
+        enabled = _get_platform_tools(
+            config,
+            "cli",
+            include_default_mcp_servers=False,
+        )
+    finally:
+        registry.deregister("_test_optional_delegate_extra")
+        registry.deregister("_test_optional_terminal_extra")
+
+    assert "delegation" in enabled
+    assert "terminal" in enabled
+
+
 def test_get_platform_tools_composite_only_unchanged():
     """Composite-only config (no configurable in list) must still take the
     else-branch path and produce the full toolset — guards against the new
@@ -1027,7 +1072,8 @@ def test_computer_use_needs_configuration_when_cua_driver_post_setup_pending():
     Returning users enabling Computer Use through `hermes tools` must reach the
     cua-driver post-setup installer even though the provider has no API keys.
     """
-    with patch("shutil.which", return_value=None):
+    with patch.dict("os.environ", {"HERMES_CUA_DRIVER_CMD": ""}), \
+         patch("shutil.which", return_value=None):
         assert _toolset_needs_configuration_prompt("computer_use", {}) is True
 
 
@@ -1036,7 +1082,8 @@ def test_computer_use_skips_configuration_when_cua_driver_already_installed():
     def fake_which(name: str):
         return "/usr/local/bin/cua-driver" if name == "cua-driver" else None
 
-    with patch("shutil.which", side_effect=fake_which):
+    with patch.dict("os.environ", {"HERMES_CUA_DRIVER_CMD": ""}), \
+         patch("shutil.which", side_effect=fake_which):
         assert _toolset_needs_configuration_prompt("computer_use", {}) is False
 
 

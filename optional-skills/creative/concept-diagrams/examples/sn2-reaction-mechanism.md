@@ -147,17 +147,17 @@ This is a **chemistry mechanism diagram** with:
 ```xml
 <!-- Filled area under curve -->
 <path class="energy-fill" d="
-  M 40,200 
-  Q 150,200 250,50 
-  Q 350,200 500,220 
+  M 40,200
+  Q 150,200 250,50
+  Q 350,200 500,220
   L 500,280 L 40,280 Z
 "/>
 
 <!-- Curve line -->
 <path class="energy-curve" d="
-  M 40,200 
+  M 40,200
   Q 100,200 150,150
-  Q 200,80 250,50 
+  Q 200,80 250,50
   Q 300,80 350,150
   Q 400,210 500,220
 "/>

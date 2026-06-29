@@ -1012,6 +1012,40 @@
   gap: 0.5rem;
   align-items: center;
 }
+.hermes-kanban-board-health {
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  font-size: 0.65rem;
+}
+.hermes-kanban-board-health--degraded,
+.hermes-kanban-board-health--unreachable {
+  background: rgba(220, 38, 38, 0.12);
+  color: rgb(248, 113, 113);
+  border: 1px solid rgba(248, 113, 113, 0.3);
+}
+.hermes-kanban-board-health--missing {
+  background: rgba(234, 179, 8, 0.12);
+  color: rgb(250, 204, 21);
+  border: 1px solid rgba(250, 204, 21, 0.3);
+}
+.hermes-kanban-degraded {
+  border-color: rgba(248, 113, 113, 0.35);
+  background: linear-gradient(180deg, rgba(127, 29, 29, 0.12), rgba(127, 29, 29, 0.04));
+}
+.hermes-kanban-degraded-icon {
+  color: rgb(248, 113, 113);
+  font-size: 1.2rem;
+}
+.hermes-kanban-degraded-path {
+  display: block;
+  margin-top: 0.25rem;
+  padding: 0.45rem 0.55rem;
+  border-radius: 0.35rem;
+  background: rgba(0, 0, 0, 0.22);
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  white-space: pre-wrap;
+  word-break: break-all;
+}
 .hermes-kanban-docs-link {
   display: inline-flex;
   align-items: center;
@@ -1581,3 +1615,82 @@
 .hermes-kanban-trash-label {
   font-weight: 500;
 }
+
+/* ---- Cross-board dependency section ---------------------------------- */
+
+.hermes-kanban-cbd-group {
+  margin-bottom: 0.5rem;
+}
+
+.hermes-kanban-cbd-group-label {
+  font-size: 0.65rem;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  color: var(--color-muted-foreground);
+  margin-bottom: 0.25rem;
+}
+
+.hermes-kanban-cbd-row {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  padding: 0.25rem 0.35rem;
+  border-radius: var(--radius);
+  font-size: 0.75rem;
+  background: color-mix(in srgb, var(--color-card) 60%, transparent);
+  margin-bottom: 0.15rem;
+}
+
+.hermes-kanban-cbd-dot {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  flex-shrink: 0;
+  background: var(--color-primary, #3b82f6);
+}
+
+.hermes-kanban-cbd-dot--blocking {
+  background: var(--color-destructive, #d14a4a);
+}
+
+.hermes-kanban-cbd-dir {
+  font-family: var(--font-mono, ui-monospace, monospace);
+  color: var(--color-muted-foreground);
+  flex-shrink: 0;
+  min-width: 1.2ch;
+  text-align: center;
+}
+
+.hermes-kanban-cbd-board {
+  font-weight: 600;
+  color: var(--color-foreground);
+  flex-shrink: 0;
+}
+
+.hermes-kanban-cbd-id {
+  font-family: var(--font-mono, ui-monospace, monospace);
+  color: var(--color-muted-foreground);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.hermes-kanban-cbd-kind {
+  margin-left: auto;
+  font-size: 0.65rem;
+  text-transform: uppercase;
+  letter-spacing: 0.03em;
+  color: var(--color-muted-foreground);
+  background: color-mix(in srgb, var(--color-muted-foreground) 10%, transparent);
+  padding: 0.1rem 0.3rem;
+  border-radius: var(--radius);
+  flex-shrink: 0;
+}
+
+.hermes-kanban-cbd-source {
+  font-size: 0.65rem;
+  color: var(--color-muted-foreground);
+  flex-shrink: 0;
+}
+
+/* Drop Link dialog reuses .hermes-kanban-dialog / .hermes-kanban-dialog-backdrop */

@@ -211,7 +211,7 @@ export const ja = defineLocale({
       keysTools: 'ツール',
       keysSettings: '設定',
       mcp: 'MCP',
-      archivedChats: 'アーカイブ済みチャット',
+      archivedChats: 'セッション',
       about: '情報',
       notifications: '通知'
     },
@@ -269,7 +269,7 @@ export const ja = defineLocale({
       gateway: 'ゲートウェイ接続…',
       keys: 'API キーを検索…',
       mcp: 'MCP サーバーを検索…',
-      sessions: 'アーカイブ済みセッションを検索…'
+      sessions: 'セッションを検索…'
     },
     modeOptions: {
       light: { label: 'ライト', description: '明るいデスクトップ表示' },

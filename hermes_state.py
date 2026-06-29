@@ -326,7 +326,13 @@ def apply_wal_with_fallback(
         if existing == "wal":
             raise
         _log_wal_fallback_once(db_label, exc)
-        conn.execute("PRAGMA journal_mode=DELETE")
+        try:
+            conn.execute("PRAGMA journal_mode=DELETE")
+        except sqlite3.OperationalError as fallback_exc:
+            raise sqlite3.OperationalError(
+                f"{db_label}: PRAGMA journal_mode=WAL failed with {exc}; "
+                f"fallback PRAGMA journal_mode=DELETE also failed with {fallback_exc}"
+            ) from fallback_exc
         return "delete"
 
 
@@ -670,6 +676,9 @@ CREATE TABLE IF NOT EXISTS sessions (
     cost_source TEXT,
     pricing_version TEXT,
     title TEXT,
+    title_source TEXT,
+    title_updated_at REAL,
+    title_revision_count INTEGER NOT NULL DEFAULT 0,
     api_call_count INTEGER DEFAULT 0,
     handoff_state TEXT,
     handoff_platform TEXT,
@@ -2218,52 +2227,188 @@ class SessionDB:
         ).fetchone()
         return row is not None
 
-    def set_session_title(self, session_id: str, title: str) -> bool:
-        """Set or update a session's title.
+    def _validate_title_unique(
+        self,
+        conn,
+        session_id: str,
+        title: str,
+        *,
+        allow_compression_ancestor_transfer: bool = False,
+        title_updated_at: Optional[float] = None,
+    ) -> None:
+        if not title:
+            return
+        cursor = conn.execute(
+            "SELECT id FROM sessions WHERE title = ? AND id != ?",
+            (title, session_id),
+        )
+        conflict = cursor.fetchone()
+        if not conflict:
+            return
+        conflict_id = conflict["id"]
+        if allow_compression_ancestor_transfer and self._is_compression_ancestor(
+            conn, ancestor_id=conflict_id, descendant_id=session_id
+        ):
+            if title_updated_at is None:
+                title_updated_at = time.time()
+            conn.execute(
+                """UPDATE sessions
+                   SET title = NULL,
+                       title_source = NULL,
+                       title_updated_at = ?,
+                       title_revision_count = COALESCE(title_revision_count, 0) + 1
+                   WHERE id = ?""",
+                (title_updated_at, conflict_id),
+            )
+            return
+        raise ValueError(f"Title '{title}' is already in use by session {conflict_id}")
+
+    def set_session_title(
+        self,
+        session_id: str,
+        title: str,
+        *,
+        title_source: str = "manual",
+    ) -> bool:
+        """Set or update a session's title and provenance.
 
         Returns True if session was found and title was set.
         Raises ValueError if title is already in use by another session,
         or if the title fails validation (too long, invalid characters).
         Empty/whitespace-only strings are normalized to None (clearing the title).
+
+        ``title_source`` records whether the title was manually supplied,
+        generated automatically, imported, or backfilled.  This lets the UI and
+        maintenance commands improve auto titles without overwriting manual
+        user labels.
         """
+        allowed_sources = {"manual", "auto", "backfill", "imported"}
+        if title_source not in allowed_sources:
+            raise ValueError(
+                f"Invalid title_source '{title_source}' (expected one of {sorted(allowed_sources)})"
+            )
         title = self.sanitize_title(title)
+        now = time.time()
+
         def _do(conn):
-            if title:
-                # Check uniqueness (allow the same session to keep its own title)
-                cursor = conn.execute(
-                    "SELECT id FROM sessions WHERE title = ? AND id != ?",
-                    (title, session_id),
-                )
-                conflict = cursor.fetchone()
-                if conflict:
-                    conflict_id = conflict["id"]
-                    # A compression continuation is the live, projected-forward
-                    # head of its conversation; its compressed predecessors are
-                    # ended and hidden from the session list (list_sessions_rich
-                    # projects roots → tip). When the title that "conflicts" is
-                    # held by such a hidden ancestor, the user has no way to free
-                    # it — renaming the visible tip back to the base name would
-                    # dead-end with "already in use by <session they can't see>".
-                    # Treat this as a transfer: move the title off the ancestor
-                    # onto the continuation. Uniqueness is preserved (still only
-                    # one session carries the exact title) and the parent-link
-                    # lineage is untouched.
-                    if self._is_compression_ancestor(
-                        conn, ancestor_id=conflict_id, descendant_id=session_id
-                    ):
-                        conn.execute(
-                            "UPDATE sessions SET title = NULL WHERE id = ?",
-                            (conflict_id,),
-                        )
-                    else:
-                        raise ValueError(
-                            f"Title '{title}' is already in use by session {conflict_id}"
-                        )
+            self._validate_title_unique(
+                conn,
+                session_id,
+                title,
+                allow_compression_ancestor_transfer=True,
+                title_updated_at=now,
+            )
             cursor = conn.execute(
-                "UPDATE sessions SET title = ? WHERE id = ?",
-                (title, session_id),
+                """UPDATE sessions
+                   SET title = ?,
+                       title_source = ?,
+                       title_updated_at = ?,
+                       title_revision_count = COALESCE(title_revision_count, 0) + 1
+                   WHERE id = ?""",
+                (title, title_source if title else None, now, session_id),
             )
             return cursor.rowcount
+        rowcount = self._execute_write(_do)
+        return rowcount > 0
+
+    def set_backfill_session_title(self, session_id: str, title: str) -> bool:
+        """Set a backfilled title only if the session is still untitled."""
+        title = self.sanitize_title(title)
+        if not title:
+            return False
+        now = time.time()
+
+        def _do(conn):
+            self._validate_title_unique(conn, session_id, title)
+            cursor = conn.execute(
+                """UPDATE sessions
+                   SET title = ?,
+                       title_source = 'backfill',
+                       title_updated_at = ?,
+                       title_revision_count = COALESCE(title_revision_count, 0) + 1
+                   WHERE id = ?
+                     AND (title IS NULL OR title = '')""",
+                (title, now, session_id),
+            )
+            return cursor.rowcount
+
+        rowcount = self._execute_write(_do)
+        return rowcount > 0
+
+    def set_auto_generated_session_title(self, session_id: str, title: str) -> bool:
+        """Regenerate a title only if it is still auto-generated."""
+        title = self.sanitize_title(title)
+        if not title:
+            return False
+        now = time.time()
+
+        def _do(conn):
+            self._validate_title_unique(conn, session_id, title)
+            cursor = conn.execute(
+                """UPDATE sessions
+                   SET title = ?,
+                       title_source = 'auto',
+                       title_updated_at = ?,
+                       title_revision_count = COALESCE(title_revision_count, 0) + 1
+                   WHERE id = ?
+                     AND title_source = 'auto'""",
+                (title, now, session_id),
+            )
+            return cursor.rowcount
+
+        rowcount = self._execute_write(_do)
+        return rowcount > 0
+
+    def set_auto_session_title(
+        self,
+        session_id: str,
+        title: str,
+        *,
+        allow_retitle: bool = False,
+    ) -> bool:
+        """Set an auto-generated title only when provenance makes it safe.
+
+        This is the race-safe path for background title generation.  It updates
+        untitled sessions, and when ``allow_retitle`` is true, performs one
+        early improvement only if the current title is still auto-generated and
+        has at most one prior title revision.  Manual/imported/backfilled titles
+        are never overwritten, even if they are set while the LLM call is in
+        flight.
+        """
+        title = self.sanitize_title(title)
+        if not title:
+            return False
+        now = time.time()
+
+        def _do(conn):
+            self._validate_title_unique(conn, session_id, title)
+            if allow_retitle:
+                cursor = conn.execute(
+                    """UPDATE sessions
+                       SET title = ?,
+                           title_source = 'auto',
+                           title_updated_at = ?,
+                           title_revision_count = COALESCE(title_revision_count, 0) + 1
+                       WHERE id = ?
+                         AND (
+                           title IS NULL OR title = '' OR
+                           (title_source = 'auto' AND COALESCE(title_revision_count, 0) <= 1)
+                         )""",
+                    (title, now, session_id),
+                )
+            else:
+                cursor = conn.execute(
+                    """UPDATE sessions
+                       SET title = ?,
+                           title_source = 'auto',
+                           title_updated_at = ?,
+                           title_revision_count = COALESCE(title_revision_count, 0) + 1
+                       WHERE id = ?
+                         AND (title IS NULL OR title = '')""",
+                    (title, now, session_id),
+                )
+            return cursor.rowcount
+
         rowcount = self._execute_write(_do)
         return rowcount > 0
 
@@ -2491,6 +2636,7 @@ class SessionDB:
     def list_sessions_rich(
         self,
         source: str = None,
+        sources: List[str] = None,
         exclude_sources: List[str] = None,
         cwd_prefix: str = None,
         limit: int = 20,
@@ -2551,9 +2697,15 @@ class SessionDB:
             where_clauses.append(_LISTABLE_CHILD_SQL)
             where_clauses.append(f"{_delegate_from_json('s.model_config')} IS NULL")
 
+        source_list = [s for s in (sources or []) if s]
+
         if source:
             where_clauses.append("s.source = ?")
             params.append(source)
+        elif source_list:
+            placeholders = ",".join("?" for _ in source_list)
+            where_clauses.append(f"s.source IN ({placeholders})")
+            params.extend(source_list)
         if exclude_sources:
             placeholders = ",".join("?" for _ in exclude_sources)
             where_clauses.append(f"s.source NOT IN ({placeholders})")
@@ -2724,7 +2876,9 @@ class SessionDB:
                 merged = dict(s)
                 for key in (
                     "id", "ended_at", "end_reason", "message_count",
-                    "tool_call_count", "title", "last_active", "preview",
+                    "tool_call_count", "title", "title_source",
+                    "title_updated_at", "title_revision_count",
+                    "last_active", "preview",
                     "model", "system_prompt", "cwd", "git_branch", "git_repo_root",
                 ):
                     if key in tip_row:
@@ -4275,6 +4429,7 @@ class SessionDB:
     def session_count(
         self,
         source: str = None,
+        sources: List[str] = None,
         cwd_prefix: str = None,
         min_message_count: int = 0,
         include_archived: bool = False,
@@ -4305,9 +4460,15 @@ class SessionDB:
             # children (parent ended with end_reason='branched').
             where_clauses.append(_LISTABLE_CHILD_SQL)
             where_clauses.append(f"{_delegate_from_json('s.model_config')} IS NULL")
+        source_list = [s for s in (sources or []) if s]
+
         if source:
             where_clauses.append("s.source = ?")
             params.append(source)
+        elif source_list:
+            placeholders = ",".join("?" for _ in source_list)
+            where_clauses.append(f"s.source IN ({placeholders})")
+            params.extend(source_list)
         if exclude_sources:
             placeholders = ",".join("?" for _ in exclude_sources)
             where_clauses.append(f"s.source NOT IN ({placeholders})")

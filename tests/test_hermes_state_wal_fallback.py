@@ -128,6 +128,34 @@ class TestApplyWalWithFallback:
         )
         with pytest.raises(sqlite3.OperationalError, match="disk I/O error"):
             apply_wal_with_fallback(conn)
+
+        conn.close()
+
+    def test_reports_both_errors_when_delete_fallback_fails(self, tmp_path):
+        """If WAL fallback is warranted but DELETE also fails, preserve both causes."""
+
+        class _BothJournalModesFailConnection(sqlite3.Connection):
+            def execute(self, sql, *args, **kwargs):  # type: ignore[override]
+                normalized = sql.lower().replace(" ", "")
+                if "journal_mode=wal" in normalized:
+                    raise sqlite3.OperationalError("locking protocol")
+                if "journal_mode=delete" in normalized:
+                    raise sqlite3.OperationalError("disk I/O error")
+                return super().execute(sql, *args, **kwargs)
+
+        conn = sqlite3.connect(
+            str(tmp_path / "broken.db"),
+            factory=_BothJournalModesFailConnection,
+            isolation_level=None,
+        )
+        with pytest.raises(sqlite3.OperationalError) as exc_info:
+            apply_wal_with_fallback(conn, db_label="kanban.db")
+        msg = str(exc_info.value)
+        assert "kanban.db" in msg
+        assert "journal_mode=WAL failed" in msg
+        assert "locking protocol" in msg
+        assert "journal_mode=DELETE also failed" in msg
+        assert "disk I/O error" in msg
         conn.close()
 
     def test_does_not_downgrade_when_disk_says_wal(self, tmp_path):

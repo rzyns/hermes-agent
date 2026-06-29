@@ -187,8 +187,8 @@ class TestDiscoveryScrubsApiField:
         monkeypatch.setenv("HERMES_HOME", str(tmp_path))
         monkeypatch.delenv("HERMES_ENABLE_PROJECT_PLUGINS", raising=False)
 
-        def _make(name: str, manifest: dict) -> None:
-            _write_plugin_manifest(tmp_path / "plugins", name, manifest)
+        def _make(name: str, manifest: dict) -> Path:
+            return _write_plugin_manifest(tmp_path / "plugins", name, manifest)
 
         return _make
 
@@ -216,7 +216,7 @@ class TestDiscoveryScrubsApiField:
         assert entry["_api_file"] is None
         assert entry["has_api"] is False
 
-    def test_safe_api_path_survives(self, user_plugin_factory, tmp_path):
+    def test_user_safe_api_path_is_scrubbed(self, user_plugin_factory, tmp_path):
         user_plugin_factory("safe", {
             "name": "safe",
             "label": "Safe",
@@ -230,6 +230,125 @@ class TestDiscoveryScrubsApiField:
         )
         plugins = web_server._get_dashboard_plugins(force_rescan=True)
         entry = next(p for p in plugins if p["name"] == "safe")
+        assert entry["_api_file"] is None
+        assert entry["has_api"] is False
+
+    def test_user_safe_api_path_survives_when_plugin_root_is_explicitly_trusted(
+        self, user_plugin_factory, tmp_path, monkeypatch
+    ):
+        dashboard = user_plugin_factory("trusted-safe", {
+            "name": "trusted-safe",
+            "label": "Trusted Safe",
+            "api": "api.py",
+            "entry": "dist/index.js",
+        })
+        (dashboard / "api.py").write_text("router = None\n")
+        monkeypatch.setenv(
+            "HERMES_DASHBOARD_TRUSTED_PLUGIN_API_ROOTS",
+            str(tmp_path / "plugins" / "trusted-safe"),
+        )
+
+        plugins = web_server._get_dashboard_plugins(force_rescan=True)
+        entry = next(p for p in plugins if p["name"] == "trusted-safe")
+        assert entry["_api_file"] == "api.py"
+        assert entry["has_api"] is True
+
+    def test_trusted_user_traversal_api_path_is_still_scrubbed(
+        self, user_plugin_factory, tmp_path, monkeypatch
+    ):
+        user_plugin_factory("trusted-traverse", {
+            "name": "trusted-traverse",
+            "label": "Trusted Traverse",
+            "api": "../../../../tmp/evil.py",
+            "entry": "dist/index.js",
+        })
+        monkeypatch.setenv(
+            "HERMES_DASHBOARD_TRUSTED_PLUGIN_API_ROOTS",
+            str(tmp_path / "plugins" / "trusted-traverse"),
+        )
+
+        plugins = web_server._get_dashboard_plugins(force_rescan=True)
+        entry = next(p for p in plugins if p["name"] == "trusted-traverse")
+        assert entry["_api_file"] is None
+        assert entry["has_api"] is False
+
+    def test_project_safe_api_path_is_scrubbed(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path / "home"))
+        (tmp_path / "home").mkdir()
+        monkeypatch.setenv("HERMES_ENABLE_PROJECT_PLUGINS", "1")
+        cwd = tmp_path / "project"
+        cwd.mkdir()
+        monkeypatch.chdir(cwd)
+        dashboard = _write_plugin_manifest(
+            cwd / ".hermes" / "plugins",
+            "safe-project",
+            {
+                "name": "safe-project",
+                "label": "Safe Project",
+                "api": "api.py",
+                "entry": "dist/index.js",
+            },
+        )
+        (dashboard / "api.py").write_text("router = None\n")
+
+        plugins = web_server._get_dashboard_plugins(force_rescan=True)
+        entry = next(p for p in plugins if p["name"] == "safe-project")
+        assert entry["_api_file"] is None
+        assert entry["has_api"] is False
+
+    def test_bundled_safe_api_path_survives(self, tmp_path, monkeypatch):
+        hermes_home = tmp_path / "home"
+        monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+        hermes_home.mkdir()
+        monkeypatch.setenv("HERMES_BUNDLED_PLUGINS", str(tmp_path / "bundled"))
+        dashboard = _write_plugin_manifest(
+            tmp_path / "bundled",
+            "safe-bundled",
+            {
+                "name": "safe-bundled",
+                "label": "Safe Bundled",
+                "api": "api.py",
+                "entry": "dist/index.js",
+            },
+        )
+        (dashboard / "api.py").write_text("router = None\n")
+
+        plugins = web_server._get_dashboard_plugins(force_rescan=True)
+        entry = next(p for p in plugins if p["name"] == "safe-bundled")
+        assert entry["_api_file"] == "api.py"
+        assert entry["has_api"] is True
+
+    def test_user_plugin_does_not_shadow_bundled_backend(self, tmp_path, monkeypatch):
+        hermes_home = tmp_path / "home"
+        monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+        hermes_home.mkdir()
+        monkeypatch.setenv("HERMES_BUNDLED_PLUGINS", str(tmp_path / "bundled"))
+
+        bundled_dashboard = _write_plugin_manifest(
+            tmp_path / "bundled",
+            "shadowed",
+            {
+                "name": "shadowed",
+                "label": "Bundled Shadowed",
+                "api": "api.py",
+                "entry": "dist/index.js",
+            },
+        )
+        (bundled_dashboard / "api.py").write_text("router = None\n")
+        _write_plugin_manifest(
+            hermes_home / "plugins",
+            "shadowed",
+            {
+                "name": "shadowed",
+                "label": "User Shadowed",
+                "api": "api.py",
+                "entry": "dist/index.js",
+            },
+        )
+
+        plugins = web_server._get_dashboard_plugins(force_rescan=True)
+        entry = next(p for p in plugins if p["name"] == "shadowed")
+        assert entry["source"] == "bundled"
         assert entry["_api_file"] == "api.py"
         assert entry["has_api"] is True
 
@@ -275,6 +394,23 @@ class TestMountApiRoutesRefusesUntrusted:
             "project-source plugin's api file was imported — "
             "GHSA-5qr3-c538-wm9j defence-in-depth regression"
         )
+
+    def test_user_source_api_imports_when_plugin_root_is_explicitly_trusted(
+        self, tmp_path, monkeypatch
+    ):
+        plugin = self._payload_plugin(tmp_path, source="user")
+        web_server._dashboard_plugins_cache = [plugin]
+        monkeypatch.setenv(
+            "HERMES_DASHBOARD_TRUSTED_PLUGIN_API_ROOTS",
+            str(tmp_path / "plug"),
+        )
+        with patch("importlib.util.spec_from_file_location") as spec:
+            spec.return_value = None  # loader is None -> early continue, safe
+            web_server._mount_plugin_api_routes()
+        assert spec.call_count == 1
+        called_path = Path(spec.call_args.args[1])
+        assert called_path.name == "api.py"
+        assert called_path.is_absolute()
 
     def test_bundled_source_api_imports_normally(self, tmp_path):
         plugin = self._payload_plugin(tmp_path, source="bundled")

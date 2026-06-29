@@ -134,6 +134,9 @@ class DecomposeOutcome:
     fanout: bool = False
     child_ids: list[str] | None = None
     new_title: Optional[str] = None
+    dry_run: bool = False
+    dry_run_tasks: list[dict] | None = None
+    dry_run_parsed: dict | None = None
 
 
 def _truncate(text: str, limit: int) -> str:
@@ -273,6 +276,7 @@ def decompose_task(
     *,
     author: Optional[str] = None,
     timeout: Optional[int] = None,
+    dry_run: bool = False,
 ) -> DecomposeOutcome:
     """Decompose a triage task into a graph of child tasks.
 
@@ -280,6 +284,11 @@ def decompose_task(
     expected failure modes (task not in triage, no aux client
     configured, API error, malformed response, decomposer returned
     fanout=true with empty task list) — those surface via ``ok=False``.
+
+    When ``dry_run=True`` the prompt, LLM call, parse, validation, and
+    normalization run exactly as in real mode, but no DB write occurs.
+    The returned outcome carries ``dry_run=True`` and the parsed plan
+    as ``dry_run_tasks`` / ``dry_run_parsed`` for evidence review.
     """
     with kb.connect_closing() as conn:
         task = kb.get_task(conn, task_id)
@@ -366,9 +375,23 @@ def decompose_task(
                 default_assignee=default_assignee,
                 valid_names=valid_names,
             )
+        effective_assignee = task.assignee or assignee_val
         if title_val is None and body_val is None:
             return DecomposeOutcome(
                 task_id, False, "decomposer returned fanout=false with no title/body",
+            )
+        if dry_run:
+            return DecomposeOutcome(
+                task_id, True, "single task (no fanout) — dry_run",
+                fanout=False, new_title=title_val, dry_run=True,
+                dry_run_tasks=[{
+                    "title": title_val,
+                    "body": body_val,
+                    "assignee": assignee_val,
+                    "assignee_update": assignee_val,
+                    "effective_assignee": effective_assignee,
+                }],
+                dry_run_parsed=parsed,
             )
         with kb.connect_closing() as conn:
             ok = kb.specify_triage_task(
@@ -437,6 +460,14 @@ def decompose_task(
             "assignee": chosen,
             "parents": clean_parents,
         })
+
+    if dry_run:
+        return DecomposeOutcome(
+            task_id, True, f"would decompose into {len(children)} children — dry_run",
+            fanout=True, dry_run=True,
+            dry_run_tasks=children,
+            dry_run_parsed=parsed,
+        )
 
     try:
         with kb.connect_closing() as conn:

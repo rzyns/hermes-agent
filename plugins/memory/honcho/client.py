@@ -17,6 +17,7 @@ import json
 import os
 import logging
 import hashlib
+import re
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -157,6 +158,34 @@ def _parse_string_map(host_obj: dict, root_obj: dict, key: str) -> dict[str, str
         alias_value = str(raw_value).strip() if raw_value is not None else ""
         if alias_key and alias_value:
             result[alias_key] = alias_value
+    return result
+
+
+def _parse_string_list(host_obj: dict, root_obj: dict, key: str) -> list[str]:
+    """Parse a list of strings with host-level whole-list override.
+
+    Accepts either bare strings or objects with a ``pattern``/``regex``/``value``
+    field so configs can name regexes without changing the runtime shape.
+    """
+    source = host_obj[key] if key in host_obj else root_obj.get(key)
+    if source is None:
+        return []
+    if isinstance(source, str):
+        items = [source]
+    elif isinstance(source, list):
+        items = source
+    else:
+        return []
+
+    result: list[str] = []
+    for item in items:
+        if isinstance(item, dict):
+            value = item.get("pattern") or item.get("regex") or item.get("value")
+        else:
+            value = item
+        text = str(value).strip() if value is not None else ""
+        if text:
+            result.append(text)
     return result
 
 
@@ -349,6 +378,10 @@ class HonchoClientConfig:
     # Honcho API limits — configurable for self-hosted instances
     # Max chars per message sent via add_messages() (Honcho cloud: 25000)
     message_max_chars: int = 25000
+    # Regexes for dropping transient operational messages before they reach
+    # Honcho's derivation pipeline. Host-level ``messageNoiseFilters`` replaces
+    # the root list as a whole.
+    message_noise_filters: list[str] = field(default_factory=list)
     # Max chars for dialectic query input to peer.chat() (Honcho cloud: 10000)
     dialectic_max_input_chars: int = 10000
     # Recall mode: how memory retrieval works when Honcho is active.
@@ -579,6 +612,11 @@ class HonchoClientConfig:
                 raw.get("messageMaxChars"),
                 default=25000,
             ),
+            message_noise_filters=_parse_string_list(
+                host_block,
+                raw,
+                "messageNoiseFilters",
+            ),
             dialectic_max_input_chars=_parse_int_config(
                 host_block.get("dialecticMaxInputChars"),
                 raw.get("dialecticMaxInputChars"),
@@ -669,6 +707,76 @@ class HonchoClientConfig:
         prefix = sanitized[:prefix_len].rstrip("-")
         return f"{prefix}-{digest}"
 
+    @staticmethod
+    def _sanitize_session_component(value: str | None) -> str | None:
+        """Return a Honcho-safe session component, or None if it sanitizes empty."""
+        if not value:
+            return None
+        sanitized = re.sub(r'[^a-zA-Z0-9_-]+', '-', value).strip('-')
+        return sanitized or None
+
+    def _with_session_peer_prefix(self, session_name: str) -> str:
+        if self.session_peer_prefix and self.peer_name:
+            return f"{self.peer_name}-{session_name}"
+        return session_name
+
+    def _gateway_session_name(self, gateway_session_key: str | None) -> str | None:
+        """Return the canonical Honcho key for a gateway session key."""
+        sanitized = self._sanitize_session_component(gateway_session_key)
+        if not sanitized:
+            return None
+        original = gateway_session_key or sanitized
+        if self.session_peer_prefix and self.peer_name:
+            sanitized = f"{self.peer_name}-{sanitized}"
+            original = f"{self.peer_name}:{original}"
+        return self._enforce_session_id_limit(sanitized, original)
+
+    def _title_session_name(self, session_title: str | None) -> str | None:
+        sanitized = self._sanitize_session_component(session_title)
+        if not sanitized:
+            return None
+        return self._with_session_peer_prefix(sanitized)
+
+    def _session_id_session_name(self, session_id: str | None) -> str | None:
+        if not session_id:
+            return None
+        return self._with_session_peer_prefix(session_id)
+
+    def resolve_session_name_candidates(
+        self,
+        cwd: str | None = None,
+        session_title: str | None = None,
+        session_id: str | None = None,
+        gateway_session_key: str | None = None,
+    ) -> list[tuple[str, str]]:
+        """Return plausible Honcho session keys for diagnostics/readback.
+
+        Stable identifiers (gateway key, raw session id) are listed before
+        user-facing labels (manual map, title), followed by strategy fallback
+        handles (repo, directory, global). ``resolve_session_name()`` still
+        applies strategy-dependent precedence when choosing the active key.
+        """
+        if not cwd:
+            cwd = os.getcwd()
+
+        candidates: list[tuple[str, str]] = []
+
+        def add(source: str, key: str | None) -> None:
+            if key:
+                candidates.append((source, key))
+
+        add("gateway_session_key", self._gateway_session_name(gateway_session_key))
+        add("session_id", self._session_id_session_name(session_id))
+        add("manual_override", self.sessions.get(cwd))
+        add("session_title", self._title_session_name(session_title))
+
+        repo_name = self._git_repo_name(cwd)
+        if repo_name:
+            add("repo", self._with_session_peer_prefix(repo_name))
+        add("directory", self._with_session_peer_prefix(Path(cwd).name))
+        add("global", self.workspace_id)
+        return candidates
+
     def resolve_session_name(
         self,
         cwd: str | None = None,
@@ -681,62 +789,47 @@ class HonchoClientConfig:
         Resolution order:
           1. Gateway session key (stable per-chat identifier from gateway platforms)
           2. per-session strategy — Hermes session_id ({timestamp}_{hex}); authoritative,
-             so a generated title never remaps a live conversation
-          3. Manual directory override from sessions map
+             so a generated title or cwd map never remaps a live conversation
+          3. Manual directory override from sessions map (non-per-session)
           4. Hermes session title (from /title command; non-per-session)
           5. per-repo strategy — git repo root directory name
           6. per-directory strategy — directory basename
           7. global strategy — workspace name
         """
-        import re
-
         if not cwd:
             cwd = os.getcwd()
 
+        candidate_map = dict(self.resolve_session_name_candidates(
+            cwd=cwd,
+            session_title=session_title,
+            session_id=session_id,
+            gateway_session_key=gateway_session_key,
+        ))
+
         # Gateway per-chat key wins everywhere — gateways (telegram/discord/…)
         # need per-chat isolation no cwd/strategy name can provide.
-        if gateway_session_key:
-            sanitized = re.sub(r'[^a-zA-Z0-9_-]+', '-', gateway_session_key).strip('-')
-            if sanitized:
-                return self._enforce_session_id_limit(sanitized, gateway_session_key)
+        if candidate_map.get("gateway_session_key"):
+            return candidate_map["gateway_session_key"]
 
         # per-session: the run's session_id IS the identity — resolve before the
         # cwd map / title so an auto-generated title can't remap a live
         # conversation onto a second Honcho session mid-stream.
-        if self.session_strategy == "per-session" and session_id:
-            if self.session_peer_prefix and self.peer_name:
-                return f"{self.peer_name}-{session_id}"
-            return session_id
+        if self.session_strategy == "per-session" and candidate_map.get("session_id"):
+            return candidate_map["session_id"]
 
         # Manual override (cwd → name), for non-per-session strategies.
-        manual = self.sessions.get(cwd)
-        if manual:
-            return manual
+        if candidate_map.get("manual_override"):
+            return candidate_map["manual_override"]
 
         # /title mid-session remap (non-per-session).
-        if session_title:
-            sanitized = re.sub(r'[^a-zA-Z0-9_-]+', '-', session_title).strip('-')
-            if sanitized:
-                if self.session_peer_prefix and self.peer_name:
-                    return f"{self.peer_name}-{sanitized}"
-                return sanitized
+        if candidate_map.get("session_title"):
+            return candidate_map["session_title"]
 
-        # per-repo: one Honcho session per git repository
-        if self.session_strategy == "per-repo":
-            base = self._git_repo_name(cwd) or Path(cwd).name
-            if self.session_peer_prefix and self.peer_name:
-                return f"{self.peer_name}-{base}"
-            return base
-
-        # per-directory: one Honcho session per working directory (default)
-        if self.session_strategy in {"per-directory", "per-session"}:
-            base = Path(cwd).name
-            if self.session_peer_prefix and self.peer_name:
-                return f"{self.peer_name}-{base}"
-            return base
-
-        # global: single session across all directories
-        return self.workspace_id
+        if self.session_strategy == "per-repo" and candidate_map.get("repo"):
+            return candidate_map["repo"]
+        if self.session_strategy in {"per-directory", "per-session", "per-repo"}:
+            return candidate_map.get("directory")
+        return candidate_map.get("global")
 
 
 _honcho_client_slot: SingletonSlot = SingletonSlot()

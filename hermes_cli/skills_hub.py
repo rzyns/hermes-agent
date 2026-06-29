@@ -15,6 +15,7 @@ import re
 import shutil
 from pathlib import Path
 from typing import Any, Dict, List, Optional
+from urllib.parse import urlparse
 
 from rich.console import Console
 from rich.panel import Panel
@@ -123,13 +124,50 @@ def _format_extra_metadata_lines(extra: Dict[str, Any]) -> list[str]:
     return lines
 
 
+def _looks_like_direct_github_identifier(identifier: str) -> bool:
+    """Return True for source-qualified GitHub refs and GitHub tree URLs."""
+    if not isinstance(identifier, str):
+        return False
+    ident = identifier.strip()
+    if ident.lower().startswith(("http://", "https://")):
+        try:
+            parsed = urlparse(ident)
+        except ValueError:
+            return False
+        if parsed.netloc.lower() != "github.com":
+            return False
+        path_parts = [part for part in parsed.path.split("/") if part]
+        return len(path_parts) >= 5 and path_parts[2] in {"tree", "blob"}
+    known_prefixes = (
+        "official/", "skills-sh/", "skills.sh/", "skils-sh/", "skils.sh/",
+        "well-known:", "url:", "clawhub/", "claude-marketplace/", "lobehub/",
+        "browse-sh/", "hermes-index/",
+    )
+    if ident.startswith(known_prefixes):
+        return False
+    return len([part for part in ident.split("/") if part]) >= 3
+
+
 def _resolve_source_meta_and_bundle(identifier: str, sources):
-    """Resolve metadata and bundle for a specific identifier."""
+    """Resolve metadata and bundle for a specific identifier.
+
+    Direct GitHub-style identifiers are source-qualified refs, not registry
+    search terms. Try GitHub adapters first so ``owner/repo/skill`` from a
+    configured custom tap cannot be stolen by a registry entry with the same
+    display name.
+    """
     meta = None
     bundle = None
     matched_source = None
 
-    for src in sources:
+    ordered_sources = list(sources)
+    direct_github_ref = _looks_like_direct_github_identifier(identifier)
+    if direct_github_ref:
+        github_sources = [src for src in ordered_sources if getattr(src, "source_id", lambda: "")() == "github"]
+        if github_sources:
+            ordered_sources = github_sources
+
+    for src in ordered_sources:
         if meta is None:
             try:
                 meta = src.inspect(identifier)
@@ -151,6 +189,109 @@ def _resolve_source_meta_and_bundle(identifier: str, sources):
             break
 
     return meta, bundle, matched_source
+
+
+def _resolve_local_skill(identifier: str):
+    """Scan local/profile filesystem for a skill matching *identifier* by name.
+
+    Uses the same scanning logic as ``tools.skills_tool._find_all_skills`` and
+    ``do_list``, walking ``~/.hermes/skills/`` and any ``skills.external_dirs``.
+    Returns ``(SkillMeta, SkillBundle)`` when found, ``(None, None)`` otherwise.
+    """
+    from tools.skills_hub import SkillMeta, SkillBundle
+    from tools.skills_tool import _find_all_skills, _parse_frontmatter, _get_category_from_path
+    from agent.skill_utils import iter_skill_index_files
+
+    # 1. Find the skill by name among all locally-visible skills.
+    local_skills = _find_all_skills(skip_disabled=True)
+    match = None
+    for skill in local_skills:
+        if skill["name"] == identifier:
+            match = skill
+            break
+
+    if not match:
+        return None, None
+
+    # 2. Locate the actual SKILL.md path so we can read its full content.
+    skill_path = None
+    from tools.skills_tool import SKILLS_DIR as _LOCAL_SKILLS_DIR
+    dirs_to_scan = [_LOCAL_SKILLS_DIR]
+    try:
+        from agent.skill_utils import get_external_skills_dirs
+        dirs_to_scan.extend(get_external_skills_dirs())
+    except Exception:
+        pass
+
+    for scan_dir in dirs_to_scan:
+        if not scan_dir.exists():
+            continue
+        for skill_md in iter_skill_index_files(scan_dir, "SKILL.md"):
+            try:
+                rel = skill_md.relative_to(scan_dir)
+            except ValueError:
+                continue
+            # The skill name is the directory name just above SKILL.md.
+            if len(rel.parts) >= 2 and rel.parts[-2] == identifier:
+                skill_path = skill_md
+                break
+            # Flat install (no category): rel is <name>/SKILL.md
+            if len(rel.parts) == 2 and rel.parts[0] == identifier:
+                skill_path = skill_md
+                break
+        if skill_path:
+            break
+
+    if not skill_path or not skill_path.exists():
+        return None, None
+
+    try:
+        content = skill_path.read_text(encoding="utf-8")
+        frontmatter, body = _parse_frontmatter(content)
+        name = frontmatter.get("name", identifier)
+        description = frontmatter.get("description", "")
+        if not description:
+            for line in body.strip().split("\n"):
+                line = line.strip()
+                if line and not line.startswith("#"):
+                    description = line
+                    break
+        category = _get_category_from_path(skill_path) or ""
+        tags = frontmatter.get("metadata", {}).get("hermes", {}).get("tags", []) if isinstance(frontmatter.get("metadata"), dict) else []
+    except Exception:
+        return None, None
+
+    meta = SkillMeta(
+        name=name,
+        description=description,
+        source="local",
+        identifier=name,
+        trust_level="local",
+        tags=tags if isinstance(tags, list) else [],
+        extra={"category": category, "local_path": str(skill_path)},
+    )
+
+    files = {"SKILL.md": content}
+    # Load any linked support files (references, templates, scripts) into bundle.files
+    for subdir in ("references", "templates", "scripts", "assets"):
+        sub = skill_path.parent / subdir
+        if sub.exists():
+            for child in sub.iterdir():
+                if child.is_file():
+                    try:
+                        files[f"{subdir}/{child.name}"] = child.read_text(encoding="utf-8")
+                    except Exception:
+                        pass
+
+    bundle = SkillBundle(
+        name=name,
+        files=files,
+        source="local",
+        identifier=name,
+        trust_level="local",
+    )
+
+    return meta, bundle
 
 
 def _derive_category_from_install_path(install_path: str) -> str:
@@ -777,18 +918,44 @@ def do_inspect(identifier: str, console: Optional[Console] = None) -> None:
     sources = create_source_router(auth)
 
     if "/" not in identifier:
-        identifier = _resolve_short_name(identifier, sources, c)
-        if not identifier:
+        # Suppress spurious console output from resolution so a false
+        # "not found" error doesn't leak when local fallback succeeds.
+        # (blocker from review t_b1408cf0)
+        class _Q:
+            def print(self, *a, **k):
+                pass
+
+        resolved = _resolve_short_name(identifier, sources, _Q())
+        if resolved:
+            identifier = resolved
+        else:
+            # Short name not found in hub — try local filesystem fallback before giving up.
+            meta, bundle = _resolve_local_skill(identifier)
+            if meta:
+                _render_inspect(meta, bundle, c)
+                return
+            # Truly missing — print the error on the real console now.
+            c.print(f"[bold red]Error:[/] No skill named '{identifier}' found in any source.\n")
             return
 
     meta, bundle, _matched_source = _resolve_source_meta_and_bundle(identifier, sources)
 
     if not meta:
+        # Hub/tap miss — try local filesystem fallback.
+        meta, bundle = _resolve_local_skill(identifier)
+
+    if not meta:
         c.print(f"[bold red]Error:[/] Could not find '{identifier}' in any source.\n")
         return
 
+    _render_inspect(meta, bundle, c)
+
+
+def _render_inspect(meta, bundle, console: Optional[Console] = None) -> None:
+    """Render inspect output for a resolved meta (+ optional bundle)."""
+    c = console or _console
     c.print()
-    trust_style = {"builtin": "bright_cyan", "trusted": "green", "community": "yellow"}.get(meta.trust_level, "dim")
+    trust_style = {"builtin": "bright_cyan", "trusted": "green", "community": "yellow", "local": "blue"}.get(meta.trust_level, "dim")
     trust_label = "official" if meta.source == "official" else meta.trust_level
 
     info_lines = [
@@ -880,10 +1047,35 @@ def inspect_skill(identifier: str) -> Optional[dict]:
     sources = create_source_router(auth)
     ident = identifier
     if "/" not in ident:
-        ident = _resolve_short_name(ident, sources, c)
-        if not ident:
-            return None
+        resolved = _resolve_short_name(ident, sources, c)
+        if resolved:
+            ident = resolved
+        else:
+            meta, bundle = _resolve_local_skill(ident)
+            if not meta:
+                return None
+            # Build dict directly (same shape as hub path below)
+            out = {
+                "name": meta.name,
+                "description": meta.description,
+                "source": meta.source,
+                "identifier": meta.identifier,
+                "tags": list(meta.tags) if meta.tags else [],
+            }
+            if bundle and "SKILL.md" in bundle.files:
+                content = bundle.files["SKILL.md"]
+                if isinstance(content, bytes):
+                    content = content.decode("utf-8", errors="replace")
+                lines = content.split("\n")
+                preview = "\n".join(lines[:50])
+                if len(lines) > 50:
+                    preview += f"\n\n... ({len(lines) - 50} more lines)"
+                out["skill_md_preview"] = preview
+            return out
+
     meta, bundle, _ = _resolve_source_meta_and_bundle(ident, sources)
+    if not meta:
+        meta, bundle = _resolve_local_skill(ident)
     if not meta:
         return None
     out: dict = {

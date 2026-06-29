@@ -56,7 +56,7 @@ The µop cache (Decoded Stream Buffer) provides an alternate path that bypasses 
 </g>
 
 <!-- Dashed bypass path indicating cache hit -->
-<path d="M180 110 L205 110 L205 175 L230 175" fill="none" class="arr" 
+<path d="M180 110 L205 110 L205 175 L230 175" fill="none" class="arr"
       stroke-dasharray="4 3" marker-end="url(#arrow)"/>
 <text class="tx" x="164" y="148" opacity=".6">hit</text>
 ```

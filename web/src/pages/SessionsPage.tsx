@@ -411,6 +411,7 @@ function SessionRow({
     : null) ?? { icon: Globe, color: "text-muted-foreground" };
   const SourceIcon = sourceInfo.icon;
   const hasTitle = session.title && session.title !== "Untitled";
+  const previewText = session.preview?.trim() ?? "";
 
   const submitRename = async () => {
     const value = renameValue.trim();
@@ -587,15 +588,22 @@ function SessionRow({
                     </Button>
                   </div>
                 ) : (
-                  <span
-                    className={`font-mondwest normal-case min-w-0 flex-1 truncate text-sm ${hasTitle ? "font-medium" : "text-muted-foreground italic"}`}
-                  >
-                    {hasTitle
-                      ? session.title
-                      : session.preview
-                        ? session.preview.slice(0, 60)
-                        : t.sessions.untitledSession}
-                  </span>
+                  <div className="flex min-w-0 flex-1 flex-col gap-0.5">
+                    <span
+                      className={`font-mondwest normal-case min-w-0 truncate text-sm ${hasTitle ? "font-medium" : "text-muted-foreground italic"}`}
+                    >
+                      {hasTitle
+                        ? session.title
+                        : previewText
+                          ? previewText.slice(0, 60)
+                          : t.sessions.untitledSession}
+                    </span>
+                    {hasTitle && previewText && (
+                      <span className="font-mondwest normal-case min-w-0 truncate text-xs text-text-secondary">
+                        {previewText.slice(0, 96)}
+                      </span>
+                    )}
+                  </div>
                 )}
                 {session.is_active && (
                   <Badge tone="success" className="shrink-0 text-xs">

@@ -135,6 +135,7 @@ VALID_HOOKS: Set[str] = {
     # First non-None string wins. Useful for vocabulary/personality transformation.
     "transform_llm_output",
     "pre_llm_call",
+    "select_tool_schemas",
     "post_llm_call",
     "pre_api_request",
     "post_api_request",
@@ -153,6 +154,14 @@ VALID_HOOKS: Set[str] = {
     #   {"action": "allow"}  /  None             -> normal dispatch
     # Kwargs: event: MessageEvent, gateway: GatewayRunner, session_store.
     "pre_gateway_dispatch",
+    # CLI command policy hooks. ``cli:update`` runs from the built-in terminal
+    # updater before any update mutation, allowing local policy plugins to
+    # deny/handle the update path without replacing the built-in subcommand.
+    "cli:update",
+    # Gateway command policy hooks. Gateway dispatch also supports
+    # ``command:<name>`` hooks dynamically; list the update hook to avoid a
+    # spurious warning for local update-safety plugins.
+    "command:update",
     # Approval lifecycle hooks. Fired by tools/approval.py when a dangerous
     # command needs user approval -- fires BOTH for CLI-interactive prompts
     # and for gateway/ACP approvals (Telegram, Discord, Slack, TUI, etc.).
@@ -547,6 +556,24 @@ class PluginContext:
                 kwargs["parent_agent"] = agent
 
         return registry.dispatch(tool_name, args, **kwargs)
+
+    # -- Kanban dependency provider registration -----------------------------
+    def register_kanban_dependency_provider(self, provider) -> None:
+        """Register a Kanban external dependency provider.
+
+        Providers participate in Kanban scheduler dependency checks for
+        board-external blockers. The core scheduler remains the enforcement
+        point; plugins supply local, deterministic blocker facts.
+        """
+        from hermes_cli import kanban_dependencies as kd
+
+        token = kd.register_dependency_provider(provider)
+        self._manager._kanban_dependency_providers.append(token)
+        logger.info(
+            "Plugin '%s' registered Kanban dependency provider: %s",
+            self.manifest.name,
+            getattr(provider, "name", provider.__class__.__name__),
+        )
 
     # -- context engine registration -----------------------------------------
 
@@ -1154,6 +1181,9 @@ class PluginManager:
         # Plugin-registered auxiliary tasks: key → {key, display_name,
         # description, defaults, plugin}. See PluginContext.register_auxiliary_task.
         self._aux_tasks: Dict[str, Dict[str, Any]] = {}
+        # Kanban dependency-provider registrations returned by
+        # kanban_dependencies.register_dependency_provider().
+        self._kanban_dependency_providers: List[Any] = []
         # Slack Block Kit action handlers registered by plugins. Each entry
         # is (matcher, callback, plugin_name); the Slack adapter wires them
         # into its slack_bolt App at connect() time. ``matcher`` is whatever
@@ -1184,6 +1214,15 @@ class PluginManager:
             self._discovered = True
             return
         if force:
+            try:
+                from hermes_cli import kanban_dependencies as kd
+                for provider in list(self._kanban_dependency_providers):
+                    kd.unregister_dependency_provider(provider)
+            except Exception:
+                logger.warning(
+                    "Failed to unregister plugin Kanban dependency providers during rediscovery",
+                    exc_info=True,
+                )
             self._plugins.clear()
             self._hooks.clear()
             self._middleware.clear()
@@ -1193,6 +1232,7 @@ class PluginManager:
             self._plugin_commands.clear()
             self._plugin_skills.clear()
             self._aux_tasks.clear()
+            self._kanban_dependency_providers.clear()
             self._slack_action_handlers.clear()
             self._context_engine = None
         # Set the flag up front as a re-entrancy guard (a plugin's register()
@@ -1790,6 +1830,12 @@ class PluginManager:
 
             {"context": "recalled text..."}
             "recalled text..."          # plain string, equivalent
+
+        For ``select_tool_schemas``, callbacks receive a request-local
+        copy of the full enabled schema list and may return a replacement
+        list. Callers should apply only the first list result so multiple
+        schema selectors do not compose implicitly. Callback exceptions are
+        swallowed here so selection fails open to the original schema list.
 
         Context is ALWAYS injected into the user message, never the
         system prompt.  This preserves the prompt cache prefix — the

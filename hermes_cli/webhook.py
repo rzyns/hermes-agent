@@ -26,6 +26,23 @@ from hermes_cli.config import cfg_get
 
 _SUBSCRIPTIONS_FILENAME = "webhook_subscriptions.json"
 _SUBSCRIPTIONS_FILE_MODE = 0o600
+_ACTION_ALIASES = {
+    "kanban_intake_links": "kanban_intake_links",
+    "kanban-intake-links": "kanban_intake_links",
+    "kanban_intake_link": "kanban_intake_links",
+    "kanban-intake-link": "kanban_intake_links",
+    "intake-links": "kanban_intake_links",
+    "intake_link": "kanban_intake_links",
+    "intake-link": "kanban_intake_links",
+}
+
+
+def _normalize_action(action: str) -> str | None:
+    """Return canonical deterministic webhook action name, or None if invalid."""
+    action = (action or "").strip().lower()
+    if not action:
+        return ""
+    return _ACTION_ALIASES.get(action)
 
 
 def _hermes_home() -> Path:
@@ -169,6 +186,19 @@ def _cmd_subscribe(args):
 
     secret = args.secret or secrets.token_urlsafe(32)
     events = [e.strip() for e in args.events.split(",")] if args.events else []
+    action = _normalize_action(getattr(args, "action", ""))
+    if action is None:
+        print(
+            "Error: Unknown --action. Supported deterministic actions: "
+            "kanban_intake_links (aliases: intake-links, kanban-intake-links)."
+        )
+        return
+    if action and getattr(args, "deliver_only", False):
+        print("Error: --action and --deliver-only are mutually exclusive no-agent modes.")
+        return
+    if action and args.skills:
+        print("Error: --skills is not used with deterministic --action webhooks.")
+        return
 
     route = {
         "description": args.description or f"Agent-created subscription: {name}",
@@ -179,6 +209,9 @@ def _cmd_subscribe(args):
         "deliver": args.deliver or "log",
         "created_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
     }
+
+    if action:
+        route["action"] = action
 
     if getattr(args, "deliver_only", False):
         if route["deliver"] == "log":
@@ -208,6 +241,8 @@ def _cmd_subscribe(args):
     print(f"  Deliver: {route['deliver']}")
     if route.get("deliver_only"):
         print("  Mode: direct delivery (no agent, zero LLM cost)")
+    if route.get("action"):
+        print(f"  Mode: deterministic action: {route['action']} (no agent)")
     if route.get("prompt"):
         prompt_preview = route["prompt"][:80] + ("..." if len(route["prompt"]) > 80 else "")
         label = "Message" if route.get("deliver_only") else "Prompt"
@@ -231,6 +266,8 @@ def _cmd_list(args):
         deliver = route.get("deliver", "log")
         if route.get("deliver_only"):
             deliver = f"{deliver} (direct — no agent)"
+        if route.get("action"):
+            deliver = f"deterministic action: {route['action']} (no agent)"
         desc = route.get("description", "")
         print(f"  ◆ {name}")
         if desc:

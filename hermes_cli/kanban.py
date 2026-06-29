@@ -25,6 +25,8 @@ from pathlib import Path
 from typing import Any, Optional
 
 from hermes_cli import kanban_db as kb
+from hermes_cli import kanban_intake_link as kil
+from hermes_cli import kanban_intake_link_health as kih
 from hermes_cli import kanban_swarm as ks
 from hermes_cli.profiles import get_active_profile_name
 
@@ -303,6 +305,19 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
     b_set_wd.add_argument("path", nargs="?", default=None,
                           help="Absolute path to use as default workdir. Omit to clear.")
 
+    b_maint = boards_sub.add_parser(
+        "maintenance",
+        help="Show or set per-board maintenance mode (dispatcher skip)",
+    )
+    b_maint.add_argument("slug")
+    b_maint.add_argument(
+        "state",
+        nargs="?",
+        choices=["on", "off", "status"],
+        default="status",
+        help="on/off to toggle, or status to show without writing",
+    )
+
     # --- create ---
     p_create = sub.add_parser("create", help="Create a new task")
     p_create.add_argument("title", help="Task title")
@@ -368,6 +383,45 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
                                "to skip the brief running-to-blocked transition.")
     p_create.add_argument("--json", action="store_true", help="Emit JSON output")
 
+    # --- intake-link ---
+    p_il = sub.add_parser(
+        "intake-link",
+        help="Create a first-class Attention Intake link-drop card",
+    )
+    p_il.add_argument("--url", required=True, help="URL to analyse")
+    p_il.add_argument("--board", default=kil.DEFAULT_BOARD,
+                      help=f"Board slug (default: {kil.DEFAULT_BOARD})")
+    p_il.add_argument("--context", default=None, help="Why this link matters")
+    p_il.add_argument("--note", default=None, help="Operator note")
+    p_il.add_argument("--assignee", default=kil.DEFAULT_ASSIGNEE,
+                      help=f"Profile name (default: {kil.DEFAULT_ASSIGNEE})")
+    p_il.add_argument("--triage", action="store_true", default=kil.DEFAULT_TRIAGE,
+                      help="Park in triage for specifier review (default: true)")
+    p_il.add_argument("--no-triage", action="store_true", default=False,
+                      dest="no_triage",
+                      help="Skip specifier triage — go straight to ready/todo")
+    p_il.add_argument("--priority", type=int, default=kil.DEFAULT_PRIORITY,
+                      help="Priority tiebreaker")
+    p_il.add_argument("--max-runtime", default=None,
+                      help="Per-task runtime cap (seconds or 30m / 2h / 1d)")
+    p_il.add_argument("--skill", action="append", default=[], dest="skills",
+                      help="Skill to force-load (repeatable)")
+    p_il.add_argument("--idempotency-key", default=None,
+                      help="Override canonical URL hash dedup key")
+    p_il.add_argument("--json", action="store_true", help="Emit JSON output")
+
+    # --- intake-link-health ---
+    p_ilh = sub.add_parser(
+        "intake-link-health",
+        help="Check register-health for Attention Intake link-drop cards",
+    )
+    p_ilh.add_argument("--task-id", default=None, help="Inspect a single task id (omit to scan board)")
+    p_ilh.add_argument("--board", default=kih.DEFAULT_BOARD if hasattr(kih, 'DEFAULT_BOARD') else "attention-intake",
+                       help="Board slug (default: attention-intake)")
+    p_ilh.add_argument("--scratch-url-audit", action="store_true",
+                       help="Read-only audit for active URL tasks still using disposable scratch workspaces")
+    p_ilh.add_argument("--json", action="store_true", help="Emit JSON output")
+
     # --- swarm ---
     p_swarm = sub.add_parser(
         "swarm",
@@ -387,6 +441,27 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
     p_swarm.add_argument("--priority", type=int, default=0, help="Priority tiebreaker")
     p_swarm.add_argument("--created-by", default=None, help="Creator/anchor profile")
     p_swarm.add_argument("--idempotency-key", default=None, help="Dedup key for the root card")
+    p_swarm.add_argument(
+        "--self-heal-policy",
+        default=None,
+        choices=["fail", "drop", "repair", "warn"],
+        help=(
+            "Preflight skill resolution policy for worker specs. "
+            "fail=abort (default), drop=remove missing skills, "
+            "repair=create a repair card, warn=log and continue."
+        ),
+    )
+    p_swarm.add_argument(
+        "--self-heal-profile",
+        default="default",
+        help="Profile assigned to self-healing repair cards (default: default)",
+    )
+    p_swarm.add_argument(
+        "--self-heal-max-repairs",
+        type=int,
+        default=4,
+        help="Maximum repair cards created per swarm (default: 4)",
+    )
     p_swarm.add_argument("--json", action="store_true", help="Emit JSON output")
 
     # --- list ---
@@ -496,13 +571,172 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
         help="Emit JSON (structured) instead of the default human table",
     )
 
+    # --- health ---
+    p_health = sub.add_parser(
+        "health",
+        aliases=["h"],
+        help="Fleet-wide or per-board DB integrity + operational health",
+    )
+    p_health.add_argument(
+        "--board", default=None,
+        help="Check one board (default: current board)",
+    )
+    p_health.add_argument(
+        "--all", action="store_true",
+        help="Check all boards",
+    )
+    p_health.add_argument(
+        "--json", action="store_true",
+        help="Emit structured JSON instead of human-readable summary",
+    )
+
+    # --- backup ---
+    p_backup = sub.add_parser(
+        "backup",
+        help="SQLite-aware backup of one or all boards with manifest generation",
+    )
+    p_backup.add_argument(
+        "--board", default=None,
+        help="Board slug to back up (default: current board)",
+    )
+    p_backup.add_argument(
+        "--all", action="store_true",
+        help="Back up every board",
+    )
+    p_backup.add_argument(
+        "--dest", default=None,
+        help="Destination directory (default: <kanban-home>/backups/)",
+    )
+    p_backup.add_argument(
+        "--label", default=None,
+        help="Optional label written into the manifest",
+    )
+    p_backup.add_argument(
+        "--manifest-only", action="store_true",
+        help="Only emit the manifest without copying the DB file",
+    )
+    p_backup.add_argument(
+        "--force", action="store_true",
+        help="Proceed even if integrity_check fails",
+    )
+    p_backup.add_argument(
+        "--json", action="store_true",
+        help="Emit structured JSON result",
+    )
+
+    # --- repair ---
+    p_repair = sub.add_parser(
+        "repair",
+        help="Repair-candidate creation and approval-gated board swap",
+    )
+    repair_sub = p_repair.add_subparsers(dest="repair_action")
+
+    p_repair_create = repair_sub.add_parser(
+        "create-candidate",
+        help="Create a repair candidate from a board (or from a backup)",
+    )
+    p_repair_create.add_argument("board")
+    p_repair_create.add_argument(
+        "--from-backup", default=None,
+        help="Use a clean backup as the source instead of the live board",
+    )
+    p_repair_create.add_argument(
+        "--reason", default="",
+        help="Human-readable reason for the repair",
+    )
+
+    p_repair_swap = repair_sub.add_parser(
+        "approve-swap",
+        help="Atomically swap a board DB with a repair candidate",
+    )
+    p_repair_swap.add_argument("board")
+    p_repair_swap.add_argument(
+        "--candidate", required=True,
+        help="Path to the repair-candidate manifest JSON",
+    )
+    p_repair_swap.add_argument(
+        "--yes-i-have-read-the-manifest", action="store_true", dest="yes_flag",
+        help="Skip the interactive confirmation prompt (foot-gun flag)",
+    )
+    p_repair_swap.add_argument(
+        "--force", action="store_true",
+        help="Proceed without maintenance-mode/running-task guard after operator review",
+    )
+
+    p_repair_list = repair_sub.add_parser(
+        "list-candidates",
+        help="List repair candidates for a board",
+    )
+    p_repair_list.add_argument("board")
+    p_repair_list.add_argument(
+        "--json", action="store_true",
+        help="Emit structured JSON",
+    )
+
+    # --- maintenance ---
+    p_maint = sub.add_parser(
+        "maintenance",
+        help="Toggle maintenance mode on a board",
+    )
+    p_maint.add_argument("board")
+    p_maint.add_argument(
+        "state", choices=["on", "off"],
+        help="Enable or disable maintenance mode",
+    )
+    p_maint.add_argument(
+        "--reason", default="",
+        help="Reason recorded when enabling maintenance",
+    )
+
     # --- link / unlink ---
+    try:
+        from plugins.kanban_cross_deps.models import VALID_EDGE_KINDS
+        cross_board_edge_kinds = sorted(VALID_EDGE_KINDS)
+    except Exception:  # pragma: no cover - defensive import fallback
+        cross_board_edge_kinds = [
+            "blocks",
+            "depends_on",
+            "depends_on_decision",
+            "derived_from_research",
+            "feeds",
+            "informed_by",
+            "related",
+            "supersedes",
+        ]
+
     p_link = sub.add_parser("link", help="Add a parent->child dependency")
-    p_link.add_argument("parent_id")
-    p_link.add_argument("child_id")
+    p_link.add_argument("parent_id", nargs="?")
+    p_link.add_argument("child_id", nargs="?")
+    p_link.add_argument("--parent-board", default=None, help="Cross-board parent board slug")
+    p_link.add_argument("--parent", dest="cross_parent_id", default=None, help="Cross-board parent task id")
+    p_link.add_argument("--child-board", default=None, help="Cross-board child board slug")
+    p_link.add_argument("--child", dest="cross_child_id", default=None, help="Cross-board child task id")
+    p_link.add_argument("--kind", default=None, choices=cross_board_edge_kinds, help="Cross-board edge kind")
+    p_link.add_argument(
+        "--blocking",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Whether the cross-board edge blocks scheduler promotion (default: false)",
+    )
+    p_link.add_argument(
+        "--required-parent-statuses",
+        default=None,
+        help="Comma-separated or JSON list of parent statuses that satisfy the edge",
+    )
+    p_link.add_argument("--source", default=None, help="Cross-board provenance source label")
+    p_link.add_argument("--created-by", default=None, help="Cross-board actor/provenance label")
+    p_link.add_argument("--metadata", default=None, help="Cross-board edge metadata as a JSON object")
+    p_link.add_argument("--json", action="store_true", help="Emit machine-readable JSON")
+
     p_unlink = sub.add_parser("unlink", help="Remove a parent->child dependency")
-    p_unlink.add_argument("parent_id")
-    p_unlink.add_argument("child_id")
+    p_unlink.add_argument("parent_id", nargs="?")
+    p_unlink.add_argument("child_id", nargs="?")
+    p_unlink.add_argument("--parent-board", default=None, help="Cross-board parent board slug")
+    p_unlink.add_argument("--parent", dest="cross_parent_id", default=None, help="Cross-board parent task id")
+    p_unlink.add_argument("--child-board", default=None, help="Cross-board child board slug")
+    p_unlink.add_argument("--child", dest="cross_child_id", default=None, help="Cross-board child task id")
+    p_unlink.add_argument("--kind", default=None, choices=cross_board_edge_kinds, help="Cross-board edge kind")
+    p_unlink.add_argument("--json", action="store_true", help="Emit machine-readable JSON")
 
     # --- claim ---
     p_claim = sub.add_parser(
@@ -849,6 +1083,13 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
         action="store_true",
         help="Emit one JSON object per task on stdout",
     )
+    p_decompose.add_argument(
+        "--dry-run",
+        dest="dry_run",
+        action="store_true",
+        help="Run the full prompt, LLM call, parse, and validation, "
+             "but do not write to the Kanban DB or create any tasks",
+    )
 
     # --- gc ---
     p_gc = sub.add_parser(
@@ -929,11 +1170,13 @@ def kanban_command(args: argparse.Namespace) -> int:
     # schema creation; `create` / `list` / every other command would
     # error out on a fresh install.
     with board_scope:
-        try:
-            kb.init_db()
-        except Exception as exc:
-            print(f"kanban: could not initialize database: {exc}", file=sys.stderr)
-            return 1
+        init_before_handler = action not in {"dispatch", "daemon"}
+        if init_before_handler:
+            try:
+                kb.init_db()
+            except Exception as exc:
+                print(f"kanban: could not initialize database: {exc}", file=sys.stderr)
+                return 1
 
         handlers = {
             "init":     _cmd_init,
@@ -973,7 +1216,13 @@ def kanban_command(args: argparse.Namespace) -> int:
             "context":  _cmd_context,
             "specify":  _cmd_specify,
             "decompose":  _cmd_decompose,
+            "intake-link": _cmd_intake_link,
+            "intake-link-health": _cmd_intake_link_health,
             "gc":       _cmd_gc,
+            "health":   _cmd_health,
+            "backup":   _cmd_backup,
+            "repair":   _cmd_repair,
+            "maintenance": _cmd_maintenance,
         }
         handler = handlers.get(action)
         if not handler:
@@ -1031,6 +1280,8 @@ def _dispatch_boards(args: argparse.Namespace) -> int:
         return _cmd_boards_rename(args)
     if sub == "set-default-workdir":
         return _cmd_boards_set_default_workdir(args)
+    if sub == "maintenance":
+        return _cmd_boards_maintenance(args)
     print(f"kanban boards: unknown action {sub!r}", file=sys.stderr)
     return 2
 
@@ -1077,6 +1328,8 @@ def _cmd_boards_list(args: argparse.Namespace) -> int:
         name = b.get("name") or ""
         if b.get("archived"):
             name += " [archived]"
+        if b.get("maintenance"):
+            name += " [maintenance]"
         print(f"{marker:2s}  {b['slug']:24s}  {name:28s}  {counts_str}")
     print()
     print(f"Current board: {current}")
@@ -1166,6 +1419,8 @@ def _cmd_boards_show(args: argparse.Namespace) -> int:
     if meta.get("description"):
         print(f"  Description:  {meta['description']}")
     print(f"  DB path:      {meta['db_path']}")
+    if meta.get("maintenance"):
+        print("  Maintenance: ON (dispatchers skip this board)")
     print(f"  Tasks:        {total} total"
           + (f" ({', '.join(f'{k}={v}' for k, v in sorted(counts.items()))})"
              if counts else ""))
@@ -1203,6 +1458,28 @@ def _cmd_boards_set_default_workdir(args: argparse.Namespace) -> int:
         print(f"Board {normed!r} default workdir set to {new_val!r}.")
     else:
         print(f"Board {normed!r} default workdir cleared.")
+    return 0
+
+
+def _cmd_boards_maintenance(args: argparse.Namespace) -> int:
+    try:
+        normed = kb._normalize_board_slug(args.slug)
+    except ValueError as exc:
+        print(f"kanban boards maintenance: {exc}", file=sys.stderr)
+        return 2
+    if not normed or not kb.board_exists(normed):
+        print(f"kanban boards maintenance: board {args.slug!r} does not exist",
+              file=sys.stderr)
+        return 1
+    state = getattr(args, "state", "status") or "status"
+    if state == "status":
+        meta = kb.read_board_metadata(normed)
+    else:
+        meta = kb.set_board_maintenance(normed, state == "on")
+    label = "ON" if meta.get("maintenance") else "off"
+    print(f"Board {normed!r} maintenance mode: {label}.")
+    if meta.get("maintenance"):
+        print("  Dispatchers skip this board; task list/status commands still work.")
     return 0
 
 
@@ -1368,6 +1645,120 @@ def _cmd_create(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_intake_link(args: argparse.Namespace) -> int:
+    """Create a first-class Attention Intake link-drop card."""
+    if not getattr(args, "url", None):
+        print("kanban intake-link: --url is required", file=sys.stderr)
+        return 2
+
+    try:
+        max_runtime = _parse_duration(getattr(args, "max_runtime", None))
+    except ValueError as exc:
+        print(f"kanban: --max-runtime: {exc}", file=sys.stderr)
+        return 2
+
+    triage = not getattr(args, "no_triage", False)
+    skills = getattr(args, "skills", None) or None
+
+    # Board handling: the incoming --board must exist.
+    board_slug = getattr(args, "board", kil.DEFAULT_BOARD)
+    if board_slug and board_slug != kb.DEFAULT_BOARD and not kb.board_exists(board_slug):
+        print(
+            f"kanban: board {board_slug!r} does not exist.",
+            file=sys.stderr,
+        )
+        return 1
+
+    # We intentionally do NOT pin HERMES_KANBAN_BOARD here; the helper
+    # and kanban_db resolve board via their own mechanics, and the CLI
+    # --board override is already handled above.
+    with kb.connect() as conn:
+        task_id = kil.create_intake_link(
+            conn,
+            url=args.url,
+            context=getattr(args, "context", None),
+            note=getattr(args, "note", None),
+            board=board_slug,
+            assignee=args.assignee,
+            triage=triage,
+            priority=args.priority,
+            skills=skills,
+            max_runtime_seconds=max_runtime,
+            idempotency_key=getattr(args, "idempotency_key", None),
+            source="cli",
+        )
+        task = kb.get_task(conn, task_id)
+
+    if getattr(args, "json", False):
+        print(json.dumps(_task_to_dict(task), indent=2, ensure_ascii=False))
+    else:
+        msg = (
+            f"Intake-link {task_id}  "
+            f"({task.status}, assignee={task.assignee or '-'}"
+        )
+        if task.idempotency_key and task.title.startswith("Link drop"):
+            # We created this row; include the URL hash snippet.
+            msg += f", dedup={task.idempotency_key[:16]}..."
+        msg += ")"
+        print(msg)
+    return 0
+
+
+def _cmd_intake_link_health(args: argparse.Namespace) -> int:
+    """Check register-health for intake-link cards."""
+    board = getattr(args, "board", "attention-intake")
+    task_id = getattr(args, "task_id", None)
+
+    if getattr(args, "scratch_url_audit", False):
+        with kb.connect(board=board) as conn:
+            result = kih.audit_active_url_scratch_workspaces(
+                conn,
+                board=board,
+                hermes_home=Path.home() / ".hermes",
+            )
+    elif task_id:
+        # Single-task mode: read task body via DB and check register.
+        with kb.connect(board=board) as conn:
+            row = conn.execute(
+                "SELECT body FROM tasks WHERE id = ?",
+                (task_id,),
+            ).fetchone()
+        if not row:
+            print(f"kanban: task {task_id!r} not found on board {board!r}", file=sys.stderr)
+            return 1
+        result = kih.check_register_for_task(task_id, row[0] or "", hermes_home=Path.home() / ".hermes")
+    else:
+        # Board-scan mode.
+        with kb.connect(board=board) as conn:
+            result = kih.scan_board_for_health(conn, hermes_home=Path.home() / ".hermes")
+
+    if getattr(args, "json", False):
+        import json
+        print(json.dumps(result, indent=2, default=str, ensure_ascii=False))
+    elif getattr(args, "scratch_url_audit", False):
+        print(
+            f"Board: {result.get('board', board)} — "
+            f"{result.get('finding_count', 0)} active scratch URL finding(s) "
+            f"across {result.get('scanned_task_count', 0)} active task(s)"
+        )
+        for finding in result.get("findings", []):
+            print(
+                f"  {finding['task_id']} [{finding['status']}]: {finding['url']} "
+                f"-> {finding['suggested_artifact_root']}"
+            )
+    else:
+        # Human-readable compact summary.
+        counts = result.get("counts", {})
+        total = result.get("scanned_task_count", 0)
+        print(f"Board: {result.get('board', board)}  — {total} intake-link task(s) scanned")
+        for key, value in counts.items():
+            print(f"  {key}: {value}")
+        if task_id:
+            verdict = result.get("verdict", "unknown")
+            print(f"  verdict for {task_id}: {verdict}")
+    return 0
+
+
 def _cmd_swarm(args: argparse.Namespace) -> int:
     try:
         workers = [ks.parse_worker_arg(raw) for raw in (args.worker or [])]
@@ -1378,6 +1769,13 @@ def _cmd_swarm(args: argparse.Namespace) -> int:
         print("kanban swarm: at least one --worker is required", file=sys.stderr)
         return 2
     with kb.connect_closing() as conn:
+        policy = None
+        if args.self_heal_policy:
+            policy = ks.SelfHealPolicy(
+                mode=args.self_heal_policy,
+                healer_profile=args.self_heal_profile,
+                max_repairs_per_swarm=args.self_heal_max_repairs,
+            )
         created = ks.create_swarm(
             conn,
             goal=args.goal,
@@ -1388,6 +1786,7 @@ def _cmd_swarm(args: argparse.Namespace) -> int:
             created_by=args.created_by or _profile_author(),
             priority=args.priority,
             idempotency_key=getattr(args, "idempotency_key", None),
+            self_heal=policy,
         )
     if getattr(args, "json", False):
         print(json.dumps(created.as_dict(), indent=2, ensure_ascii=False))
@@ -1796,7 +2195,341 @@ def _cmd_diagnostics(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_health(args: argparse.Namespace) -> int:
+    """Fleet-wide or per-board DB integrity + operational health."""
+    from hermes_cli import kanban_health as kh
+
+    if getattr(args, "all", False):
+        report = kh.fleet_health_report()
+    else:
+        board = getattr(args, "board", None)
+        report = kh.board_health_report(board)
+        report = {"boards": [report], "summary": {"total": 1, "healthy": 1 if report["healthy"] else 0, "degraded": 0 if report["healthy"] else 1}}
+
+    if getattr(args, "json", False):
+        print(json.dumps(report, indent=2, ensure_ascii=False))
+        return 0 if report["summary"]["degraded"] == 0 else 1
+
+    for b in report["boards"]:
+        slug = b["slug"]
+        db = b["db_path"]
+        healthy = b["healthy"]
+        status = "HEALTHY" if healthy else "DEGRADED"
+        print(f"Board: {slug}")
+        print(f"  DB: {db}")
+        print(f"  integrity_check: {b['integrity_check']}")
+        print(f"  foreign_key_check: {b['foreign_key_check']}")
+        wal = b.get("wal") or {}
+        shm = b.get("shm") or {}
+        if wal.get("present"):
+            print(f"  WAL: present ({wal.get('size_bytes', 0)} bytes)")
+        else:
+            print(f"  WAL: none")
+        if shm.get("present"):
+            print(f"  SHM: present ({shm.get('size_bytes', 0)} bytes)")
+        else:
+            print(f"  SHM: none")
+        tc = b.get("task_counts", {})
+        print(f"  tasks: {tc.get('total', 0)} total, {tc.get('running', 0)} running")
+        if b.get("maintenance_mode"):
+            print(f"  maintenance: ON")
+        print(f"  status: {status}")
+        print()
+    summary = report["summary"]
+    print(f"Summary: {summary['total']} boards, {summary['healthy']} healthy, {summary['degraded']} degraded")
+    return 0 if summary["degraded"] == 0 else 1
+
+
+def _cmd_backup(args: argparse.Namespace) -> int:
+    """SQLite-aware backup of one or all boards with manifest generation."""
+    from hermes_cli import kanban_health as kh
+
+    dest = getattr(args, "dest", None)
+    if dest is None:
+        dest = str(kb.kanban_home() / "backups")
+    label = getattr(args, "label", None)
+    manifest_only = getattr(args, "manifest_only", False)
+    force = getattr(args, "force", False)
+    use_json = getattr(args, "json", False)
+
+    boards: list[str] = []
+    if getattr(args, "all", False):
+        boards = [m["slug"] for m in kb.list_boards()]
+    else:
+        board = getattr(args, "board", None)
+        if board:
+            boards = [board]
+        else:
+            boards = [kb.get_current_board()]
+
+    results: list[dict] = []
+    exit_code = 0
+    for slug in boards:
+        try:
+            out_path = kh.backup_board(
+                slug,
+                dest_dir=Path(dest),
+                label=label,
+                manifest_only=manifest_only,
+                force=force,
+            )
+            results.append({"board": slug, "path": str(out_path), "error": None})
+        except kb.KanbanDbCorruptError as exc:
+            results.append({"board": slug, "path": None, "error": str(exc)})
+            exit_code = 1
+        except Exception as exc:
+            results.append({"board": slug, "path": None, "error": str(exc)})
+            exit_code = 2
+
+    if use_json:
+        print(json.dumps(results, indent=2, ensure_ascii=False))
+    else:
+        for r in results:
+            slug = r["board"]
+            if r["error"]:
+                print(f"{slug}: FAILED — {r['error']}")
+            else:
+                print(f"{slug}: backed up to {r['path']}")
+    return exit_code
+
+
+def _cmd_repair(args: argparse.Namespace) -> int:
+    """Dispatch repair subcommands."""
+    from hermes_cli import kanban_health as kh
+
+    sub = getattr(args, "repair_action", None)
+    if not sub:
+        print("kanban repair: subcommand required (create-candidate, approve-swap, list-candidates)", file=sys.stderr)
+        return 2
+
+    if sub == "create-candidate":
+        board = args.board
+        from_backup = Path(args.from_backup) if getattr(args, "from_backup", None) else None
+        reason = getattr(args, "reason", "")
+        manifest_path = kh.create_repair_candidate(board, from_backup=from_backup, reason=reason)
+        print(manifest_path)
+        return 0
+
+    if sub == "approve-swap":
+        board = args.board
+        candidate = Path(args.candidate)
+        yes_flag = getattr(args, "yes_flag", False)
+        force = getattr(args, "force", False)
+        if not yes_flag and not force:
+            print("kanban repair approve-swap: requires --yes-i-have-read-the-manifest", file=sys.stderr)
+            return 2
+        receipt = kh.approve_swap_board(board, candidate_manifest_path=candidate, yes_flag=yes_flag, force=force)
+        print(json.dumps(receipt, indent=2, ensure_ascii=False))
+        return 0
+
+    if sub == "list-candidates":
+        # Simple glob under temp for candidates matching this board
+        import tempfile
+        board = args.board
+        candidates = []
+        tmp = Path(tempfile.gettempdir())
+        for d in tmp.glob(f"hermes-repair-{board}-*"):
+            manifest = d / "repair-candidate.json"
+            if manifest.exists():
+                candidates.append(str(manifest))
+        if getattr(args, "json", False):
+            print(json.dumps(candidates, indent=2, ensure_ascii=False))
+        else:
+            if candidates:
+                for c in candidates:
+                    print(c)
+            else:
+                print(f"No repair candidates found for board {board}.")
+        return 0
+
+    print(f"kanban repair: unknown subcommand {sub!r}", file=sys.stderr)
+    return 2
+
+
+def _cmd_maintenance(args: argparse.Namespace) -> int:
+    """Toggle maintenance mode on a board."""
+    from hermes_cli import kanban_health as kh
+
+    board = args.board
+    state = args.state
+    reason = getattr(args, "reason", "")
+    enabled = state == "on"
+    kh.set_maintenance_mode(board, enabled, reason=reason)
+    print(f"Maintenance mode {'enabled' if enabled else 'disabled'} for board {board}")
+    return 0
+
+
+def _cmd_arg_error(args: argparse.Namespace, message: str, *, stream=None) -> None:
+    """Emit a CLI argument/contract error, honoring ``--json`` when present."""
+    if getattr(args, "json", False):
+        print(json.dumps({"ok": False, "error": message}, indent=2, ensure_ascii=False))
+    else:
+        print(message, file=stream or sys.stderr)
+
+
+def _cross_board_link_mode_requested(args: argparse.Namespace) -> bool:
+    """Return True when the link/unlink invocation used cross-board flags."""
+    cross_fields = (
+        "parent_board",
+        "cross_parent_id",
+        "child_board",
+        "cross_child_id",
+        "kind",
+        "required_parent_statuses",
+        "source",
+        "created_by",
+        "metadata",
+    )
+    if any(getattr(args, field, None) is not None for field in cross_fields):
+        return True
+    return bool(getattr(args, "blocking", False))
+
+
+def _validate_link_argument_mode(args: argparse.Namespace) -> tuple[bool, bool]:
+    """Validate local-vs-cross-board link/unlink mode.
+
+    Returns ``(ok, cross_board_mode)``.  The legacy board-local form is the
+    positional pair ``parent_id child_id``.  The cross-board registry form is
+    all-flagged and must not be mixed with positional ids.
+    """
+    has_positional = args.parent_id is not None or args.child_id is not None
+    wants_cross_board = _cross_board_link_mode_requested(args)
+    if has_positional and wants_cross_board:
+        _cmd_arg_error(args, "choose either positional parent_id child_id OR cross-board flags, not both")
+        return False, wants_cross_board
+    if wants_cross_board:
+        missing = [
+            flag
+            for attr, flag in (
+                ("parent_board", "--parent-board"),
+                ("cross_parent_id", "--parent"),
+                ("child_board", "--child-board"),
+                ("cross_child_id", "--child"),
+                ("kind", "--kind"),
+            )
+            if not getattr(args, attr, None)
+        ]
+        if missing:
+            _cmd_arg_error(args, f"cross-board link/unlink requires {', '.join(missing)}")
+            return False, True
+        return True, True
+    if not args.parent_id or not args.child_id:
+        _cmd_arg_error(args, "positional parent_id and child_id are required")
+        return False, False
+    return True, False
+
+
+def _parse_cross_board_required_statuses(raw: str | None) -> list[str]:
+    if raw is None:
+        return ["done", "archived"]
+    text = raw.strip()
+    if not text:
+        raise ValueError("--required-parent-statuses must not be empty")
+    if text.startswith("["):
+        parsed = json.loads(text)
+        if not isinstance(parsed, list):
+            raise ValueError("--required-parent-statuses JSON must be a list")
+        statuses = [str(value).strip() for value in parsed]
+    else:
+        statuses = [part.strip() for part in text.split(",")]
+    statuses = [status for status in statuses if status]
+    if not statuses:
+        raise ValueError("--required-parent-statuses must contain at least one status")
+    return statuses
+
+
+def _parse_cross_board_metadata(raw: str | None) -> dict[str, Any]:
+    if raw is None:
+        return {}
+    try:
+        parsed = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"--metadata must be a JSON object: {exc}") from exc
+    if not isinstance(parsed, dict):
+        raise ValueError("--metadata must be a JSON object")
+    return dict(parsed)
+
+
+def _cross_board_edge_identity(args: argparse.Namespace) -> dict[str, str]:
+    return {
+        "parent_board": str(args.parent_board),
+        "parent_id": str(args.cross_parent_id),
+        "child_board": str(args.child_board),
+        "child_id": str(args.cross_child_id),
+        "kind": str(args.kind),
+    }
+
+
+def _cmd_cross_board_link(args: argparse.Namespace) -> int:
+    from plugins.kanban_cross_deps.store import CrossBoardRegistry
+
+    try:
+        required_statuses = _parse_cross_board_required_statuses(
+            getattr(args, "required_parent_statuses", None)
+        )
+        metadata = _parse_cross_board_metadata(getattr(args, "metadata", None))
+        edge = CrossBoardRegistry().add(
+            parent_board=args.parent_board,
+            parent_id=args.cross_parent_id,
+            child_board=args.child_board,
+            child_id=args.cross_child_id,
+            kind=args.kind,
+            blocking=bool(getattr(args, "blocking", False)),
+            required_parent_statuses=required_statuses,
+            source=getattr(args, "source", None) or "canonical",
+            created_by=getattr(args, "created_by", None),
+            metadata=metadata,
+        )
+    except (ValueError, json.JSONDecodeError) as exc:
+        _cmd_arg_error(args, str(exc))
+        return 1
+
+    if getattr(args, "json", False):
+        print(json.dumps({"ok": True, "linked": True, "edge": edge.to_dict()}, indent=2, ensure_ascii=False))
+    else:
+        print(
+            f"Linked cross-board {edge.parent_board}/{edge.parent_id} "
+            f"--[{edge.kind}]{' (blocking)' if edge.blocking else ''}--> "
+            f"{edge.child_board}/{edge.child_id}"
+        )
+    return 0
+
+
+def _cmd_cross_board_unlink(args: argparse.Namespace) -> int:
+    from plugins.kanban_cross_deps.store import CrossBoardRegistry
+
+    reg = CrossBoardRegistry()
+    identity = _cross_board_edge_identity(args)
+    existing = reg.list_edges(**identity, limit=1)
+    if not existing:
+        _cmd_arg_error(
+            args,
+            "No such cross-board edge: "
+            f"{args.parent_board}/{args.cross_parent_id} -> {args.child_board}/{args.cross_child_id} kind={args.kind}",
+        )
+        return 1
+    edge = existing[0]
+    removed = reg.remove(edge.id)
+    if not removed:
+        _cmd_arg_error(args, f"Could not remove cross-board edge {edge.id}")
+        return 1
+
+    if getattr(args, "json", False):
+        print(json.dumps({"ok": True, "unlinked": True, "edge_id": edge.id, "edge": identity}, indent=2, ensure_ascii=False))
+    else:
+        print(
+            f"Unlinked cross-board {edge.parent_board}/{edge.parent_id} "
+            f"--[{edge.kind}]--> {edge.child_board}/{edge.child_id}"
+        )
+    return 0
+
+
 def _cmd_link(args: argparse.Namespace) -> int:
+    ok, cross_board = _validate_link_argument_mode(args)
+    if not ok:
+        return 2
+    if cross_board:
+        return _cmd_cross_board_link(args)
     with kb.connect_closing() as conn:
         kb.link_tasks(conn, args.parent_id, args.child_id)
     print(f"Linked {args.parent_id} -> {args.child_id}")
@@ -1804,6 +2537,11 @@ def _cmd_link(args: argparse.Namespace) -> int:
 
 
 def _cmd_unlink(args: argparse.Namespace) -> int:
+    ok, cross_board = _validate_link_argument_mode(args)
+    if not ok:
+        return 2
+    if cross_board:
+        return _cmd_cross_board_unlink(args)
     with kb.connect_closing() as conn:
         ok = kb.unlink_tasks(conn, args.parent_id, args.child_id)
     if not ok:
@@ -2030,25 +2768,48 @@ def _cmd_promote(args: argparse.Namespace) -> int:
             ids.append(tid)
             seen.add(tid)
 
+    force = bool(getattr(args, "force", False))
+    dry_run = bool(getattr(args, "dry_run", False))
+    board = getattr(args, "board", None)
+
     results: list[dict[str, object]] = []
-    with kb.connect_closing() as conn:
-        for tid in ids:
-            ok, err = kb.promote_task(
-                conn,
-                tid,
-                actor=author,
-                reason=reason,
-                force=bool(args.force),
-                dry_run=bool(args.dry_run),
-            )
-            results.append({
-                "task_id": tid,
-                "promoted": ok,
-                "dry_run": bool(args.dry_run),
-                "forced": bool(args.force),
-                "reason": reason,
-                "error": err,
-            })
+    if not force:
+        try:
+            from hermes_cli.plugins import discover_plugins
+
+            discover_plugins()
+        except Exception as exc:
+            err = f"could not load enabled Kanban dependency providers: {exc}"
+            for tid in ids:
+                results.append({
+                    "task_id": tid,
+                    "promoted": False,
+                    "dry_run": dry_run,
+                    "forced": force,
+                    "reason": reason,
+                    "error": err,
+                })
+
+    if not results:
+        with kb.connect_closing() as conn:
+            for tid in ids:
+                ok, err = kb.promote_task(
+                    conn,
+                    tid,
+                    actor=author,
+                    reason=reason,
+                    force=force,
+                    dry_run=dry_run,
+                    board=board,
+                )
+                results.append({
+                    "task_id": tid,
+                    "promoted": ok,
+                    "dry_run": dry_run,
+                    "forced": force,
+                    "reason": reason,
+                    "error": err,
+                })
 
     failed = [r for r in results if not r["promoted"]]
     if as_json:
@@ -2127,6 +2888,7 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
         _cfg = load_config()
         _kanban_cfg = _cfg.get("kanban", {}) if isinstance(_cfg, dict) else {}
         default_assignee = (_kanban_cfg.get("default_assignee") or "").strip() or None
+        maintenance_mode = bool(_kanban_cfg.get("maintenance_mode", False))
 
         def _coerce_positive_int(value):
             if value is None:
@@ -2149,9 +2911,31 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
         )
     except Exception:
         default_assignee = None
+        maintenance_mode = False
         max_in_progress_per_profile = None
         max_in_progress = None
         max_spawn = getattr(args, "max", None)
+    board = getattr(args, "board", None)
+    if maintenance_mode or kb.board_in_maintenance(board):
+        if getattr(args, "json", False):
+            print(json.dumps({
+                "maintenance_mode": True,
+                "board": board or kb.get_current_board(),
+                "reclaimed": 0,
+                "crashed": [],
+                "timed_out": [],
+                "stale": [],
+                "auto_blocked": [],
+                "promoted": 0,
+                "spawned": [],
+                "skipped_unassigned": [],
+                "skipped_nonspawnable": [],
+                "skipped_per_profile_capped": [],
+                "auto_assigned_default": [],
+            }, indent=2))
+        else:
+            print("Kanban dispatcher skipped: maintenance mode is enabled.")
+        return 0
     with kb.connect_closing() as conn:
         res = kb.dispatch_once(
             conn,
@@ -2259,6 +3043,27 @@ def _cmd_daemon(args: argparse.Namespace) -> int:
         return 2
 
     # Legacy path — same logic as before, kept behind --force.
+    try:
+        from hermes_cli.config import load_config as _load_config
+        _cfg = _load_config()
+        _kanban_cfg = _cfg.get("kanban", {}) if isinstance(_cfg, dict) else {}
+        if bool(_kanban_cfg.get("maintenance_mode", False)):
+            print(
+                "Kanban dispatcher not started: kanban.maintenance_mode=true.",
+                file=sys.stderr,
+            )
+            return 0
+    except Exception:
+        pass
+    try:
+        if kb.board_in_maintenance(None):
+            print(
+                "Kanban dispatcher not started: current board is in maintenance mode.",
+                file=sys.stderr,
+            )
+            return 0
+    except Exception:
+        pass
     # Make sure the DB exists before printing "started" so the user sees the
     # correct DB path and any init error surfaces immediately.
     kb.init_db()
@@ -2628,6 +3433,7 @@ def _cmd_decompose(args: argparse.Namespace) -> int:
     tenant = getattr(args, "tenant", None)
     author = getattr(args, "author", None) or _profile_author()
     want_json = bool(getattr(args, "json", False))
+    dry_run = bool(getattr(args, "dry_run", False))
 
     if args.task_id and all_flag:
         print(
@@ -2645,7 +3451,7 @@ def _cmd_decompose(args: argparse.Namespace) -> int:
                 + "."
             )
             if want_json:
-                print(json.dumps({"decomposed": 0, "total": 0}))
+                print(json.dumps({"decomposed": 0, "total": 0, "dry_run": dry_run}))
             else:
                 print(msg)
             return 0
@@ -2660,20 +3466,30 @@ def _cmd_decompose(args: argparse.Namespace) -> int:
 
     ok_count = 0
     for tid in ids:
-        outcome = decomp.decompose_task(tid, author=author)
+        outcome = decomp.decompose_task(tid, author=author, dry_run=dry_run)
         if outcome.ok:
             ok_count += 1
         if want_json:
-            print(json.dumps({
+            payload = {
                 "task_id": outcome.task_id,
                 "ok": outcome.ok,
                 "reason": outcome.reason,
                 "fanout": outcome.fanout,
                 "child_ids": outcome.child_ids,
                 "new_title": outcome.new_title,
-            }))
+                "dry_run": outcome.dry_run,
+            }
+            if dry_run:
+                payload["dry_run_tasks"] = outcome.dry_run_tasks
+                payload["dry_run_parsed"] = outcome.dry_run_parsed
+            print(json.dumps(payload))
         elif outcome.ok:
-            if outcome.fanout and outcome.child_ids:
+            if outcome.fanout and outcome.dry_run:
+                print(
+                    f"[DRY RUN] Would decompose {outcome.task_id} → "
+                    f"{len(outcome.dry_run_tasks or [])} children"
+                )
+            elif outcome.fanout and outcome.child_ids:
                 child_summary = ", ".join(outcome.child_ids)
                 print(
                     f"Decomposed {outcome.task_id} → {len(outcome.child_ids)} "
@@ -2685,10 +3501,16 @@ def _cmd_decompose(args: argparse.Namespace) -> int:
                     if outcome.new_title
                     else ""
                 )
-                print(
-                    f"Specified {outcome.task_id} → todo "
-                    f"(no fanout){title_suffix}"
-                )
+                if outcome.dry_run:
+                    print(
+                        f"[DRY RUN] Would specify {outcome.task_id} → todo "
+                        f"(no fanout){title_suffix}"
+                    )
+                else:
+                    print(
+                        f"Specified {outcome.task_id} → todo "
+                        f"(no fanout){title_suffix}"
+                    )
         else:
             print(
                 f"kanban: decompose {outcome.task_id}: {outcome.reason}",

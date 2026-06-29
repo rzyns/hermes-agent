@@ -1819,4 +1819,3 @@ class TestCrossProcessInvalidationDefersCleanup:
 
         assert release_calls == [old_agent]
         runner._cleanup_agent_resources.assert_not_called()
-

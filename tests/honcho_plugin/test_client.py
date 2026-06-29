@@ -608,6 +608,9 @@ class TestObservationModeMigration:
 
 
 class TestGetHonchoClient:
+    def setup_method(self):
+        reset_honcho_client()
+
     def teardown_method(self):
         reset_honcho_client()
 

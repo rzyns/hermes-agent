@@ -18,7 +18,7 @@
   const { React } = SDK;
   const h = React.createElement;
   const {
-    Card, CardContent,
+    Card, CardContent, PluginSlot,
     Badge, Button, Input, Label, Select, SelectOption,
   } = SDK.components;
   const { useState, useEffect, useCallback, useMemo, useRef } = SDK.hooks;
@@ -66,6 +66,20 @@
       }
     }
     return str;
+  }
+
+  function boardHealthStatus(board) {
+    return (board && board.health && board.health.status) || "healthy";
+  }
+
+  function boardHealthLabel(t, status) {
+    const labels = {
+      healthy: tx(t, "boardHealthHealthy", "healthy"),
+      degraded: tx(t, "boardHealthDegraded", "degraded"),
+      missing: tx(t, "boardHealthMissing", "missing"),
+      unreachable: tx(t, "boardHealthUnreachable", "unreachable"),
+    };
+    return labels[status] || status || labels.healthy;
   }
 
   // ``fetchJSON`` throws ``Error("<status>: <raw body>")`` on non-2xx, and
@@ -194,6 +208,7 @@
 
   const API = "/api/plugins/kanban";
   const MIME_TASK = "text/x-hermes-task";
+  const OPEN_TASK_EVENT = "hermes-kanban:open-task";
 
   // Docs link — surfaced as a `?` icon next to the board switcher and as
   // `title=` hints on unlabelled controls. Kept in one place so rebrands or
@@ -509,6 +524,7 @@
     const [board, setBoard] = useState(() => readSelectedBoard() || null);
     const [boardList, setBoardList] = useState([]);      // [{slug, name, counts, ...}]
     const [showNewBoard, setShowNewBoard] = useState(false);
+    const [showDropLinkDialog, setShowDropLinkDialog] = useState(false);
 
     const [kanbanBoard, setKanbanBoard] = useState(null);  // the grid data
     // Alias so the rest of the function can keep using `board` semantically
@@ -653,6 +669,18 @@
           ws.onmessage = function (ev) {
             try {
               const msg = JSON.parse(ev.data);
+              if (msg && msg.degraded) {
+                wsClosedRef.current = true;
+                setBoardData(Object.assign({
+                  columns: [],
+                  tenants: [],
+                  assignees: [],
+                  latest_event_id: 0,
+                }, msg));
+                setError(null);
+                try { ws.close(); } catch (_closeErr) { /* noop */ }
+                return;
+              }
               if (msg && Array.isArray(msg.events) && msg.events.length > 0) {
                 cursorRef.current = msg.cursor || cursorRef.current;
                 // Stamp per-task signal so the TaskDrawer can reload itself.
@@ -958,6 +986,19 @@
       clearSelected();
     }, [board, clearSelected]);
 
+    useEffect(function () {
+      function onOpenTask(ev) {
+        const detail = (ev && ev.detail) || {};
+        const taskId = detail.taskId || detail.task_id || detail.id;
+        const nextBoard = detail.boardSlug || detail.board || detail.board_slug;
+        if (!taskId) return;
+        if (nextBoard && nextBoard !== board) switchBoard(nextBoard);
+        setSelectedTaskId(taskId);
+      }
+      window.addEventListener(OPEN_TASK_EVENT, onOpenTask);
+      return function () { window.removeEventListener(OPEN_TASK_EVENT, onOpenTask); };
+    }, [board, switchBoard]);
+
     const createNewBoard = useCallback(function (payload) {
       return SDK.fetchJSON(`${API}/boards`, {
         method: "POST",
@@ -1025,6 +1066,34 @@
     }
     if (!filteredBoard) return null;
 
+    if (filteredBoard.degraded) {
+      return h(ErrorBoundary, null,
+        h("div", { className: "hermes-kanban flex flex-col gap-4" },
+          h(BoardSwitcher, {
+            board: board || filteredBoard.board_slug,
+            boardList: boardList,
+            onSwitch: switchBoard,
+            onNewClick: function () { setShowNewBoard(true); },
+            onDropLinkClick: function () { setShowDropLinkDialog(true); },
+            onDeleteBoard: deleteBoard,
+          }),
+          showNewBoard ? h(NewBoardDialog, {
+            onCancel: function () { setShowNewBoard(false); },
+            onCreate: function (payload) {
+              return createNewBoard(payload).then(function () { setShowNewBoard(false); });
+            },
+          }) : null,
+          h(DegradedBoardNotice, {
+            boardData: filteredBoard,
+            board: board,
+            boardList: boardList,
+            onSwitch: switchBoard,
+          }),
+          h(PluginSlot, { name: "kanban:bottom" }),
+        ),
+      );
+    }
+
     const renderMd = !config || config.render_markdown !== false;
 
     return h(ErrorBoundary, null,
@@ -1034,6 +1103,7 @@
           boardList: boardList,
           onSwitch: switchBoard,
           onNewClick: function () { setShowNewBoard(true); },
+          onDropLinkClick: function () { setShowDropLinkDialog(true); },
           onDeleteBoard: deleteBoard,
         }),
         showNewBoard ? h(NewBoardDialog, {
@@ -1042,6 +1112,27 @@
             return createNewBoard(payload).then(function () { setShowNewBoard(false); });
           },
         }) : null,
+        showDropLinkDialog ? h(DropLinkDialog, {
+          onCancel: function () { setShowDropLinkDialog(false); },
+          onCreate: async function (payload) {
+            try {
+              const res = await SDK.fetchJSON(withBoard(API + "/intake-links", "attention-intake"), {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify(payload),
+              });
+              setShowDropLinkDialog(false);
+              if (res && res.task && res.task.id) {
+                setSelectedTaskId(res.task.id);
+              }
+              loadBoard();
+              loadBoardList();
+            } catch (e) {
+              setError("Intake link failed: " + parseApiErrorMessage(e));
+            }
+          },
+        }) : null,
+        h(PluginSlot, { name: "kanban:top" }),
         h(OrchestrationPanel, null),
         h(AttentionStrip, {
           boardData,
@@ -1088,6 +1179,7 @@
           onCreate: createTask,
           allTasks: boardData.columns.reduce(function (acc, c) { return acc.concat(c.tasks); }, []),
         }),
+        h(PluginSlot, { name: "kanban:bottom" }),
         selectedTaskId ? h(TaskDrawer, {
           taskId: selectedTaskId,
           boardSlug: board,
@@ -1804,12 +1896,58 @@
     );
   }
 
+  function DegradedBoardNotice(props) {
+    const { t } = useI18n();
+    const boardData = props.boardData || {};
+    const boardList = props.boardList || [];
+    const boardSlug = boardData.board_slug || props.board || "default";
+    const boardMeta = boardList.find(function (b) { return b.slug === boardSlug; });
+    const boardName = (boardMeta && boardMeta.name) || boardSlug;
+    return h(Card, { className: "hermes-kanban-degraded" },
+      h(CardContent, { className: "p-5 flex flex-col gap-3" },
+        h("div", { className: "flex items-center gap-2" },
+          h("span", { className: "hermes-kanban-degraded-icon", "aria-hidden": "true" }, "⚠"),
+          h("div", { className: "text-base font-semibold" },
+            tx(t, "degradedBoard", "Board '{name}' is degraded", { name: boardName })),
+        ),
+        boardData.reason ? h("div", { className: "text-sm text-muted-foreground" },
+          tx(t, "degradedReason", "Reason: {reason}", { reason: boardData.reason })) : null,
+        boardData.corrupt_backup_path ? h("div", { className: "text-xs" },
+          h("div", { className: "font-medium" }, tx(t, "degradedBackupPath", "Corrupt file backed up to:")),
+          h("code", { className: "hermes-kanban-degraded-path" }, boardData.corrupt_backup_path),
+        ) : null,
+        h("div", { className: "text-sm text-muted-foreground" },
+          tx(t, "selectHealthyBoard", "This board cannot be displayed. Select a healthy board from the switcher above.")),
+        h("div", { className: "flex flex-wrap gap-2" },
+          h(Button, {
+            size: "sm",
+            onClick: function () {
+              const healthy = boardList.find(function (b) {
+                return b.slug !== boardSlug && boardHealthStatus(b) === "healthy";
+              });
+              if (healthy && props.onSwitch) props.onSwitch(healthy.slug);
+            },
+            disabled: !boardList.some(function (b) {
+              return b.slug !== boardSlug && boardHealthStatus(b) === "healthy";
+            }),
+          }, tx(t, "switchToHealthyBoard", "Switch to a healthy board")),
+          h(Button, {
+            size: "sm",
+            variant: "outline",
+            onClick: function () { window.open("https://hermes-agent.nousresearch.com/docs/user-guide/features/kanban", "_blank", "noopener"); },
+          }, tx(t, "viewRepairGuidance", "View repair guidance")),
+        ),
+      ),
+    );
+  }
+
   function BoardSwitcher(props) {
     const { t } = useI18n();
     const list = props.boardList || [];
     const current = list.find(function (b) { return b.slug === props.board; });
     const currentName = current && current.name ? current.name : props.board;
     const currentTotal = current ? current.total : 0;
+    const currentHealth = boardHealthStatus(current);
     const hasMultipleBoards = list.length > 1;
 
     // Hide entirely when only the default board exists AND it's empty —
@@ -1818,7 +1956,7 @@
     // task (so the user can discover multi-project before they need it)
     // OR when any non-default board exists.
     const totalAcrossAllBoards = list.reduce(function (n, b) { return n + (b.total || 0); }, 0);
-    const shouldShow = hasMultipleBoards || totalAcrossAllBoards > 0;
+    const shouldShow = hasMultipleBoards || totalAcrossAllBoards > 0 || currentHealth !== "healthy";
     if (!shouldShow) {
       return h("div", {
         className: "hermes-kanban-boardswitcher-compact",
@@ -1846,18 +1984,32 @@
               title: "Boards are independent work streams. Each board has its own tasks, tenants, and assignees.",
             }, selectChangeHandler(function (v) { if (v) props.onSwitch(v); })),
               list.map(function (b) {
-                const label = b.total > 0
+                const status = boardHealthStatus(b);
+                const baseLabel = b.total > 0
                   ? `${b.name || b.slug} · ${b.total}`
                   : (b.name || b.slug);
+                const label = status && status !== "healthy"
+                  ? `${baseLabel} · ${boardHealthLabel(t, status)}`
+                  : baseLabel;
                 return h(SelectOption, { key: b.slug, value: b.slug }, label);
               }),
             ),
             h("span", { className: "text-xs text-muted-foreground" },
               `${currentTotal || 0} task${currentTotal === 1 ? "" : "s"}`),
+            currentHealth && currentHealth !== "healthy"
+              ? h(Badge, { className: "hermes-kanban-board-health hermes-kanban-board-health--" + currentHealth },
+                boardHealthLabel(t, currentHealth))
+              : null,
           ),
         ),
         h("div", { className: "flex-1" }),
         h(DocsLink, null),
+        h(Button, {
+          onClick: props.onDropLinkClick,
+          size: "sm",
+          className: "h-8",
+          title: "Drop a Link onto the Attention Intake board.",
+        }, tx(t, "dropLink", "Drop Link")),
         h(Button, {
           onClick: props.onNewClick,
           size: "sm",
@@ -1877,6 +2029,73 @@
             title: tx(t, "archiveBoardTitle", "Archive this board"),
           }, tx(t, "archive", "Archive"))
           : null,
+      ),
+    );
+  }
+
+  function DropLinkDialog(props) {
+    const { t } = useI18n();
+    const [url, setUrl] = useState("");
+    const [note, setNote] = useState("");
+    const [submitting, setSubmitting] = useState(false);
+    const [err, setErr] = useState(null);
+    function onSubmit(ev) {
+      if (ev) ev.preventDefault();
+      const trimmed = url.trim();
+      if (!trimmed) { setErr("URL is required"); return; }
+      try { new URL(trimmed); } catch (_) { setErr("Not a valid URL"); return; }
+      setSubmitting(true);
+      setErr(null);
+      props.onCreate({ url: trimmed, context: note.trim() || undefined }).catch(function (e) { setErr(e.message || String(e)); setSubmitting(false); });
+    }
+    return h("div", {
+      className: "hermes-kanban-dialog-backdrop",
+      onClick: function (e) { if (e.target === e.currentTarget) props.onCancel(); },
+    },
+      h("form", {
+        className: "hermes-kanban-dialog",
+        onSubmit: onSubmit,
+      },
+        h("div", { className: "hermes-kanban-dialog-title" },
+          tx(t, "dropLinkTitle", "Drop Link — Attention Intake")),
+        h("div", { className: "text-xs text-muted-foreground mb-2" },
+          tx(t, "dropLinkDescription",
+            "Creates a first-class intake card on the attention-intake board. Duplicates are deduplicated by canonical URL hash.")),
+        h("div", { className: "flex flex-col gap-3" },
+          h("div", { className: "flex flex-col gap-1" },
+            h(Label, { className: "text-xs" }, tx(t, "url", "URL"), " ", h("span", { className: "text-destructive" }, "*")),
+            h(Input, {
+              value: url,
+              onChange: function (e) { setUrl(e.target.value); },
+              placeholder: "https://…",
+              autoFocus: true,
+              className: "h-8",
+            }),
+          ),
+          h("div", { className: "flex flex-col gap-1" },
+            h(Label, { className: "text-xs" }, tx(t, "note", "Note (optional)")),
+            h(Input, {
+              value: note,
+              onChange: function (e) { setNote(e.target.value); },
+              placeholder: "Why this link matters…",
+              className: "h-8",
+            }),
+          ),
+        ),
+        err ? h("div", { className: "text-xs text-destructive mt-2" }, err) : null,
+        h("div", { className: "hermes-kanban-dialog-actions" },
+          h(Button, {
+            type: "button",
+            onClick: props.onCancel,
+            size: "sm",
+            disabled: submitting,
+          }, tx(t, "cancel", "Cancel")),
+          h(Button, {
+            type: "submit",
+            size: "sm",
+            disabled: submitting || !url.trim(),
+          }, submitting ? tx(t, "dropping", "Dropping…") : tx(t, "dropLink", "Drop Link")),
+        ),
       ),
     );
   }
@@ -3225,6 +3444,7 @@
     const events = props.data.events || [];
     const attachments = props.data.attachments || [];
     const links = props.data.links || { parents: [], children: [] };
+    const crossBoard = props.data.cross_board || { upstream: [], downstream: [] };
 
     return h("div", { className: "hermes-kanban-drawer-body" },
       h("div", { className: "hermes-kanban-drawer-title" },
@@ -3294,6 +3514,10 @@
         onRemoveParent: props.onRemoveParent,
         onAddChild: props.onAddChild,
         onRemoveChild: props.onRemoveChild,
+      }),
+      h(CrossBoardDepsSection, {
+        upstream: crossBoard.upstream,
+        downstream: crossBoard.downstream,
       }),
       t.result ? h("div", { className: "hermes-kanban-section" },
         h("div", { className: "hermes-kanban-section-head" }, tx(i18n, "result", "Result")),
@@ -3639,6 +3863,45 @@
           ? h(MarkdownBlock, { source: props.task.body, enabled: props.renderMarkdown })
           : h("div", { className: "text-xs text-muted-foreground italic" },
               tx(t, "noDescription", "— no description —")),
+    );
+  }
+
+  // -------------------------------------------------------------------------
+  // Cross-board dependency section (read-only — only the registry CLI may
+  // create or remove edges, so the UI is purely informative)
+  // -------------------------------------------------------------------------
+
+  function CrossBoardDepsSection(props) {
+    const { t } = useI18n();
+    var upstream   = props.upstream   || [];
+    var downstream = props.downstream || [];
+    if (!upstream.length && !downstream.length) return null;
+
+    function edgeRow(e, direction) {
+      var kind = e.kind || "depends";
+      var blocking = e.blocking ? true : false;
+      var source = e.source || "";
+      var provenanceLabel = (blocking ? "blocking, " : "non-blocking, ") + (source || "canonical");
+      return h("div", { className: "hermes-kanban-cbd-row", key: e.id },
+        h("span", { className: "hermes-kanban-cbd-dot " + (blocking ? "hermes-kanban-cbd-dot--blocking" : "") }),
+        h("span", { className: "hermes-kanban-cbd-dir" }, direction),
+        h("span", { className: "hermes-kanban-cbd-board" }, e.parent_board || e.child_board || ""),
+        h("span", { className: "hermes-kanban-cbd-id" }, e.parent_id || e.child_id || ""),
+        h("span", { className: "hermes-kanban-cbd-kind" }, kind),
+        source ? h("span", { className: "hermes-kanban-cbd-source" }, "(" + provenanceLabel + ")") : null,
+      );
+    }
+
+    return h("div", { className: "hermes-kanban-section" },
+      h("div", { className: "hermes-kanban-section-head" }, tx(t, "crossBoardDeps", "Cross-board dependencies")),
+      upstream.length > 0 ? h("div", { className: "hermes-kanban-cbd-group" },
+        h("div", { className: "hermes-kanban-cbd-group-label" }, tx(t, "upstream", "Upstream")),
+        upstream.map(function (e) { return edgeRow(e, "←"); }),
+      ) : null,
+      downstream.length > 0 ? h("div", { className: "hermes-kanban-cbd-group" },
+        h("div", { className: "hermes-kanban-cbd-group-label" }, tx(t, "downstream", "Downstream")),
+        downstream.map(function (e) { return edgeRow(e, "→"); }),
+      ) : null,
     );
   }
 

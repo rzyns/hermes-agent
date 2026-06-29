@@ -1096,7 +1096,8 @@ kanban task.
   `init`, `create`, `list` (alias `ls`), `show`, `assign`, `link`,
   `unlink`, `comment`, `complete`, `block`, `unblock`, `archive`,
   `tail`, plus less-commonly-used `watch`, `stats`, `runs`, `log`,
-  `assignees`, `heartbeat`, `notify-*`, `dispatch`, `daemon`, `gc`.
+  `assignees`, `heartbeat`, `intake-link`, `intake-link-health`,
+  `notify-*`, `dispatch`, `daemon`, `gc`.
 - **Worker/orchestrator toolset:** `tools/kanban_tools.py` exposes
   `kanban_show`, `kanban_complete`, `kanban_block`, `kanban_heartbeat`,
   `kanban_comment`, `kanban_create`, `kanban_link`; profiles that
@@ -1109,6 +1110,12 @@ kanban task.
 - **Plugin assets:** `plugins/kanban/dashboard/` (web UI) +
   `plugins/kanban/systemd/` (`hermes-kanban-dispatcher.service` for
   standalone dispatcher deployment).
+- **Artifact/reference hygiene:** `hermes_cli/kanban_artifacts.py` builds
+  durable `artifact-manifest.json` handoffs; `hermes_cli/kanban_research_route.py`
+  materializes blocked Attention→Agent Research route targets; completion prose
+  should use board-qualified cross-board refs (`board/t_<hex>`), and
+  `hermes kanban intake-link-health --scratch-url-audit` reports active URL
+  tasks still using disposable scratch workspaces.
 
 Isolation model:
 - **Board** is the hard boundary — workers are spawned with
@@ -1397,3 +1404,8 @@ not the specific names.
 
 Reviewers should reject new change-detector tests; authors should convert
 them into invariants before re-requesting review.
+
+
+<!-- gbrain:retrieval-reflex:resolver-rows -->
+- retrieval-reflex | a named person/company/project/place becomes the subject; a brain-page pointer appears in context; "who is", "what do we know about", "tell me about"; about to assert a non-trivial detail about a named entity
+<!-- /gbrain:retrieval-reflex:resolver-rows -->

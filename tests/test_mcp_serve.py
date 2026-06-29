@@ -976,6 +976,51 @@ class TestRunMcpServer:
             mcp_serve.run_mcp_server()
         assert exc_info.value.code == 1
 
+    def test_run_uses_anyio_runner(self, monkeypatch):
+        """FastMCP's stdio transport must run under AnyIO's runner.
+
+        Running the same coroutine through ``asyncio.run`` can leave stdio MCP
+        clients waiting forever for initialize. Keep this entrypoint aligned
+        with FastMCP's own ``run(transport="stdio")`` implementation.
+        """
+        import asyncio
+        import anyio
+        import mcp_serve
+
+        calls = []
+
+        class FakeBridge:
+            def start(self):
+                calls.append("bridge.start")
+
+            def stop(self):
+                calls.append("bridge.stop")
+
+        class FakeServer:
+            async def run_stdio_async(self):
+                calls.append("server.run_stdio_async")
+
+        def fake_anyio_run(func):
+            calls.append("anyio.run")
+            asyncio.run(func())
+
+        monkeypatch.setattr(mcp_serve, "EventBridge", FakeBridge)
+        monkeypatch.setattr(
+            mcp_serve,
+            "create_mcp_server",
+            lambda *, event_bridge: FakeServer(),
+        )
+        monkeypatch.setattr(anyio, "run", fake_anyio_run)
+
+        mcp_serve.run_mcp_server()
+
+        assert calls == [
+            "bridge.start",
+            "anyio.run",
+            "server.run_stdio_async",
+            "bridge.stop",
+        ]
+
 
 class TestCliIntegration:
     def test_parse_serve(self):

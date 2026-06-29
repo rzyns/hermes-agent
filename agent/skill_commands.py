@@ -154,24 +154,36 @@ def _load_skill_payload(skill_identifier: str, task_id: str | None = None) -> tu
             except Exception:
                 pass
 
-            # Prefer the lexical path under a trusted skill root before
-            # resolving symlinks.  Slash-command discovery can legitimately
-            # find a skill via ~/.hermes/skills/<name> where <name> is a
-            # symlink to a checked-out skill elsewhere.  Resolving first turns
-            # that trusted visible path into an arbitrary absolute path that
-            # skill_view() refuses to load.
+            # Prefer lexical normalization under a trusted visible skill root
+            # before resolving symlinks. Slash-command discovery can record a
+            # symlink path under ~/.hermes/skills; resolving it first can escape
+            # that trusted root and make skill_view() receive an unsupported
+            # arbitrary absolute path.
             for root in trusted_roots:
                 try:
                     normalized = str(identifier_path.relative_to(root))
                     break
-                except ValueError:
+                except Exception:
                     continue
 
+            # If lexical normalization did not match, allow already-resolved
+            # absolute paths that are still under a trusted local/external skill
+            # root. This preserves support for explicit external skill dirs
+            # without accepting arbitrary absolute paths.
             if normalized is None:
                 try:
-                    normalized = str(identifier_path.resolve().relative_to(SKILLS_DIR.resolve()))
+                    resolved_identifier = identifier_path.resolve()
+                    for root in trusted_roots:
+                        try:
+                            normalized = str(resolved_identifier.relative_to(root.resolve()))
+                            break
+                        except Exception:
+                            continue
                 except Exception:
-                    normalized = raw_identifier
+                    pass
+
+            if normalized is None:
+                normalized = raw_identifier
         else:
             normalized = raw_identifier.lstrip("/")
 

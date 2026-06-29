@@ -208,10 +208,14 @@ class HonchoMemoryProvider(MemoryProvider):
         self._manager = None   # HonchoSessionManager
         self._config = None    # HonchoClientConfig
         self._session_key = ""
+        # Monotonic generation used to discard background initialization work
+        # that was started for a previous Hermes session_id.
+        self._session_generation = 0
         self._prefetch_result = ""
         self._prefetch_lock = threading.Lock()
         self._prefetch_thread: Optional[threading.Thread] = None
         self._sync_thread: Optional[threading.Thread] = None
+        self._shutdown_event = threading.Event()
 
         # B1: recall_mode — set during initialize from config
         self._recall_mode = "hybrid"  # "context", "tools", or "hybrid"
@@ -406,10 +410,27 @@ class HonchoMemoryProvider(MemoryProvider):
             cfg = self._config
             init_kwargs = dict(self._lazy_init_kwargs)
             init_session_id = self._lazy_init_session_id or "hermes-default"
+            init_generation = self._session_generation
 
             def _run() -> None:
                 try:
                     self._do_session_init(cfg, init_session_id, **init_kwargs)
+                    if init_generation != self._session_generation:
+                        # A session switch happened while this background init
+                        # was resolving the old Honcho session. Discard the
+                        # partially initialized old session so the next turn can
+                        # initialize the current key instead of writing stale.
+                        self._manager = None
+                        self._session_initialized = False
+                        if self._config and self._lazy_init_kwargs is not None:
+                            self._session_key = self._resolve_session_key(
+                                self._config,
+                                self._lazy_init_session_id or "hermes-default",
+                                **self._lazy_init_kwargs,
+                            )
+                        self._init_error = ""
+                        logger.debug("Honcho background session init discarded after session switch")
+                        return
                     self._lazy_init_kwargs = None
                     self._lazy_init_session_id = None
                     self._init_error = ""
@@ -798,7 +819,7 @@ class HonchoMemoryProvider(MemoryProvider):
         Context refresh updates the base layer (representation + card).
         Dialectic fires the LLM reasoning supplement.
         """
-        if self._cron_skipped:
+        if self._cron_skipped or self._shutdown_event.is_set():
             return
         # B1: tools-only mode — no prefetch
         if self._recall_mode == "tools":
@@ -845,6 +866,8 @@ class HonchoMemoryProvider(MemoryProvider):
         _fired_at = self._turn_count
 
         def _run():
+            if self._shutdown_event.is_set():
+                return
             try:
                 result = self._run_dialectic_depth(query)
             except Exception as e:
@@ -852,6 +875,8 @@ class HonchoMemoryProvider(MemoryProvider):
                 self._dialectic_empty_streak += 1
                 return
             if result and result.strip():
+                if self._shutdown_event.is_set():
+                    return
                 with self._prefetch_lock:
                     self._prefetch_result = result
                     self._prefetch_result_fired_at = _fired_at
@@ -1055,6 +1080,8 @@ class HonchoMemoryProvider(MemoryProvider):
         results: list[str] = []
 
         for i in range(self._dialectic_depth):
+            if self._shutdown_event.is_set():
+                return ""
             if i == 0:
                 prompt = self._build_dialectic_prompt(0, results, is_cold)
             else:
@@ -1108,6 +1135,78 @@ class HonchoMemoryProvider(MemoryProvider):
     def on_turn_start(self, turn_number: int, message: str, **kwargs) -> None:
         """Track turn count for cadence and injection_frequency logic."""
         self._turn_count = turn_number
+
+    def on_session_switch(
+        self,
+        new_session_id: str,
+        *,
+        parent_session_id: str = "",
+        reset: bool = False,
+        rewound: bool = False,
+        **kwargs,
+    ) -> None:
+        """Rebind cached Honcho state after Hermes changes session_id.
+
+        Honcho resolves a storage key during provider initialization and keeps
+        that key in ``self._session_key`` for later writes, prefetches, and tool
+        calls.  Compression, /resume, /branch, and gateway session rotation can
+        change ``AIAgent.session_id`` without rebuilding the provider, so the
+        cached key must be refreshed here or future writes can land in the old
+        Honcho session.
+        """
+        if self._cron_skipped or not new_session_id:
+            return
+
+        # Invalidate any background initialization that was started for the
+        # previous session id.  The worker checks this generation when it
+        # finishes and discards stale manager/key state.
+        self._session_generation += 1
+
+        switch_kwargs = dict(self._lazy_init_kwargs or {})
+        switch_kwargs.update(kwargs)
+        if parent_session_id:
+            switch_kwargs["parent_session_id"] = parent_session_id
+        if reset:
+            switch_kwargs["reset"] = reset
+        if rewound:
+            switch_kwargs["rewound"] = rewound
+
+        self._lazy_init_session_id = new_session_id
+        if self._lazy_init_kwargs is not None or not self._session_initialized:
+            self._lazy_init_kwargs = switch_kwargs
+
+        if self._config:
+            self._session_key = self._resolve_session_key(
+                self._config,
+                new_session_id,
+                **switch_kwargs,
+            )
+        else:
+            self._session_key = new_session_id or "hermes-default"
+
+        # Clear context/dialectic caches that belong to the previous session.
+        with self._base_context_lock:
+            self._base_context_cache = None
+        with self._prefetch_lock:
+            self._prefetch_result = ""
+            self._prefetch_result_fired_at = -999
+        self._last_context_turn = -999
+        self._last_dialectic_turn = -999
+        self._dialectic_empty_streak = 0
+        self._prefetch_thread_started_at = 0.0
+        if reset:
+            self._turn_count = 0
+
+        # If session initialization is still in flight, do not treat the old
+        # partially initialized manager as ready for the new key.  Once the old
+        # worker exits, the next prefetch/tool/write call will initialize the
+        # updated lazy session id.
+        if self._init_thread and self._init_thread.is_alive():
+            self._manager = None
+            self._session_initialized = False
+
+        self._init_error = ""
+        logger.debug("Honcho session switched: %s", self._session_key)
 
     @staticmethod
     def _chunk_message(content: str, limit: int) -> list[str]:
@@ -1217,7 +1316,7 @@ class HonchoMemoryProvider(MemoryProvider):
         Messages exceeding the Honcho API limit (default 25k chars) are
         split into multiple messages with continuation markers.
         """
-        if self._cron_skipped:
+        if self._cron_skipped or self._shutdown_event.is_set():
             return
         if self._recall_mode == "tools" and not self._session_ready():
             return
@@ -1228,10 +1327,13 @@ class HonchoMemoryProvider(MemoryProvider):
         msg_limit = self._config.message_max_chars if self._config else 25000
         clean_user_content = sanitize_context(user_content or "").strip()
         clean_assistant_content = sanitize_context(assistant_content or "").strip()
+        session_key = self._session_key
 
         def _sync():
+            if self._shutdown_event.is_set():
+                return
             try:
-                session = self._manager.get_or_create(self._session_key)
+                session = self._manager.get_or_create(session_key)
                 for chunk in self._chunk_message(clean_user_content, msg_limit):
                     session.add_message("user", chunk)
                 for chunk in self._chunk_message(clean_assistant_content, msg_limit):
@@ -1263,7 +1365,7 @@ class HonchoMemoryProvider(MemoryProvider):
         """
         if action != "add" or target != "user" or not content:
             return
-        if self._cron_skipped:
+        if self._cron_skipped or self._shutdown_event.is_set():
             return
         if self._recall_mode == "tools" and not self._session_ready():
             return
@@ -1271,9 +1373,11 @@ class HonchoMemoryProvider(MemoryProvider):
             self._start_session_init_background()
             return
 
+        session_key = self._session_key
+
         def _write():
             try:
-                self._manager.create_conclusion(self._session_key, content)
+                self._manager.create_conclusion(session_key, content)
             except Exception as e:
                 logger.debug("Honcho memory mirror failed: %s", e)
 
@@ -1412,15 +1516,51 @@ class HonchoMemoryProvider(MemoryProvider):
             return tool_error(f"Honcho {tool_name} failed: {e}")
 
     def shutdown(self) -> None:
+        self._shutdown_event.set()
+        self._close_honcho_client()
         for t in (self._prefetch_thread, self._sync_thread):
             if t and t.is_alive():
                 t.join(timeout=5.0)
-        # Flush any remaining messages
-        if self._manager and not (self._init_thread and self._init_thread.is_alive() and not self._session_initialized):
+        # Flush any remaining messages and stop the manager-owned async writer.
+        # Calling only flush_all() leaves the daemon writer thread alive until
+        # interpreter shutdown, which can abort CPython when the thread is still
+        # inside Honcho/httpx response validation during oneshot CLI exit.  Avoid
+        # shutting the manager down while the startup init thread is still alive
+        # and the session has not initialized yet.
+        if self._manager and not (
+            self._init_thread and self._init_thread.is_alive() and not self._session_initialized
+        ):
             try:
-                self._manager.flush_all()
+                self._manager.shutdown()
             except Exception:
                 pass
+
+    def _close_honcho_client(self) -> None:
+        """Best-effort close of Honcho/httpx clients to interrupt shutdown reads."""
+        try:
+            client = getattr(self._manager, "_honcho", None) if self._manager else None
+            if client is None:
+                return
+            try:
+                http_client = client._get_http_client()
+            except Exception:
+                http_client = None
+            if http_client is not None and hasattr(http_client, "close"):
+                try:
+                    http_client.close()
+                except Exception:
+                    pass
+            async_http_client = getattr(client, "_async_http_client", None)
+            raw_async = getattr(async_http_client, "_client", None)
+            if raw_async is not None and getattr(raw_async, "is_closed", True) is False:
+                try:
+                    import asyncio
+
+                    asyncio.run(raw_async.aclose())
+                except Exception:
+                    pass
+        except Exception:
+            pass
 
 
 # ---------------------------------------------------------------------------
