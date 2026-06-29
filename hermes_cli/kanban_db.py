@@ -6457,6 +6457,34 @@ def classify_worker_log_failure(log_text: Optional[str]) -> Optional[dict[str, A
     return None
 
 
+_SWARM_ROOT_MARKER = "Kanban Swarm v1 planning/root card"
+
+
+def _find_swarm_root(conn: sqlite3.Connection, task_id: str, *, max_depth: int = 8) -> Optional[str]:
+    """Return the nearest swarm-root ancestor of ``task_id``.
+
+    Walks up the parent chain until it finds a task whose body contains the
+    swarm root marker (``Kanban Swarm v1 planning/root card``).  ``max_depth``
+    bounds the walk so deep accidental DAGs don't loop or explode.
+    """
+
+    seen: set[str] = set()
+    frontier = [(task_id, 0)]
+    while frontier:
+        current, depth = frontier.pop(0)
+        if depth >= max_depth:
+            continue
+        for parent in parent_ids(conn, current):
+            if parent in seen:
+                continue
+            seen.add(parent)
+            parent_task = get_task(conn, parent)
+            if parent_task and _SWARM_ROOT_MARKER in (parent_task.body or ""):
+                return parent
+            frontier.append((parent, depth + 1))
+    return None
+
+
 def create_swarm_repair_task(
     conn: sqlite3.Connection,
     failed_task_id: str,
@@ -6465,31 +6493,28 @@ def create_swarm_repair_task(
     board: Optional[str] = None,
     created_by: str = "self-healer",
 ) -> Optional[str]:
-    """Create a repair card for a swarm worker that crashed operationally.
+    """Create a repair card for a swarm node that crashed operationally.
 
     Reads the worker log, classifies the failure, and creates a blocked
     repair task assigned to ``healer_profile`` as a sibling of the failed
-    task under the swarm root.  Returns the new repair task id, or
+    task under the swarm root.  Returns the new task id, or
     ``None`` when the failure is not a recognized operational wiring issue
     or the task is not part of a swarm.
 
     This is the manual/automated repair hook for Phase 2/3 self-healing.
     It is intentionally conservative: it only acts on known startup-level
     operational failures (missing skill, unknown toolset, missing profile)
-    and only when the crashed task has a swarm root ancestor.
+    and only when the crashed task has a swarm root ancestor.  Unlike the
+    original MVP, it walks the full ancestor chain, so it also handles
+    verifiers, synthesizers, and replacement/repair cards that are not direct
+    children of the root.
     """
 
     failed = get_task(conn, failed_task_id)
     if failed is None:
         return None
 
-    # Find the swarm root: a parent whose body contains the swarm marker.
-    swarm_root: Optional[str] = None
-    for parent in parent_ids(conn, failed_task_id):
-        parent_task = get_task(conn, parent)
-        if parent_task and "Kanban Swarm v1 planning/root card" in (parent_task.body or ""):
-            swarm_root = parent
-            break
+    swarm_root = _find_swarm_root(conn, failed_task_id)
     if swarm_root is None:
         return None
 
@@ -6502,12 +6527,18 @@ def create_swarm_repair_task(
     if kind not in {"missing_skill", "unknown_toolset", "missing_profile", "command_not_found"}:
         return None
 
+    # Idempotency: don't create duplicate repair cards for the same failed task.
+    for comment in list_comments(conn, failed_task_id):
+        body = comment.body or ""
+        if "Self-healing repair card created" in body or "Repair card `" in body:
+            return None
+
     detail = classification.get("detail", kind)
     missing = classification.get("missing_skills") or classification.get("missing_toolsets") or []
     missing_str = ", ".join(missing) if missing else ""
 
     body = (
-        f"Operational repair for crashed swarm worker `{failed_task_id}`.\n\n"
+        f"Operational repair for crashed swarm node `{failed_task_id}`.\n\n"
         f"Swarm root: `{swarm_root}`\n"
         f"Failed task: `{failed.title}` (assignee `{failed.assignee}`)\n"
         f"Failure kind: `{kind}`\n"
@@ -6516,8 +6547,9 @@ def create_swarm_repair_task(
         "Repair actions:\n"
         "1. Inspect the worker log and confirm the root cause.\n"
         "2. If the profile is missing skills/toolsets, install/sync them or "
-        "create a replacement worker assigned to a compatible profile.\n"
-        "3. Link the replacement worker as a parent of the verifier.\n"
+        "create a replacement node assigned to a compatible profile.\n"
+        "3. Link the replacement node so it takes the place of the failed "
+        "node in the swarm topology (e.g. as a parent of the verifier/synthesizer).\n"
         "4. Preserve this blocked failed card as evidence.\n"
         "5. Carry forward every non-authorization from the root blackboard."
     )
@@ -6541,7 +6573,7 @@ def create_swarm_repair_task(
         repair_id,
         author=created_by,
         body=(
-            f"Self-healing repair card created for crashed worker `{failed_task_id}`. "
+            f"Self-healing repair card created for crashed swarm node `{failed_task_id}`. "
             f"Failure classification: `{kind}` — {detail}"
         ),
     )
@@ -6550,7 +6582,7 @@ def create_swarm_repair_task(
         failed_task_id,
         author=created_by,
         body=(
-            f"Repair card `{repair_id}` created because this worker crashed "
+            f"Repair card `{repair_id}` created because this swarm node crashed "
             f"with `{kind}`: {detail}"
         ),
     )
