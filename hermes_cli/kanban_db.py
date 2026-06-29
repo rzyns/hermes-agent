@@ -6377,6 +6377,187 @@ DEFAULT_LOG_BACKUP_COUNT = 1
 KANBAN_TERMINAL_TIMEOUT_GRACE_SECONDS = 30
 
 # ---------------------------------------------------------------------------
+# Worker crash classification
+# ---------------------------------------------------------------------------
+
+_UNKNOWN_SKILL_RE = re.compile(
+    r"Error:\s*Unknown skill\(s\):\s*([A-Za-z0-9_\-/,\s]+)",
+    re.IGNORECASE,
+)
+_UNKNOWN_TOOLSET_RE = re.compile(
+    r"Warning:\s*Unknown toolsets?:\s*([A-Za-z0-9_\-/,\s]+)",
+    re.IGNORECASE,
+)
+_MISSING_PROFILE_RE = re.compile(
+    r"Profile\s+['\"]([^'\"]+)['\"]\s+does not exist",
+    re.IGNORECASE,
+)
+_AUTH_QUOTA_RE = re.compile(
+    r"\b(429|rate.?limit|quota|unauthorized|401|403|api.?key|credential)\b",
+    re.IGNORECASE,
+)
+_COMMAND_NOT_FOUND_RE = re.compile(
+    r"(command not found|No such file or directory|not found in PATH)",
+    re.IGNORECASE,
+)
+
+
+def classify_worker_log_failure(log_text: Optional[str]) -> Optional[dict[str, Any]]:
+    """Classify a worker log excerpt into an operational failure kind.
+
+    Returns ``None`` when no known pattern matches.  Returned dict has at
+    least ``kind`` and ``detail`` keys; additional keys are pattern-specific
+    (e.g. ``missing_skills`` for the ``missing_skill`` kind).
+    """
+
+    if not log_text:
+        return None
+    text = log_text[-4000:]  # tail only; startup errors are at the top
+
+    m = _UNKNOWN_SKILL_RE.search(text)
+    if m:
+        raw = m.group(1)
+        names = [n.strip() for n in raw.replace(",", " ").split() if n.strip()]
+        return {
+            "kind": "missing_skill",
+            "detail": f"Unknown skill(s): {', '.join(names)}",
+            "missing_skills": names,
+        }
+
+    m = _UNKNOWN_TOOLSET_RE.search(text)
+    if m:
+        raw = m.group(1)
+        names = [n.strip() for n in raw.replace(",", " ").split() if n.strip()]
+        return {
+            "kind": "unknown_toolset",
+            "detail": f"Unknown toolset(s): {', '.join(names)}",
+            "missing_toolsets": names,
+        }
+
+    m = _MISSING_PROFILE_RE.search(text)
+    if m:
+        return {
+            "kind": "missing_profile",
+            "detail": f"Profile '{m.group(1)}' does not exist",
+            "profile": m.group(1),
+        }
+
+    if _AUTH_QUOTA_RE.search(text):
+        return {
+            "kind": "auth_or_quota",
+            "detail": "Authentication, credential, or quota/rate-limit failure",
+        }
+
+    if _COMMAND_NOT_FOUND_RE.search(text):
+        return {
+            "kind": "command_not_found",
+            "detail": "Required command or executable not found",
+        }
+
+    return None
+
+
+def create_swarm_repair_task(
+    conn: sqlite3.Connection,
+    failed_task_id: str,
+    *,
+    healer_profile: str = "default",
+    board: Optional[str] = None,
+    created_by: str = "self-healer",
+) -> Optional[str]:
+    """Create a repair card for a swarm worker that crashed operationally.
+
+    Reads the worker log, classifies the failure, and creates a blocked
+    repair task assigned to ``healer_profile`` as a sibling of the failed
+    task under the swarm root.  Returns the new repair task id, or
+    ``None`` when the failure is not a recognized operational wiring issue
+    or the task is not part of a swarm.
+
+    This is the manual/automated repair hook for Phase 2/3 self-healing.
+    It is intentionally conservative: it only acts on known startup-level
+    operational failures (missing skill, unknown toolset, missing profile)
+    and only when the crashed task has a swarm root ancestor.
+    """
+
+    failed = get_task(conn, failed_task_id)
+    if failed is None:
+        return None
+
+    # Find the swarm root: a parent whose body contains the swarm marker.
+    swarm_root: Optional[str] = None
+    for parent in parent_ids(conn, failed_task_id):
+        parent_task = get_task(conn, parent)
+        if parent_task and "Kanban Swarm v1 planning/root card" in (parent_task.body or ""):
+            swarm_root = parent
+            break
+    if swarm_root is None:
+        return None
+
+    log_text = read_worker_log(failed_task_id, tail_bytes=4096, board=board)
+    classification = classify_worker_log_failure(log_text)
+    if classification is None:
+        return None
+
+    kind = classification["kind"]
+    if kind not in {"missing_skill", "unknown_toolset", "missing_profile", "command_not_found"}:
+        return None
+
+    detail = classification.get("detail", kind)
+    missing = classification.get("missing_skills") or classification.get("missing_toolsets") or []
+    missing_str = ", ".join(missing) if missing else ""
+
+    body = (
+        f"Operational repair for crashed swarm worker `{failed_task_id}`.\n\n"
+        f"Swarm root: `{swarm_root}`\n"
+        f"Failed task: `{failed.title}` (assignee `{failed.assignee}`)\n"
+        f"Failure kind: `{kind}`\n"
+        f"Detail: {detail}\n"
+        f"Missing skills/toolsets: {missing_str or '(none detected)'}\n\n"
+        "Repair actions:\n"
+        "1. Inspect the worker log and confirm the root cause.\n"
+        "2. If the profile is missing skills/toolsets, install/sync them or "
+        "create a replacement worker assigned to a compatible profile.\n"
+        "3. Link the replacement worker as a parent of the verifier.\n"
+        "4. Preserve this blocked failed card as evidence.\n"
+        "5. Carry forward every non-authorization from the root blackboard."
+    )
+
+    repair_id = create_task(
+        conn,
+        title=f"Repair: {failed.title}",
+        body=body,
+        assignee=healer_profile,
+        created_by=created_by,
+        parents=[swarm_root],
+        tenant=failed.tenant,
+        priority=(failed.priority or 0) + 1,
+        workspace_kind=failed.workspace_kind,
+        workspace_path=failed.workspace_path,
+        skills=["kanban-worker"],
+        initial_status="blocked",
+    )
+    add_comment(
+        conn,
+        repair_id,
+        author=created_by,
+        body=(
+            f"Self-healing repair card created for crashed worker `{failed_task_id}`. "
+            f"Failure classification: `{kind}` — {detail}"
+        ),
+    )
+    add_comment(
+        conn,
+        failed_task_id,
+        author=created_by,
+        body=(
+            f"Repair card `{repair_id}` created because this worker crashed "
+            f"with `{kind}`: {detail}"
+        ),
+    )
+    return repair_id
+
+
+# ---------------------------------------------------------------------------
 # Respawn guard constants
 # ---------------------------------------------------------------------------
 
@@ -7259,6 +7440,23 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
             )
             if tripped:
                 auto_blocked.append(tid)
+                # Phase 2/3 self-healing: when a swarm worker is auto-blocked
+                # due to an operational wiring crash, optionally create a
+                # repair card.  Disabled by default; enable via
+                # ``kanban.self_heal.enabled: true`` in config.yaml.
+                try:
+                    heal_enabled, heal_profile = _self_heal_config()
+                    if heal_enabled:
+                        board = get_current_board()
+                        create_swarm_repair_task(
+                            conn, tid,
+                            healer_profile=heal_profile,
+                            board=board,
+                            created_by="self-healer",
+                        )
+                except Exception:
+                    # Repair-card creation must never break the dispatcher.
+                    pass
     # Stash auto-blocked ids on the function for the dispatch loop to pick up.
     # Keeps the public return type (``list[str]``) stable for direct callers
     # and tests that destructure the result; ``dispatch_once`` reads this
@@ -7422,6 +7620,24 @@ def _record_task_failure(
                 )
             # Timeout/crash path's caller already emitted its own event.
     return blocked
+
+
+def _self_heal_config() -> tuple[bool, str]:
+    """Read optional self-healing config from ``kanban.self_heal``.
+
+    Returns ``(enabled, healer_profile)``.  Defaults are conservative:
+    disabled and ``healer_profile='default'``.
+    """
+
+    try:
+        from hermes_cli.config import load_config
+
+        cfg = (load_config().get("kanban") or {}).get("self_heal") or {}
+    except Exception:
+        return (False, "default")
+    enabled = bool(cfg.get("enabled", False))
+    healer = str(cfg.get("healer_profile") or "default").strip() or "default"
+    return (enabled, healer)
 
 
 # Backward-compat alias. Old name is referenced from tests and possibly
