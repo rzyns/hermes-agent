@@ -27,6 +27,7 @@ import shutil
 import stat
 import subprocess
 import sys
+import time
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath, PureWindowsPath
 from typing import List, Optional, Tuple
@@ -485,14 +486,23 @@ def remove_wrapper_script(name: str) -> bool:
     return False
 
 
-def _profile_alias_map() -> dict[str, str]:
-    """Return ``profile_name -> preferred wrapper alias`` by scanning once.
+# Cap how much of a wrapper file we read when reverse-looking-up its profile.
+# Real wrappers are a few hundred bytes of shell; the needle (``hermes -p X``)
+# sits near the top. The wrapper dir (e.g. ``~/.local/bin``) commonly also holds
+# large unrelated binaries (ffmpeg, node, …) — reading those whole, N times, was
+# the dominant cost in ``list_profiles`` (~4.5s). Reading a small head slice and
+# skipping NUL-bearing (binary) content keeps the scan to a single cheap pass.
+_WRAPPER_READ_LIMIT = 8192
 
-    ``list_profiles()`` used to call :func:`find_alias_for_profile` for every
-    profile, and that helper scanned every file in ``~/.local/bin`` each time.
-    On developer machines with many wrapper/binary shims, the repeated scan can
-    add ~1-2s per profile and make dashboard endpoints that include profile
-    summaries appear hung. Build the reverse lookup once and reuse it.
+
+def build_alias_map() -> dict[str, str]:
+    """Single-pass reverse map ``{canonical_profile -> alias_name}``.
+
+    Scans the wrapper dir ONCE (vs. :func:`find_alias_for_profile` per profile)
+    and reads only a small head slice of each candidate wrapper, skipping
+    binaries. A custom alias (file name != profile) wins over the profile-named
+    wrapper, matching ``find_alias_for_profile``'s preference; deterministic via
+    sorted iteration.
     """
     wrapper_dir = _get_wrapper_dir()
     if not wrapper_dir.is_dir():
@@ -513,11 +523,8 @@ def _profile_alias_map() -> dict[str, str]:
         if not is_windows and entry.suffix:
             continue
         try:
-            # Hermes-created wrappers are tiny. Skipping large executables and
-            # binary shims avoids spending time decoding unrelated tools.
-            if entry.stat().st_size > 64 * 1024:
-                continue
-            content = entry.read_text()
+            with open(entry, "r", encoding="utf-8", errors="strict") as f:
+                content = f.read(_WRAPPER_READ_LIMIT)
         except (OSError, UnicodeDecodeError):
             continue
         match = profile_ref_re.search(content)
@@ -533,6 +540,11 @@ def _profile_alias_map() -> dict[str, str]:
     aliases = dict(profile_named)
     aliases.update(custom)
     return aliases
+
+
+def _profile_alias_map() -> dict[str, str]:
+    """Backward-compatible private alias for :func:`build_alias_map`."""
+    return build_alias_map()
 
 
 def _migrate_profile_config_if_outdated(profile_dir: Path) -> None:
@@ -578,9 +590,13 @@ def find_alias_for_profile(profile_name: str) -> Optional[str]:
     A custom alias (name != profile) is preferred over the profile-named wrapper
     so ``profile list``/``show`` surface the command the user actually typed.
     Results are sorted for deterministic output when several aliases match.
+
+    For listing ALL profiles at once, prefer :func:`build_alias_map` — calling
+    this per-profile re-reads every wrapper file N times (O(N*M)); on a wrapper
+    dir like ``~/.local/bin`` that also holds large unrelated binaries (ffmpeg
+    etc.) that meant multi-second ``list_profiles`` latency and desktop timeouts.
     """
-    canon = normalize_profile_name(profile_name)
-    return _profile_alias_map().get(canon)
+    return build_alias_map().get(normalize_profile_name(profile_name))
 
 
 # ---------------------------------------------------------------------------
@@ -697,16 +713,68 @@ def _check_gateway_running(profile_dir: Path) -> bool:
         return False
 
 
+# In-process cache for skill counts. Walking ``skills_dir.rglob("SKILL.md")``
+# recurses the entire skill tree (each skill carries references/scripts/assets
+# sub-trees); the default profile alone has ~270 skills, and ``list_profiles``
+# calls this for EVERY profile (16+), so an uncached scan costs ~6s — long
+# enough that the desktop's per-request backend calls time out and the sidebar
+# renders "全部智能体 0". We cache the count keyed by the skills dir, invalidated
+# when the dir tree's signature (skills_dir + immediate category dirs mtimes)
+# changes (catches skill add/remove) or after a short TTL (catches deep edits).
+_SKILL_COUNT_CACHE: dict[str, tuple[float, float, int]] = {}
+_SKILL_COUNT_TTL_SECONDS = 30.0
+
+
+def _skills_dir_signature(skills_dir: Path) -> float:
+    """Cheap change-signature for a skills tree.
+
+    Max mtime of ``skills_dir`` and its immediate children (category dirs).
+    Adding/removing a category bumps ``skills_dir``'s mtime; adding/removing a
+    skill inside a category bumps that category dir's mtime. One ``scandir``
+    (not a recursive walk) keeps this O(#categories), not O(#files).
+    """
+    try:
+        sig = skills_dir.stat().st_mtime
+    except OSError:
+        return 0.0
+    try:
+        with os.scandir(skills_dir) as it:
+            for entry in it:
+                try:
+                    if entry.is_dir(follow_symlinks=False):
+                        m = entry.stat(follow_symlinks=False).st_mtime
+                        if m > sig:
+                            sig = m
+                except OSError:
+                    continue
+    except OSError:
+        pass
+    return sig
+
+
 def _count_skills(profile_dir: Path) -> int:
-    """Count installed skills in a profile."""
+    """Count installed skills in a profile (cached by skills-dir signature)."""
     skills_dir = profile_dir / "skills"
     if not skills_dir.is_dir():
         return 0
+
+    key = str(skills_dir)
+    signature = _skills_dir_signature(skills_dir)
+    now = time.time()
+    cached = _SKILL_COUNT_CACHE.get(key)
+    if (
+        cached is not None
+        and cached[0] == signature
+        and (now - cached[1]) < _SKILL_COUNT_TTL_SECONDS
+    ):
+        return cached[2]
+
     count = 0
     for md in skills_dir.rglob("SKILL.md"):
         if is_excluded_skill_path(md):
             continue
         count += 1
+    _SKILL_COUNT_CACHE[key] = (signature, now, count)
     return count
 
 
@@ -830,7 +898,7 @@ def list_profiles() -> List[ProfileInfo]:
             if not _PROFILE_ID_RE.match(name):
                 continue
             model, provider = _read_config_model(entry)
-            alias_name = alias_by_profile.get(name)
+            alias_name = alias_by_profile.get(normalize_profile_name(name))
             if alias_name:
                 is_windows = sys.platform == "win32"
                 alias_path = wrapper_dir / (f"{alias_name}.bat" if is_windows else alias_name)
