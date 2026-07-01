@@ -55,6 +55,23 @@ def _install_example_plugin(_isolate_hermes_home):
         shutil.rmtree(dst)
     shutil.copytree(_EXAMPLE_PLUGIN_FIXTURE, dst)
 
+    # The dashboard gates user-plugin asset serving behind the
+    # ``plugins.enabled`` allow-list (GHSA-mcfc-hp25-cjv7).  These fixtures
+    # exercise static asset serving, so opt the example plugin in exactly as a
+    # real operator would with `hermes plugins enable example`.  Backend Python
+    # stays unmounted unless a test explicitly supplies a trusted API root.
+    from hermes_cli.config import load_config, save_config
+
+    _cfg = load_config()
+    _plugins_cfg = _cfg.setdefault("plugins", {})
+    _enabled = _plugins_cfg.get("enabled")
+    if not isinstance(_enabled, list):
+        _enabled = []
+    if "example" not in _enabled:
+        _enabled.append("example")
+    _plugins_cfg["enabled"] = _enabled
+    save_config(_cfg)
+
     web_server._dashboard_plugins_cache = None
     web_server._get_dashboard_plugins(force_rescan=True)
     try:

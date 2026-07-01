@@ -479,6 +479,73 @@ async def host_header_middleware(request: Request, call_next):
     return await call_next(request)
 
 
+@app.middleware("http")
+async def _plugin_api_runtime_gate(request: Request, call_next):
+    """Block requests to disabled plugin API routes at request time.
+
+    :func:`_mount_plugin_api_routes` gates at import time, but if a plugin
+    is disabled *after* the dashboard is already running, its FastAPI router
+    remains mounted until restart.  This middleware enforces the enabled/
+    disabled policy on every request to ``/api/plugins/{name}/...`` so that
+    runtime config changes take effect immediately.
+
+    Registered BEFORE the auth middlewares (so it executes AFTER them): a
+    request that hasn't cleared auth must get auth's 401 first, never this
+    gate's 404 — otherwise an unauthenticated caller could fingerprint which
+    plugins are installed/enabled by reading the status code. We only reach
+    the enabled/disabled check for a request that auth already let through.
+    """
+    path = request.url.path
+    if path.startswith("/api/plugins/"):
+        # Only gate authenticated requests. Unauthenticated ones fall
+        # through so auth_middleware / the OAuth gate return 401 first and
+        # this route can't be used as a plugin-name oracle.
+        _authed = (
+            getattr(request.state, "token_authenticated", False)
+            or getattr(request.app.state, "auth_required", False)
+            or _has_valid_session_token(request)
+            or _has_valid_query_token(request, path)
+        )
+        if _authed:
+            # Extract plugin name from /api/plugins/<name>/...
+            parts = path.split("/")
+            # parts: ['', 'api', 'plugins', '<name>', ...]
+            if len(parts) >= 4:
+                plugin_name = parts[3]
+                if plugin_name:
+                    try:
+                        from hermes_cli.plugins_cmd import (
+                            _get_enabled_set,
+                            _get_disabled_set,
+                        )
+                        enabled_set = _get_enabled_set()
+                        disabled_set = _get_disabled_set()
+                    except Exception:
+                        enabled_set = set()
+                        disabled_set = set()
+                    # Determine plugin source.  Check the cached plugin list;
+                    # if not found, assume user plugin (safe default — blocks).
+                    plugins = _get_dashboard_plugins()
+                    plugin = next(
+                        (p for p in plugins if p.get("name") == plugin_name),
+                        None,
+                    )
+                    source = plugin.get("source") if plugin else "user"
+                    if source == "user":
+                        if plugin_name in disabled_set or plugin_name not in enabled_set:
+                            return JSONResponse(
+                                status_code=404,
+                                content={"detail": "Plugin not found"},
+                            )
+                    elif source == "bundled":
+                        if plugin_name in disabled_set:
+                            return JSONResponse(
+                                status_code=404,
+                                content={"detail": "Plugin not found"},
+                            )
+    return await call_next(request)
+
+
 # ---------------------------------------------------------------------------
 # Dashboard OAuth auth gate — engaged only when start_server flags the
 # bind as non-loopback-without-insecure.  No-op pass-through in loopback
@@ -13372,10 +13439,12 @@ def _safe_plugin_api_relpath(api_field: Any, *, dashboard_dir: Path) -> Optional
     return api_field
 
 
-# Plugin sources whose Python backend (dashboard manifest `api` file) must NEVER
-# be auto-imported by the dashboard web server — only bundled plugins may. Shared
-# by the discovery-time scrub and the mount-time refuse guards so a typo in one
-# site cannot silently disable a security gate (GHSA-5qr3-c538-wm9j / #43719).
+# Plugin sources whose Python backend (dashboard manifest `api` file) must not
+# be auto-imported by default.  They need an explicit trusted dashboard API root
+# (and user plugins must also pass the plugins.enabled/plugins.disabled gate).
+# Shared by the discovery-time scrub and the mount-time refuse guards so a typo
+# in one site cannot silently disable a security gate (GHSA-5qr3-c538-wm9j /
+# #43719 / GHSA-mcfc-hp25-cjv7).
 _NON_BUNDLED_PLUGIN_SOURCES = frozenset({"user", "project"})
 _TRUSTED_DASHBOARD_PLUGIN_API_ROOTS_ENV = "HERMES_DASHBOARD_TRUSTED_PLUGIN_API_ROOTS"
 
@@ -13586,16 +13655,41 @@ def _get_dashboard_plugins(force_rescan: bool = False) -> list:
 
 @app.get("/api/dashboard/plugins")
 async def get_dashboard_plugins():
-    """Return discovered dashboard plugins (excludes user-hidden ones)."""
+    """Return discovered dashboard plugins (excludes user-hidden and non-enabled ones)."""
     plugins = _get_dashboard_plugins()
     # Read user's hidden plugins list from config.
     config = load_config()
     hidden: list = cfg_get(config, "dashboard", "hidden_plugins", default=[]) or []
-    # Strip internal fields before sending to frontend and filter out hidden.
+    # Gate: only serve user plugins that are in plugins.enabled and not
+    # in plugins.disabled.  This prevents the frontend from loading JS/CSS
+    # from plugins the user has not explicitly activated.  (#46435)
+    try:
+        from hermes_cli.plugins_cmd import _get_enabled_set, _get_disabled_set
+        enabled_set = _get_enabled_set()
+        disabled_set = _get_disabled_set()
+    except Exception:
+        enabled_set = set()
+        disabled_set = set()
+
+    def _is_active(p: dict) -> bool:
+        name = p.get("name", "")
+        if name in hidden:
+            return False
+        if p.get("source") == "user":
+            if name in disabled_set:
+                return False
+            if name not in enabled_set:
+                return False
+        elif p.get("source") == "bundled":
+            if name in disabled_set:
+                return False
+        return True
+
+    # Strip internal fields before sending to frontend.
     return [
         {k: v for k, v in p.items() if not k.startswith("_")}
         for p in plugins
-        if p["name"] not in hidden
+        if _is_active(p)
     ]
 
 
@@ -13893,11 +13987,30 @@ async def serve_plugin_asset(plugin_name: str, file_path: str):
     allowlist, anyone on the loopback port can curl the ``.py`` source
     of a private third-party plugin. Reject everything outside the
     browser-asset set.
+
+    User plugins must be in plugins.enabled before their assets are
+    served. (#46435, GHSA-mcfc-hp25-cjv7)
     """
     plugins = _get_dashboard_plugins()
     plugin = next((p for p in plugins if p["name"] == plugin_name), None)
     if not plugin:
         raise HTTPException(status_code=404, detail="Plugin not found")
+
+    # Gate: user plugins must be enabled to serve assets;
+    # bundled plugins must not be explicitly disabled.
+    try:
+        from hermes_cli.plugins_cmd import _get_enabled_set, _get_disabled_set
+        enabled_set = _get_enabled_set()
+        disabled_set = _get_disabled_set()
+    except Exception:
+        enabled_set = set()
+        disabled_set = set()
+    if plugin.get("source") == "user":
+        if plugin_name in disabled_set or plugin_name not in enabled_set:
+            raise HTTPException(status_code=404, detail="Plugin not found")
+    elif plugin.get("source") == "bundled":
+        if plugin_name in disabled_set:
+            raise HTTPException(status_code=404, detail="Plugin not found")
 
     base = Path(plugin["_dir"])
     target = (base / file_path).resolve()
@@ -13975,39 +14088,71 @@ def _mount_plugin_api_routes():
     ``/api/plugins/<name>/``.  The function is idempotent so dashboard
     plugin rescans can mount APIs from plugins added after process start.
 
-    Backend import is restricted to bundled plugins. User and project
-    plugins can extend the dashboard UI via static JS/CSS, but their
-    Python ``api`` file is never auto-imported by the web server.  See
-    GHSA-5qr3-c538-wm9j (#29156).
+    Backend import is trusted for bundled plugins by default.  User and
+    project plugins can extend the dashboard UI via static JS/CSS, but their
+    Python ``api`` file is not imported unless its dashboard directory is under
+    an explicit ``HERMES_DASHBOARD_TRUSTED_PLUGIN_API_ROOTS`` root; user
+    plugins additionally must be enabled via ``plugins.enabled`` and not listed
+    in ``plugins.disabled``.  This preserves the non-bundled import hardening
+    (GHSA-5qr3-c538-wm9j / #43719) and the upstream installed-but-not-enabled
+    execution gate (#46435, GHSA-mcfc-hp25-cjv7).
     """
+    try:
+        from hermes_cli.plugins_cmd import _get_enabled_set, _get_disabled_set
+        enabled_set = _get_enabled_set()
+        disabled_set = _get_disabled_set()
+    except Exception:
+        enabled_set = set()
+        disabled_set = set()
+
     spa_catch_all_routes = _move_spa_catch_all_routes_to_end()
     try:
         for plugin in _get_dashboard_plugins():
             api_file_name = plugin.get("_api_file")
-            plugin_name = str(plugin["name"])
-            if plugin_name in _mounted_dashboard_plugin_apis:
-                continue
             if not api_file_name:
                 continue
+            plugin_name = str(plugin.get("name", ""))
+            if not plugin_name:
+                continue
+            if plugin_name in _mounted_dashboard_plugin_apis:
+                continue
+
             source = plugin.get("source")
+            if source == "user":
+                if plugin_name in disabled_set:
+                    _log.debug(
+                        "Plugin %s: skipping API mount (explicitly disabled)",
+                        plugin_name,
+                    )
+                    continue
+                if plugin_name not in enabled_set:
+                    _log.debug(
+                        "Plugin %s: skipping API mount (not in plugins.enabled)",
+                        plugin_name,
+                    )
+                    continue
+            elif source == "bundled":
+                if plugin_name in disabled_set:
+                    _log.debug(
+                        "Plugin %s: skipping API mount (explicitly disabled)",
+                        plugin_name,
+                    )
+                    continue
+
             dashboard_dir = Path(plugin["_dir"])
             if source in _NON_BUNDLED_PLUGIN_SOURCES and not _dashboard_plugin_api_root_is_trusted(
                 dashboard_dir=dashboard_dir
             ):
-                # Backend Python auto-import is reserved for bundled plugins;
-                # user and project plugins extend the dashboard with static UI
-                # assets only (GHSA-5qr3-c538-wm9j / #43719). Defence-in-depth:
-                # discovery already nulls unsafe _api_file values, but
-                # re-refusing here — at the actual importlib call site — keeps
-                # the import primitive contained if a future caller or tampered
-                # cache entry slips a non-bundled plugin through.
                 _reason = {
-                    "user": "user-installed plugins may not auto-import Python code",
-                    "project": (
-                        "project plugins may not auto-import Python code; backend "
-                        "auto-import is reserved for bundled plugins"
+                    "user": (
+                        "user-installed plugins need both plugins.enabled and an "
+                        "explicit trusted dashboard API root before backend code imports"
                     ),
-                }.get(source, "only bundled plugins may auto-import Python code")
+                    "project": (
+                        "project plugins may not auto-import Python code by default; "
+                        "backend auto-import requires an explicit trusted dashboard API root"
+                    ),
+                }.get(source, "only bundled plugins may auto-import Python code by default")
                 _log.warning(
                     "Plugin %s: ignoring backend api=%s (%s; set %s to an "
                     "absolute controlled plugin/dashboard directory to trust "
@@ -14018,6 +14163,7 @@ def _mount_plugin_api_routes():
                     _TRUSTED_DASHBOARD_PLUGIN_API_ROOTS_ENV,
                 )
                 continue
+
             api_path = dashboard_dir / api_file_name
             try:
                 resolved_api = api_path.resolve()

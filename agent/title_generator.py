@@ -161,7 +161,7 @@ def build_title_context(
 def generate_title(
     user_message: str,
     assistant_response: str,
-    timeout: float = 30.0,
+    timeout: Optional[float] = None,
     failure_callback: Optional[FailureCallback] = None,
     main_runtime: dict = None,
     title_context: str | None = None,
@@ -197,7 +197,15 @@ def generate_title(
             timeout=timeout,
             main_runtime=main_runtime,
         )
-        title = (response.choices[0].message.content or "").strip()
+        content = response.choices[0].message.content or ""
+        # Strip thinking/reasoning blocks that think-enabled models
+        # (MiniMax M2.7, DeepSeek, etc.) emit even for simple prompts like
+        # title generation. Without this the raw <think>...</think> XML
+        # leaks into session titles. Reuses the canonical scrubber so all
+        # tag variants (unterminated blocks, orphan closes, mixed case)
+        # are handled, not just a single literal <think> pair.
+        from agent.agent_runtime_helpers import strip_think_blocks
+        title = strip_think_blocks(None, content).strip()
         # Clean up: remove quotes, trailing punctuation, prefixes like "Title: "
         title = title.strip('"\'')
         if title.lower().startswith("title:"):
