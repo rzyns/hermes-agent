@@ -1,4 +1,5 @@
 import pytest
+import time
 
 from hermes_cli import kanban_db as kb
 from hermes_cli.kanban_swarm import (
@@ -7,7 +8,17 @@ from hermes_cli.kanban_swarm import (
     create_swarm,
     latest_blackboard,
     post_blackboard_update,
+    preflight_worker_skills,
 )
+
+
+def _write_skill(root, name):
+    skill_dir = root / name
+    skill_dir.mkdir(parents=True, exist_ok=True)
+    (skill_dir / "SKILL.md").write_text(
+        f"---\nname: {name}\n---\n\n# {name}\n",
+        encoding="utf-8",
+    )
 
 
 def test_create_swarm_builds_parallel_workers_verifier_and_synthesizer(tmp_path):
@@ -161,6 +172,165 @@ def test_preflight_fail_raises_on_missing_skill(tmp_path, monkeypatch):
         conn.close()
 
 
+def test_preflight_fail_checks_generated_gate_skills_before_creating_cards(tmp_path, monkeypatch):
+    """Fail-fast preflight covers generated verifier/synthesizer skills too."""
+    hermes_home = tmp_path / "hermes"
+    monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+    (hermes_home / "skills").mkdir(parents=True)
+    # The generated gate profiles exist, but their profile-local skill trees do
+    # not contain the helper skills that the swarm helper would otherwise force.
+    for profile in ("reviewer", "writer"):
+        profile_home = hermes_home / "profiles" / profile
+        (profile_home / "skills").mkdir(parents=True)
+        (profile_home / "config.yaml").write_text(
+            "skills:\n  external_dirs: []\n",
+            encoding="utf-8",
+        )
+
+    conn = kb.connect(tmp_path / "kanban.db")
+    try:
+        with pytest.raises(ValueError) as exc_info:
+            create_swarm(
+                conn,
+                goal="Generated gate preflight should fail before DB writes.",
+                workers=[SwarmWorkerSpec(profile="default", title="Worker", body="Do work")],
+                verifier_assignee="reviewer",
+                synthesizer_assignee="writer",
+                self_heal=SelfHealPolicy(mode="fail"),
+            )
+        msg = str(exc_info.value)
+        assert "reviewer/Verify swarm outputs" in msg
+        assert "requesting-code-review" in msg
+        assert "writer/Synthesize swarm outputs" in msg
+        assert "humanizer" in msg
+        assert len(kb.list_tasks(conn)) == 0
+    finally:
+        conn.close()
+
+
+def test_preflight_uses_profile_external_dirs_not_dispatcher_home(tmp_path, monkeypatch):
+    """Skill preflight matches the profile-scoped HERMES_HOME used by workers."""
+    hermes_home = tmp_path / "hermes"
+    external_skills = tmp_path / "external-skills"
+    _write_skill(external_skills, "profile-visible-skill")
+    monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+    (hermes_home / "skills").mkdir(parents=True)
+    (hermes_home / "config.yaml").write_text(
+        f"skills:\n  external_dirs:\n    - {external_skills}\n",
+        encoding="utf-8",
+    )
+    profile_home = hermes_home / "profiles" / "worker-profile"
+    (profile_home / "skills").mkdir(parents=True)
+    (profile_home / "config.yaml").write_text(
+        "skills:\n  external_dirs: []\n",
+        encoding="utf-8",
+    )
+
+    conn = kb.connect(tmp_path / "kanban.db")
+    try:
+        with pytest.raises(ValueError) as exc_info:
+            create_swarm(
+                conn,
+                goal="Profile-specific preflight should not trust default external dirs.",
+                workers=[
+                    SwarmWorkerSpec(
+                        profile="worker-profile",
+                        title="Worker",
+                        body="Do work",
+                        skills=["profile-visible-skill"],
+                    ),
+                ],
+                verifier_assignee="default",
+                synthesizer_assignee="default",
+                self_heal=SelfHealPolicy(mode="fail"),
+            )
+        assert "worker-profile/Worker" in str(exc_info.value)
+        assert "profile-visible-skill" in str(exc_info.value)
+        assert len(kb.list_tasks(conn)) == 0
+    finally:
+        conn.close()
+
+
+def test_preflight_resolves_profile_external_dirs(tmp_path, monkeypatch):
+    """The resolver honors the real config key: skills.external_dirs."""
+    hermes_home = tmp_path / "hermes"
+    external_skills = tmp_path / "external-skills"
+    _write_skill(external_skills, "profile-visible-skill")
+    monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+    profile_home = hermes_home / "profiles" / "worker-profile"
+    (profile_home / "skills").mkdir(parents=True)
+    (profile_home / "config.yaml").write_text(
+        f"skills:\n  external_dirs:\n    - {external_skills}\n",
+        encoding="utf-8",
+    )
+
+    available, missing = preflight_worker_skills(
+        SwarmWorkerSpec(
+            profile="worker-profile",
+            title="Worker",
+            body="Do work",
+            skills=["profile-visible-skill"],
+        )
+    )
+    assert available == ["profile-visible-skill"]
+    assert missing == []
+
+
+def test_preflight_repair_drops_missing_generated_gate_skills(tmp_path, monkeypatch):
+    """Repair/drop policy must not create verifier/synth cards that will crash."""
+    hermes_home = tmp_path / "hermes"
+    monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+    (hermes_home / "skills").mkdir(parents=True)
+    for profile in ("reviewer", "writer"):
+        profile_home = hermes_home / "profiles" / profile
+        (profile_home / "skills").mkdir(parents=True)
+        (profile_home / "config.yaml").write_text(
+            "skills:\n  external_dirs: []\n",
+            encoding="utf-8",
+        )
+
+    conn = kb.connect(tmp_path / "kanban.db")
+    try:
+        created = create_swarm(
+            conn,
+            goal="Repair policy should keep generated gates dispatchable.",
+            workers=[SwarmWorkerSpec(profile="default", title="Worker", body="Do work")],
+            verifier_assignee="reviewer",
+            synthesizer_assignee="writer",
+            self_heal=SelfHealPolicy(mode="repair", healer_profile="ops"),
+        )
+
+        verifier = kb.get_task(conn, created.verifier_id)
+        synthesizer = kb.get_task(conn, created.synthesizer_id)
+        assert verifier is not None
+        assert synthesizer is not None
+        assert verifier.skills == []
+        assert synthesizer.skills == []
+        board = latest_blackboard(conn, created.root_id)
+        gate_entries = [
+            entry for entry in board["preflight_skill_check"]
+            if entry.get("generated_gate") is True
+        ]
+        assert gate_entries == [
+            {
+                "profile": "reviewer",
+                "title": "Verify swarm outputs",
+                "missing_skills": ["requesting-code-review"],
+                "action": "drop_generated_gate_skill",
+                "generated_gate": True,
+            },
+            {
+                "profile": "writer",
+                "title": "Synthesize swarm outputs",
+                "missing_skills": ["humanizer"],
+                "action": "drop_generated_gate_skill",
+                "generated_gate": True,
+            },
+        ]
+    finally:
+        conn.close()
+
+
 def test_preflight_drop_removes_missing_skills(tmp_path, monkeypatch):
     """When policy=drop, unavailable skills are stripped and the worker is created."""
     monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes"))
@@ -240,6 +410,26 @@ def test_classify_worker_log_failure_detects_missing_skill():
     assert result is not None
     assert result["kind"] == "missing_skill"
     assert result["missing_skills"] == ["oss-substrate-audit", "kanban-evidence-audit"]
+
+
+def test_classify_worker_log_failure_checks_startup_error_at_log_head():
+    result = kb.classify_worker_log_failure(
+        "Error: Unknown skill(s): requesting-code-review\n"
+        + ("later verbose output\n" * 1000)
+    )
+    assert result is not None
+    assert result["kind"] == "missing_skill"
+    assert result["missing_skills"] == ["requesting-code-review"]
+
+
+def test_classify_worker_log_failure_does_not_consume_next_error_line():
+    result = kb.classify_worker_log_failure(
+        "Error: Unknown skill(s): requesting-code-review\n"
+        "Error: Unknown skill(s): humanizer\n"
+    )
+    assert result is not None
+    assert result["kind"] == "missing_skill"
+    assert result["missing_skills"] == ["requesting-code-review"]
 
 
 def test_classify_worker_log_failure_returns_none_for_unmatched_log():
@@ -384,3 +574,60 @@ def test_create_swarm_repair_task_no_repair_for_unmatched_failure(tmp_path):
         assert kb.create_swarm_repair_task(conn, worker_id) is None
     finally:
         conn.close()
+
+
+def test_dispatch_auto_repair_uses_explicit_board_logs(tmp_path, monkeypatch):
+    """Gateway-style multi-board dispatch must classify crashes on that board."""
+    import hermes_cli.kanban_db as _kb
+
+    hermes_home = tmp_path / "hermes"
+    monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+    hermes_home.mkdir(parents=True, exist_ok=True)
+    (hermes_home / "config.yaml").write_text(
+        "kanban:\n  self_heal:\n    enabled: true\n    healer_profile: ops\n",
+        encoding="utf-8",
+    )
+
+    kb.create_board("other-board")
+    kb.create_board("swarm-board")
+    kb.set_current_board("other-board")
+
+    monkeypatch.setattr(_kb, "_pid_alive", lambda _pid: False)
+    monkeypatch.setattr(_kb, "_classify_worker_exit", lambda _pid: ("nonzero_exit", 1))
+
+    with kb.connect(board="swarm-board") as conn:
+        created = create_swarm(
+            conn,
+            goal="Board-aware auto repair.",
+            workers=[SwarmWorkerSpec(profile="default", title="Worker", body="Do work")],
+            verifier_assignee="default",
+            synthesizer_assignee="default",
+        )
+        verifier_id = created.verifier_id
+        host = _kb._claimer_id().split(":", 1)[0]
+        conn.execute(
+            "UPDATE tasks SET status='running', worker_pid=?, claim_lock=?, "
+            "started_at=?, consecutive_failures=? WHERE id=?",
+            (424242, f"{host}:worker", int(time.time()) - 3600, 2, verifier_id),
+        )
+        log_path = kb.worker_log_path(verifier_id, board="swarm-board")
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+        log_path.write_text(
+            "Error: Unknown skill(s): requesting-code-review\n",
+            encoding="utf-8",
+        )
+        conn.commit()
+
+        result = kb.dispatch_once(conn, dry_run=True, board="swarm-board")
+        assert verifier_id in result.auto_blocked
+        repair_children = []
+        for child_id in kb.child_ids(conn, created.root_id):
+            child = kb.get_task(conn, child_id)
+            assert child is not None
+            if (child.title or "").startswith("Repair:"):
+                repair_children.append(child_id)
+        assert len(repair_children) == 1
+        repair = kb.get_task(conn, repair_children[0])
+        assert repair is not None
+        assert repair.assignee == "ops"
+        assert "requesting-code-review" in (repair.body or "")

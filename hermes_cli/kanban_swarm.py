@@ -28,6 +28,8 @@ import yaml
 from hermes_cli import kanban_db as kb
 
 BLACKBOARD_PREFIX = "[swarm:blackboard] "
+DEFAULT_VERIFIER_SKILLS = ["requesting-code-review"]
+DEFAULT_SYNTHESIZER_SKILLS = ["humanizer"]
 
 
 @dataclass(frozen=True)
@@ -50,7 +52,8 @@ class SelfHealPolicy:
         mode: How to react to preflight skill/profile failures.
             - ``fail``: raise before creating any card (default).
             - ``drop``: drop unavailable forced skills; keep task body guidance.
-            - ``repair``: create a repair card assigned to ``healer_profile``.
+            - ``repair``: create a repair card for broken worker specs; drop
+              unavailable optional generated-gate skills so gates still run.
             - ``warn``: create the worker anyway, but log a blackboard warning.
         healer_profile: Profile that receives self-healing repair cards.
         max_repairs_per_swarm: Hard cap on repair cards created per swarm.
@@ -96,8 +99,8 @@ def _require_text(value: str, field_name: str) -> str:
     return text
 
 
-def _profile_hermes_home(profile: str) -> str:
-    """Resolve a profile name to its HERMES_HOME directory string."""
+def _profile_hermes_home(profile: str, fallback_home: Optional[str] = None) -> str:
+    """Resolve the HERMES_HOME the worker subprocess will use for a profile."""
 
     from hermes_cli.profiles import resolve_profile_env, normalize_profile_name
 
@@ -105,11 +108,11 @@ def _profile_hermes_home(profile: str) -> str:
         return resolve_profile_env(normalize_profile_name(profile))
     except FileNotFoundError:
         # For tests with fake profiles, fall back to the active HERMES_HOME.
-        return os.environ.get("HERMES_HOME", str(Path.home() / ".hermes"))
+        return fallback_home or os.environ.get("HERMES_HOME", str(Path.home() / ".hermes"))
 
 
 def _external_skill_dirs(hermes_home: str) -> list[Path]:
-    """Return configured external_skill_dirs for a HERMES_HOME."""
+    """Return configured ``skills.external_dirs`` for a HERMES_HOME."""
 
     cfg_path = Path(hermes_home) / "config.yaml"
     if not cfg_path.is_file():
@@ -117,8 +120,24 @@ def _external_skill_dirs(hermes_home: str) -> list[Path]:
     try:
         cfg = yaml.safe_load(cfg_path.read_text(encoding="utf-8")) or {}
         skill_cfg = cfg.get("skills") or {}
-        dirs = skill_cfg.get("external_skill_dirs") or []
-        return [Path(d).expanduser() for d in dirs if d]
+        dirs = skill_cfg.get("external_dirs") or skill_cfg.get("external_skill_dirs") or []
+        if isinstance(dirs, str):
+            dirs = [dirs]
+        if not isinstance(dirs, list):
+            return []
+        roots: list[Path] = []
+        for raw in dirs:
+            if not raw:
+                continue
+            expanded = os.path.expanduser(os.path.expandvars(str(raw)))
+            path = Path(expanded)
+            if not path.is_absolute():
+                path = (Path(hermes_home) / path).resolve()
+            else:
+                path = path.resolve()
+            if path.is_dir() and path not in roots:
+                roots.append(path)
+        return roots
     except Exception:
         return []
 
@@ -157,17 +176,17 @@ def preflight_worker_skills(
     spec: SwarmWorkerSpec,
     hermes_home: Optional[str] = None,
 ) -> tuple[list[str], list[str]]:
-    """Return (available, missing) forced skills for a worker spec.
+    """Return (available, missing) forced skills for a worker/gate spec.
 
-    ``hermes_home`` defaults to the active ``HERMES_HOME`` environment value
-    (falling back to ``~/.hermes``).  This is the skill tree the spawned
-    worker CLI will actually see, because workers are launched from the
-    board owner's environment with ``-p <profile>``.  The ``kanban-worker``
-    skill is treated as a built-in dispatcher injection and is excluded from
-    the check.
+    By default this resolves the profile-scoped ``HERMES_HOME`` that
+    ``_default_spawn`` injects before launching ``hermes -p <profile>``.
+    Tests and diagnostic callers may pass ``hermes_home`` to override that
+    resolution.  The ``kanban-worker`` skill is treated as a built-in
+    dispatcher injection and is excluded from the check.
     """
 
-    home = hermes_home or os.environ.get("HERMES_HOME") or str(Path.home() / ".hermes")
+    fallback_home = os.environ.get("HERMES_HOME") or str(Path.home() / ".hermes")
+    home = hermes_home or _profile_hermes_home(spec.profile, fallback_home=fallback_home)
     forced = [s for s in (spec.skills or []) if s and s != "kanban-worker"]
     available = [s for s in forced if _skill_resolves(s, home)]
     missing = [s for s in forced if s not in available]
@@ -194,6 +213,105 @@ def _fail_fast_preflight(
             + "; ".join(failures)
         )
 
+
+def _append_preflight_manifest(
+    conn: sqlite3.Connection,
+    root_id: str,
+    *,
+    author: str,
+    entries: list[dict[str, Any]],
+) -> None:
+    """Append preflight entries without overwriting earlier worker/gate rows."""
+
+    if not entries:
+        return
+    existing = latest_blackboard(conn, root_id).get("preflight_skill_check")
+    manifest = list(existing) if isinstance(existing, list) else []
+    manifest.extend(entries)
+    post_blackboard_update(
+        conn,
+        root_id,
+        author=author,
+        key="preflight_skill_check",
+        value=manifest,
+    )
+
+
+def _generated_gate_specs(
+    *,
+    verifier_assignee: str,
+    verifier_title: str,
+    synthesizer_assignee: str,
+    synthesizer_title: str,
+) -> list[SwarmWorkerSpec]:
+    return [
+        SwarmWorkerSpec(
+            profile=verifier_assignee,
+            title=verifier_title,
+            body="",
+            skills=list(DEFAULT_VERIFIER_SKILLS),
+        ),
+        SwarmWorkerSpec(
+            profile=synthesizer_assignee,
+            title=synthesizer_title,
+            body="",
+            skills=list(DEFAULT_SYNTHESIZER_SKILLS),
+        ),
+    ]
+
+
+def _resolve_generated_gate_skills(
+    conn: sqlite3.Connection,
+    root_id: str,
+    *,
+    gate_specs: list[SwarmWorkerSpec],
+    policy: Optional[SelfHealPolicy],
+    created_by: str,
+) -> tuple[list[str], list[str]]:
+    """Resolve forced skills for generated verifier/synthesizer cards.
+
+    Native swarm gate skills are optional methodology helpers: the gate task
+    body already contains the required review/synthesis instructions.  Under
+    drop/repair policies, remove unavailable generated gate skills so the
+    auto-created gate remains dispatchable instead of crashing at CLI startup.
+    """
+
+    if policy is None:
+        return list(gate_specs[0].skills), list(gate_specs[1].skills)
+
+    resolved: list[list[str]] = []
+    manifest: list[dict[str, Any]] = []
+    for spec in gate_specs:
+        _, missing = preflight_worker_skills(spec)
+        if missing:
+            if policy is not None and policy.mode in {"drop", "repair"}:
+                action = "drop_generated_gate_skill"
+                skills = [s for s in spec.skills if s not in missing]
+            else:
+                action = "warn"
+                skills = list(spec.skills)
+            manifest.append(
+                {
+                    "profile": spec.profile,
+                    "title": spec.title,
+                    "missing_skills": missing,
+                    "action": action,
+                    "generated_gate": True,
+                }
+            )
+        else:
+            skills = list(spec.skills)
+        resolved.append(skills)
+
+    _append_preflight_manifest(
+        conn,
+        root_id,
+        author=created_by,
+        entries=manifest,
+    )
+    return resolved[0], resolved[1]
+
+
 def _apply_preflight_policy(
     conn: sqlite3.Connection,
     root_id: str,
@@ -214,7 +332,8 @@ def _apply_preflight_policy(
     created normally, plus a list of repair/replacement task ids created.
     """
 
-    # Run cheap skill resolution per worker under the active HERMES_HOME.
+    # Run cheap skill resolution per worker under the profile-scoped
+    # HERMES_HOME that the worker process will actually see.
     checks: list[tuple[SwarmWorkerSpec, list[str]]] = []
     for spec in workers:
         _, missing = preflight_worker_skills(spec, hermes_home=hermes_home)
@@ -237,12 +356,11 @@ def _apply_preflight_policy(
                 }
             )
 
-    post_blackboard_update(
+    _append_preflight_manifest(
         conn,
         root_id,
         author=created_by,
-        key="preflight_skill_check",
-        value=manifest,
+        entries=manifest,
     )
 
     if policy.mode == "warn":
@@ -381,11 +499,11 @@ def create_swarm(
     ``done`` with parallel workers are ``ready``, the verifier
     waits for every worker, and the synthesizer waits for the verifier.
 
-    ``self_heal`` enables preflight skill checks. When a worker's forced
-    skills cannot be resolved under the active ``HERMES_HOME`` (the skill
-    tree the spawned worker CLI will see), the policy decides whether to
-    fail fast (default), drop the unavailable skills, create a repair card,
-    or just warn.
+    ``self_heal`` enables preflight skill checks. When a worker's or generated
+    gate's forced skills cannot be resolved under the profile-scoped
+    ``HERMES_HOME`` the spawned worker CLI will see, the policy decides whether
+    to fail fast (default), drop unavailable optional skills, create a repair
+    card for broken worker specs, or just warn.
     """
 
     goal = _require_text(goal, "goal")
@@ -398,12 +516,17 @@ def create_swarm(
         _require_text(spec.profile, f"workers[{i}].profile")
         _require_text(spec.title, f"workers[{i}].title")
 
-    active_home = os.environ.get("HERMES_HOME") or str(Path.home() / ".hermes")
+    gate_specs = _generated_gate_specs(
+        verifier_assignee=verifier_assignee,
+        verifier_title=verifier_title,
+        synthesizer_assignee=synthesizer_assignee,
+        synthesizer_title=synthesizer_title,
+    )
 
     # Fail-fast preflight: when policy is 'fail', validate all forced skills
     # before touching the DB so we never create a half-baked swarm root.
     if self_heal is not None and self_heal.mode == "fail":
-        _fail_fast_preflight(worker_specs, hermes_home=active_home)
+        _fail_fast_preflight(worker_specs + gate_specs)
 
     root = kb.create_task(
         conn,
@@ -465,7 +588,6 @@ def create_swarm(
             workspace_path=workspace_path,
             priority=priority,
             goal=goal,
-            hermes_home=active_home,
         )
 
     context_suffix = _swarm_context(root, goal)
@@ -491,6 +613,13 @@ def create_swarm(
     # NOT gate the verifier (the replacement workers produced by the repair
     # policy already do).  Include them in the topology for traceability.
     verifier_parents = list(worker_ids)
+    verifier_skills, synthesizer_skills = _resolve_generated_gate_skills(
+        conn,
+        root,
+        gate_specs=gate_specs,
+        policy=self_heal,
+        created_by=created_by,
+    )
 
     verifier_body = (
         "Review every worker handoff and blackboard update. Gate the swarm: "
@@ -509,7 +638,7 @@ def create_swarm(
         priority=priority,
         workspace_kind=workspace_kind,
         workspace_path=workspace_path,
-        skills=["requesting-code-review"],
+        skills=verifier_skills,
     )
 
     synthesizer_body = (
@@ -528,7 +657,7 @@ def create_swarm(
         priority=priority,
         workspace_kind=workspace_kind,
         workspace_path=workspace_path,
-        skills=["humanizer"],
+        skills=synthesizer_skills,
     )
 
     created = SwarmCreated(root, worker_ids, verifier, synthesizer, repair_ids=repair_ids)

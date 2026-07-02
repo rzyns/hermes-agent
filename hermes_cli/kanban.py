@@ -446,9 +446,10 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
         default=None,
         choices=["fail", "drop", "repair", "warn"],
         help=(
-            "Preflight skill resolution policy for worker specs. "
-            "fail=abort (default), drop=remove missing skills, "
-            "repair=create a repair card, warn=log and continue."
+            "Preflight skill resolution policy for worker specs and generated "
+            "verifier/synthesizer gates. fail=abort (default), "
+            "drop=remove missing skills, repair=create repair cards for "
+            "workers and drop missing optional gate skills, warn=log and continue."
         ),
     )
     p_swarm.add_argument(

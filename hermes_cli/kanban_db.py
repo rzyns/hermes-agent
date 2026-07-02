@@ -6381,11 +6381,11 @@ KANBAN_TERMINAL_TIMEOUT_GRACE_SECONDS = 30
 # ---------------------------------------------------------------------------
 
 _UNKNOWN_SKILL_RE = re.compile(
-    r"Error:\s*Unknown skill\(s\):\s*([A-Za-z0-9_\-/,\s]+)",
+    r"Error:\s*Unknown skill\(s\):\s*([A-Za-z0-9_\-/, \t]+)",
     re.IGNORECASE,
 )
 _UNKNOWN_TOOLSET_RE = re.compile(
-    r"Warning:\s*Unknown toolsets?:\s*([A-Za-z0-9_\-/,\s]+)",
+    r"Warning:\s*Unknown toolsets?:\s*([A-Za-z0-9_\-/, \t]+)",
     re.IGNORECASE,
 )
 _MISSING_PROFILE_RE = re.compile(
@@ -6412,7 +6412,9 @@ def classify_worker_log_failure(log_text: Optional[str]) -> Optional[dict[str, A
 
     if not log_text:
         return None
-    text = log_text[-4000:]  # tail only; startup errors are at the top
+    head = log_text[:4000]
+    tail = log_text[-4000:]
+    text = head if len(log_text) <= 4000 else f"{head}\n{tail}"
 
     m = _UNKNOWN_SKILL_RE.search(text)
     if m:
@@ -7286,12 +7288,19 @@ def _error_fingerprint(error_text: str) -> str:
     return fp.lower().strip()
 
 
-def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
+def detect_crashed_workers(
+    conn: sqlite3.Connection,
+    *,
+    board: Optional[str] = None,
+) -> list[str]:
     """Reclaim ``running`` tasks whose worker PID is no longer alive.
 
     Appends a ``crashed`` event and drops the task back to ``ready``.
     Different from ``release_stale_claims``: this checks liveness
     immediately rather than waiting for the claim TTL.
+
+    The optional ``board`` pins repair-card log lookup for multi-board
+    gateway dispatch; when omitted, current-board resolution is used.
 
     Only considers tasks claimed by *this host* — PIDs from other hosts
     are meaningless here. The host-local check is enough because
@@ -7479,11 +7488,11 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
                 try:
                     heal_enabled, heal_profile = _self_heal_config()
                     if heal_enabled:
-                        board = get_current_board()
+                        repair_board = board or get_current_board()
                         create_swarm_repair_task(
                             conn, tid,
                             healer_profile=heal_profile,
-                            board=board,
+                            board=repair_board,
                             created_by="self-healer",
                         )
                 except Exception:
@@ -8024,7 +8033,7 @@ def _dispatch_once_locked(
     result.stale = detect_stale_running(
         conn, stale_timeout_seconds=stale_timeout_seconds,
     )
-    result.crashed = detect_crashed_workers(conn)
+    result.crashed = detect_crashed_workers(conn, board=board)
     # detect_crashed_workers stashes protocol-violation auto-blocks on
     # itself so the public list-return stays stable. Pull them into the
     # DispatchResult here so telemetry / tests see the trip.
