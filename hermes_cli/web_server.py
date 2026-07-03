@@ -942,8 +942,10 @@ class MoaModelSlot(BaseModel):
 class MoaPresetPayload(BaseModel):
     reference_models: list[MoaModelSlot] = []
     aggregator: MoaModelSlot = MoaModelSlot()
-    reference_temperature: float = 0.6
-    aggregator_temperature: float = 0.4
+    # None = temperature omitted from API calls (provider default), matching
+    # single-model agent behavior.
+    reference_temperature: Optional[float] = None
+    aggregator_temperature: Optional[float] = None
     max_tokens: int = 4096
     enabled: bool = True
 
@@ -956,8 +958,8 @@ class MoaConfigPayload(BaseModel):
     # clients during this PR's transition window.
     reference_models: list[MoaModelSlot] = []
     aggregator: MoaModelSlot = MoaModelSlot()
-    reference_temperature: float = 0.6
-    aggregator_temperature: float = 0.4
+    reference_temperature: Optional[float] = None
+    aggregator_temperature: Optional[float] = None
     max_tokens: int = 4096
     enabled: bool = True
     profile: Optional[str] = None
@@ -1186,6 +1188,19 @@ _FS_READDIR_HIDDEN = {
     "target",
     "venv",
 }
+
+# Filenames that must never be listed, read, or downloaded through the
+# managed-files API.  These typically contain credentials (API keys, tokens)
+# and exposing them through the dashboard file browser is a security leak —
+# see issue #57505.
+def _is_sensitive_filename(name: str) -> bool:
+    """Return True for ``.env`` and any ``.env.<suffix>`` variant.
+
+    Case-insensitive so ``.ENV`` / ``.Env.local`` on case-insensitive
+    filesystems (macOS/Windows mounts) can't slip past the guard.
+    """
+    lowered = name.lower()
+    return lowered == ".env" or lowered.startswith(".env.")
 _FS_DATA_URL_MAX_BYTES = 16 * 1024 * 1024
 _FS_TEXT_SOURCE_MAX_BYTES = 64 * 1024 * 1024
 _FS_TEXT_PREVIEW_MAX_BYTES = 512 * 1024
@@ -1616,7 +1631,11 @@ async def list_managed_files(request: Request, path: Optional[str] = None):
         raise HTTPException(status_code=400, detail="Path is not a directory")
 
     try:
-        entries = [_managed_file_entry(policy, child) for child in target.iterdir()]
+        entries = [
+            _managed_file_entry(policy, child)
+            for child in target.iterdir()
+            if not _is_sensitive_filename(child.name)
+        ]
     except PermissionError:
         raise HTTPException(status_code=403, detail="Directory is not readable")
     except OSError as exc:
@@ -1642,6 +1661,8 @@ async def read_managed_file(request: Request, path: str):
         raise HTTPException(status_code=404, detail="File not found")
     if not target.is_file():
         raise HTTPException(status_code=400, detail="Path is not a file")
+    if _is_sensitive_filename(target.name):
+        raise HTTPException(status_code=403, detail="Access to sensitive files is not allowed")
 
     try:
         size = target.stat().st_size
@@ -1684,6 +1705,8 @@ async def download_managed_file(request: Request, path: str):
         raise HTTPException(status_code=404, detail="File not found")
     if not target.is_file():
         raise HTTPException(status_code=400, detail="Path is not a file")
+    if _is_sensitive_filename(target.name):
+        raise HTTPException(status_code=403, detail="Access to sensitive files is not allowed")
 
     try:
         size = target.stat().st_size
@@ -11463,6 +11486,176 @@ async def get_toolset_config(name: str, profile: Optional[str] = None):
 class ToolsetProviderSelect(BaseModel):
     provider: str
     profile: Optional[str] = None
+
+
+# Toolsets whose backends carry a selectable model catalog, mapped to the
+# config.yaml section their `model` key lives in. Mirrors the CLI's
+# post-selection model pickers (`_configure_imagegen_model_for_plugin` /
+# `_configure_videogen_model_for_plugin` in tools_config.py).
+_MODEL_CATALOG_TOOLSETS = {
+    "image_gen": "image_gen",
+    "video_gen": "video_gen",
+}
+
+
+def _resolve_toolset_model_plugin(ts_key: str, provider_row: dict) -> Optional[str]:
+    """Map a provider picker row to its model-catalog plugin name.
+
+    Plugin-backed rows carry ``image_gen_plugin_name`` / ``video_gen_plugin_name``;
+    the managed "Nous Subscription" image row instead carries the legacy
+    ``imagegen_backend: "fal"`` marker (same underlying FAL catalog).
+    """
+    if ts_key == "image_gen":
+        return provider_row.get("image_gen_plugin_name") or (
+            "fal" if provider_row.get("imagegen_backend") else None
+        )
+    if ts_key == "video_gen":
+        return provider_row.get("video_gen_plugin_name")
+    return None
+
+
+def _toolset_model_catalog(ts_key: str, plugin_name: str):
+    """Return ``(catalog_dict, default_model)`` for a toolset's plugin backend."""
+    from hermes_cli.tools_config import (
+        _plugin_image_gen_catalog,
+        _plugin_video_gen_catalog,
+    )
+
+    if ts_key == "image_gen":
+        return _plugin_image_gen_catalog(plugin_name)
+    return _plugin_video_gen_catalog(plugin_name)
+
+
+def _find_toolset_provider_row(ts_key: str, config: dict, provider: Optional[str]) -> Optional[dict]:
+    """Resolve a provider picker row by name, or the active row when omitted."""
+    from hermes_cli.tools_config import (
+        TOOL_CATEGORIES,
+        _is_provider_active,
+        _visible_providers,
+    )
+
+    cat = TOOL_CATEGORIES.get(ts_key)
+    if cat is None:
+        return None
+    rows = _visible_providers(cat, config, force_fresh=True)
+    if provider:
+        return next((p for p in rows if p.get("name") == provider), None)
+    return next(
+        (p for p in rows if _is_provider_active(p, config, force_fresh=True)), None
+    )
+
+
+@app.get("/api/tools/toolsets/{name}/models")
+async def get_toolset_models(
+    name: str, provider: Optional[str] = None, profile: Optional[str] = None
+):
+    """Return the model catalog for a toolset backend (image/video gen).
+
+    The GUI counterpart of the model picker `hermes tools` runs after a
+    backend is selected — e.g. FAL's multi-model catalog (speed / strengths /
+    price per model). ``provider`` names a picker row; omitted, the currently
+    active provider is used. Toolsets without model catalogs return
+    ``has_models: false``.
+    """
+    section = _MODEL_CATALOG_TOOLSETS.get(name)
+    if section is None:
+        return {"name": name, "has_models": False, "models": [], "current": None, "default": None}
+
+    with _profile_scope(profile):
+        config = load_config()
+        row = _find_toolset_provider_row(name, config, provider)
+        plugin = _resolve_toolset_model_plugin(name, row) if row else None
+        if not plugin:
+            return {
+                "name": name,
+                "has_models": False,
+                "models": [],
+                "current": None,
+                "default": None,
+            }
+
+        catalog, default_model = _toolset_model_catalog(name, plugin)
+        section_cfg = config.get(section)
+        current = None
+        if isinstance(section_cfg, dict):
+            raw = section_cfg.get("model")
+            if isinstance(raw, str) and raw.strip():
+                current = raw.strip()
+        if current not in catalog:
+            current = default_model if default_model in catalog else None
+
+    models = [
+        {
+            "id": model_id,
+            "display": meta.get("display", model_id),
+            "speed": meta.get("speed", ""),
+            "strengths": meta.get("strengths", ""),
+            "price": meta.get("price", ""),
+        }
+        for model_id, meta in catalog.items()
+    ]
+    return {
+        "name": name,
+        "has_models": bool(models),
+        "provider": row.get("name") if row else None,
+        "plugin": plugin,
+        "models": models,
+        "current": current,
+        "default": default_model,
+    }
+
+
+class ToolsetModelSelect(BaseModel):
+    model: str
+    provider: Optional[str] = None
+    profile: Optional[str] = None
+
+
+@app.put("/api/tools/toolsets/{name}/model")
+async def select_toolset_model(
+    name: str, body: ToolsetModelSelect, profile: Optional[str] = None
+):
+    """Persist a backend model selection (``image_gen.model`` / ``video_gen.model``).
+
+    Validates the model against the resolved backend's catalog — the same
+    write the CLI's post-selection model picker performs. Returns 400 for
+    toolsets without model catalogs or unknown model ids.
+    """
+    section = _MODEL_CATALOG_TOOLSETS.get(name)
+    if section is None:
+        raise HTTPException(
+            status_code=400, detail=f"Toolset has no model catalog: {name}"
+        )
+
+    model_id = (body.model or "").strip()
+    if not model_id:
+        raise HTTPException(status_code=400, detail="model is required")
+
+    with _profile_scope(body.profile or profile):
+        config = load_config()
+        row = _find_toolset_provider_row(name, config, body.provider)
+        plugin = _resolve_toolset_model_plugin(name, row) if row else None
+        if not plugin:
+            raise HTTPException(
+                status_code=400,
+                detail=f"No model-capable backend is active for {name}",
+            )
+
+        catalog, _default = _toolset_model_catalog(name, plugin)
+        if model_id not in catalog:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Unknown model {model_id!r} for backend {plugin!r}",
+            )
+
+        section_cfg = config.setdefault(section, {})
+        if not isinstance(section_cfg, dict):
+            section_cfg = {}
+            config[section] = section_cfg
+        section_cfg["model"] = model_id
+        save_config(config)
+
+    return {"ok": True, "name": name, "model": model_id, "plugin": plugin}
 
 
 @app.put("/api/tools/toolsets/{name}/provider")
