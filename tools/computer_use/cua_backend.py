@@ -501,47 +501,7 @@ def _windows_from_tool_result(out: Dict[str, Any]) -> List[Dict[str, Any]]:
         data,
         names=("windows", "_legacy_windows"),
     )
-    windows: List[Dict[str, Any]] = []
-    for raw in raw_windows:
-        try:
-            pid = int(raw["pid"])
-            window_id = int(raw.get("window_id", raw.get("id")))
-        except (KeyError, TypeError, ValueError):
-            continue
-        title = raw.get("title") if isinstance(raw.get("title"), str) else ""
-        process_name = _process_name_for_pid(pid)
-        has_explicit_app_name = isinstance(raw.get("app_name"), str) and bool(raw.get("app_name"))
-        app_name = (
-            raw.get("app_name")
-            or raw.get("app")
-            or raw.get("name")
-            or raw.get("bundle_id")
-            or process_name
-            or title
-            or ""
-        )
-        if not isinstance(app_name, str):
-            app_name = str(app_name)
-        match_text = (
-            f"{app_name} {process_name}" if has_explicit_app_name else f"{app_name} {title} {process_name}"
-        )
-        raw_bounds = _raw_window_bounds(raw)
-        explicit_off_screen = bool(raw.get("off_screen", False))
-        explicitly_not_on_screen = raw.get("is_on_screen") is False
-        windows.append({
-            "app_name": app_name,
-            "pid": pid,
-            "window_id": window_id,
-            "off_screen": bool(
-                explicit_off_screen
-                or explicitly_not_on_screen
-                or _window_is_parked_offscreen(raw_bounds)
-            ),
-            "title": title,
-            "z_index": raw.get("z_index", 0),
-            "match_text": match_text.lower(),
-        })
-    return windows
+    return _ingest_windows(raw_windows)
 
 
 def _frontmost_sort_key(window: Dict[str, Any]) -> float:
@@ -1067,6 +1027,66 @@ def _image_from_tool_result(out: Dict[str, Any]) -> tuple[Optional[str], Optiona
         return b64, mime
 
     return None, None
+
+
+def _ingest_windows(raw_windows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Normalise cua-driver ``list_windows`` entries, dropping unusable ones.
+
+    Every downstream operation needs both an integer ``pid`` (for
+    get_window_state / action tools) and ``window_id`` (for screenshot /
+    element clicks), so a window missing either is uncapturable.
+
+    Crucially, on X11 a window's PID comes from the *optional*
+    ``_NET_WM_PID`` property — the desktop root, panels, and
+    override-redirect popups routinely omit it, so the driver reports
+    ``pid: null`` for them. Coercing every entry unconditionally
+    (``int(w["pid"])``) let one such window abort enumeration of the real,
+    targetable windows. We skip the unusable entries instead so capture()
+    and focus_app() still find the windows that matter.
+    """
+    windows: List[Dict[str, Any]] = []
+    for raw in raw_windows:
+        if not isinstance(raw, dict):
+            continue
+        try:
+            pid = int(raw["pid"])
+            window_id = int(raw.get("window_id", raw.get("id")))
+        except (KeyError, TypeError, ValueError):
+            continue
+        title = raw.get("title") if isinstance(raw.get("title"), str) else ""
+        process_name = _process_name_for_pid(pid)
+        has_explicit_app_name = isinstance(raw.get("app_name"), str) and bool(raw.get("app_name"))
+        app_name = (
+            raw.get("app_name")
+            or raw.get("app")
+            or raw.get("name")
+            or raw.get("bundle_id")
+            or process_name
+            or title
+            or ""
+        )
+        if not isinstance(app_name, str):
+            app_name = str(app_name)
+        match_text = (
+            f"{app_name} {process_name}" if has_explicit_app_name else f"{app_name} {title} {process_name}"
+        )
+        raw_bounds = _raw_window_bounds(raw)
+        explicit_off_screen = bool(raw.get("off_screen", False))
+        explicitly_not_on_screen = raw.get("is_on_screen") is False
+        windows.append({
+            "app_name": app_name,
+            "pid": pid,
+            "window_id": window_id,
+            "off_screen": bool(
+                explicit_off_screen
+                or explicitly_not_on_screen
+                or _window_is_parked_offscreen(raw_bounds)
+            ),
+            "title": title,
+            "z_index": raw.get("z_index", 0),
+            "match_text": match_text.lower(),
+        })
+    return windows
 
 
 # ---------------------------------------------------------------------------

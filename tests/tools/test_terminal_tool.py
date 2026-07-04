@@ -3,12 +3,22 @@
 import tools.terminal_tool as terminal_tool
 
 
+def _reset_gateway_session_context_for_env_fallback():
+    try:
+        from gateway.session_context import reset_session_vars
+    except Exception:
+        return
+    reset_session_vars()
+
+
 def setup_function():
+    _reset_gateway_session_context_for_env_fallback()
     terminal_tool._reset_cached_sudo_passwords()
 
 
 def teardown_function():
     terminal_tool._reset_cached_sudo_passwords()
+    _reset_gateway_session_context_for_env_fallback()
 
 
 def test_searching_for_sudo_does_not_trigger_rewrite(monkeypatch):
@@ -230,6 +240,30 @@ def test_get_env_config_ignores_bad_docker_json_for_ssh_backend(monkeypatch):
     assert config["env_type"] == "ssh"
     assert config["docker_volumes"] == []
     assert config["docker_env"] == {}
+
+
+def test_get_env_config_preserves_ssh_tilde_cwd(monkeypatch):
+    """SSH cwd '~' is expanded by the remote shell, not the Hermes host."""
+    monkeypatch.setenv("TERMINAL_ENV", "ssh")
+    monkeypatch.setenv("TERMINAL_CWD", "~")
+    monkeypatch.setenv("HOME", "/opt/data")
+
+    config = terminal_tool._get_env_config()
+
+    assert config["env_type"] == "ssh"
+    assert config["cwd"] == "~"
+
+
+def test_get_env_config_preserves_ssh_tilde_child_cwd(monkeypatch):
+    """SSH cwd '~/x' must not become the local/container HOME path."""
+    monkeypatch.setenv("TERMINAL_ENV", "ssh")
+    monkeypatch.setenv("TERMINAL_CWD", "~/project")
+    monkeypatch.setenv("HOME", "/opt/data")
+
+    config = terminal_tool._get_env_config()
+
+    assert config["env_type"] == "ssh"
+    assert config["cwd"] == "~/project"
 
 
 def test_get_env_config_still_rejects_bad_docker_json_for_docker_backend(monkeypatch):
