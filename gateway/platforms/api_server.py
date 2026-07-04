@@ -776,7 +776,21 @@ def _make_request_fingerprint(body: Dict[str, Any], keys: List[str]) -> str:
     return sha256(repr(subset).encode("utf-8")).hexdigest()
 
 
-_RAW_MODEL_PREFIX = "raw/"
+# Async handlers for raw-model passthrough — extracted to gateway/raw_provider.py.
+# api_server.py keeps all its helper functions (defined above) so any callers
+# that import those names directly from this file keep working.
+from gateway.raw_provider import (
+    handle_raw_chat_completions as _handle_raw_chat_completions_base,
+    write_raw_sse_chat_completion as _write_raw_sse_chat_completion_base,
+)
+
+# Re-export the legacy string constants so callers that reach into the
+# api_server module namespace directly still find them.
+_RAW_PROVIDER_UNAVAILABLE_MESSAGE = "Raw model provider is unavailable."
+_RAW_PROVIDER_UNSUPPORTED_MESSAGE = "Raw model provider is unsupported or not configured."
+_RAW_PROVIDER_ROUTE_UNSUPPORTED_MESSAGE = "Raw model provider does not expose chat completions."
+_RAW_PROVIDER_ERROR_MESSAGE = "Raw model provider request failed."
+
 _RAW_CHAT_COMPLETIONS_FORWARD_FIELDS = frozenset({
     "messages",
     "tools",
@@ -2263,118 +2277,12 @@ class APIServerAdapter(BasePlatformAdapter):
     ) -> "web.Response":
         """Proxy ``raw/<provider>/<model>`` chat-completions to the provider.
 
-        This path intentionally does not construct an ``AIAgent``.  Caller
-        messages/tools remain caller-owned and returned tool calls are passed
-        back for the client to execute.
+        Delegated to :func:`gateway.raw_provider.handle_raw_chat_completions`.
+        Kept as a method here so existing call-sites (tests, subclasses) keep working.
         """
-        messages = body.get("messages")
-        if not messages or not isinstance(messages, list):
-            return web.json_response(
-                _openai_error("Missing or invalid 'messages' field"),
-                status=400,
-            )
-
-        provider = route["provider"]
-        upstream_model = route["model"]
-        completion_id = f"chatcmpl-{uuid.uuid4().hex[:29]}"
-        created = int(time.time())
-        stream = _coerce_request_bool(body.get("stream"), default=False)
-
-        try:
-            from agent.auxiliary_client import resolve_provider_client
-
-            client, resolved_model = await asyncio.to_thread(
-                resolve_provider_client,
-                provider,
-                model=upstream_model,
-            )
-        except Exception as exc:
-            logger.warning(
-                "Raw model proxy could not resolve provider %s: %s",
-                provider,
-                _raw_provider_exception_for_log(exc),
-            )
-            return web.json_response(
-                _openai_error(
-                    _RAW_PROVIDER_UNAVAILABLE_MESSAGE,
-                    err_type="server_error",
-                    code="raw_provider_unavailable",
-                    param="model",
-                ),
-                status=502,
-            )
-
-        if client is None or not resolved_model:
-            return web.json_response(
-                _openai_error(
-                    _RAW_PROVIDER_UNSUPPORTED_MESSAGE,
-                    code="raw_provider_unavailable",
-                    param="model",
-                ),
-                status=400,
-            )
-
-        try:
-            create_fn = client.chat.completions.create
-        except Exception:
-            return web.json_response(
-                _openai_error(
-                    _RAW_PROVIDER_ROUTE_UNSUPPORTED_MESSAGE,
-                    code="raw_route_unsupported",
-                    param="model",
-                ),
-                status=400,
-            )
-
-        upstream_kwargs = {
-            key: body[key]
-            for key in _RAW_CHAT_COMPLETIONS_FORWARD_FIELDS
-            if key in body
-        }
-        upstream_kwargs["model"] = resolved_model
-        upstream_kwargs["messages"] = messages
-        upstream_kwargs["stream"] = stream
-
-        idempotency_key = request.headers.get("Idempotency-Key")
-        if idempotency_key:
-            extra_headers = upstream_kwargs.get("extra_headers")
-            if isinstance(extra_headers, dict):
-                extra_headers = dict(extra_headers)
-            else:
-                extra_headers = {}
-            extra_headers.setdefault("Idempotency-Key", idempotency_key)
-            upstream_kwargs["extra_headers"] = extra_headers
-
-        if stream:
-            return await self._write_raw_sse_chat_completion(
-                request,
-                create_fn,
-                upstream_kwargs,
-            )
-
-        try:
-            raw_response = await asyncio.to_thread(create_fn, **upstream_kwargs)
-            response_data = _raw_chat_completion_payload(
-                raw_response,
-                completion_id=completion_id,
-                created=created,
-                model=resolved_model,
-            )
-        except Exception as exc:
-            logger.warning(
-                "Raw model proxy chat completion failed: %s",
-                _raw_provider_exception_for_log(exc),
-            )
-            return web.json_response(
-                _openai_error(
-                    _RAW_PROVIDER_ERROR_MESSAGE,
-                    err_type="server_error",
-                    code="raw_provider_error",
-                ),
-                status=502,
-            )
-
-        return web.json_response(response_data)
+        origin = request.headers.get("Origin", "")
+        cors_headers = self._cors_headers_for_origin(origin) if origin else None
+        return await _handle_raw_chat_completions_base(request, body, route, cors_headers=cors_headers)
 
     async def _write_raw_sse_chat_completion(
         self,
@@ -2382,63 +2290,13 @@ class APIServerAdapter(BasePlatformAdapter):
         create_fn: Any,
         upstream_kwargs: Dict[str, Any],
     ) -> "web.StreamResponse":
-        """Forward provider ChatCompletion chunks as OpenAI SSE data lines."""
-        sse_headers = {
-            "Content-Type": "text/event-stream",
-            "Cache-Control": "no-cache",
-            "X-Accel-Buffering": "no",
-        }
+        """Forward provider ChatCompletion chunks as OpenAI SSE data lines.
+
+        Delegated to :func:`gateway.raw_provider.write_raw_sse_chat_completion`.
+        """
         origin = request.headers.get("Origin", "")
-        cors = self._cors_headers_for_origin(origin) if origin else None
-        if cors:
-            sse_headers.update(cors)
-        response = web.StreamResponse(status=200, headers=sse_headers)
-        await response.prepare(request)
-
-        try:
-            stream_obj = await asyncio.to_thread(create_fn, **upstream_kwargs)
-            if hasattr(stream_obj, "__aiter__"):
-                async for chunk in stream_obj:
-                    data = json.dumps(_jsonable_raw_value(chunk), ensure_ascii=False)
-                    await response.write(f"data: {data}\n\n".encode("utf-8"))
-            else:
-                try:
-                    iterator = iter(stream_obj)
-                except TypeError:
-                    data = json.dumps(
-                        _raw_chat_completion_stream_chunk_from_final(stream_obj),
-                        ensure_ascii=False,
-                    )
-                    await response.write(f"data: {data}\n\n".encode("utf-8"))
-                else:
-                    while True:
-                        has_item, chunk = await asyncio.to_thread(_next_stream_item, iterator)
-                        if not has_item:
-                            break
-                        data = json.dumps(_jsonable_raw_value(chunk), ensure_ascii=False)
-                        await response.write(f"data: {data}\n\n".encode("utf-8"))
-            await response.write(b"data: [DONE]\n\n")
-        except (ConnectionResetError, ConnectionAbortedError, BrokenPipeError):
-            logger.info("Raw model proxy SSE client disconnected")
-        except Exception as exc:
-            logger.warning(
-                "Raw model proxy SSE stream failed: %s",
-                _raw_provider_exception_for_log(exc),
-            )
-            try:
-                error_chunk = _openai_error(
-                    _RAW_PROVIDER_ERROR_MESSAGE,
-                    err_type="server_error",
-                    code="raw_provider_error",
-                )
-                await response.write(
-                    f"event: error\ndata: {json.dumps(error_chunk)}\n\n".encode("utf-8")
-                )
-                await response.write(b"data: [DONE]\n\n")
-            except Exception:
-                pass
-
-        return response
+        cors_headers = self._cors_headers_for_origin(origin) if origin else None
+        return await _write_raw_sse_chat_completion_base(request, create_fn, upstream_kwargs, cors_headers=cors_headers)
 
     async def _handle_chat_completions(self, request: "web.Request") -> "web.Response":
         """POST /v1/chat/completions — OpenAI Chat Completions format."""
