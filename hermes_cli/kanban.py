@@ -2876,6 +2876,25 @@ def _cmd_tail(args: argparse.Namespace) -> int:
         return 0
 
 
+def _skipped_external_to_dicts(
+    skipped_external: list[tuple[str, list[dict[str, Any]]]],
+) -> list[dict[str, Any]]:
+    return [
+        {"task_id": task_id, "blockers": blockers}
+        for task_id, blockers in skipped_external
+    ]
+
+
+def _discover_dispatch_plugins() -> None:
+    """Load plugins before a scheduler tick so dependency providers register."""
+
+    try:
+        from hermes_cli.plugins import discover_plugins
+        discover_plugins()
+    except Exception as exc:
+        print(f"Warning: plugin discovery failed before kanban dispatch: {exc}", file=sys.stderr)
+
+
 def _cmd_dispatch(args: argparse.Namespace) -> int:
     # Honour kanban.default_assignee as the fallback for unassigned ready
     # tasks (#27145), kanban.max_in_progress as the global concurrency cap
@@ -2931,12 +2950,14 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
                 "spawned": [],
                 "skipped_unassigned": [],
                 "skipped_nonspawnable": [],
+                "skipped_external": [],
                 "skipped_per_profile_capped": [],
                 "auto_assigned_default": [],
             }, indent=2))
         else:
             print("Kanban dispatcher skipped: maintenance mode is enabled.")
         return 0
+    _discover_dispatch_plugins()
     with kb.connect_closing() as conn:
         res = kb.dispatch_once(
             conn,
@@ -2961,6 +2982,7 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
             ],
             "skipped_unassigned": res.skipped_unassigned,
             "skipped_nonspawnable": res.skipped_nonspawnable,
+            "skipped_external": _skipped_external_to_dicts(res.skipped_external),
             "skipped_per_profile_capped": [
                 {"task_id": tid, "assignee": who, "current": current}
                 for (tid, who, current) in res.skipped_per_profile_capped

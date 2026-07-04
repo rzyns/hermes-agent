@@ -8,6 +8,7 @@ operator footgun that only manifests in long-running setups.
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import sys
 import tempfile
@@ -23,10 +24,20 @@ def isolated_kanban_home(monkeypatch):
     test_home = tempfile.mkdtemp(prefix="kanban_cli_passthrough_")
     os.makedirs(os.path.join(test_home, "profiles", "default"), exist_ok=True)
     monkeypatch.setenv("HERMES_HOME", test_home)
-    for mod in list(sys.modules.keys()):
-        if mod.startswith("hermes_cli") or mod.startswith("hermes_state") or mod == "hermes_constants":
-            del sys.modules[mod]
-    yield test_home
+    module_names = [
+        mod for mod in list(sys.modules.keys())
+        if mod.startswith("hermes_cli") or mod.startswith("hermes_state") or mod == "hermes_constants"
+    ]
+    saved_modules = {mod: sys.modules[mod] for mod in module_names}
+    for mod in module_names:
+        del sys.modules[mod]
+    try:
+        yield test_home
+    finally:
+        for mod in list(sys.modules.keys()):
+            if mod.startswith("hermes_cli") or mod.startswith("hermes_state") or mod == "hermes_constants":
+                del sys.modules[mod]
+        sys.modules.update(saved_modules)
 
 
 def test_cli_dispatch_passes_max_in_progress_from_config(isolated_kanban_home, monkeypatch):
@@ -114,6 +125,94 @@ def test_cli_invalid_max_in_progress_silently_disables(isolated_kanban_home, mon
             f"invalid max_in_progress={bad_val!r} should fall through to None, "
             f"got {captured.get('max_in_progress')!r}"
         )
+
+
+def test_cli_dispatch_discovers_dependency_providers_and_reports_skipped_external_json(
+    isolated_kanban_home,
+    monkeypatch,
+    capsys,
+):
+    """CLI dry-run must match the gateway/provider-registered scheduler path.
+
+    Regression for the Symphony dependency gate: raw
+    ``hermes kanban dispatch --dry-run --json`` previously did not discover
+    plugin dependency providers and did not serialize ``skipped_external``, so
+    a cross-board-blocked child appeared spawnable in the operator evidence.
+    """
+    from hermes_cli import kanban as kb_cli
+    from hermes_cli import kanban_db
+    from hermes_cli import kanban_dependencies as kd
+
+    monkeypatch.setattr("hermes_cli.config.load_config", lambda: {"kanban": {}})
+    with kanban_db.connect_closing() as conn:
+        child_id = kanban_db.create_task(
+            conn,
+            title="externally blocked child",
+            assignee="default",
+        )
+
+    original_providers = list(kd._providers)
+    kd._providers[:] = []
+    registered = []
+    discover_calls = []
+
+    class FakeDependencyProvider:
+        name = "fake_cross_board"
+
+        def blockers_for(self, *, board, task_id):
+            if board == "default" and task_id == child_id:
+                return [
+                    kd.ExternalBlocker(
+                        parent_board="upstream-board",
+                        parent_id="t_parent",
+                        status="ready",
+                        reason="parent status 'ready' not in ['done']",
+                        provenance={"edge_id": "x_test_edge"},
+                    )
+                ]
+            return []
+
+    def fake_discover_plugins(*args, **kwargs):
+        discover_calls.append({"args": args, "kwargs": kwargs})
+        provider = FakeDependencyProvider()
+        registered.append(provider)
+        kd.register_dependency_provider(provider)
+
+    monkeypatch.setattr("hermes_cli.plugins.discover_plugins", fake_discover_plugins)
+
+    try:
+        args = argparse.Namespace(
+            dry_run=True,
+            max=5,
+            failure_limit=2,
+            json=True,
+            board=None,
+        )
+        assert kb_cli._cmd_dispatch(args) == 0
+        data = json.loads(capsys.readouterr().out)
+
+        assert discover_calls, "CLI dispatch must discover plugins before scheduler dry-run"
+        assert data["spawned"] == []
+        assert data["skipped_external"] == [
+            {
+                "task_id": child_id,
+                "blockers": [
+                    {
+                        "parent_board": "upstream-board",
+                        "parent_id": "t_parent",
+                        "status": "ready",
+                        "kind": "blocks",
+                        "reason": "parent status 'ready' not in ['done']",
+                        "satisfied": False,
+                        "provenance": {"edge_id": "x_test_edge"},
+                    }
+                ],
+            }
+        ]
+    finally:
+        for provider in registered:
+            kd.unregister_dependency_provider(provider)
+        kd._providers[:] = original_providers
 
 
 def test_kanban_swarm_uses_existing_humanizer_skill():
