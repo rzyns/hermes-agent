@@ -530,6 +530,13 @@ def _build_embedded_profile_env(config: dict[str, Any], *, llm_api_key: str | No
     if current_base_url:
         env_values["HINDSIGHT_API_LLM_BASE_URL"] = str(current_base_url)
 
+    reasoning_effort = config.get("llm_reasoning_effort") or os.environ.get(
+        "HINDSIGHT_API_LLM_REASONING_EFFORT",
+        "",
+    )
+    if reasoning_effort:
+        env_values["HINDSIGHT_API_LLM_REASONING_EFFORT"] = str(reasoning_effort)
+
     idle_timeout = (
         config.get("idle_timeout")
         if config.get("idle_timeout") is not None
@@ -1050,6 +1057,12 @@ class HindsightMemoryProvider(MemoryProvider):
                 self._idle_timeout = idle_timeout
                 kwargs["idle_timeout"] = idle_timeout
                 self._client = HindsightEmbedded(**kwargs)
+                reasoning_effort = self._config.get("llm_reasoning_effort") or os.environ.get(
+                    "HINDSIGHT_API_LLM_REASONING_EFFORT",
+                    "",
+                )
+                if reasoning_effort and hasattr(self._client, "config"):
+                    self._client.config["HINDSIGHT_API_LLM_REASONING_EFFORT"] = str(reasoning_effort)
             else:
                 _ensure_cloud_client_dependency()
                 from hindsight_client import Hindsight
