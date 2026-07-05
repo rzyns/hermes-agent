@@ -1675,6 +1675,10 @@ DEFAULT_CONFIG = {
         # behavior of showing tool-call summaries inline.
         "resume_skip_tool_only": True,
         "busy_input_mode": "interrupt",  # interrupt | queue | steer
+        # When busy_input_mode="steer", suppress only the visible
+        # "Steered into current run" confirmation bubble by setting this false.
+        # The mid-turn steering itself still happens.
+        "busy_steer_ack_enabled": True,
         # Which interface bare `hermes` (and `hermes chat`) launches by default:
         #   "cli" — the classic prompt_toolkit REPL (default, preserves prior behavior)
         #   "tui" — the modern Ink TUI (same as passing `--tui`)
@@ -1773,6 +1777,15 @@ DEFAULT_CONFIG = {
         # applies where tool_progress is already enabled. Per-platform override
         # via display.platforms.<platform>.tool_progress_grouping.
         "tool_progress_grouping": "accumulate",
+        # Optional custom phrases for generic long-running status messages.
+        # Built-in defaults live in gateway/assets/status_phrases.yaml. Users
+        # can set `path`/`paths` to HERMES_HOME-relative YAML files/directories
+        # (or rely on conventional status_phrases.yaml / status_phrases/*.yaml).
+        # Keys: status, generic. Use
+        # mode: "append" (default) to add phrases, or "replace" to fully
+        # replace configured surfaces. Per-platform overrides live under
+        # display.platforms.<platform>.status_phrases.
+        "status_phrases": {},
         # How a reasoning/thinking summary renders when show_reasoning is on.
         # "code" (default) = 💭 fenced code block; "blockquote" = "> " lines;
         # "subtext" = "-# " lines (Discord small grey metadata text). Discord
@@ -2017,6 +2030,10 @@ DEFAULT_CONFIG = {
     
     "stt": {
         "enabled": True,
+        # When true, gateway voice messages are transcribed for the agent and
+        # the raw transcript is also echoed back to the user as a 🎙️ message.
+        # Set false to keep STT for the agent while suppressing that user-facing echo.
+        "echo_transcripts": True,
         "provider": "local",  # "local" (free, faster-whisper) | "groq" | "openai" (Whisper API) | "mistral" (Voxtral Transcribe) | "elevenlabs" (Scribe)
         "local": {
             "model": "base",  # tiny, base, small, medium, large-v3
@@ -2972,6 +2989,11 @@ DEFAULT_CONFIG = {
         #               ignored paths — node_modules, venv, build outputs —
         #               are never touched.
         "non_interactive_local_changes": "stash",
+        # Refresh an already-installed cua-driver during `hermes update`.
+        # The refresh is best-effort and macOS-only. Turn this off if the
+        # upstream installer is not appropriate for the machine, for example
+        # on non-admin accounts where `/Applications` is not writable.
+        "refresh_cua_driver": True,
     },
 
     # Language Server Protocol — semantic diagnostics from real
@@ -4490,6 +4512,26 @@ def get_missing_skill_config_vars() -> List[Dict[str, Any]]:
     return missing
 
 
+# ``_normalize_custom_provider_entry`` runs on every ``load_picker_context()``
+# call (i.e. per interactive picker/inventory request), so any warning it emits
+# fires repeatedly for the same static config. Deduplicate per (provider,
+# signature): on Windows a repeated-warning storm contends on
+# ``concurrent-log-handler``'s cross-process rotation lock and can peg a core /
+# stall the gateway/serve event loop. The cache lives for the process lifetime.
+_PROVIDER_NORMALIZE_WARNED: set = set()
+
+
+def _warn_once_per_provider(
+    provider_key: str, signature: str, msg: str, *args: Any
+) -> None:
+    """Emit ``logger.warning(msg, *args)`` at most once per (provider, signature)."""
+    dedup_key = (provider_key or "?", signature)
+    if dedup_key in _PROVIDER_NORMALIZE_WARNED:
+        return
+    _PROVIDER_NORMALIZE_WARNED.add(dedup_key)
+    logger.warning(msg, *args)
+
+
 def _normalize_custom_provider_entry(
     entry: Any,
     *,
@@ -4516,6 +4558,11 @@ def _normalize_custom_provider_entry(
     if "api_key_env" in entry and "key_env" not in entry:
         entry["key_env"] = entry["api_key_env"]
     _KNOWN_KEYS = {
+        # ``provider`` duplicates the ``providers.<name>`` mapping key and is
+        # unused here, but Hermes' own config writer has historically emitted it
+        # into provider entries. Accept it silently so those (self-written)
+        # configs don't warn on every load.
+        "provider",
         "name", "api", "url", "base_url", "api_key", "key_env", "api_key_env",
         "api_mode", "transport", "model", "default_model", "models",
         "context_length", "rate_limit_delay",
@@ -4525,7 +4572,8 @@ def _normalize_custom_provider_entry(
     }
     for camel, snake in _CAMEL_ALIASES.items():
         if camel in entry and snake not in entry:
-            logger.warning(
+            _warn_once_per_provider(
+                provider_key, f"camel:{camel}",
                 "providers.%s: camelCase key '%s' auto-mapped to '%s' "
                 "(use snake_case to avoid this warning)",
                 provider_key or "?", camel, snake,
@@ -4533,7 +4581,8 @@ def _normalize_custom_provider_entry(
             entry[snake] = entry[camel]
     unknown = set(entry.keys()) - _KNOWN_KEYS - set(_CAMEL_ALIASES.keys())
     if unknown:
-        logger.warning(
+        _warn_once_per_provider(
+            provider_key, "unknown:" + ",".join(sorted(unknown)),
             "providers.%s: unknown config keys ignored: %s",
             provider_key or "?", ", ".join(sorted(unknown)),
         )
@@ -4604,13 +4653,29 @@ def _normalize_custom_provider_entry(
     if isinstance(models, dict) and models:
         normalized["models"] = models
     elif isinstance(models, list) and models:
-        # Hand-edited configs (and older Hermes versions) write ``models`` as
-        # a plain list of model ids. Preserve them by converting to the dict
-        # shape downstream code expects; otherwise normalize silently drops
-        # the list and /model shows the provider with (0) models.
-        normalized["models"] = {
-            str(m): {} for m in models if isinstance(m, str) and m.strip()
-        }
+        # Hand-edited configs (and older Hermes versions) may write
+        # ``models`` as a plain list of ids or as ``[{id: ...}]`` rows.
+        # Preserve both by converting to the dict shape downstream code
+        # expects; otherwise normalize silently drops the list and /model
+        # shows the provider with (0) models.
+        normalized_models: Dict[str, Any] = {}
+        for item in models:
+            if isinstance(item, str) and item.strip():
+                normalized_models[item.strip()] = {}
+                continue
+            if not isinstance(item, dict):
+                continue
+            model_id = item.get("id")
+            if not isinstance(model_id, str) or not model_id.strip():
+                model_id = item.get("name")
+            if not isinstance(model_id, str) or not model_id.strip():
+                continue
+            model_meta = {
+                k: v for k, v in item.items() if k not in {"id", "name"}
+            }
+            normalized_models[model_id.strip()] = model_meta
+        if normalized_models:
+            normalized["models"] = normalized_models
 
     context_length = entry.get("context_length")
     if isinstance(context_length, int) and context_length > 0:
@@ -5312,7 +5377,7 @@ def migrate_config(interactive: bool = True, quiet: bool = False) -> Dict[str, A
             if old_enabled and old_enabled.lower() in {"false", "0", "no"}:
                 display["tool_progress"] = "off"
                 results["config_added"].append("display.tool_progress=off (from HERMES_TOOL_PROGRESS=false)")
-            elif old_mode and old_mode.lower() in {"new", "all"}:
+            elif old_mode and old_mode.lower() in {"new", "all", "verbose"}:
                 display["tool_progress"] = old_mode.lower()
                 results["config_added"].append(f"display.tool_progress={old_mode.lower()} (from HERMES_TOOL_PROGRESS_MODE)")
             else:
