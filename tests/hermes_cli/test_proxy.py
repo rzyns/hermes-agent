@@ -621,6 +621,42 @@ def test_subscription_adapter_glm_model_routes_to_zai(tmp_path, monkeypatch):
     assert adapter.raw_chat_route_for_model("glm-5.2") is None
 
 
+def test_subscription_adapter_model_ownership_fallback(tmp_path, monkeypatch):
+    """Models with no prefix-pattern must route to their owning provider
+    via the fallback model-ownership lookup.
+
+    This is the self-consistency guarantee: any model that list_models()
+    advertises must be routable.  Without this fallback, OpenRouter models
+    like 'deepseek/deepseek-chat' would misroute to MiniMax.
+    """
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    (tmp_path / "auth.json").write_text(json.dumps({
+        "version": 1,
+        "providers": {
+            "minimax-oauth": {"tokens": {"access_token": "minimax-token"}},
+        },
+    }))
+    # Simulate OpenRouter API key presence
+    monkeypatch.setenv("OPENROUTER_API_KEY", "fake-or-key")
+
+    from hermes_cli.proxy.adapters.subscription import (
+        _provider_candidates_for_model,
+        _providers_owning_model,
+    )
+
+    # These have no prefix pattern — must be found via ownership lookup
+    assert _providers_owning_model("deepseek/deepseek-chat") == ["openrouter"]
+    assert _providers_owning_model("anthropic/claude-sonnet-4.6") == ["openrouter"]
+    assert _providers_owning_model("qwen/qwen3-plus") == ["openrouter"]
+
+    # The public API also returns the right candidates
+    assert _provider_candidates_for_model("deepseek/deepseek-chat") == ["openrouter"]
+    assert _provider_candidates_for_model("anthropic/claude-sonnet-4.6") == ["openrouter"]
+
+    # Unknown models return empty (will fall through to auto-detect)
+    assert _providers_owning_model("totally-fake-model-xyz") == []
+
+
 def test_subscription_adapter_list_models_aggregates_providers(tmp_path, monkeypatch):
     """list_models() must return models from all credentialed providers."""
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))

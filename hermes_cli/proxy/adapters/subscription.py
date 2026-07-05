@@ -147,7 +147,64 @@ def _provider_candidates_for_model(model: Optional[str]) -> list[str]:
         return ["minimax-oauth"]
     if bare.startswith("glm-"):
         return ["zai"]
-    return []
+    # Fall back to searching credentialed providers' model lists.
+    # This keeps /v1/models and routing self-consistent: any model that
+    # list_models() advertises is guaranteed to be routable.
+    return _providers_owning_model(model)
+
+
+# Static model lists for providers whose profile doesn't list them.
+# Single source of truth used by both list_models() and routing lookup.
+_STATIC_PROVIDER_MODELS: dict[str, list[str]] = {
+    "openai-codex": ["gpt-5.5"],
+    "minimax-oauth": [
+        "MiniMax-M3", "MiniMax-M2.7", "MiniMax-M2.7-highspeed",
+        "MiniMax-M2.5", "MiniMax-M2.5-highspeed",
+        "MiniMax-M2.1", "MiniMax-M2.1-highspeed", "MiniMax-M2",
+    ],
+}
+
+
+def _providers_owning_model(model: Optional[str]) -> list[str]:
+    """Return credentialed providers whose model list contains ``model``.
+
+    Searches the same sources as ``list_models()``: ``fallback_models``,
+    ``default_aux_model``, and the static model table.  Only returns providers
+    that actually have credentials (auth.json or env var).
+    """
+    if not isinstance(model, str) or not model.strip():
+        return []
+
+    import os
+
+    target = model.strip()
+    target_lower = target.lower()
+    found: list[str] = []
+
+    try:
+        import providers as _providers_mod
+
+        for profile in _providers_mod.list_providers():
+            name = profile.name
+            has_auth = _provider_has_credentials(name)
+            env_has = any(os.getenv(v) for v in profile.env_vars) if profile.env_vars else False
+            if not (has_auth or env_has):
+                continue
+
+            # Build this provider's known model set
+            known: set[str] = set()
+            known.update(m.lower() for m in (profile.fallback_models or []))
+            aux = getattr(profile, "default_aux_model", "")
+            if aux:
+                known.add(aux.lower())
+            known.update(m.lower() for m in _STATIC_PROVIDER_MODELS.get(name, []))
+
+            if target_lower in known:
+                found.append(name)
+    except Exception as exc:
+        logger.debug("subscription-proxy: model ownership lookup failed: %s", exc)
+
+    return found
 
 
 def _raw_chat_route_for_model(model: Optional[str]) -> Optional[dict[str, str]]:
@@ -235,16 +292,6 @@ class SubscriptionProxyAdapter(UpstreamAdapter):
 
         import providers as _providers_mod
 
-        # Static model lists for providers whose profile doesn't list them.
-        _STATIC_MODELS: dict[str, list[str]] = {
-            "openai-codex": ["gpt-5.5"],
-            "minimax-oauth": [
-                "MiniMax-M3", "MiniMax-M2.7", "MiniMax-M2.7-highspeed",
-                "MiniMax-M2.5", "MiniMax-M2.5-highspeed",
-                "MiniMax-M2.1", "MiniMax-M2.1-highspeed", "MiniMax-M2",
-            ],
-        }
-
         seen: set[str] = set()
         models: list[dict[str, Any]] = []
         created = int(time.time())
@@ -262,7 +309,7 @@ class SubscriptionProxyAdapter(UpstreamAdapter):
             aux = getattr(profile, "default_aux_model", "")
             if aux:
                 candidates.append(aux)
-            candidates.extend(_STATIC_MODELS.get(name, []))
+            candidates.extend(_STATIC_PROVIDER_MODELS.get(name, []))
 
             for model_id in candidates:
                 if model_id in seen:
