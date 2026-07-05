@@ -13,7 +13,7 @@ from __future__ import annotations
 
 import logging
 import threading
-from typing import FrozenSet, Optional
+from typing import Any, FrozenSet, Optional
 
 from hermes_cli.proxy.adapters.base import UpstreamAdapter, UpstreamCredential
 
@@ -221,6 +221,61 @@ class SubscriptionProxyAdapter(UpstreamAdapter):
 
     def raw_chat_route_for_model(self, model: Optional[str]) -> Optional[dict[str, str]]:
         return _raw_chat_route_for_model(model)
+
+    def list_models(self) -> list[dict[str, Any]]:
+        """Aggregate models from all credentialed providers.
+
+        Returns a flat list of OpenAI-shaped model objects, merging:
+        - provider ``fallback_models`` lists
+        - provider ``default_aux_model`` values
+        - static known-good models for providers with empty profiles
+        """
+        import os
+        import time
+
+        import providers as _providers_mod
+
+        # Static model lists for providers whose profile doesn't list them.
+        _STATIC_MODELS: dict[str, list[str]] = {
+            "openai-codex": ["gpt-5.5"],
+            "minimax-oauth": [
+                "MiniMax-M3", "MiniMax-M2.7", "MiniMax-M2.7-highspeed",
+                "MiniMax-M2.5", "MiniMax-M2.5-highspeed",
+                "MiniMax-M2.1", "MiniMax-M2.1-highspeed", "MiniMax-M2",
+            ],
+        }
+
+        seen: set[str] = set()
+        models: list[dict[str, Any]] = []
+        created = int(time.time())
+
+        for profile in _providers_mod.list_providers():
+            name = profile.name
+            has_auth = _provider_has_credentials(name)
+            env_has = any(os.getenv(v) for v in profile.env_vars) if profile.env_vars else False
+            if not (has_auth or env_has):
+                continue
+
+            # Collect model IDs from fallback_models, default_aux_model, and static list.
+            candidates: list[str] = []
+            candidates.extend(profile.fallback_models or [])
+            aux = getattr(profile, "default_aux_model", "")
+            if aux:
+                candidates.append(aux)
+            candidates.extend(_STATIC_MODELS.get(name, []))
+
+            for model_id in candidates:
+                if model_id in seen:
+                    continue
+                seen.add(model_id)
+                models.append({
+                    "id": model_id,
+                    "object": "model",
+                    "created": created,
+                    "owned_by": name,
+                })
+
+        return models
 
     def get_retry_credential(
         self,

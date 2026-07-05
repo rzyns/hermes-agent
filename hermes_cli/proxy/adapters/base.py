@@ -15,7 +15,7 @@ from __future__ import annotations
 
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
-from typing import FrozenSet, Optional
+from typing import Any, FrozenSet, Optional
 
 
 @dataclass(frozen=True)
@@ -106,6 +106,17 @@ class UpstreamAdapter(ABC):
         Responses API backend for ``gpt-*`` models).
         """
         _ = model
+        return None
+
+    def list_models(self) -> Optional[list[dict[str, Any]]]:
+        """Return aggregated model list for ``GET /v1/models``, or ``None``
+        to forward the request to the upstream.
+
+        Single-upstream adapters (Nous, xAI) return ``None`` so the proxy
+        forwards to the upstream's own ``/models`` endpoint.  Multi-provider
+        adapters (Subscription) override this to aggregate from all
+        credentialed providers.
+        """
         return None
 
     def describe(self) -> str:

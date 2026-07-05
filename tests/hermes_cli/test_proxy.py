@@ -621,6 +621,48 @@ def test_subscription_adapter_glm_model_routes_to_zai(tmp_path, monkeypatch):
     assert adapter.raw_chat_route_for_model("glm-5.2") is None
 
 
+def test_subscription_adapter_list_models_aggregates_providers(tmp_path, monkeypatch):
+    """list_models() must return models from all credentialed providers."""
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    (tmp_path / "auth.json").write_text(json.dumps({
+        "version": 1,
+        "providers": {
+            "openai-codex": {"tokens": {"access_token": "codex-token"}},
+            "minimax-oauth": {"tokens": {"access_token": "minimax-token"}},
+        },
+    }))
+    monkeypatch.setenv("GLM_API_KEY", "fake-glm-key")
+
+    adapter = SubscriptionProxyAdapter()
+    models = adapter.list_models()
+
+    # Must include models from all three credentialed providers
+    model_ids = {m["id"] for m in models}
+    assert "gpt-5.5" in model_ids, "must include openai-codex models"
+    assert any(m.startswith("MiniMax") for m in model_ids), "must include minimax models"
+    assert "glm-5.2" in model_ids, "must include zai models"
+    assert "glm-4.5-flash" in model_ids, "must include zai default_aux_model"
+
+    # All entries must have valid OpenAI shapes
+    for m in models:
+        assert m["object"] == "model"
+        assert m["id"]
+        assert m["owned_by"]
+
+    # No duplicates
+    ids = [m["id"] for m in models]
+    assert len(ids) == len(set(ids)), "duplicate model IDs in list"
+
+
+def test_base_adapter_list_models_returns_none_by_default():
+    """Single-upstream adapters must return None (forward to upstream)."""
+    from hermes_cli.proxy.adapters.base import UpstreamAdapter
+
+    # NousPortalAdapter and XAIGrokAdapter should inherit the default
+    adapter = NousPortalAdapter()
+    assert adapter.list_models() is None
+
+
 def test_subscription_adapter_gpt_model_prefers_openai_codex(monkeypatch):
     class FakeClient:
         base_url = "https://chatgpt.com/backend-api/codex"

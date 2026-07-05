@@ -147,6 +147,17 @@ def create_app(adapter: UpstreamAdapter) -> "web.Application":
         body = await request.read()
         model_hint, parsed_body = _extract_json_body_model(body)
 
+        # Aggregated model listing for multi-provider adapters.
+        if rel_path == "/models" and request.method == "GET":
+            try:
+                aggregated = adapter.list_models()
+            except Exception:
+                aggregated = None
+            if aggregated is not None:
+                return web.json_response(
+                    {"object": "list", "data": aggregated}
+                )
+
         if rel_path == "/chat/completions" and parsed_body is not None:
             raw_route = adapter.raw_chat_route_for_model(model_hint)
             if raw_route is not None:
