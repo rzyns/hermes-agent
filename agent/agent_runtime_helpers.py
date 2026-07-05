@@ -1644,6 +1644,20 @@ def create_openai_client(agent, client_kwargs: dict, *, reason: str, shared: boo
             agent._client_log_context(),
         )
         return client
+    if agent.provider == "claude-code" or str(client_kwargs.get("base_url", "")).startswith("claude-code://"):
+        try:
+            from claude_code_client import ClaudeCodeClient
+        except ImportError:
+            pass  # Plugin not installed — fall through to normal client construction
+        else:
+            client = ClaudeCodeClient(**client_kwargs)
+            _ra().logger.info(
+                "Claude Code provider client created (%s, shared=%s) %s",
+                reason,
+                shared,
+                agent._client_log_context(),
+            )
+            return client
     if agent.provider == "gemini":
         from agent.gemini_native_adapter import GeminiNativeClient, is_native_gemini_base_url
 
