@@ -19,6 +19,27 @@ from hermes_cli.proxy.adapters.base import UpstreamAdapter, UpstreamCredential
 
 logger = logging.getLogger(__name__)
 
+
+def _rewrite_anthropic_base_url(base_url: str) -> str:
+    """Rewrite Anthropic-style base URL to OpenAI-compatible format.
+
+    Mirrors the logic in ``agent.auxiliary_client._to_openai_base_url`` so the
+    proxy produces the same URL that the auxiliary client hits internally.
+
+    MiniMax exposes ``/anthropic`` for the Anthropic Messages API wire and ``/v1``
+    for the OpenAI Messages API wire.  The auxiliary client uses the OpenAI SDK,
+    so it rewrites ``/anthropic`` → ``/v1``.  We do the same here.
+    """
+    if base_url.endswith("/anthropic"):
+        # ZAI (open.bigmodel.cn) uses /api/anthropic for Anthropic wire
+        # but /api/paas/v4 for OpenAI wire.
+        if "open.bigmodel.cn" in base_url or "bigmodel" in base_url:
+            return base_url[: -len("/anthropic")] + "/paas/v4"
+        return base_url[: -len("/anthropic")] + "/v1"
+    if base_url.endswith("/coding") and "api.kimi.com" in base_url:
+        return base_url + "/v1"
+    return base_url
+
 _ALLOWED_PATHS: FrozenSet[str] = frozenset({
     "/chat/completions",
     "/responses",
@@ -57,6 +78,31 @@ def _get_active_provider_id() -> Optional[str]:
         return None
 
 
+def _any_provider_has_credentials() -> bool:
+    """Return True if any provider has stored credentials that can be used."""
+    try:
+        from hermes_cli.auth import _load_auth_store, _auth_store_lock
+        with _auth_store_lock():
+            store = _load_auth_store()
+        providers = store.get("providers") or {}
+        for provider_id, state in providers.items():
+            if not isinstance(state, dict):
+                continue
+            # Check for the most common credential shapes.
+            if (
+                state.get("access_token")
+                or state.get("agent_key")
+                or state.get("tokens")
+            ):
+                return True
+        return False
+    except Exception as exc:
+        logger.debug(
+            "subscription-proxy: could not check credential availability: %s", exc
+        )
+        return False
+
+
 class SubscriptionProxyAdapter(UpstreamAdapter):
     """Proxy upstream that routes to the user's active subscription provider.
 
@@ -92,16 +138,24 @@ class SubscriptionProxyAdapter(UpstreamAdapter):
             return True
         # Also accept the active provider being set (even if non-Nous).
         active = _get_active_provider_id()
-        return active is not None
+        if active:
+            return True
+        # Auto-detect: if any provider has usable credentials, we're good.
+        return _any_provider_has_credentials()
 
     def get_credential(self) -> UpstreamCredential:
         # Try Nous Portal first — it has dedicated JWT refresh logic.
         if _is_nous_auth_available():
             with self._lock:
                 return self._credential_from_nous()
-        # Fall back to the generic provider-client path.
+        # Try the explicitly active provider next.
+        active = _get_active_provider_id()
+        if active:
+            with self._lock:
+                return self._credential_from_active_provider(active)
+        # Fall back to auto-detection.
         with self._lock:
-            return self._credential_from_active_provider()
+            return self._credential_from_auto_detected_provider()
 
     def get_retry_credential(
         self,
@@ -182,13 +236,15 @@ class SubscriptionProxyAdapter(UpstreamAdapter):
             expires_at=refreshed.get("expires_at"),
         )
 
-    def _credential_from_active_provider(self) -> UpstreamCredential:
-        """Resolve credentials for the active (non-Nous) provider.
+    def _credential_from_active_provider(
+        self, provider: Optional[str] = None
+    ) -> UpstreamCredential:
+        """Resolve credentials for an explicitly named (or active) provider.
 
         Uses ``resolve_provider_client`` to get a configured client, then
         extracts the bearer token and base URL for the proxy forwarder.
         """
-        active_provider = _get_active_provider_id()
+        active_provider = provider or _get_active_provider_id()
         if not active_provider:
             raise RuntimeError(
                 "No active subscription provider found. "
@@ -211,9 +267,14 @@ class SubscriptionProxyAdapter(UpstreamAdapter):
             ) from exc
 
         # Extract base URL and bearer from the client.
-        base_url = getattr(client, "base_url", None)
+        # Note: AnthropicAuxiliaryClient exposes "https://api.minimax.io/anthropic"
+        # as its base_url, but the actual OpenAI-compatible upstream path is
+        # "https://api.minimax.io/v1" (it rewrites /anthropic → /v1 internally via
+        # _to_openai_base_url).  Apply the same rewrite here so the proxy produces
+        # the correct upstream URL (e.g. "https://api.minimax.io/v1" +
+        # "/chat/completions" = "https://api.minimax.io/v1/chat/completions").
         if base_url is not None:
-            base_url = str(base_url).rstrip("/")
+            base_url = _rewrite_anthropic_base_url(str(base_url).rstrip("/"))
         if not base_url:
             raise RuntimeError(
                 f"Provider {active_provider!r} client has no base_url. "
@@ -237,6 +298,65 @@ class SubscriptionProxyAdapter(UpstreamAdapter):
             bearer=bearer,
             base_url=base_url,
             expires_at=None,
+        )
+
+    def _credential_from_auto_detected_provider(self) -> UpstreamCredential:
+        """Auto-detect the best available provider and return its credentials.
+
+        Tries providers in order of preference (minimax-oauth, openai-codex,
+        etc.) by attempting to resolve a client for each and returning the first
+        that succeeds. This handles the case where no provider is explicitly
+        set as active but valid credentials exist in the auth store.
+        """
+        # Order matters — prefer providers with OpenAI-compatible surfaces.
+        candidates = ["minimax-oauth", "openai-codex"]
+
+        last_error: Optional[RuntimeError] = None
+        for provider_id in candidates:
+            try:
+                from agent.auxiliary_client import resolve_provider_client
+
+                client, _resolved_model = resolve_provider_client(provider_id)
+                if client is None:
+                    continue
+
+                base_url = getattr(client, "base_url", None)
+                if base_url is not None:
+                    base_url = _rewrite_anthropic_base_url(str(base_url).rstrip("/"))
+                if not base_url:
+                    continue
+
+                api_key = getattr(client, "api_key", None)
+                if api_key is None:
+                    continue
+                bearer = str(api_key).strip()
+                if not bearer:
+                    continue
+
+                logger.info(
+                    "subscription-proxy: auto-detected provider %r for proxy",
+                    provider_id,
+                )
+                return UpstreamCredential(
+                    bearer=bearer,
+                    base_url=base_url,
+                    expires_at=None,
+                )
+            except Exception as exc:
+                logger.debug(
+                    "subscription-proxy: auto-detect skipped %r: %s",
+                    provider_id,
+                    exc,
+                )
+                if isinstance(exc, RuntimeError):
+                    last_error = exc
+                continue
+
+        if last_error:
+            raise last_error
+        raise RuntimeError(
+            "No usable subscription credentials found. "
+            "Run `hermes auth add <provider>` to configure a provider."
         )
 
 
