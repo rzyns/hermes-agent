@@ -786,6 +786,7 @@ from gateway.raw_provider import (
 
 # Re-export the legacy string constants so callers that reach into the
 # api_server module namespace directly still find them.
+_RAW_MODEL_PREFIX = "raw/"  # must mirror gateway.raw_provider.RAW_MODEL_PREFIX
 _RAW_PROVIDER_UNAVAILABLE_MESSAGE = "Raw model provider is unavailable."
 _RAW_PROVIDER_UNSUPPORTED_MESSAGE = "Raw model provider is unsupported or not configured."
 _RAW_PROVIDER_ROUTE_UNSUPPORTED_MESSAGE = "Raw model provider does not expose chat completions."
