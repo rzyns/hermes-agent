@@ -599,6 +599,28 @@ def test_subscription_adapter_raw_chat_route_for_gpt_models(tmp_path, monkeypatc
     assert adapter.raw_chat_route_for_model("MiniMax-M2.7") is None
 
 
+def test_subscription_adapter_glm_model_routes_to_zai(tmp_path, monkeypatch):
+    """glm-* models must route to the zai provider, not MiniMax or Codex."""
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    (tmp_path / "auth.json").write_text(json.dumps({
+        "version": 1,
+        "providers": {
+            "openai-codex": {"tokens": {"access_token": "codex-token"}},
+            "minimax-oauth": {"tokens": {"access_token": "minimax-token"}},
+        },
+    }))
+
+    from hermes_cli.proxy.adapters.subscription import _provider_candidates_for_model
+
+    assert _provider_candidates_for_model("glm-5.2") == ["zai"]
+    assert _provider_candidates_for_model("glm-5") == ["zai"]
+    assert _provider_candidates_for_model("GLM-5.2") == ["zai"]
+
+    # glm-* does NOT use raw-chat routing (standard OpenAI-compatible endpoint)
+    adapter = SubscriptionProxyAdapter()
+    assert adapter.raw_chat_route_for_model("glm-5.2") is None
+
+
 def test_subscription_adapter_gpt_model_prefers_openai_codex(monkeypatch):
     class FakeClient:
         base_url = "https://chatgpt.com/backend-api/codex"

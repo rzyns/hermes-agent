@@ -145,6 +145,8 @@ def _provider_candidates_for_model(model: Optional[str]) -> list[str]:
         return ["openai-codex", "nous"]
     if bare.startswith("minimax"):
         return ["minimax-oauth"]
+    if bare.startswith("glm-"):
+        return ["zai"]
     return []
 
 
