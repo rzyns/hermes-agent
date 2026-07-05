@@ -73,7 +73,8 @@ class NousPortalAdapter(UpstreamAdapter):
             or (state.get("refresh_token") and state.get("access_token"))
         )
 
-    def get_credential(self) -> UpstreamCredential:
+    def get_credential(self, *, model: Optional[str] = None) -> UpstreamCredential:
+        _ = model
         return self._get_credential()
 
     def get_retry_credential(
@@ -81,8 +82,10 @@ class NousPortalAdapter(UpstreamAdapter):
         *,
         failed_credential: UpstreamCredential,
         status_code: int,
+        model: Optional[str] = None,
     ) -> Optional[UpstreamCredential]:
-        _ = failed_credential
+        _ = failed_credential, model
+        # Only retry JWT-like tokens on upstream 401. Agent keys are opaque;
         if status_code != 401:
             return None
         logger.info("proxy: Nous upstream rejected bearer; force-refreshing invoke JWT")

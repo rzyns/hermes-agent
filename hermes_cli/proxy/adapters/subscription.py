@@ -103,6 +103,62 @@ def _any_provider_has_credentials() -> bool:
         return False
 
 
+def _provider_has_credentials(provider_id: str) -> bool:
+    """Return True if a specific provider has stored credentials."""
+    try:
+        from hermes_cli.auth import _load_auth_store, _auth_store_lock
+        with _auth_store_lock():
+            store = _load_auth_store()
+        providers = store.get("providers") or {}
+        state = providers.get(provider_id)
+        if not isinstance(state, dict):
+            return False
+        return bool(
+            state.get("access_token")
+            or state.get("agent_key")
+            or state.get("tokens")
+        )
+    except Exception as exc:
+        logger.debug(
+            "subscription-proxy: could not check credentials for %r: %s",
+            provider_id,
+            exc,
+        )
+        return False
+
+
+def _bare_model_name(model: Optional[str]) -> str:
+    """Return a normalized model slug without provider prefix."""
+    if not isinstance(model, str):
+        return ""
+    return model.strip().lower().rsplit("/", 1)[-1]
+
+
+def _provider_candidates_for_model(model: Optional[str]) -> list[str]:
+    """Preferred provider order for a requested model family."""
+    bare = _bare_model_name(model)
+    if not bare:
+        return []
+    if bare == "gpt-5.5" or bare.startswith("gpt-"):
+        # OpenAI Codex OAuth only serves GPT-family models; do not let a
+        # MiniMax credential win simply because it appears first in auth.json.
+        return ["openai-codex", "nous"]
+    if bare.startswith("minimax"):
+        return ["minimax-oauth"]
+    return []
+
+
+def _raw_chat_route_for_model(model: Optional[str]) -> Optional[dict[str, str]]:
+    """Return a raw-provider chat route for models that need protocol translation."""
+    bare = _bare_model_name(model)
+    if bare == "gpt-5.5" or bare.startswith("gpt-"):
+        # The chatgpt.com Codex backend is Responses-only.  Hermes' shared raw
+        # provider handler wraps it with a Chat Completions-compatible surface.
+        if _provider_has_credentials("openai-codex"):
+            return {"provider": "openai-codex", "model": bare}
+    return None
+
+
 class SubscriptionProxyAdapter(UpstreamAdapter):
     """Proxy upstream that routes to the user's active subscription provider.
 
@@ -143,7 +199,11 @@ class SubscriptionProxyAdapter(UpstreamAdapter):
         # Auto-detect: if any provider has usable credentials, we're good.
         return _any_provider_has_credentials()
 
-    def get_credential(self) -> UpstreamCredential:
+    def get_credential(self, *, model: Optional[str] = None) -> UpstreamCredential:
+        preferred = _provider_candidates_for_model(model)
+        if preferred:
+            return self._credential_from_preferred_providers(preferred, model=model)
+
         # Try Nous Portal first — it has dedicated JWT refresh logic.
         if _is_nous_auth_available():
             with self._lock:
@@ -152,17 +212,22 @@ class SubscriptionProxyAdapter(UpstreamAdapter):
         active = _get_active_provider_id()
         if active:
             with self._lock:
-                return self._credential_from_active_provider(active)
+                return self._credential_from_active_provider(active, requested_model=model)
         # Fall back to auto-detection.
         with self._lock:
-            return self._credential_from_auto_detected_provider()
+            return self._credential_from_auto_detected_provider(model=model)
+
+    def raw_chat_route_for_model(self, model: Optional[str]) -> Optional[dict[str, str]]:
+        return _raw_chat_route_for_model(model)
 
     def get_retry_credential(
         self,
         *,
         failed_credential: UpstreamCredential,
         status_code: int,
+        model: Optional[str] = None,
     ) -> Optional[UpstreamCredential]:
+        _ = model
         # Only retry on 401 (auth expired); 429 must be handled by the
         # individual pool/rotation logic inside each provider's client.
         if status_code != 401:
@@ -236,8 +301,49 @@ class SubscriptionProxyAdapter(UpstreamAdapter):
             expires_at=refreshed.get("expires_at"),
         )
 
+    def _credential_from_preferred_providers(
+        self,
+        providers: list[str],
+        *,
+        model: Optional[str],
+    ) -> UpstreamCredential:
+        """Resolve credentials from model-specific provider candidates only."""
+        last_error: Optional[Exception] = None
+        for provider_id in providers:
+            try:
+                if provider_id == "nous":
+                    if not _is_nous_auth_available():
+                        continue
+                    with self._lock:
+                        return self._credential_from_nous()
+                with self._lock:
+                    return self._credential_from_active_provider(
+                        provider_id,
+                        requested_model=model,
+                    )
+            except Exception as exc:
+                last_error = exc
+                logger.debug(
+                    "subscription-proxy: model %r skipped provider %r: %s",
+                    model,
+                    provider_id,
+                    exc,
+                )
+                continue
+        if last_error is not None:
+            raise RuntimeError(
+                f"No usable provider found for requested model {model!r}. "
+                f"Last error: {last_error}"
+            ) from last_error
+        raise RuntimeError(
+            f"No configured provider is known to serve requested model {model!r}."
+        )
+
     def _credential_from_active_provider(
-        self, provider: Optional[str] = None
+        self,
+        provider: Optional[str] = None,
+        *,
+        requested_model: Optional[str] = None,
     ) -> UpstreamCredential:
         """Resolve credentials for an explicitly named (or active) provider.
 
@@ -255,7 +361,10 @@ class SubscriptionProxyAdapter(UpstreamAdapter):
             from agent.auxiliary_client import resolve_provider_client
 
             # Thread-safe resolution — returns (client, resolved_model).
-            client, _resolved_model = resolve_provider_client(active_provider)
+            client, _resolved_model = resolve_provider_client(
+                active_provider,
+                model=requested_model,
+            )
             if client is None:
                 raise RuntimeError(
                     f"Provider {active_provider!r} is not configured or not available. "
@@ -267,6 +376,7 @@ class SubscriptionProxyAdapter(UpstreamAdapter):
             ) from exc
 
         # Extract base URL and bearer from the client.
+        base_url = getattr(client, "base_url", None)
         # Note: AnthropicAuxiliaryClient exposes "https://api.minimax.io/anthropic"
         # as its base_url, but the actual OpenAI-compatible upstream path is
         # "https://api.minimax.io/v1" (it rewrites /anthropic → /v1 internally via
@@ -300,7 +410,11 @@ class SubscriptionProxyAdapter(UpstreamAdapter):
             expires_at=None,
         )
 
-    def _credential_from_auto_detected_provider(self) -> UpstreamCredential:
+    def _credential_from_auto_detected_provider(
+        self,
+        *,
+        model: Optional[str] = None,
+    ) -> UpstreamCredential:
         """Auto-detect the best available provider and return its credentials.
 
         Tries providers in order of preference (minimax-oauth, openai-codex,
@@ -308,40 +422,26 @@ class SubscriptionProxyAdapter(UpstreamAdapter):
         that succeeds. This handles the case where no provider is explicitly
         set as active but valid credentials exist in the auth store.
         """
-        # Order matters — prefer providers with OpenAI-compatible surfaces.
-        candidates = ["minimax-oauth", "openai-codex"]
+        # Order matters.  Model-specific candidates are handled first so a
+        # gpt-* request does not get sent to MiniMax just because MiniMax has
+        # valid credentials.
+        candidates = _provider_candidates_for_model(model) or [
+            "minimax-oauth",
+            "openai-codex",
+        ]
 
         last_error: Optional[RuntimeError] = None
         for provider_id in candidates:
             try:
-                from agent.auxiliary_client import resolve_provider_client
-
-                client, _resolved_model = resolve_provider_client(provider_id)
-                if client is None:
-                    continue
-
-                base_url = getattr(client, "base_url", None)
-                if base_url is not None:
-                    base_url = _rewrite_anthropic_base_url(str(base_url).rstrip("/"))
-                if not base_url:
-                    continue
-
-                api_key = getattr(client, "api_key", None)
-                if api_key is None:
-                    continue
-                bearer = str(api_key).strip()
-                if not bearer:
-                    continue
-
+                cred = self._credential_from_active_provider(
+                    provider_id,
+                    requested_model=model,
+                )
                 logger.info(
                     "subscription-proxy: auto-detected provider %r for proxy",
                     provider_id,
                 )
-                return UpstreamCredential(
-                    bearer=bearer,
-                    base_url=base_url,
-                    expires_at=None,
-                )
+                return cred
             except Exception as exc:
                 logger.debug(
                     "subscription-proxy: auto-detect skipped %r: %s",

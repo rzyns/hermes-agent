@@ -614,13 +614,11 @@ _ANTHROPIC_DEFAULT_BASE_URL = "https://api.anthropic.com"
 _AUTH_JSON_PATH = get_hermes_home() / "auth.json"
 
 # Codex OAuth endpoint used when a caller explicitly requests
-# provider="openai-codex".  There is deliberately no hardcoded default
-# model: the set of models OpenAI accepts on this endpoint for
-# ChatGPT-account auth is an undocumented, shifting allow-list, and
-# pinning one here has drifted silently twice (gpt-5.3-codex → gpt-5.2-codex
-# → gpt-5.4 over 6 weeks in early 2026).  Callers must pass the model
-# they want explicitly (from config.yaml model.model, auxiliary.<task>.model,
-# or the user's active Codex model selection).
+# provider="openai-codex".  The provider profile carries the current
+# default model (gpt-5.5).  Keep that default in sync with the
+# ChatGPT-account allow-list and the _is_codex_gpt55() family helper below;
+# older hardcoded defaults drifted silently twice (gpt-5.3-codex →
+# gpt-5.2-codex → gpt-5.4 over 6 weeks in early 2026).
 _CODEX_AUX_BASE_URL = "https://chatgpt.com/backend-api/codex"
 
 

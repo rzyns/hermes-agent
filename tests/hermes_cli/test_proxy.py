@@ -14,6 +14,7 @@ import pytest
 from hermes_cli.proxy.adapters import ADAPTERS, get_adapter
 from hermes_cli.proxy.adapters.base import UpstreamAdapter, UpstreamCredential
 from hermes_cli.proxy.adapters.nous_portal import NousPortalAdapter
+from hermes_cli.proxy.adapters.subscription import SubscriptionProxyAdapter
 from hermes_cli.proxy.adapters.xai import XAIGrokAdapter
 
 
@@ -565,6 +566,59 @@ def test_xai_adapter_retry_returns_none_for_unrelated_status(tmp_path, monkeypat
 
 
 # ---------------------------------------------------------------------------
+# SubscriptionProxyAdapter
+# ---------------------------------------------------------------------------
+
+
+def test_subscription_adapter_default_codex_model_is_gpt55():
+    from agent.auxiliary_client import _get_aux_model_for_provider
+
+    assert _get_aux_model_for_provider("openai-codex") == "gpt-5.5"
+
+
+def test_subscription_adapter_raw_chat_route_for_gpt_models(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    (tmp_path / "auth.json").write_text(json.dumps({
+        "version": 1,
+        "providers": {
+            "openai-codex": {"tokens": {"access_token": "codex-token"}},
+            "minimax-oauth": {"tokens": {"access_token": "minimax-token"}},
+        },
+    }))
+
+    adapter = SubscriptionProxyAdapter()
+
+    assert adapter.raw_chat_route_for_model("gpt-5.5") == {
+        "provider": "openai-codex",
+        "model": "gpt-5.5",
+    }
+    assert adapter.raw_chat_route_for_model("openai/gpt-5.5-pro") == {
+        "provider": "openai-codex",
+        "model": "gpt-5.5-pro",
+    }
+    assert adapter.raw_chat_route_for_model("MiniMax-M2.7") is None
+
+
+def test_subscription_adapter_gpt_model_prefers_openai_codex(monkeypatch):
+    class FakeClient:
+        base_url = "https://chatgpt.com/backend-api/codex"
+        api_key = "codex-token"
+
+    with patch(
+        "hermes_cli.proxy.adapters.subscription._is_nous_auth_available",
+        return_value=False,
+    ), patch(
+        "agent.auxiliary_client.resolve_provider_client",
+        return_value=(FakeClient(), "gpt-5.5"),
+    ) as mock_resolve:
+        cred = SubscriptionProxyAdapter().get_credential(model="gpt-5.5")
+
+    mock_resolve.assert_called_once_with("openai-codex", model="gpt-5.5")
+    assert cred.bearer == "codex-token"
+    assert cred.base_url == "https://chatgpt.com/backend-api/codex"
+
+
+# ---------------------------------------------------------------------------
 # Server: path filtering + forwarding
 #
 # We run the proxy AND a fake upstream as real aiohttp servers on ephemeral
@@ -590,6 +644,8 @@ class FakeAdapter(UpstreamAdapter):
         self._retry_bearer = retry_bearer
         self.calls = 0
         self.retry_calls = 0
+        self.model_hints = []
+        self.retry_model_hints = []
 
     @property
     def name(self): return "fake"
@@ -602,8 +658,9 @@ class FakeAdapter(UpstreamAdapter):
 
     def is_authenticated(self): return True
 
-    def get_credential(self):
+    def get_credential(self, *, model=None):
         self.calls += 1
+        self.model_hints.append(model)
         if self._raise:
             raise RuntimeError("simulated auth failure")
         return UpstreamCredential(
@@ -611,9 +668,10 @@ class FakeAdapter(UpstreamAdapter):
             expires_at="2099-01-01T00:00:00Z",
         )
 
-    def get_retry_credential(self, *, failed_credential, status_code):
+    def get_retry_credential(self, *, failed_credential, status_code, model=None):
         _ = failed_credential
         self.retry_calls += 1
+        self.retry_model_hints.append(model)
         if status_code != 401 or not self._retry_bearer:
             return None
         return UpstreamCredential(
@@ -621,6 +679,19 @@ class FakeAdapter(UpstreamAdapter):
             base_url=self._base_url,
             expires_at="2099-01-01T00:00:00Z",
         )
+
+
+class RawRouteAdapter(FakeAdapter):
+    """Fake adapter that delegates a model family to raw-provider chat."""
+
+    def __init__(self, base_url: str, *, route: dict[str, str]):
+        super().__init__(base_url)
+        self._route = route
+        self.raw_route_model_hints = []
+
+    def raw_chat_route_for_model(self, model):
+        self.raw_route_model_hints.append(model)
+        return self._route
 
 
 async def _start_runner(app: "web.Application"):
@@ -701,12 +772,61 @@ def test_server_forwards_chat_completions():
                     assert data["echoed"] is True
 
             assert len(captured["requests"]) == 1
+            assert adapter.model_hints == ["Hermes-4-70B"]
             req = captured["requests"][0]
             assert req["auth"] == "Bearer real-portal-key"
             assert "Hermes-4-70B" in req["body"]
         finally:
             await proxy_runner.cleanup()
             await upstream_runner.cleanup()
+
+    asyncio.run(run())
+
+
+def test_server_delegates_raw_chat_route_before_upstream_passthrough():
+    async def run():
+        captured: Dict[str, Any] = {}
+        adapter = RawRouteAdapter(
+            "http://unused.example/v1",
+            route={"provider": "openai-codex", "model": "gpt-5.5"},
+        )
+        proxy_runner, proxy_base = await _start_runner(create_app(adapter))
+
+        async def fake_raw_handler(request, body, route, *, cors_headers=None):
+            captured["body"] = body
+            captured["route"] = route
+            captured["cors_headers"] = cors_headers
+            captured["idempotency_key"] = request.headers.get("Idempotency-Key")
+            return web.json_response({"ok": True, "route": route})
+
+        try:
+            with patch(
+                "gateway.raw_provider.handle_raw_chat_completions",
+                side_effect=fake_raw_handler,
+            ):
+                async with aiohttp.ClientSession() as session:
+                    async with session.post(
+                        f"{proxy_base}/v1/chat/completions",
+                        json={
+                            "model": "gpt-5.5",
+                            "messages": [{"role": "user", "content": "hi"}],
+                        },
+                        headers={"Idempotency-Key": "idem-123"},
+                    ) as resp:
+                        assert resp.status == 200
+                        data = await resp.json()
+                        assert data["route"] == {
+                            "provider": "openai-codex",
+                            "model": "gpt-5.5",
+                        }
+
+            assert adapter.calls == 0
+            assert adapter.raw_route_model_hints == ["gpt-5.5"]
+            assert captured["body"]["model"] == "gpt-5.5"
+            assert captured["route"] == {"provider": "openai-codex", "model": "gpt-5.5"}
+            assert captured["idempotency_key"] == "idem-123"
+        finally:
+            await proxy_runner.cleanup()
 
     asyncio.run(run())
 
@@ -735,6 +855,8 @@ def test_server_retries_once_with_adapter_retry_credential_on_401():
                     assert data["ok"] is True
 
             assert adapter.retry_calls == 1
+            assert adapter.model_hints == ["Hermes-4-70B"]
+            assert adapter.retry_model_hints == ["Hermes-4-70B"]
             assert [req["auth"] for req in captured["requests"]] == [
                 "Bearer jwt-bearer",
                 "Bearer legacy-bearer",

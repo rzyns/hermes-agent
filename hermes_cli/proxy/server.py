@@ -12,9 +12,10 @@ or rewrite request/response bodies. It's a credential-attaching forwarder.
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import signal
-from typing import Optional
+from typing import Any, Optional
 
 try:
     import aiohttp
@@ -81,6 +82,27 @@ def _filter_response_headers(headers) -> dict:
     return out
 
 
+def _extract_json_body_model(body: bytes) -> tuple[Optional[str], Optional[dict[str, Any]]]:
+    """Return (model, parsed-object) for OpenAI JSON request bodies.
+
+    Invalid JSON, non-object JSON, or non-string ``model`` values simply return
+    ``(None, None)`` so the proxy can preserve its historical passthrough
+    behavior and let the upstream validate the original body.
+    """
+    if not body:
+        return None, None
+    try:
+        parsed = json.loads(body.decode("utf-8"))
+    except Exception:
+        return None, None
+    if not isinstance(parsed, dict):
+        return None, None
+    model = parsed.get("model")
+    if isinstance(model, str) and model.strip():
+        return model.strip(), parsed
+    return None, parsed
+
+
 def create_app(adapter: UpstreamAdapter) -> "web.Application":
     """Build the aiohttp application bound to a specific upstream adapter."""
     if not AIOHTTP_AVAILABLE:
@@ -118,17 +140,37 @@ def create_app(adapter: UpstreamAdapter) -> "web.Application":
                 code="path_not_allowed",
             )
 
+        # Forward body verbatim for normal upstreams. Read into memory once —
+        # request bodies for chat/completions/embeddings are small (<1MB
+        # typically). If we ever need to forward large multipart uploads we'll
+        # switch to streaming the request body too.
+        body = await request.read()
+        model_hint, parsed_body = _extract_json_body_model(body)
+
+        if rel_path == "/chat/completions" and parsed_body is not None:
+            raw_route = adapter.raw_chat_route_for_model(model_hint)
+            if raw_route is not None:
+                try:
+                    from gateway.raw_provider import handle_raw_chat_completions
+
+                    return await handle_raw_chat_completions(
+                        request,
+                        parsed_body,
+                        raw_route,
+                    )
+                except Exception as exc:
+                    logger.warning("proxy: raw chat route failed: %s", exc)
+                    return _json_error(
+                        502,
+                        "raw chat route failed",
+                        code="raw_route_failed",
+                    )
+
         try:
-            cred = adapter.get_credential()
+            cred = adapter.get_credential(model=model_hint)
         except Exception as exc:
             logger.warning("proxy: credential resolution failed: %s", exc)
             return _json_error(401, str(exc), code="upstream_auth_failed")
-
-        # Forward body verbatim. Read into memory once — request bodies for
-        # chat/completions/embeddings are small (<1MB typically). If we ever
-        # need to forward large multipart uploads we'll switch to streaming
-        # the request body too.
-        body = await request.read()
 
         timeout = aiohttp.ClientTimeout(total=None, sock_connect=15, sock_read=300)
 
@@ -199,6 +241,7 @@ def create_app(adapter: UpstreamAdapter) -> "web.Application":
                 retry_cred = adapter.get_retry_credential(
                     failed_credential=cred,
                     status_code=upstream_resp.status,
+                    model=model_hint,
                 )
             except Exception as exc:
                 logger.warning("proxy: retry credential resolution failed: %s", exc)

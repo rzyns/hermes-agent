@@ -53,7 +53,8 @@ class XAIGrokAdapter(UpstreamAdapter):
         pool = self._load_pool()
         return bool(pool and pool.has_available())
 
-    def get_credential(self) -> UpstreamCredential:
+    def get_credential(self, *, model: Optional[str] = None) -> UpstreamCredential:
+        _ = model
         with self._lock:
             pool = self._load_pool()
             if pool is None or not pool.has_credentials():
@@ -78,7 +79,9 @@ class XAIGrokAdapter(UpstreamAdapter):
         *,
         failed_credential: UpstreamCredential,
         status_code: int,
+        model: Optional[str] = None,
     ) -> Optional[UpstreamCredential]:
+        _ = model
         if status_code not in {401, 429}:
             return None
 

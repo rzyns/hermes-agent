@@ -68,7 +68,7 @@ class UpstreamAdapter(ABC):
         """
 
     @abstractmethod
-    def get_credential(self) -> UpstreamCredential:
+    def get_credential(self, *, model: Optional[str] = None) -> UpstreamCredential:
         """Return a fresh credential, refreshing or rotating if necessary.
 
         Implementations should:
@@ -86,13 +86,26 @@ class UpstreamAdapter(ABC):
         *,
         failed_credential: UpstreamCredential,
         status_code: int,
+        model: Optional[str] = None,
     ) -> Optional[UpstreamCredential]:
         """Return an alternate credential after an upstream auth failure.
 
         The default is no retry. Providers can override this for one-shot
         fallback paths after the upstream rejects the first request.
         """
-        _ = failed_credential, status_code
+        _ = failed_credential, status_code, model
+        return None
+
+    def raw_chat_route_for_model(self, model: Optional[str]) -> Optional[dict[str, str]]:
+        """Return a raw-provider route for chat-completions, if needed.
+
+        Most upstreams expose ``/chat/completions`` directly and return ``None``.
+        Adapters for subscription/provider pools can override this to route a
+        model family through Hermes' raw-provider compatibility layer when the
+        upstream uses a different wire protocol (for example OpenAI Codex's
+        Responses API backend for ``gpt-*`` models).
+        """
+        _ = model
         return None
 
     def describe(self) -> str:
