@@ -1028,6 +1028,10 @@ def build_assistant_message(agent, assistant_message, finish_reason: str) -> dic
     if ordered_blocks:
         msg["anthropic_content_blocks"] = ordered_blocks
 
+    provider_warnings = getattr(assistant_message, "provider_warnings", None)
+    if provider_warnings:
+        msg["provider_warnings"] = provider_warnings
+
     # Codex Responses API: preserve encrypted reasoning items for
     # multi-turn continuity. These get replayed as input on the next turn.
     codex_items = getattr(assistant_message, "codex_reasoning_items", None)

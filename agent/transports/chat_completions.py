@@ -669,6 +669,13 @@ class ChatCompletionsTransport(ProviderTransport):
         rd = getattr(msg, "reasoning_details", None)
         if rd:
             provider_data["reasoning_details"] = rd
+        provider_warnings = getattr(msg, "provider_warnings", None)
+        if provider_warnings is None and hasattr(msg, "model_extra"):
+            model_extra = getattr(msg, "model_extra", None) or {}
+            if isinstance(model_extra, dict):
+                provider_warnings = model_extra.get("provider_warnings")
+        if provider_warnings:
+            provider_data["provider_warnings"] = provider_warnings
 
         # OpenAI structured-refusal field. When a model declines, the SDK
         # populates ``message.refusal`` with the explanation and leaves
