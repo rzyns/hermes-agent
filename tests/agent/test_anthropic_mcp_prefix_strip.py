@@ -98,6 +98,26 @@ class TestAnthropicMcpPrefixStrip:
         assert len(result.tool_calls) == 1
         assert result.tool_calls[0].name == "mcp_linear_get_issue"
 
+    def test_restores_reserved_native_namespace_for_collision(self):
+        """``mcp__hermes__honcho_search`` -> bare native ``honcho_search``.
+
+        A native Hermes tool named ``honcho_search`` and an MCP server tool named
+        ``mcp_honcho_search`` both map to ``mcp__honcho_search`` under the normal
+        OAuth prefix rule. The request side moves only the bare native tool into
+        the reserved native namespace so Anthropic sees unique tool names; the
+        response side must strip that namespace back to the dispatcher name.
+        """
+        transport = self._get_transport()
+        block = _make_tool_use_block("mcp__hermes__honcho_search")
+        response = _make_response(block)
+
+        registry = _FakeRegistry({"honcho_search", "mcp_honcho_search"})
+        with patch("tools.registry.registry", registry):
+            result = transport.normalize_response(response, strip_tool_prefix=True)
+
+        assert len(result.tool_calls) == 1
+        assert result.tool_calls[0].name == "honcho_search"
+
     def test_no_strip_when_flag_false(self):
         """When strip_tool_prefix=False, names are never modified."""
         transport = self._get_transport()
@@ -240,6 +260,25 @@ class TestAnthropicOAuthOutgoingPrefix:
         names = sorted(t["name"] for t in kwargs["tools"])
         assert names == ["mcp__linear_get_issue", "mcp__read_file", "mcp__terminal"]
         # The core invariant: NOTHING single-underscore reaches the wire.
+        for n in names:
+            assert not (n.startswith("mcp_") and not n.startswith("mcp__"))
+
+    def test_oauth_disambiguates_native_tool_colliding_with_mcp_tool(self):
+        """Post-prefix names must remain unique for native/MCP collisions.
+
+        Regression for Anthropic HTTP 400 "tools: Tool names must be unique":
+        ``honcho_search`` and ``mcp_honcho_search`` would otherwise both become
+        ``mcp__honcho_search`` after the OAuth rewrite.
+        """
+        kwargs = self._build([
+            {"type": "function", "function": {"name": "honcho_search",
+                                              "description": "native", "parameters": {}}},
+            {"type": "function", "function": {"name": "mcp_honcho_search",
+                                              "description": "mcp", "parameters": {}}},
+        ])
+        names = sorted(t["name"] for t in kwargs["tools"])
+        assert names == ["mcp__hermes__honcho_search", "mcp__honcho_search"]
+        assert len(names) == len(set(names))
         for n in names:
             assert not (n.startswith("mcp_") and not n.startswith("mcp__"))
 

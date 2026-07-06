@@ -373,6 +373,7 @@ def _detect_claude_code_version() -> str:
 
 _CLAUDE_CODE_SYSTEM_PREFIX = "You are Claude Code, Anthropic's official CLI for Claude."
 _MCP_TOOL_PREFIX = "mcp__"
+_MCP_HERMES_NATIVE_TOOL_PREFIX = "mcp__hermes__"
 
 
 def _get_claude_code_version() -> str:
@@ -2554,7 +2555,7 @@ def build_anthropic_kwargs(
         #    (verified empirically: a single ``mcp_foo`` tool flips a request
         #    from plan-billing to the extra-usage lane; ``mcp__foo`` is accepted).
         #
-        #    Two cases, both must land on the double-underscore ``mcp__`` form:
+        #    Two common cases land on the double-underscore ``mcp__`` form:
         #      a) bare Hermes-native tools (``read_file``)  -> ``mcp__read_file``
         #      b) native MCP server tools registered under their full
         #         single-underscore ``mcp_<server>_<tool>`` name
@@ -2564,7 +2565,45 @@ def build_anthropic_kwargs(
         #    so any session with an MCP server configured still tripped the
         #    classifier. normalize_response reverses both forms via registry
         #    lookup so the dispatcher still sees the original name. GH-25255.
+        #
+        #    The normal map is not injective: a bare native tool named
+        #    ``honcho_search`` and an MCP server tool named ``mcp_honcho_search``
+        #    both become ``mcp__honcho_search``. Anthropic validates uniqueness
+        #    *after* this OAuth rewrite and rejects the request with HTTP 400
+        #    "tools: Tool names must be unique."  When such a collision is
+        #    present, put the bare Hermes-native tool under a reserved native
+        #    namespace (``mcp__hermes__honcho_search``) and leave the MCP tool at
+        #    ``mcp__honcho_search``. The response normalizer strips that reserved
+        #    namespace before registry dispatch.
+        tool_names: set[str] = set()
+        for tool in anthropic_tools or []:
+            if isinstance(tool, dict):
+                tool_name = tool.get("name")
+                if isinstance(tool_name, str):
+                    tool_names.add(tool_name)
+
+        def _default_oauth_wire_name(name: str) -> str:
+            if name.startswith("mcp__"):
+                return name  # already correct, don't double-prefix
+            if name.startswith("mcp_"):
+                # single-underscore native MCP tool -> promote to double
+                return "mcp__" + name[len("mcp_"):]
+            return _MCP_TOOL_PREFIX + name  # bare name -> mcp__<name>
+
+        default_wire_to_names: Dict[str, set[str]] = {}
+        for name in tool_names:
+            default_wire_to_names.setdefault(_default_oauth_wire_name(name), set()).add(name)
+        colliding_native_tool_names = {
+            name
+            for originals in default_wire_to_names.values()
+            if len(originals) > 1
+            for name in originals
+            if not name.startswith("mcp_")
+        }
+
         def _to_oauth_wire_name(name: str) -> str:
+            if name in colliding_native_tool_names:
+                return _MCP_HERMES_NATIVE_TOOL_PREFIX + name
             if name.startswith("mcp__"):
                 return name  # already correct, don't double-prefix
             if name.startswith("mcp_"):

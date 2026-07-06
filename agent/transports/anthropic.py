@@ -84,7 +84,11 @@ class AnthropicTransport(ProviderTransport):
         to OpenAI finish_reason, and collects reasoning_details in provider_data.
         """
         import json
-        from agent.anthropic_adapter import _to_plain_data, _sanitize_replay_block
+        from agent.anthropic_adapter import (
+            _MCP_HERMES_NATIVE_TOOL_PREFIX,
+            _to_plain_data,
+            _sanitize_replay_block,
+        )
         from agent.transports.types import ToolCall
 
         strip_tool_prefix = kwargs.get("strip_tool_prefix", False)
@@ -136,6 +140,9 @@ class AnthropicTransport(ProviderTransport):
                     # ``mcp__`` prefix (added in build_anthropic_kwargs to avoid
                     # Anthropic's single-underscore third-party classifier).
                     # Reverse it back to the name the registry/dispatcher knows.
+                    # Colliding bare-native names are sent through the reserved
+                    # ``mcp__hermes__`` namespace so they do not collide with an
+                    # MCP server tool of the same post-prefix name.
                     # Two original forms map onto the same ``mcp__`` wire name:
                     #   ``mcp__read_file``       <- bare native tool ``read_file``
                     #   ``mcp__linear_get_issue`` <- MCP server tool
@@ -144,7 +151,9 @@ class AnthropicTransport(ProviderTransport):
                     # is actually registered; never rewrite a name the LLM used
                     # that already resolves natively. GH-25255.
                     from tools.registry import registry as _tool_registry
-                    if not _tool_registry.get_entry(name):
+                    if name.startswith(_MCP_HERMES_NATIVE_TOOL_PREFIX):
+                        name = name[len(_MCP_HERMES_NATIVE_TOOL_PREFIX):]
+                    elif not _tool_registry.get_entry(name):
                         bare = name[len(_MCP_PREFIX):]            # read_file
                         single = "mcp_" + bare                    # mcp_read_file / mcp_linear_get_issue
                         if _tool_registry.get_entry(single):
