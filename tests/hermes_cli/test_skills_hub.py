@@ -35,6 +35,28 @@ def hub_env(monkeypatch, tmp_path):
     return hub_dir
 
 
+def test_resolve_install_target_uses_dynamic_skills_dir_without_module_constant(monkeypatch, tmp_path):
+    """Regression for installs after skills_hub path constants became dynamic.
+
+    PEP 562 ``__getattr__`` helps external ``from tools.skills_hub import
+    SKILLS_DIR`` callers, but unqualified ``SKILLS_DIR`` inside this module is
+    still a normal global lookup. The install path resolver must use the
+    per-call helper directly so a fresh process with no monkeypatched module
+    constant can install skills.
+    """
+    import tools.skills_hub as hub
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
+    monkeypatch.delitem(hub.__dict__, "SKILLS_DIR", raising=False)
+
+    target = hub._resolve_install_target_path(
+        "research/long-research",
+        "long-research",
+    )
+
+    assert target == tmp_path / ".hermes" / "skills" / "research" / "long-research"
+
+
 # ---------------------------------------------------------------------------
 # Fixtures for common skill setups
 # ---------------------------------------------------------------------------

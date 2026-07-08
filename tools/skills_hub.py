@@ -272,9 +272,10 @@ def _resolve_install_target_path(install_path: str, skill_name: str) -> Path:
     """
     normalized = _normalize_lock_install_path(install_path, skill_name)
     parts = normalized.split("/")
-    skills_root = SKILLS_DIR.resolve()
+    skills_dir = _skills_dir()
+    skills_root = skills_dir.resolve()
 
-    parent = SKILLS_DIR
+    parent = skills_dir
     for part in parts[:-1]:
         parent = parent / part
         if _is_path_redirect(parent):
