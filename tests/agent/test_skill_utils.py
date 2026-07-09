@@ -14,6 +14,7 @@ from agent.skill_utils import (
     iter_skill_index_files,
     resolve_skill_config_values,
     skill_matches_platform,
+    skill_matches_platform_list,
 )
 
 
@@ -268,6 +269,7 @@ class TestSkillMatchesPlatformTermux:
             "agent.skill_utils.is_termux", return_value=True
         ):
             assert skill_matches_platform(fm) is True
+            assert skill_matches_platform_list(fm["platforms"]) is True
 
     def test_linux_macos_windows_skill_loads_on_termux(self):
         # The common "[linux, macos, windows]" tag used by github-*,
@@ -277,6 +279,7 @@ class TestSkillMatchesPlatformTermux:
             "agent.skill_utils.is_termux", return_value=True
         ):
             assert skill_matches_platform(fm) is True
+            assert skill_matches_platform_list(fm["platforms"]) is True
 
     def test_linux_skill_loads_on_termux_linux_platform(self):
         # Pre-3.13 Termux reports sys.platform == "linux" already — this
@@ -286,6 +289,7 @@ class TestSkillMatchesPlatformTermux:
             "agent.skill_utils.is_termux", return_value=True
         ):
             assert skill_matches_platform(fm) is True
+            assert skill_matches_platform_list(fm["platforms"]) is True
 
     def test_macos_only_skill_still_excluded_on_termux(self):
         # macOS-only skills (apple-notes, imessage, ...) should NOT load
@@ -295,6 +299,7 @@ class TestSkillMatchesPlatformTermux:
             "agent.skill_utils.is_termux", return_value=True
         ):
             assert skill_matches_platform(fm) is False
+            assert skill_matches_platform_list(fm["platforms"]) is False
 
     def test_windows_only_skill_still_excluded_on_termux(self):
         fm = {"platforms": ["windows"]}
@@ -302,6 +307,7 @@ class TestSkillMatchesPlatformTermux:
             "agent.skill_utils.is_termux", return_value=True
         ):
             assert skill_matches_platform(fm) is False
+            assert skill_matches_platform_list(fm["platforms"]) is False
 
     def test_explicit_termux_or_android_tag_matches(self):
         # Skills can also opt in explicitly via platforms:[termux] or
@@ -311,6 +317,8 @@ class TestSkillMatchesPlatformTermux:
         ):
             assert skill_matches_platform({"platforms": ["termux"]}) is True
             assert skill_matches_platform({"platforms": ["android"]}) is True
+            assert skill_matches_platform_list(["termux"]) is True
+            assert skill_matches_platform_list(["android"]) is True
 
     def test_non_termux_android_does_not_widen(self):
         # If we're somehow on a plain Android Python (not Termux), don't
@@ -320,6 +328,7 @@ class TestSkillMatchesPlatformTermux:
             "agent.skill_utils.is_termux", return_value=False
         ):
             assert skill_matches_platform(fm) is False
+            assert skill_matches_platform_list(fm["platforms"]) is False
 
     def test_linux_skill_on_real_linux_unaffected(self):
         # The non-Termux Linux path must not change.
@@ -328,6 +337,7 @@ class TestSkillMatchesPlatformTermux:
             "agent.skill_utils.is_termux", return_value=False
         ):
             assert skill_matches_platform(fm) is True
+            assert skill_matches_platform_list(fm["platforms"]) is True
 
     def test_macos_skill_on_real_macos_unaffected(self):
         fm = {"platforms": ["macos"]}
@@ -335,6 +345,7 @@ class TestSkillMatchesPlatformTermux:
             "agent.skill_utils.is_termux", return_value=False
         ):
             assert skill_matches_platform(fm) is True
+            assert skill_matches_platform_list(fm["platforms"]) is True
 
 
 class TestNormalizeSkillLookupName:

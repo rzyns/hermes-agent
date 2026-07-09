@@ -58,6 +58,10 @@ from gateway.platforms.base import (
     MessageType,
     SendResult,
 )
+from gateway.platforms.webhook_filters import (
+    DEFAULT_SCRIPT_TIMEOUT_SECONDS,
+    WebhookRouteProcessor,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -172,6 +176,15 @@ class WebhookAdapter(BasePlatformAdapter):
         self._max_body_bytes: int = int(
             config.extra.get("max_body_bytes", 1_048_576)
         )  # 1MB
+        self._script_timeout_seconds: int = int(
+            config.extra.get(
+                "script_timeout_seconds",
+                DEFAULT_SCRIPT_TIMEOUT_SECONDS,
+            )
+        )
+        self._route_processor = WebhookRouteProcessor(
+            script_timeout_seconds=self._script_timeout_seconds
+        )
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -805,6 +818,45 @@ class WebhookAdapter(BasePlatformAdapter):
             return web.json_response(
                 {"status": "ignored", "event": event_type}
             )
+
+        if not self._route_processor.route_filters_match(
+            route_config, payload, event_type, request.headers
+        ):
+            logger.info(
+                "[webhook] filtered event=%s route=%s",
+                event_type,
+                route_name,
+            )
+            return web.json_response(
+                {
+                    "status": "ignored",
+                    "reason": "filter",
+                    "route": route_name,
+                }
+            )
+
+        if route_config.get("script"):
+            # run_route_script shells out (subprocess.run, up to its timeout);
+            # run it in a worker thread so it can't block the gateway event loop.
+            keep, transformed_payload = await asyncio.to_thread(
+                self._route_processor.run_route_script,
+                route_config.get("script"),
+                payload,
+            )
+            if not keep:
+                logger.info(
+                    "[webhook] script ignored event=%s route=%s",
+                    event_type,
+                    route_name,
+                )
+                return web.json_response(
+                    {
+                        "status": "ignored",
+                        "reason": "script",
+                        "route": route_name,
+                    }
+                )
+            payload = transformed_payload or payload
 
         # Format prompt from template
         prompt_template = route_config.get("prompt", "")
