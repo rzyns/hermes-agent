@@ -3883,6 +3883,38 @@ class TestCompressionChainProjection:
         assert tip_row["_lineage_root_id"] == "root1"
         assert tip_row["cwd"] == "/tmp/workspaces/tip"
 
+    def test_list_projection_falls_back_to_nearest_workspace_metadata(self, db):
+        """Null tip fields inherit independently from the nearest ancestor.
+
+        Historical rotation rows can lack workspace metadata. A later segment
+        may also have changed one field without changing the others, so each
+        projected field must walk back independently rather than copying only
+        the root row as one all-or-nothing record.
+        """
+        import time as _time
+
+        self._build_compression_chain(db, _time.time() - 3600)
+        db.update_session_cwd(
+            "root1",
+            "/work/root",
+            git_branch="main",
+            git_repo_root="/work/repo",
+        )
+        db.update_session_cwd("mid1", "/work/repo/feature", git_branch="feature")
+        db._conn.execute(
+            "UPDATE sessions SET git_repo_root = NULL WHERE id = ?",
+            ("mid1",),
+        )
+        db._conn.commit()
+
+        sessions = db.list_sessions_rich(source="cli", limit=20)
+        tip_row = next(s for s in sessions if s["id"] == "tip1")
+
+        assert tip_row["_lineage_root_id"] == "root1"
+        assert tip_row["cwd"] == "/work/repo/feature"
+        assert tip_row["git_branch"] == "feature"
+        assert tip_row["git_repo_root"] == "/work/repo"
+
     def test_list_without_projection_returns_raw_root(self, db):
         """project_compression_tips=False returns the raw parent-NULL root
         rows — useful for admin/debug UIs.

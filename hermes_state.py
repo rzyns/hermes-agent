@@ -1609,6 +1609,8 @@ class SessionDB:
         thread_id: str = None,
         parent_session_id: str = None,
         cwd: str = None,
+        git_branch: str = None,
+        git_repo_root: str = None,
     ) -> None:
         """Insert a session row, enriching NULL metadata on conflict.
 
@@ -1632,9 +1634,10 @@ class SessionDB:
             conn.execute(
                 """INSERT INTO sessions (
                    id, source, user_id, session_key, chat_id, chat_type, thread_id,
-                   model, model_config, system_prompt, parent_session_id, cwd, started_at
+                   model, model_config, system_prompt, parent_session_id, cwd,
+                   git_branch, git_repo_root, started_at
                 )
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                    ON CONFLICT(id) DO UPDATE SET
                        model = COALESCE(sessions.model, excluded.model),
                        model_config = COALESCE(sessions.model_config, excluded.model_config),
@@ -1644,7 +1647,9 @@ class SessionDB:
                        chat_type = COALESCE(sessions.chat_type, excluded.chat_type),
                        thread_id = COALESCE(sessions.thread_id, excluded.thread_id),
                        parent_session_id = COALESCE(sessions.parent_session_id, excluded.parent_session_id),
-                       cwd = COALESCE(sessions.cwd, excluded.cwd)""",
+                       cwd = COALESCE(sessions.cwd, excluded.cwd),
+                       git_branch = COALESCE(sessions.git_branch, excluded.git_branch),
+                       git_repo_root = COALESCE(sessions.git_repo_root, excluded.git_repo_root)""",
                 (
                     session_id,
                     source,
@@ -1658,6 +1663,8 @@ class SessionDB:
                     system_prompt,
                     parent_session_id,
                     cwd,
+                    git_branch,
+                    git_repo_root,
                     time.time(),
                 ),
             )
@@ -2592,6 +2599,44 @@ class SessionDB:
             row = cursor.fetchone()
         return dict(row) if row else None
 
+    def _get_nearest_lineage_workspace_metadata(self, session_id: str) -> Dict[str, Any]:
+        """Return each workspace field from its nearest non-empty ancestor.
+
+        Compression continuations created before workspace inheritance was
+        added can have partially-null metadata. Resolve fields independently so
+        a legitimate value on the live tip remains authoritative while only
+        missing values fall back through the parent chain.
+        """
+        with self._lock:
+            row = self._conn.execute(
+                """
+                WITH RECURSIVE lineage(
+                    id, parent_session_id, cwd, git_branch, git_repo_root, depth
+                ) AS (
+                    SELECT id, parent_session_id, cwd, git_branch, git_repo_root, 0
+                    FROM sessions WHERE id = ?
+                    UNION ALL
+                    SELECT s.id, s.parent_session_id, s.cwd, s.git_branch,
+                           s.git_repo_root, lineage.depth + 1
+                    FROM sessions s
+                    JOIN lineage ON s.id = lineage.parent_session_id
+                    WHERE lineage.depth < 100
+                )
+                SELECT
+                    (SELECT cwd FROM lineage
+                     WHERE NULLIF(TRIM(cwd), '') IS NOT NULL
+                     ORDER BY depth LIMIT 1) AS cwd,
+                    (SELECT git_branch FROM lineage
+                     WHERE NULLIF(TRIM(git_branch), '') IS NOT NULL
+                     ORDER BY depth LIMIT 1) AS git_branch,
+                    (SELECT git_repo_root FROM lineage
+                     WHERE NULLIF(TRIM(git_repo_root), '') IS NOT NULL
+                     ORDER BY depth LIMIT 1) AS git_repo_root
+                """,
+                (session_id,),
+            ).fetchone()
+        return dict(row) if row else {}
+
     def resolve_session_id(self, session_id_or_prefix: str) -> Optional[str]:
         """Resolve an exact or uniquely prefixed session ID to the full ID.
 
@@ -3281,6 +3326,12 @@ class SessionDB:
                 ):
                     if key in tip_row:
                         merged[key] = tip_row[key]
+                workspace_keys = ("cwd", "git_branch", "git_repo_root")
+                if any(not merged.get(key) for key in workspace_keys):
+                    inherited = self._get_nearest_lineage_workspace_metadata(tip_id)
+                    for key in workspace_keys:
+                        if not merged.get(key) and inherited.get(key):
+                            merged[key] = inherited[key]
                 merged["_lineage_root_id"] = s["id"]
                 projected.append(merged)
             sessions = projected
