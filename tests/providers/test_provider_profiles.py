@@ -1,5 +1,10 @@
 """Tests for the provider module registry and profiles."""
 
+from types import SimpleNamespace
+
+import pytest
+
+import providers
 from providers import get_provider_profile, _REGISTRY
 from providers.base import ProviderProfile, OMIT_TEMPERATURE
 
@@ -563,3 +568,97 @@ class TestBaseProfile:
         eb, tl = p.build_api_kwargs_extras()
         assert eb == {}
         assert tl == {}
+
+
+@pytest.fixture
+def isolated_provider_registry(monkeypatch):
+    """Keep factory tests independent from bundled and user-plugin discovery."""
+    monkeypatch.setattr(providers, "_REGISTRY", {})
+    monkeypatch.setattr(providers, "_ALIASES", {})
+    monkeypatch.setattr(providers, "_CLIENT_FACTORIES", {})
+    monkeypatch.setattr(providers, "_discovered", True)
+    return providers
+
+
+class TestProviderClientFactories:
+    def test_factory_resolves_by_name_alias_and_base_url(
+        self, isolated_provider_registry
+    ):
+        registry = isolated_provider_registry
+        profile = ProviderProfile(
+            name="external",
+            aliases=("external-alias",),
+            base_url="external://local",
+            auth_type="external_process",
+        )
+        factory = lambda **kwargs: kwargs
+        registry.register_provider(profile)
+        registry.register_provider_client_factory(profile.name, factory)
+
+        assert registry.get_provider_client_factory("external") is factory
+        assert registry.get_provider_client_factory("external-alias") is factory
+        assert (
+            registry.get_provider_client_factory(
+                "unknown", base_url="external://local"
+            )
+            is factory
+        )
+
+    def test_replacement_invalidates_factory_and_stale_alias(
+        self, isolated_provider_registry
+    ):
+        registry = isolated_provider_registry
+        original = ProviderProfile(name="external", aliases=("old-alias",))
+        replacement = ProviderProfile(name="external", aliases=("new-alias",))
+        registry.register_provider(original)
+        registry.register_provider_client_factory("external", lambda **_: object())
+
+        registry.register_provider(replacement)
+
+        assert registry.get_provider_client_factory("external") is None
+        assert registry.resolve_provider_profile("old-alias") is None
+        assert registry.resolve_provider_profile("new-alias") is replacement
+
+    def test_canonical_name_precedes_conflicting_alias(
+        self, isolated_provider_registry
+    ):
+        registry = isolated_provider_registry
+        canonical = ProviderProfile(name="canonical")
+        other = ProviderProfile(name="other", aliases=("canonical",))
+        canonical_factory = lambda **_: "canonical"
+        registry.register_provider(canonical)
+        registry.register_provider_client_factory("canonical", canonical_factory)
+        registry.register_provider(other)
+
+        assert registry.resolve_provider_profile("canonical") is canonical
+        assert registry.get_provider_client_factory("canonical") is canonical_factory
+
+    def test_missing_factory_returns_none(self, isolated_provider_registry):
+        registry = isolated_provider_registry
+        registry.register_provider(ProviderProfile(name="ordinary"))
+        assert registry.get_provider_client_factory("ordinary") is None
+
+    def test_runtime_fails_closed_without_external_factory(
+        self, isolated_provider_registry
+    ):
+        registry = isolated_provider_registry
+        profile = ProviderProfile(
+            name="external",
+            base_url="external://local",
+            auth_type="external_process",
+        )
+        registry.register_provider(profile)
+
+        from agent.agent_runtime_helpers import create_openai_client
+
+        agent = SimpleNamespace(provider="external")
+        with pytest.raises(
+            registry.ExternalProviderClientUnavailableError,
+            match="client factory is not available",
+        ):
+            create_openai_client(
+                agent,
+                {"api_key": "unused", "base_url": "external://local"},
+                reason="test",
+                shared=False,
+            )

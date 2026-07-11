@@ -499,8 +499,13 @@ def _install_plugin_core(identifier: str, *, force: bool) -> tuple[Path, dict, s
             subdir.rstrip("/").rsplit("/", 1)[-1] if subdir else _repo_name_from_url(git_url)
         )
 
+        install_root = plugins_dir
+        if manifest.get("kind") == "model-provider":
+            install_root = plugins_dir / "model-providers"
+            install_root.mkdir(parents=True, exist_ok=True)
+
         try:
-            target = _sanitize_plugin_name(plugin_name, plugins_dir)
+            target = _sanitize_plugin_name(plugin_name, install_root)
         except ValueError as e:
             raise PluginOperationError(str(e)) from e
 

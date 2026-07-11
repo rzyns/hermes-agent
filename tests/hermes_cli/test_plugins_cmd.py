@@ -928,3 +928,52 @@ class TestSubdirInstallE2E:
         identifier = f"file://{repo_root}#does-not-exist"
         with pytest.raises(PluginOperationError, match="does not exist"):
             pc._install_plugin_core(identifier, force=False)
+
+    def test_model_provider_installs_under_discovery_root(self, tmp_path, monkeypatch):
+        if shutil.which("git") is None:
+            pytest.skip("git not available")
+
+        import subprocess as sp
+
+        from hermes_cli import plugins_cmd as pc
+
+        repo_root = tmp_path / "model-provider-repo"
+        repo_root.mkdir()
+        (repo_root / "plugin.yaml").write_text(
+            "name: test-model-provider\n"
+            "kind: model-provider\n"
+            "manifest_version: 1\n"
+            "description: Test provider\n"
+        )
+        (repo_root / "__init__.py").write_text("# provider entry\n")
+        git_env = {
+            **os.environ,
+            "GIT_AUTHOR_NAME": "t",
+            "GIT_AUTHOR_EMAIL": "t@t",
+            "GIT_COMMITTER_NAME": "t",
+            "GIT_COMMITTER_EMAIL": "t@t",
+        }
+        sp.run(["git", "init", "-q"], cwd=repo_root, check=True, env=git_env)
+        sp.run(["git", "add", "-A"], cwd=repo_root, check=True, env=git_env)
+        sp.run(
+            ["git", "commit", "-q", "-m", "init"],
+            cwd=repo_root,
+            check=True,
+            env=git_env,
+        )
+
+        plugins_dir = tmp_path / "installed"
+        plugins_dir.mkdir()
+        monkeypatch.setattr(pc, "_plugins_dir", lambda: plugins_dir)
+
+        target, manifest, name = pc._install_plugin_core(
+            repo_root.as_uri(), force=False
+        )
+
+        assert name == "test-model-provider"
+        assert manifest["kind"] == "model-provider"
+        assert target == (
+            plugins_dir / "model-providers" / "test-model-provider"
+        ).resolve()
+        assert target.is_dir()
+        assert not (plugins_dir / "test-model-provider").exists()

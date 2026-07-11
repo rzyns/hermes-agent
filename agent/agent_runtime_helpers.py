@@ -1668,20 +1668,30 @@ def create_openai_client(agent, client_kwargs: dict, *, reason: str, shared: boo
             agent._client_log_context(),
         )
         return client
-    if agent.provider == "claude-code" or str(client_kwargs.get("base_url", "")).startswith("claude-code://"):
-        try:
-            from claude_code_client import ClaudeCodeClient
-        except ImportError:
-            pass  # Plugin not installed — fall through to normal client construction
-        else:
-            client = ClaudeCodeClient(**client_kwargs)
-            _ra().logger.info(
-                "Claude Code provider client created (%s, shared=%s) %s",
-                reason,
-                shared,
-                agent._client_log_context(),
-            )
-            return client
+    from providers import (
+        ExternalProviderClientUnavailableError,
+        get_provider_client_factory,
+        resolve_provider_profile,
+    )
+
+    base_url = str(client_kwargs.get("base_url", "") or "")
+    profile = resolve_provider_profile(agent.provider, base_url=base_url)
+    client_factory = get_provider_client_factory(agent.provider, base_url=base_url)
+    if client_factory is not None:
+        client = client_factory(**client_kwargs)
+        _ra().logger.info(
+            "%s provider client created (%s, shared=%s) %s",
+            profile.name if profile is not None else agent.provider,
+            reason,
+            shared,
+            agent._client_log_context(),
+        )
+        return client
+    if profile is not None and profile.auth_type == "external_process":
+        raise ExternalProviderClientUnavailableError(
+            f"External-process provider '{profile.name}' was selected, but its "
+            "client factory is not available. Reinstall or repair the provider plugin."
+        )
     if agent.provider == "gemini":
         from agent.gemini_native_adapter import GeminiNativeClient, is_native_gemini_base_url
 

@@ -35,13 +35,26 @@ import importlib.util
 import logging
 import sys
 from pathlib import Path
+from typing import Any, Protocol
 
 from providers.base import OMIT_TEMPERATURE, ProviderProfile  # noqa: F401
 
 logger = logging.getLogger(__name__)
 
+
+class ProviderClientFactory(Protocol):
+    """Callable supplied by a provider plugin to construct its transport client."""
+
+    def __call__(self, **client_kwargs: Any) -> Any: ...
+
+
+class ExternalProviderClientUnavailableError(RuntimeError):
+    """Selected external-process provider has no loadable client factory."""
+
+
 _REGISTRY: dict[str, ProviderProfile] = {}
 _ALIASES: dict[str, str] = {}
+_CLIENT_FACTORIES: dict[str, ProviderClientFactory] = {}
 _discovered = False
 
 # Repo-root ``plugins/model-providers/`` — populated at discovery time.
@@ -55,11 +68,62 @@ def register_provider(profile: ProviderProfile) -> None:
 
     Later registrations with the same name replace earlier ones — so user
     plugins under ``$HERMES_HOME/plugins/model-providers/`` can override
-    bundled profiles without editing repo code.
+    bundled profiles without editing repo code. Replacing a profile also
+    invalidates its prior client factory so an override cannot accidentally
+    inherit another plugin's executable transport.
     """
+    previous = _REGISTRY.get(profile.name)
+    if previous is not None and previous is not profile:
+        _CLIENT_FACTORIES.pop(profile.name, None)
+        for alias, canonical in list(_ALIASES.items()):
+            if canonical == profile.name:
+                del _ALIASES[alias]
     _REGISTRY[profile.name] = profile
     for alias in profile.aliases:
         _ALIASES[alias] = profile.name
+
+
+def register_provider_client_factory(
+    provider_name: str,
+    factory: ProviderClientFactory,
+) -> None:
+    """Register the transport factory owned by a provider plugin."""
+    canonical = _ALIASES.get(provider_name, provider_name)
+    _CLIENT_FACTORIES[canonical] = factory
+
+
+def resolve_provider_profile(
+    name: str,
+    *,
+    base_url: str | None = None,
+) -> ProviderProfile | None:
+    """Resolve a profile by name/alias, then by exact declared base URL."""
+    if not _discovered:
+        _discover_providers()
+    profile = _REGISTRY.get(name)
+    if profile is None:
+        canonical = _ALIASES.get(name, name)
+        profile = _REGISTRY.get(canonical)
+    if profile is not None:
+        return profile
+    if base_url:
+        return next(
+            (candidate for candidate in _REGISTRY.values() if candidate.base_url == base_url),
+            None,
+        )
+    return None
+
+
+def get_provider_client_factory(
+    name: str,
+    *,
+    base_url: str | None = None,
+) -> ProviderClientFactory | None:
+    """Return a plugin-owned client factory by provider identity or marker URL."""
+    profile = resolve_provider_profile(name, base_url=base_url)
+    if profile is None:
+        return None
+    return _CLIENT_FACTORIES.get(profile.name)
 
 
 def get_provider_profile(name: str) -> ProviderProfile | None:
@@ -67,10 +131,7 @@ def get_provider_profile(name: str) -> ProviderProfile | None:
 
     Returns None if the provider has no profile (falls back to generic).
     """
-    if not _discovered:
-        _discover_providers()
-    canonical = _ALIASES.get(name, name)
-    return _REGISTRY.get(canonical)
+    return resolve_provider_profile(name)
 
 
 def list_providers() -> list[ProviderProfile]:
