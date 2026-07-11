@@ -17,6 +17,7 @@ import os
 import shutil
 import subprocess
 import sys
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Optional
 
@@ -70,6 +71,126 @@ class PluginOperationError(Exception):
 # Plugins may declare ``manifest_version: 1`` in plugin.yaml;
 # future breaking changes to the manifest schema bump this.
 _SUPPORTED_MANIFEST_VERSION = 1
+_INSTALL_SOURCE_FILE = ".hermes-plugin-source.json"
+
+
+@dataclass(frozen=True)
+class PluginInstallSource:
+    """Validated Git source and installed-file inventory for a plugin."""
+
+    git_url: str
+    subdir: Optional[str]
+    source_files: tuple[str, ...] = ()
+
+    def identifier(self) -> str:
+        return f"{self.git_url}#{self.subdir}" if self.subdir else self.git_url
+
+
+def _installed_source_files(target: Path) -> tuple[str, ...]:
+    """Inventory source-owned files without descending into Git metadata."""
+    files: list[str] = []
+    for root, dirnames, filenames in os.walk(target, followlinks=False):
+        dirnames[:] = [
+            name for name in dirnames if name not in {".git", "__pycache__"}
+        ]
+        root_path = Path(root)
+        for filename in filenames:
+            path = root_path / filename
+            relative = path.relative_to(target).as_posix()
+            if relative != _INSTALL_SOURCE_FILE and not path.is_symlink():
+                files.append(relative)
+    return tuple(sorted(files))
+
+
+def _write_install_source(target: Path, source: PluginInstallSource) -> None:
+    """Persist update provenance after a successful Git installation."""
+    receipt = target / _INSTALL_SOURCE_FILE
+    payload = {
+        "schema_version": 1,
+        "git_url": source.git_url,
+        "subdir": source.subdir,
+        "source_files": list(source.source_files or _installed_source_files(target)),
+    }
+    receipt.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
+
+
+def _read_install_source(target: Path) -> Optional[PluginInstallSource]:
+    """Read and validate recorded Git provenance for a git-less install."""
+    receipt = target / _INSTALL_SOURCE_FILE
+    if not receipt.is_file():
+        return None
+    try:
+        payload = json.loads(receipt.read_text(encoding="utf-8"))
+        if not isinstance(payload, dict) or payload.get("schema_version") != 1:
+            raise ValueError("unsupported schema")
+        git_url = payload.get("git_url")
+        subdir = payload.get("subdir")
+        source_files = payload.get("source_files")
+        if not isinstance(git_url, str) or not git_url:
+            raise ValueError("git_url must be a non-empty string")
+        if subdir is not None and (not isinstance(subdir, str) or not subdir):
+            raise ValueError("subdir must be null or a non-empty string")
+        if not isinstance(source_files, list) or not all(
+            isinstance(item, str)
+            and item
+            and not Path(item).is_absolute()
+            and ".." not in Path(item).parts
+            and "\\" not in item
+            for item in source_files
+        ):
+            raise ValueError("source_files must contain safe relative paths")
+        source = PluginInstallSource(
+            git_url=git_url,
+            subdir=subdir,
+            source_files=tuple(source_files),
+        )
+        resolved_url, resolved_subdir = _resolve_git_url(source.identifier())
+        if (resolved_url, resolved_subdir) != (source.git_url, source.subdir):
+            raise ValueError("source fields do not resolve canonically")
+        return source
+    except (OSError, ValueError, TypeError, json.JSONDecodeError) as exc:
+        raise PluginOperationError(
+            f"Invalid install provenance in {receipt.name}: {exc}",
+        ) from exc
+
+
+def _backup_user_plugin_files(
+    target: Path,
+    source: PluginInstallSource,
+    backup: Path,
+) -> None:
+    """Copy files not owned by the prior source tree into a temporary backup."""
+    source_owned = set(source.source_files)
+    for root, dirnames, filenames in os.walk(target, followlinks=False):
+        dirnames[:] = [
+            name for name in dirnames if name not in {".git", "__pycache__"}
+        ]
+        root_path = Path(root)
+        for filename in filenames:
+            path = root_path / filename
+            relative = path.relative_to(target)
+            relative_text = relative.as_posix()
+            if (
+                relative_text == _INSTALL_SOURCE_FILE
+                or relative_text in source_owned
+                or path.is_symlink()
+            ):
+                continue
+            destination = backup / relative
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(path, destination)
+
+
+def _restore_user_plugin_files(backup: Path, target: Path) -> None:
+    """Restore preserved user-owned files after a clean source reinstall."""
+    if not backup.is_dir():
+        return
+    for path in backup.rglob("*"):
+        if not path.is_file() or path.is_symlink():
+            continue
+        destination = target / path.relative_to(backup)
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(path, destination)
 
 
 def _plugins_dir() -> Path:
@@ -429,16 +550,34 @@ def _display_removed(name: str, plugins_dir: Path) -> None:
 
 
 def _require_installed_plugin(name: str, plugins_dir: Path, console) -> Path:
-    """Return the plugin path if it exists, or exit with an error listing installed plugins."""
+    """Resolve a top-level or model-provider plugin, or exit with an inventory."""
     target = _sanitize_plugin_name(name, plugins_dir, allow_subdir=True)
-    if not target.exists():
-        installed = ", ".join(d.name for d in plugins_dir.iterdir() if d.is_dir()) or "(none)"
-        console.print(
-            f"[red]Error:[/red] Plugin '{name}' not found in {plugins_dir}.\n"
-            f"Installed plugins: {installed}"
+    if target.exists():
+        return target
+
+    # Model providers live in a dedicated namespace but CLI commands accept their
+    # manifest name, matching enable/disable behavior.
+    model_providers_dir = plugins_dir / "model-providers"
+    if "/" not in name and "\\" not in name and model_providers_dir.is_dir():
+        provider_target = _sanitize_plugin_name(name, model_providers_dir)
+        if provider_target.exists():
+            return provider_target
+
+    installed_names = [
+        path.name
+        for path in plugins_dir.iterdir()
+        if path.is_dir() and path.name != "model-providers"
+    ]
+    if model_providers_dir.is_dir():
+        installed_names.extend(
+            path.name for path in model_providers_dir.iterdir() if path.is_dir()
         )
-        sys.exit(1)
-    return target
+    installed = ", ".join(sorted(installed_names)) or "(none)"
+    console.print(
+        f"[red]Error:[/red] Plugin '{name}' not found in {plugins_dir}.\n"
+        f"Installed plugins: {installed}"
+    )
+    sys.exit(1)
 
 
 # ---------------------------------------------------------------------------
@@ -446,11 +585,17 @@ def _require_installed_plugin(name: str, plugins_dir: Path, console) -> Path:
 # ---------------------------------------------------------------------------
 
 
-def _install_plugin_core(identifier: str, *, force: bool) -> tuple[Path, dict, str]:
+def _install_plugin_core(
+    identifier: str,
+    *,
+    force: bool,
+    expected_target: Optional[Path] = None,
+) -> tuple[Path, dict, str]:
     """Clone Git plugin into ``~/.hermes/plugins``.
 
     Returns ``(target_dir, installed_manifest, canonical_name)``.
-    Raises ``PluginOperationError`` on failure.
+    Raises ``PluginOperationError`` on failure. When *expected_target* is set,
+    destination identity is verified before an existing install is replaced.
     """
     import tempfile
 
@@ -509,6 +654,12 @@ def _install_plugin_core(identifier: str, *, force: bool) -> tuple[Path, dict, s
         except ValueError as e:
             raise PluginOperationError(str(e)) from e
 
+        if expected_target is not None and target.resolve() != expected_target.resolve():
+            raise PluginOperationError(
+                "Recorded plugin source now resolves to a different install target "
+                f"('{target}' instead of '{expected_target}'). Refusing update.",
+            )
+
         mv = manifest.get("manifest_version")
         if mv is not None:
             try:
@@ -536,6 +687,10 @@ def _install_plugin_core(identifier: str, *, force: bool) -> tuple[Path, dict, s
             shutil.rmtree(target)
 
         shutil.move(str(tmp_target), str(target))
+        _write_install_source(
+            target,
+            PluginInstallSource(git_url=git_url, subdir=subdir),
+        )
 
     has_yaml = (target / "plugin.yaml").exists() or (target / "plugin.yml").exists()
     if not has_yaml and not (target / "__init__.py").exists():
@@ -651,12 +806,44 @@ def cmd_update(name: str) -> None:
         console.print(f"[red]Error:[/red] {e}")
         sys.exit(1)
 
-    if not (target / ".git").exists():
+    git_metadata = target / ".git"
+    if not git_metadata.exists():
+        try:
+            source = _read_install_source(target)
+        except PluginOperationError as e:
+            console.print(f"[red]Error:[/red] {e}")
+            sys.exit(1)
+        if source is None:
+            console.print(
+                f"[red]Error:[/red] Plugin '{name}' has no Git metadata or "
+                "recorded install provenance. Reinstall it once with "
+                "`hermes plugins install <source> --force` before updating."
+            )
+            sys.exit(1)
+
         console.print(
-            f"[red]Error:[/red] Plugin '{name}' was not installed from git "
-            f"(no .git directory). Cannot update."
+            f"[dim]Updating {name} by clean reinstall from its recorded source...[/dim]"
         )
-        sys.exit(1)
+        import tempfile
+
+        try:
+            with tempfile.TemporaryDirectory() as backup_dir:
+                backup = Path(backup_dir) / "user-files"
+                _backup_user_plugin_files(target, source, backup)
+                _install_plugin_core(
+                    source.identifier(),
+                    force=True,
+                    expected_target=target,
+                )
+                _restore_user_plugin_files(backup, target)
+        except (OSError, PluginOperationError) as e:
+            console.print(f"[red]Error:[/red] {e}")
+            sys.exit(1)
+        console.print(
+            f"[green]✓[/green] Plugin [bold]{name}[/bold] updated from "
+            "its recorded monorepo subdirectory."
+        )
+        return
 
     console.print(f"[dim]Updating {name}...[/dim]")
 

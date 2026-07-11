@@ -1,5 +1,10 @@
 """Tests for the provider module registry and profiles."""
 
+import json
+import os
+from pathlib import Path
+import subprocess
+import sys
 from types import SimpleNamespace
 
 import pytest
@@ -31,6 +36,107 @@ class TestRegistry:
         get_provider_profile("nvidia")  # trigger discovery
         for name, profile in _REGISTRY.items():
             assert profile.name == name
+
+    @pytest.mark.parametrize(
+        ("enabled", "disabled", "expected_visible"),
+        [
+            (["model-providers/phase4-policy"], [], True),
+            ([], [], False),
+            (
+                ["model-providers/phase4-policy"],
+                ["model-providers/phase4-policy"],
+                False,
+            ),
+        ],
+    )
+    def test_user_provider_discovery_honors_plugin_policy_in_fresh_process(
+        self,
+        tmp_path,
+        enabled,
+        disabled,
+        expected_visible,
+    ):
+        home = tmp_path / "hermes-home"
+        plugin = home / "plugins" / "model-providers" / "phase4-policy"
+        plugin.mkdir(parents=True)
+        (plugin / "plugin.yaml").write_text(
+            "name: phase4-policy\nkind: model-provider\nversion: 1\n",
+            encoding="utf-8",
+        )
+        (plugin / "__init__.py").write_text(
+            "from providers import register_provider\n"
+            "from providers.base import ProviderProfile\n"
+            "register_provider(ProviderProfile(name='phase4-policy'))\n",
+            encoding="utf-8",
+        )
+        (home / "config.yaml").write_text(
+            "plugins:\n"
+            f"  enabled: {json.dumps(enabled)}\n"
+            f"  disabled: {json.dumps(disabled)}\n",
+            encoding="utf-8",
+        )
+
+        env = os.environ.copy()
+        env["HERMES_HOME"] = str(home)
+        repo = Path(providers.__file__).resolve().parent.parent
+        result = subprocess.run(
+            [
+                sys.executable,
+                "-c",
+                "from providers import get_provider_profile; "
+                "print(get_provider_profile('phase4-policy') is not None)",
+            ],
+            cwd=repo,
+            env=env,
+            text=True,
+            capture_output=True,
+            timeout=30,
+            check=True,
+        )
+        assert (result.stdout.strip() == "True") is expected_visible
+
+    def test_disabled_user_provider_masks_conflicting_bundled_alias(
+        self,
+        tmp_path,
+    ):
+        home = tmp_path / "hermes-home"
+        plugin = home / "plugins" / "model-providers" / "claude-code-provider"
+        plugin.mkdir(parents=True)
+        (plugin / "plugin.yaml").write_text(
+            "name: claude-code-provider\n"
+            "kind: model-provider\n"
+            "provider_names: [claude-code]\n",
+            encoding="utf-8",
+        )
+        (plugin / "__init__.py").write_text(
+            "raise AssertionError('disabled provider was imported')\n",
+            encoding="utf-8",
+        )
+        (home / "config.yaml").write_text(
+            "plugins:\n"
+            "  enabled: []\n"
+            "  disabled: [model-providers/claude-code-provider]\n",
+            encoding="utf-8",
+        )
+
+        env = os.environ.copy()
+        env["HERMES_HOME"] = str(home)
+        repo = Path(providers.__file__).resolve().parent.parent
+        result = subprocess.run(
+            [
+                sys.executable,
+                "-c",
+                "from providers import get_provider_profile; "
+                "print(get_provider_profile('claude-code') is not None)",
+            ],
+            cwd=repo,
+            env=env,
+            text=True,
+            capture_output=True,
+            timeout=30,
+            check=True,
+        )
+        assert result.stdout.strip() == "False"
 
 
 class TestNvidiaProfile:

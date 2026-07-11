@@ -160,6 +160,61 @@ def _user_plugins_dir() -> Path | None:
         return None
 
 
+def _user_plugin_policy_names(plugin_dir: Path) -> set[str]:
+    """Return config identities accepted for an installed user provider plugin."""
+    names = {plugin_dir.name, f"model-providers/{plugin_dir.name}"}
+    manifest_path = plugin_dir / "plugin.yaml"
+    if not manifest_path.exists():
+        manifest_path = plugin_dir / "plugin.yml"
+    if manifest_path.exists():
+        try:
+            import yaml
+
+            manifest = yaml.safe_load(manifest_path.read_text(encoding="utf-8")) or {}
+            manifest_name = manifest.get("name")
+            if isinstance(manifest_name, str) and manifest_name:
+                names.add(manifest_name)
+        except Exception as exc:
+            logger.warning("Failed to read user provider manifest %s: %s", plugin_dir, exc)
+    return names
+
+
+def _user_plugin_is_enabled(plugin_dir: Path) -> bool:
+    """Apply the canonical plugin enabled/disabled policy to a user provider."""
+    try:
+        from hermes_cli.plugins import _get_disabled_plugins, _get_enabled_plugins
+
+        names = _user_plugin_policy_names(plugin_dir)
+        disabled = _get_disabled_plugins()
+        if names & disabled:
+            return False
+        enabled = _get_enabled_plugins()
+        return enabled is not None and bool(names & enabled)
+    except Exception as exc:
+        logger.warning("Failed to resolve user provider policy for %s: %s", plugin_dir, exc)
+        return False
+
+
+def _user_plugin_declared_provider_names(plugin_dir: Path) -> set[str]:
+    """Read provider identities that a disabled plugin must mask from aliases."""
+    manifest_path = plugin_dir / "plugin.yaml"
+    if not manifest_path.exists():
+        manifest_path = plugin_dir / "plugin.yml"
+    if not manifest_path.exists():
+        return set()
+    try:
+        import yaml
+
+        manifest = yaml.safe_load(manifest_path.read_text(encoding="utf-8")) or {}
+        names = manifest.get("provider_names", [])
+        if not isinstance(names, list):
+            return set()
+        return {name for name in names if isinstance(name, str) and name}
+    except Exception as exc:
+        logger.warning("Failed to read user provider manifest %s: %s", plugin_dir, exc)
+        return set()
+
+
 def _import_plugin_dir(plugin_dir: Path, source: str) -> None:
     """Import a single plugin directory so it self-registers.
 
@@ -225,9 +280,16 @@ def _discover_providers() -> None:
     #    These can override any bundled profile of the same name (last-writer-wins
     #    in register_provider()).
     user_dir = _user_plugins_dir()
+    disabled_user_provider_names: set[str] = set()
     if user_dir is not None:
         for child in sorted(user_dir.iterdir()):
             if not child.is_dir() or child.name.startswith(("_", ".")):
+                continue
+            if not _user_plugin_is_enabled(child):
+                disabled_user_provider_names.update(
+                    _user_plugin_declared_provider_names(child)
+                )
+                logger.debug("Skipping disabled user provider plugin %s", child.name)
                 continue
             _import_plugin_dir(child, "user")
 
@@ -250,3 +312,9 @@ def _discover_providers() -> None:
                 )
     except Exception:
         pass
+
+    # A disabled external provider must not silently fall through to a bundled
+    # alias with the same selector (for example ``claude-code`` -> Anthropic).
+    # Only aliases are masked: bundled canonical provider names remain available.
+    for provider_name in disabled_user_provider_names:
+        _ALIASES.pop(provider_name, None)

@@ -5,6 +5,7 @@ from __future__ import annotations
 import logging
 import os
 import shutil
+import subprocess
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
@@ -14,6 +15,7 @@ import yaml
 from hermes_cli.plugins_cmd import (
     PluginOperationError,
     _copy_example_files,
+    _install_plugin_core,
     _read_manifest,
     _repo_name_from_url,
     _resolve_git_executable,
@@ -472,6 +474,66 @@ class TestCmdUpdate:
         cmd_update("test-plugin")
 
         mock_run.assert_called_once()
+
+    @pytest.mark.parametrize("kind", ["standalone", "model-provider"])
+    def test_update_gitless_subdirectory_reinstalls_from_recorded_source(
+        self,
+        tmp_path,
+        monkeypatch,
+        kind,
+    ):
+        from hermes_cli.plugins_cmd import cmd_update
+
+        source = tmp_path / "source"
+        plugin = source / "plugins" / "demo"
+        plugin.mkdir(parents=True)
+        (plugin / "plugin.yaml").write_text(
+            f"name: demo\nkind: {kind}\nversion: 1\n",
+            encoding="utf-8",
+        )
+        payload = plugin / "payload.txt"
+        payload.write_text("v1\n", encoding="utf-8")
+        example = plugin / "settings.toml.example"
+        example.write_text("value = 'v1'\n", encoding="utf-8")
+        subprocess.run(["git", "init", "-q", str(source)], check=True)
+        subprocess.run(
+            ["git", "-C", str(source), "config", "user.name", "Test"],
+            check=True,
+        )
+        subprocess.run(
+            ["git", "-C", str(source), "config", "user.email", "test@example.invalid"],
+            check=True,
+        )
+        subprocess.run(["git", "-C", str(source), "add", "."], check=True)
+        subprocess.run(
+            ["git", "-C", str(source), "commit", "-qm", "v1"],
+            check=True,
+        )
+
+        home = tmp_path / "hermes-home"
+        monkeypatch.setenv("HERMES_HOME", str(home))
+        identifier = f"file://{source}#plugins/demo"
+        target, _, _ = _install_plugin_core(identifier, force=False)
+        assert not (target / ".git").exists()
+        assert (target / "payload.txt").read_text(encoding="utf-8") == "v1\n"
+        settings = target / "settings.toml"
+        settings.write_text("value = 'custom'\n", encoding="utf-8")
+
+        payload.write_text("v2\n", encoding="utf-8")
+        example.write_text("value = 'v2'\n", encoding="utf-8")
+        subprocess.run(["git", "-C", str(source), "add", "."], check=True)
+        subprocess.run(
+            ["git", "-C", str(source), "commit", "-qm", "v2"],
+            check=True,
+        )
+
+        cmd_update("demo")
+
+        assert (target / "payload.txt").read_text(encoding="utf-8") == "v2\n"
+        assert (target / "settings.toml.example").read_text(
+            encoding="utf-8"
+        ) == "value = 'v2'\n"
+        assert settings.read_text(encoding="utf-8") == "value = 'custom'\n"
 
     @patch("hermes_cli.plugins_cmd._sanitize_plugin_name")
     @patch("hermes_cli.plugins_cmd._plugins_dir")
