@@ -130,3 +130,26 @@ class TestPlatformForwardedAtBoundary:
         kwargs = calls[-1].kwargs
         assert kwargs.get("platform") == "telegram"
         assert kwargs.get("boundary_reason") == "compression"
+
+
+class TestWorkspaceMetadataMigratesOnRotation:
+    def test_workspace_metadata_follows_compression_rotation(self, tmp_path: Path):
+        db = SessionDB(db_path=tmp_path / "state.db")
+        parent = "PARENT_WORKSPACE_ROT"
+        db.create_session(parent, source="cli")
+        db.update_session_cwd(
+            parent,
+            "/work/repo/feature",
+            git_branch="feature/session-lineage",
+            git_repo_root="/work/repo",
+        )
+        agent = _build_agent_with_db(db, parent)
+
+        agent._compress_context(_msgs(), "sys", approx_tokens=120_000)
+
+        child = db.get_session(agent.session_id)
+        assert child is not None
+        assert child["parent_session_id"] == parent
+        assert child["cwd"] == "/work/repo/feature"
+        assert child["git_branch"] == "feature/session-lineage"
+        assert child["git_repo_root"] == "/work/repo"
