@@ -180,16 +180,32 @@ def _user_plugin_policy_names(plugin_dir: Path) -> set[str]:
 
 
 def _user_plugin_is_enabled(plugin_dir: Path) -> bool:
-    """Apply the canonical plugin enabled/disabled policy to a user provider."""
-    try:
-        from hermes_cli.plugins import _get_disabled_plugins, _get_enabled_plugins
+    """Apply the canonical plugin enabled/disabled policy to a user provider.
 
+    Read through ``hermes_cli.config`` rather than ``hermes_cli.plugins``.
+    Config eagerly enumerates provider profiles at import time, so provider
+    discovery can run while the plugin manager is only partially initialized;
+    calling back into that module would make policy depend on import order.
+    """
+    try:
+        from hermes_cli.config import cfg_get, load_config
+
+        config = load_config()
         names = _user_plugin_policy_names(plugin_dir)
-        disabled = _get_disabled_plugins()
+        configured_disabled = cfg_get(config, "plugins", "disabled", default=[])
+        disabled = (
+            set(configured_disabled) if isinstance(configured_disabled, list) else set()
+        )
         if names & disabled:
             return False
-        enabled = _get_enabled_plugins()
-        return enabled is not None and bool(names & enabled)
+
+        plugins_config = config.get("plugins")
+        if not isinstance(plugins_config, dict) or "enabled" not in plugins_config:
+            return False
+        configured_enabled = plugins_config.get("enabled")
+        if not isinstance(configured_enabled, list):
+            return False
+        return bool(names & set(configured_enabled))
     except Exception as exc:
         logger.warning("Failed to resolve user provider policy for %s: %s", plugin_dir, exc)
         return False

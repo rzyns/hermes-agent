@@ -79,6 +79,12 @@ def test_user_plugin_overrides_bundled(tmp_path, monkeypatch):
     hermes_home = tmp_path / ".hermes"
     hermes_home.mkdir()
     monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+    (hermes_home / "config.yaml").write_text(
+        "plugins:\n"
+        "  enabled: [model-providers/gmi]\n"
+        "  disabled: []\n",
+        encoding="utf-8",
+    )
     # get_hermes_home() may be module-cached depending on codebase; ensure the
     # env var is the source of truth. Most code paths re-read it each call.
 

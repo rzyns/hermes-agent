@@ -95,6 +95,54 @@ class TestRegistry:
         )
         assert (result.stdout.strip() == "True") is expected_visible
 
+    def test_user_provider_discovery_survives_cli_first_import_in_fresh_process(
+        self,
+        tmp_path,
+    ):
+        home = tmp_path / "hermes-home"
+        plugin = home / "plugins" / "model-providers" / "phase4-policy"
+        plugin.mkdir(parents=True)
+        (plugin / "plugin.yaml").write_text(
+            "name: phase4-policy\n"
+            "kind: model-provider\n"
+            "version: 1\n"
+            "provider_names: [phase4-policy]\n",
+            encoding="utf-8",
+        )
+        (plugin / "__init__.py").write_text(
+            "from providers import register_provider\n"
+            "from providers.base import ProviderProfile\n"
+            "register_provider(ProviderProfile(name='phase4-policy'))\n",
+            encoding="utf-8",
+        )
+        (home / "config.yaml").write_text(
+            "plugins:\n"
+            "  enabled: [model-providers/phase4-policy]\n"
+            "  disabled: []\n",
+            encoding="utf-8",
+        )
+
+        env = os.environ.copy()
+        env["HERMES_HOME"] = str(home)
+        repo = Path(providers.__file__).resolve().parent.parent
+        result = subprocess.run(
+            [
+                sys.executable,
+                "-c",
+                "from hermes_cli.plugins import _get_enabled_plugins; "
+                "from providers import get_provider_profile; "
+                "print(get_provider_profile('phase4-policy') is not None)",
+            ],
+            cwd=repo,
+            env=env,
+            text=True,
+            capture_output=True,
+            timeout=30,
+            check=True,
+        )
+        assert result.stderr == ""
+        assert result.stdout.strip() == "True"
+
     def test_disabled_user_provider_masks_conflicting_bundled_alias(
         self,
         tmp_path,
