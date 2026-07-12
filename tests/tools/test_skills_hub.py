@@ -2035,13 +2035,16 @@ class TestGitHubSourceCustomTapIdentifiers:
         auth.get_headers.return_value = {}
         return GitHubSource(auth=auth, extra_taps=[{"repo": "rzyns/hermes-stuff", "path": "skills/"}])
 
-    @patch.object(GitHubSource, "_download_directory")
-    def test_fetch_resolves_owner_repo_skill_through_matching_tap_path(self, mock_download):
-        mock_download.side_effect = lambda repo, path, ref=None: (
-            {"SKILL.md": "---\nname: plan\n---\n", "references/kanban-artifact-planning.md": "# ref"}
-            if (repo, path) == ("rzyns/hermes-stuff", "skills/plan")
-            else {}
+    @patch.object(GitHubSource, "_fetch_file_bytes")
+    @patch.object(GitHubSource, "_fetch_file_content")
+    def test_fetch_resolves_owner_repo_skill_through_matching_tap_path(self, mock_fetch, mock_bytes):
+        skill_md = "---\nname: plan\n---\n[plan ref](references/kanban-artifact-planning.md)\n"
+        mock_fetch.side_effect = lambda repo, path, ref=None: (
+            skill_md
+            if (repo, path) == ("rzyns/hermes-stuff", "skills/plan/SKILL.md")
+            else None
         )
+        mock_bytes.side_effect = lambda repo, path, ref=None: b"# ref"
 
         bundle = self._source().fetch("rzyns/hermes-stuff/plan")
 
@@ -2049,7 +2052,7 @@ class TestGitHubSourceCustomTapIdentifiers:
         assert bundle.name == "plan"
         assert bundle.identifier == "rzyns/hermes-stuff/skills/plan"
         assert "references/kanban-artifact-planning.md" in bundle.files
-        assert mock_download.call_args_list[0] == (("rzyns/hermes-stuff", "skills/plan"), {"ref": None})
+        assert mock_fetch.call_args_list[0] == (("rzyns/hermes-stuff", "skills/plan/SKILL.md"), {"ref": None})
 
     @patch.object(GitHubSource, "_fetch_file_content")
     def test_inspect_resolves_owner_repo_skill_through_matching_tap_path(self, mock_fetch):
@@ -2080,16 +2083,22 @@ class TestGitHubSourceCustomTapIdentifiers:
         assert candidates[0].ref == "main"
         assert candidates[0].identifier == "https://github.com/rzyns/hermes-stuff/tree/main/skills/plan"
 
-    @patch.object(GitHubSource, "_download_directory")
-    def test_fetch_tree_url_carries_ref_and_preserves_provenance(self, mock_download):
-        mock_download.return_value = {"SKILL.md": "---\nname: plan\n---\n"}
+    @patch.object(GitHubSource, "_fetch_file_bytes")
+    @patch.object(GitHubSource, "_fetch_file_content")
+    def test_fetch_tree_url_carries_ref_and_preserves_provenance(self, mock_fetch, mock_bytes):
+        skill_md = "---\nname: plan\n---\n# plan\n"
+        mock_fetch.return_value = skill_md
+        mock_bytes.return_value = b""
 
         bundle = self._source().fetch("https://github.com/rzyns/hermes-stuff/tree/main/skills/plan")
 
         assert bundle is not None
         assert bundle.identifier == "https://github.com/rzyns/hermes-stuff/tree/main/skills/plan"
-        assert bundle.metadata == {"repo": "rzyns/hermes-stuff", "path": "skills/plan", "ref": "main"}
-        mock_download.assert_called_once_with("rzyns/hermes-stuff", "skills/plan", ref="main")
+        assert bundle.metadata["repo"] == "rzyns/hermes-stuff"
+        assert bundle.metadata["path"] == "skills/plan"
+        assert bundle.metadata["ref"] == "main"
+        assert "source_url" in bundle.metadata
+        mock_fetch.assert_called_once_with("rzyns/hermes-stuff", "skills/plan/SKILL.md", ref="main")
 
     @patch.object(GitHubSource, "_fetch_file_content")
     def test_inspect_tree_url_carries_ref_and_preserves_provenance(self, mock_fetch):
@@ -2209,7 +2218,7 @@ class TestGitHubSourceCustomTapIdentifiers:
                 {"type": "blob", "path": "skills/plan/SKILL.md"},
             ],
         })
-        raw_resp = MagicMock(status_code=200, text="# plan from main")
+        raw_resp = MagicMock(status_code=200, text="# plan from main", content=b"# plan from main")
         mock_get.side_effect = [tree_resp, raw_resp]
 
         files = src._download_directory("rzyns/hermes-stuff", "skills/plan", ref="main")

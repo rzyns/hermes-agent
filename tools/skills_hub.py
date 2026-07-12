@@ -30,7 +30,7 @@ from hermes_constants import get_hermes_home
 from hermes_cli._subprocess_compat import windows_hide_flags
 from agent.skill_utils import is_excluded_skill_path
 from typing import Any, Dict, List, Optional, Tuple, Union
-from urllib.parse import urljoin, urlparse, urlunparse
+from urllib.parse import unquote, urljoin, urlparse, urlsplit, urlunparse
 
 import httpx
 import yaml
@@ -161,6 +161,50 @@ class _GitHubIdentifierCandidate:
     path: str
     identifier: str
     ref: Optional[str] = None
+
+
+_ALLOWED_SUPPORT_DIRS = frozenset({"references", "templates", "scripts", "assets", "examples"})
+_LOCAL_LINK_RE = re.compile(
+    r"(?:\]\(|`|(?:^|[\s\"']))((?:references|templates|scripts|assets|examples)/[^\s)`\"'<>]+)",
+    re.MULTILINE,
+)
+_SUSPICIOUS_LOCAL_REF_RE = re.compile(
+    r"(?:references|templates|scripts|assets|examples)/(?:[^\s)`\"'<>]*/)?\.\.(?:/|$)"
+)
+
+
+def _referenced_support_paths(skill_md: str) -> Optional[set[str]]:
+    """Extract safe referenced paths; return None on a traversal attempt."""
+    normalized = skill_md.replace("\\", "/")
+    if _SUSPICIOUS_LOCAL_REF_RE.search(normalized):
+        return None
+    paths: set[str] = set()
+    for match in _LOCAL_LINK_RE.finditer(normalized):
+        raw = unquote(urlsplit(match.group(1).rstrip(".,;:")).path)
+        try:
+            safe = _validate_bundle_rel_path(raw)
+        except ValueError:
+            return None
+        if safe.split("/", 1)[0] in _ALLOWED_SUPPORT_DIRS:
+            paths.add(safe)
+    return paths
+
+
+def source_url_for_bundle(bundle: SkillBundle) -> str:
+    """Best available human-facing immutable-source provenance URL."""
+    explicit = bundle.metadata.get("source_url") or bundle.metadata.get("url")
+    if explicit:
+        return str(explicit)
+    if bundle.source == "github":
+        # Prefer an exact pinned ref when the bundle carries one (direct tree
+        # URL install), otherwise fall back to ``main`` for shorthand ids.
+        ref = bundle.metadata.get("ref")
+        parts = bundle.identifier.split("/", 2)
+        if len(parts) >= 2:
+            revision = ref or "main"
+            suffix = f"/tree/{revision}/{parts[2]}" if len(parts) == 3 else ""
+            return f"https://github.com/{parts[0]}/{parts[1]}{suffix}"
+    return bundle.identifier
 
 
 def _normalize_bundle_path(path_value: str, *, field_name: str, allow_nested: bool) -> str:
@@ -572,6 +616,7 @@ class GitHubSource(SkillSource):
         # Per-instance cache: repo/ref -> (resolved_ref, tree_entries)
         # Survives within a single search/install flow, avoiding redundant API calls.
         self._tree_cache: Dict[str, Tuple[str, List[dict]]] = {}
+        self._tree_revisions: Dict[str, str] = {}
         # Per-repo cache of the optional skills.sh.json grouping sidecar,
         # mapping skill_name -> human-readable grouping title. ``None`` means
         # "fetched, no sidecar"; a missing key means "not fetched yet".
@@ -638,17 +683,74 @@ class GitHubSource(SkillSource):
         registry has an unrelated skill with the same display name.
         """
         for candidate in self._identifier_candidates(identifier):
-            files = self._download_directory(candidate.repo, candidate.path, ref=candidate.ref)
-            if not files or "SKILL.md" not in files:
+            # Fetch SKILL.md first so we can resolve only the referenced
+            # support files (references/templates/scripts/assets/examples).
+            # Anything else in the directory (READMEs, unrelated files) is
+            # skipped — this keeps the bundle small and the install fast.
+            skill_md = self._fetch_file_content(
+                candidate.repo, f"{candidate.path.rstrip('/')}/SKILL.md", ref=candidate.ref,
+            )
+            if skill_md is None:
+                continue
+
+            referenced = _referenced_support_paths(skill_md)
+            if referenced is None:
+                # Traversal attempt in SKILL.md — fail closed for this candidate.
+                continue
+
+            bundle_files: Dict[str, Union[str, bytes]] = {"SKILL.md": skill_md}
+            tree = self._get_repo_tree(candidate.repo, ref=candidate.ref)
+            revision = ""
+            if tree is not None:
+                _branch, entries = tree
+                prefix = f"{candidate.path.rstrip('/')}/"
+                entries_by_path = {item.get("path", ""): item for item in entries}
+                for rel_path in sorted(referenced):
+                    item_path = f"{prefix}{rel_path}"
+                    item = entries_by_path.get(item_path)
+                    if item is None:
+                        logger.warning("Referenced skill support file is missing: %s", item_path)
+                        bundle_files = None  # mark as failed
+                        break
+                    if item.get("type") != "blob" or item.get("mode") == "120000":
+                        logger.warning("Rejected non-regular file in skill bundle: %s", item_path)
+                        bundle_files = None
+                        break
+                    content = self._fetch_file_bytes(
+                        candidate.repo, item_path, ref=candidate.ref,
+                    )
+                    if content is None:
+                        bundle_files = None
+                        break
+                    bundle_files[rel_path] = content
+                revision = self._tree_revisions.get(candidate.repo) or (tree[0] if tree else "")
+            else:
+                # No tree available: fetch each referenced file directly.
+                for rel_path in referenced:
+                    content = self._fetch_file_bytes(
+                        candidate.repo, f"{candidate.path.rstrip('/')}/{rel_path}", ref=candidate.ref,
+                    )
+                    if content is None:
+                        bundle_files = None
+                        break
+                    bundle_files[rel_path] = content
+
+            if bundle_files is None:
+                # A referenced file was missing/rejected — this candidate fails.
                 continue
 
             skill_name = candidate.path.rstrip("/").split("/")[-1]
             trust = self.trust_level_for(candidate.identifier)
 
-            bundle_files: Dict[str, Union[str, bytes]] = dict(files)
             metadata: Dict[str, Any] = {}
             if candidate.ref is not None:
                 metadata.update({"repo": candidate.repo, "path": candidate.path, "ref": candidate.ref})
+            if revision:
+                metadata["source_revision"] = revision
+            metadata["source_url"] = (
+                f"https://github.com/{candidate.repo}/tree/{revision or 'main'}/{candidate.path.rstrip('/')}"
+            )
+
             return SkillBundle(
                 name=skill_name,
                 files=bundle_files,
@@ -910,6 +1012,9 @@ class GitHubSource(SkillSource):
             return None
 
         entries = tree_data.get("tree", [])
+        revision = tree_data.get("sha")
+        if isinstance(revision, str) and revision:
+            self._tree_revisions[repo] = revision
         self._tree_cache[cache_key] = (tree_ref, entries)
         return (tree_ref, entries)
 
@@ -1231,7 +1336,22 @@ class GitHubSource(SkillSource):
         return None
 
     def _fetch_file_content(self, repo: str, path: str, ref: Optional[str] = None) -> Optional[str]:
-        """Fetch a single file's content from GitHub."""
+        """Fetch a single text file from GitHub, falling back to git CLI."""
+        content = self._fetch_file_bytes(repo, path, ref=ref)
+        if content is None:
+            return None
+        try:
+            return content.decode("utf-8")
+        except UnicodeDecodeError:
+            return None
+
+    def _fetch_file_bytes(self, repo: str, path: str, ref: Optional[str] = None) -> Optional[bytes]:
+        """Fetch exact file bytes from GitHub without text decoding.
+
+        Falls back to a local ``git`` clone when the Contents API is
+        unavailable (private repos with a credential helper but no configured
+        ``gh``/``GITHUB_TOKEN``).
+        """
         url = f"https://api.github.com/repos/{repo}/contents/{path}"
         params = {"ref": ref} if ref is not None else None
         resp = self._github_get(
@@ -1240,10 +1360,11 @@ class GitHubSource(SkillSource):
             headers={**self.auth.get_headers(), "Accept": "application/vnd.github.v3.raw"},
         )
         if resp is not None and resp.status_code == 200:
-            return resp.text
-        return self._fetch_file_content_via_git(repo, path, ref=ref)
+            return resp.content
+        return self._fetch_file_bytes_via_git(repo, path, ref=ref)
 
-    def _fetch_file_content_via_git(self, repo: str, path: str, ref: Optional[str] = None) -> Optional[str]:
+    def _fetch_file_bytes_via_git(self, repo: str, path: str, ref: Optional[str] = None) -> Optional[bytes]:
+        """Git-CLI fallback for ``_fetch_file_bytes`` (private-repo support)."""
         rel = PurePosixPath(path.strip("/"))
         if not self._is_safe_git_path(path) or not rel.name:
             return None
@@ -1251,7 +1372,20 @@ class GitHubSource(SkillSource):
         if not parent:
             return None
         files = self._download_directory_via_git(repo, parent, ref=ref)
-        return files.get(rel.name)
+        raw = files.get(rel.name)
+        if raw is None:
+            return None
+        return raw.encode("utf-8") if isinstance(raw, str) else raw
+
+    def _fetch_file_content_via_git(self, repo: str, path: str, ref: Optional[str] = None) -> Optional[str]:
+        """Git-CLI fallback returning decoded text (legacy callers)."""
+        raw = self._fetch_file_bytes_via_git(repo, path, ref=ref)
+        if raw is None:
+            return None
+        try:
+            return raw.decode("utf-8")
+        except UnicodeDecodeError:
+            return None
 
     def _get_skillsh_groupings(self, repo: str) -> Optional[Dict[str, str]]:
         """Fetch and parse the repo-root ``skills.sh.json`` grouping sidecar.
@@ -1593,12 +1727,12 @@ class WellKnownSkillSource(SkillSource):
 # ---------------------------------------------------------------------------
 
 class UrlSource(SkillSource):
-    """Fetch a single-file SKILL.md skill directly from an HTTP(S) URL.
+    """Fetch SKILL.md plus explicitly referenced, allowlisted support files.
 
     The identifier IS the URL (e.g. ``https://example.com/path/SKILL.md``).
-    Only single-file skills are supported — multi-file skills with
-    ``references/`` or ``scripts/`` subfolders need a manifest we can't
-    discover from a bare URL.
+    Bare URLs cannot safely enumerate a repository, so only exact references
+    below references/templates/scripts/assets are fetched. Other repository
+    files are never copied.
 
     The skill name is read from the ``name:`` field in the SKILL.md YAML
     frontmatter (with a URL-slug fallback). Trust level is always
@@ -1677,6 +1811,19 @@ class UrlSource(SkillSource):
 
         fm = GitHubSource._parse_frontmatter_quick(text)
         name = self._resolve_skill_name(fm, url)
+        referenced = _referenced_support_paths(text)
+        if referenced is None:
+            return None
+        files: Dict[str, Union[str, bytes]] = {"SKILL.md": text}
+        base_url = url.rsplit("/", 1)[0] + "/"
+        for rel_path in sorted(referenced):
+            support_url = urljoin(base_url, rel_path)
+            if urlparse(support_url).netloc != urlparse(url).netloc:
+                return None
+            content = self._fetch_bytes(support_url)
+            if content is None:
+                return None
+            files[rel_path] = content
 
         # When auto-resolution fails, return a bundle with an empty name and
         # ``awaiting_name=True`` in metadata. The install flow (``do_install``)
@@ -1693,11 +1840,11 @@ class UrlSource(SkillSource):
 
         return SkillBundle(
             name=skill_name,
-            files={"SKILL.md": text},
+            files=files,
             source="url",
             identifier=url,
             trust_level="community",
-            metadata={"url": url, "awaiting_name": not skill_name},
+            metadata={"url": url, "source_url": url, "awaiting_name": not skill_name},
         )
 
     @staticmethod
@@ -1705,6 +1852,13 @@ class UrlSource(SkillSource):
         resp = _guarded_http_get(url, timeout=20)
         if resp is not None and resp.status_code == 200:
             return resp.text
+        return None
+
+    @staticmethod
+    def _fetch_bytes(url: str) -> Optional[bytes]:
+        resp = _guarded_http_get(url, timeout=20)
+        if resp is not None and resp.status_code == 200:
+            return resp.content
         return None
 
     # Skill names must look like identifiers: lowercase letters/digits with
@@ -3579,6 +3733,7 @@ class HubLockFile:
         install_path: str,
         files: List[str],
         metadata: Optional[Dict[str, Any]] = None,
+        scan_provenance: Optional[Dict[str, Any]] = None,
     ) -> None:
         # Validate both the skill name and the install path SHAPE before
         # writing into lock.json. A poisoned lock entry is the precondition
@@ -3596,6 +3751,7 @@ class HubLockFile:
             "install_path": safe_install_path,
             "files": files,
             "metadata": metadata or {},
+            "scan_provenance": scan_provenance or {},
             "installed_at": datetime.now(timezone.utc).isoformat(),
             "updated_at": datetime.now(timezone.utc).isoformat(),
         }
@@ -3736,6 +3892,7 @@ def install_from_quarantine(
     category: str,
     bundle: SkillBundle,
     scan_result: ScanResult,
+    scan_provenance: Optional[Dict[str, Any]] = None,
 ) -> Path:
     """Move a scanned skill from quarantine into the skills directory."""
     safe_skill_name = _validate_skill_name(skill_name)
@@ -3806,6 +3963,7 @@ def install_from_quarantine(
         install_path=str(install_dir.relative_to(_skills_dir())),
         files=list(bundle.files.keys()),
         metadata=bundle.metadata,
+        scan_provenance=scan_provenance or getattr(scan_result, "scan_provenance", None),
     )
 
     append_audit_log(
