@@ -189,9 +189,16 @@ def _git_status_porcelain_for_worker(task_id: str) -> Optional[str]:
         return None
     if inside.returncode != 0 or inside.stdout.strip() != "true":
         return None
+    # Scope the porcelain output to the workspace path (`-- .`). Without
+    # this, a scratch/dir workspace that happens to live inside a larger
+    # repo (e.g. ~/.hermes) reports the *entire* repo's dirty state, so
+    # pre-existing churn outside the task's declared workspace blocks
+    # completion unfairly. With `-- .` only files under the workspace
+    # directory are considered. Linked worktrees are naturally scoped
+    # already, so this is a no-op for them.
     try:
         status = subprocess.run(
-            ["git", "-C", workspace, "status", "--porcelain"],
+            ["git", "-C", workspace, "status", "--porcelain", "--", "."],
             check=False,
             capture_output=True,
             text=True,

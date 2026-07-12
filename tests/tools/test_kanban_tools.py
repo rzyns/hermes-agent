@@ -1539,6 +1539,133 @@ def test_git_handoff_guard_blocks_dirty_block_without_reason(monkeypatch, tmp_pa
 
 
 # ---------------------------------------------------------------------------
+# Dirty-check scope regression tests
+# ---------------------------------------------------------------------------
+#
+# The guard must scope `git status --porcelain` to the workspace directory
+# (`-- .`). A scratch or dir workspace that lives inside a larger repo
+# (the common case for ~/.hermes) must NOT inherit dirty state from files
+# outside the workspace path. See t_2e847548 / t_61217763.
+
+def _make_repo_with_subdir(tmp_path):
+    """Create a git repo with a subdirectory that simulates a workspace."""
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    subprocess.run(
+        ["git", "init"],
+        cwd=repo,
+        check=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    # Configure a dummy commit author so git operations work in CI sandboxes.
+    subprocess.run(
+        ["git", "config", "user.email", "test@example.com"],
+        cwd=repo,
+        check=True,
+        capture_output=True,
+    )
+    subprocess.run(
+        ["git", "config", "user.name", "Test"],
+        cwd=repo,
+        check=True,
+        capture_output=True,
+    )
+    ws = repo / "workspace_subdir"
+    ws.mkdir()
+    return repo, ws
+
+
+def test_git_handoff_guard_ignores_out_of_scope_dirt(monkeypatch, tmp_path):
+    """A workspace dir inside a repo must not be blocked by dirty files
+    outside it. This is the core regression for the scratch/dir scope bug.
+    """
+    from tools.kanban_tools import _guard_git_handoff
+
+    repo, ws = _make_repo_with_subdir(tmp_path)
+    # Dirty file OUTSIDE the workspace subdir
+    (repo / "unrelated.txt").write_text("churn\n", encoding="utf-8")
+
+    monkeypatch.setenv("HERMES_KANBAN_TASK", "t_fake")
+    monkeypatch.setenv("HERMES_KANBAN_WORKSPACE", str(ws))
+
+    out = _guard_git_handoff("t_fake", metadata={}, action="complete")
+    assert out is None, (
+        "guard should not fire: dirty file is outside the workspace scope"
+    )
+
+
+def test_git_handoff_guard_blocks_in_scope_dirt_without_reason(monkeypatch, tmp_path):
+    """Dirty files INSIDE the workspace subdir must still block completion."""
+    from tools.kanban_tools import _guard_git_handoff
+
+    repo, ws = _make_repo_with_subdir(tmp_path)
+    # Dirty file INSIDE the workspace subdir
+    (ws / "changed.txt").write_text("dirty\n", encoding="utf-8")
+
+    monkeypatch.setenv("HERMES_KANBAN_TASK", "t_fake")
+    monkeypatch.setenv("HERMES_KANBAN_WORKSPACE", str(ws))
+
+    out = _guard_git_handoff("t_fake", metadata={}, action="complete")
+    assert out is not None
+    assert "metadata.no_commit_reason" in json.loads(out)["error"]
+
+
+def test_git_handoff_guard_allows_in_scope_dirt_with_reason(monkeypatch, tmp_path):
+    """In-scope dirty files with an explicit no_commit_reason must pass."""
+    from tools.kanban_tools import _guard_git_handoff
+
+    repo, ws = _make_repo_with_subdir(tmp_path)
+    (ws / "changed.txt").write_text("dirty\n", encoding="utf-8")
+
+    monkeypatch.setenv("HERMES_KANBAN_TASK", "t_fake")
+    monkeypatch.setenv("HERMES_KANBAN_WORKSPACE", str(ws))
+
+    out = _guard_git_handoff(
+        "t_fake",
+        metadata={"no_commit_reason": "intentionally left dirty"},
+        action="complete",
+    )
+    assert out is None
+
+
+def test_git_handoff_guard_mixed_in_and_out_of_scope_dirt_blocks(monkeypatch, tmp_path):
+    """When both in-scope and out-of-scope files are dirty, the guard must
+    fire (in-scope dirt is present) but only the in-scope file matters.
+    """
+    from tools.kanban_tools import _guard_git_handoff
+
+    repo, ws = _make_repo_with_subdir(tmp_path)
+    (repo / "unrelated.txt").write_text("churn\n", encoding="utf-8")
+    (ws / "changed.txt").write_text("dirty\n", encoding="utf-8")
+
+    monkeypatch.setenv("HERMES_KANBAN_TASK", "t_fake")
+    monkeypatch.setenv("HERMES_KANBAN_WORKSPACE", str(ws))
+
+    out = _guard_git_handoff("t_fake", metadata={}, action="complete")
+    assert out is not None
+
+
+def test_git_handoff_guard_empty_scratch_in_dirty_repo(monkeypatch, tmp_path):
+    """An empty scratch workspace (no files of its own) inside a repo with
+    lots of churn must close cleanly — simulates the t_61217763 scenario.
+    """
+    from tools.kanban_tools import _guard_git_handoff
+
+    repo, ws = _make_repo_with_subdir(tmp_path)
+    # Lots of dirt outside the workspace
+    for i in range(5):
+        (repo / f"churn_{i}.txt").write_text("churn\n", encoding="utf-8")
+
+    monkeypatch.setenv("HERMES_KANBAN_TASK", "t_fake")
+    monkeypatch.setenv("HERMES_KANBAN_WORKSPACE", str(ws))
+
+    out = _guard_git_handoff("t_fake", metadata={}, action="complete")
+    assert out is None
+
+
+# ---------------------------------------------------------------------------
 # Worker task-ownership enforcement (regression tests for #19534)
 # ---------------------------------------------------------------------------
 #
