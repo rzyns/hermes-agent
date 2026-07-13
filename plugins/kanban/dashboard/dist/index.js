@@ -2107,6 +2107,7 @@
     const [name, setName] = useState("");
     const [description, setDescription] = useState("");
     const [icon, setIcon] = useState("");
+    const [projectDirectory, setProjectDirectory] = useState("");
     const [switchTo, setSwitchTo] = useState(true);
     const [submitting, setSubmitting] = useState(false);
     const [err, setErr] = useState(null);
@@ -2131,6 +2132,7 @@
         name: name.trim() || autoName || undefined,
         description: description.trim() || undefined,
         icon: icon.trim() || undefined,
+        default_workdir: projectDirectory.trim() || undefined,
         switch: switchTo,
       }).catch(function (e) {
         setErr(String(e && e.message ? e.message : e));
@@ -2185,6 +2187,27 @@
               placeholder: "What goes on this board?",
               className: "h-8",
             }),
+          ),
+          h("div", { className: "flex flex-col gap-1" },
+            h(Label, { className: "text-xs" },
+              tx(t, "projectDirectory", "Project directory"), " ",
+              h("span", { className: "text-muted-foreground" },
+                tx(t, "projectDirectoryHint", "(recommended)"))),
+            h(Input, {
+              value: projectDirectory,
+              onChange: function (e) { setProjectDirectory(e.target.value); },
+              placeholder: tx(t, "projectDirectoryPlaceholder",
+                "Absolute path to the project folder"),
+              title: tx(t, "projectDirectoryHelp",
+                "Git projects use preserved worktrees. Other folders use the directory directly. Leave blank only for temporary work."),
+              className: "h-8",
+              autoCapitalize: "none",
+              autoCorrect: "off",
+              spellCheck: false,
+            }),
+            h("div", { className: "text-xs text-muted-foreground" },
+              tx(t, "projectDirectoryExplanation",
+                "Sets the default location for task files so project output is preserved.")),
           ),
           h("div", { className: "flex flex-col gap-1" },
             h(Label, { className: "text-xs" }, tx(t, "icon", "Icon"), " ",
