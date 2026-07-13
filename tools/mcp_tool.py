@@ -637,18 +637,13 @@ def _wrap_command_with_watchdog(command: str, args: list) -> tuple[str, list]:
         return command, args
     try:
         my_pid = os.getpid()
-        try:
-            import psutil
-            create_time = psutil.Process(my_pid).create_time()
-        except ImportError:
-            create_time = time.time()
     except Exception:
         # Never let watchdog bookkeeping failure block a real MCP connection.
         return command, args
     watchdog_args = [
         os.path.join(os.path.dirname(os.path.abspath(__file__)), "mcp_stdio_watchdog.py"),
         "--ppid", str(my_pid),
-        "--create-time", repr(create_time),
+        "--create-time", "0.0",  # retained for watchdog CLI compatibility
         "--",
         command,
         *args,
@@ -1837,29 +1832,32 @@ class MCPServerTask:
         Raises on a genuine connection failure so the caller triggers a
         reconnect; returns normally when the session is alive.
         """
-        if not self._ping_unsupported:
-            try:
-                await asyncio.wait_for(self.session.send_ping(), timeout=30.0)
-                return
-            except Exception as exc:
-                # Only a "method not found" means ping is unsupported. Any
-                # other error (timeout, closed transport, session expired) is
-                # a real liveness failure — propagate so we reconnect.
-                if not _is_method_not_found_error(exc):
-                    raise
-                if not self._advertises_tools():
-                    # No ping, no tools → no cheaper probe to fall back to.
-                    raise
-                self._ping_unsupported = True
-                logger.info(
-                    "MCP server '%s': does not implement the optional 'ping' "
-                    "utility (-32601); using 'list_tools' for keepalive on "
-                    "this connection.",
-                    self.name,
-                )
+        async with self._rpc_lock:
+            if not self._ping_unsupported:
+                try:
+                    await asyncio.wait_for(self.session.send_ping(), timeout=30.0)
+                    return
+                except Exception as exc:
+                    # Only a "method not found" means ping is unsupported. Any
+                    # other error (timeout, closed transport, session expired) is
+                    # a real liveness failure — propagate so we reconnect.
+                    if not _is_method_not_found_error(exc):
+                        raise
+                    if not self._advertises_tools():
+                        # No ping, no tools → no cheaper probe to fall back to.
+                        raise
+                    self._ping_unsupported = True
+                    logger.info(
+                        "MCP server '%s': does not implement the optional 'ping' "
+                        "utility (-32601); using 'list_tools' for keepalive on "
+                        "this connection.",
+                        self.name,
+                    )
 
-        # Fallback probe for servers without ping support.
-        await asyncio.wait_for(self.session.list_tools(), timeout=30.0)
+            # Fallback probe for servers without ping support. Keep it in the
+            # same RPC critical section: tools/list_changed refreshes and tool
+            # calls share this ClientSession stream and must not overlap it.
+            await asyncio.wait_for(self.session.list_tools(), timeout=30.0)
 
     async def _wait_for_lifecycle_event(self) -> str:
         """Block until either _shutdown_event or _reconnect_event fires.

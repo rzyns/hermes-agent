@@ -25,8 +25,6 @@ import sys
 import threading
 import time
 
-import psutil
-
 import cli as cli_mod
 from cli import HermesCLI
 from rich.console import Console
@@ -52,17 +50,14 @@ _in_flight = threading.Event()  # set while a command is executing
 
 
 def _is_orphaned(original_ppid, parent_create_time, getppid=os.getppid) -> bool:
-    """True once our spawning gateway is gone. Compare to the ORIGINAL ppid
-    (never ==1: Linux reparents to a subreaper) and guard PID reuse via
-    create_time."""
-    if getppid() != original_ppid:
-        return True
-    try:
-        if not psutil.pid_exists(original_ppid):
-            return True
-        return psutil.Process(original_ppid).create_time() != parent_create_time
-    except psutil.Error:
-        return True
+    """True once the spawning gateway is no longer this process's parent.
+
+    ``getppid`` is kernel-maintained and changes on reparenting. Do not use
+    ``psutil.create_time()`` as a second identity check: its epoch-derived
+    value can drift on WSL while the parent remains alive.
+    """
+    del parent_create_time  # retained in the argv contract for compatibility
+    return getppid() != original_ppid
 
 
 def _prepare_slash_worker_runtime() -> None:
@@ -145,11 +140,7 @@ def main():
     # Start before the (hundreds-of-ms) HermesCLI build — that window is itself
     # an orphan risk if the gateway dies mid-spawn.
     orig_ppid = os.getppid()
-    try:
-        parent_create_time = psutil.Process(orig_ppid).create_time()
-    except psutil.Error:
-        parent_create_time = 0.0
-    _start_parent_death_watchdog(orig_ppid, parent_create_time)
+    _start_parent_death_watchdog(orig_ppid, 0.0)
     _prepare_slash_worker_runtime()
 
     with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):

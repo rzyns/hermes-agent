@@ -26,16 +26,15 @@ instead, which:
      protocol talks directly over those pipes, so the supervisor must be a
      no-op relay, not a bytes-in-the-middle proxy;
   3. runs a background thread that polls the ORIGINAL parent PID using the
-     exact same orphan-detection algorithm already proven in
-     ``tui_gateway/slash_worker.py`` (``_is_orphaned``): compare current
-     ``getppid()`` against the recorded original, and guard PID reuse via
-     ``psutil`` process creation time;
+     same kernel parent-relationship check as ``tui_gateway/slash_worker.py``:
+     compare current ``getppid()`` against the recorded original. Once the
+     parent dies, POSIX reparents the watchdog before that numeric PID can be
+     reused, so this avoids unstable epoch-derived process timestamps;
   4. the instant the original parent is gone, terminates the real child's
      process group (SIGTERM, grace period, then SIGKILL) and exits.
 
-This is intentionally a thin, dependency-light script (``psutil`` only,
-already a hard dependency via ``tui_gateway/slash_worker.py``) so it starts
-fast and can't itself become a resource leak.
+This is intentionally a thin, stdlib-only script so it starts fast and can't
+itself become a resource leak.
 
 Usage (see ``tools/mcp_tool.py::_run_stdio``)::
 
@@ -54,35 +53,29 @@ import sys
 import threading
 import time
 
-try:
-    import psutil
-except ImportError:  # pragma: no cover - psutil is a hard dependency elsewhere
-    psutil = None
-
 _POLL_INTERVAL_S = 2.0
 _TERM_GRACE_S = 3.0
 
 
-def _is_orphaned(original_ppid: int, parent_create_time: float, getppid=os.getppid) -> bool:
-    """Mirrors ``tui_gateway.slash_worker._is_orphaned`` exactly.
+def _is_orphaned(
+    original_ppid: int,
+    parent_create_time: float,  # retained for CLI compatibility/diagnostics
+    getppid=os.getppid,
+) -> bool:
+    """Return whether the process that spawned this watchdog is gone.
 
-    True once the process that spawned us is gone. Never trusts a bare
-    ``getppid() == 1`` check (Linux reparents orphans to a subreaper, not
-    always PID 1), and guards against PID reuse via the recorded creation
-    time of the original parent.
+    The kernel-maintained parent relationship is the identity check: once the
+    original parent exits, this process is reparented to init or a subreaper,
+    so ``getppid()`` changes. Do not compare ``psutil.create_time()`` here.
+    On WSL its epoch-derived value can drift while a process is alive (observed
+    by several seconds), which previously killed healthy MCP servers and
+    surfaced as reconnect storms and ``ClosedResourceError``.
+
+    PID reuse cannot preserve the old parent-child relationship: reparenting
+    happens before the dead parent's numeric PID can be reused.
     """
-    if getppid() != original_ppid:
-        return True
-    if psutil is None:
-        # No reliable staleness check available; fall back to the ppid
-        # comparison alone (still catches the common case).
-        return False
-    try:
-        if not psutil.pid_exists(original_ppid):
-            return True
-        return psutil.Process(original_ppid).create_time() != parent_create_time
-    except psutil.Error:
-        return True
+    del parent_create_time
+    return getppid() != original_ppid
 
 
 def _terminate_process_group(proc: subprocess.Popen) -> None:

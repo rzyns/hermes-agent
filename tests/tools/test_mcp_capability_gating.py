@@ -272,6 +272,27 @@ class TestKeepaliveProbeFallback:
     that don't implement the optional ping utility — without reconnect-looping,
     and without regressing servers that DO support ping."""
 
+    async def test_keepalive_serializes_with_notification_refresh_rpc(self):
+        """Keepalive must not overlap a tools/list_changed refresh.
+
+        ``ClientSession`` receives notifications and responses on the same
+        anyio memory streams.  Issuing ``ping`` while the background refresh
+        owns the shared RPC lock can close the stream on real stdio servers,
+        causing synchronized ``ClosedResourceError`` reconnect loops.
+        """
+        task = MCPServerTask("test")
+        task.initialize_result = _caps(tools=SimpleNamespace())
+        async def send_ping():
+            assert task._rpc_lock.locked(), "keepalive ping escaped the shared RPC lock"
+
+        task.session = SimpleNamespace(
+            send_ping=AsyncMock(side_effect=send_ping),
+            list_tools=AsyncMock(),
+        )
+
+        await task._keepalive_probe()
+        task.session.send_ping.assert_awaited_once()
+
     async def test_uses_ping_when_supported(self):
         task = MCPServerTask("test")
         task.initialize_result = _caps(tools=SimpleNamespace())

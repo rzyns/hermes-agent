@@ -1,5 +1,3 @@
-import psutil
-
 from tui_gateway import slash_worker
 
 
@@ -8,14 +6,11 @@ def test_is_orphaned_true_when_ppid_changes():
     assert slash_worker._is_orphaned(1234, 1.0, getppid=lambda: 999999) is True
 
 
-def test_is_orphaned_true_when_parent_create_time_mismatch():
-    # Same ppid but a different create_time means the PID was reused.
-    me = psutil.Process()
-    assert slash_worker._is_orphaned(me.pid, 0.0, getppid=lambda: me.pid) is True
+def test_is_orphaned_ignores_create_time_drift_while_parent_relationship_is_live():
+    # WSL can shift psutil's epoch-derived create_time for a live process.
+    # The kernel parent relationship remains authoritative.
+    assert slash_worker._is_orphaned(1234, 0.0, getppid=lambda: 1234) is False
 
 
 def test_is_orphaned_false_when_parent_alive_and_matches():
-    me = psutil.Process()
-    assert (
-        slash_worker._is_orphaned(me.pid, me.create_time(), getppid=lambda: me.pid) is False
-    )
+    assert slash_worker._is_orphaned(1234, 1.0, getppid=lambda: 1234) is False
