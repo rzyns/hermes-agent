@@ -1133,17 +1133,18 @@ class TestStripProviderPrefix:
 
     @patch("agent.model_metadata.fetch_model_metadata")
     def test_ollama_model_tag_not_mangled_in_context_lookup(self, mock_fetch):
-        """Ensure 'qwen3.5:27b' is NOT reduced to '27b' during context length lookup.
+        """Ensure an Ollama ``model:tag`` is not reduced to only its tag.
 
-        We mock a custom endpoint that knows 'qwen3.5:27b' — the full name
-        must reach the endpoint metadata lookup intact.
+        Use an intentionally unknown family so an evolving static catalog
+        cannot short-circuit the custom-endpoint lookup this test exercises.
         """
         mock_fetch.return_value = {}
         with patch("agent.model_metadata.fetch_endpoint_model_metadata") as mock_ep, \
-             patch("agent.model_metadata._is_custom_endpoint", return_value=True):
-            mock_ep.return_value = {"qwen3.5:27b": {"context_length": 32768}}
+             patch("agent.model_metadata._is_custom_endpoint", return_value=True), \
+             patch("agent.model_metadata._is_known_provider_base_url", return_value=False):
+            mock_ep.return_value = {"localmodel:27b": {"context_length": 32768}}
             result = get_model_context_length(
-                "qwen3.5:27b",
+                "localmodel:27b",
                 base_url="http://localhost:11434/v1",
             )
         assert result == 32768

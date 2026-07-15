@@ -66,6 +66,7 @@ async function renderSkills() {
 }
 
 beforeEach(() => {
+  vi.useRealTimers()
   getSkills.mockResolvedValue([])
   getToolsets.mockResolvedValue([toolset()])
   toggleToolset.mockResolvedValue({ ok: true, name: 'web', enabled: false })

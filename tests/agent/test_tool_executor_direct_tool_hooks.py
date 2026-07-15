@@ -68,6 +68,9 @@ class _FakeAgent:
     def _apply_pending_steer_to_tool_results(self, _messages, _count):
         pass
 
+    def _flush_messages_to_session_db(self, _messages):
+        pass
+
 
 def _tool_call(name, args, tool_call_id="call-direct-1"):
     return SimpleNamespace(
@@ -87,7 +90,7 @@ def test_sequential_direct_tool_hooks_receive_matching_ids(monkeypatch):
     pre_calls = []
     hook_calls = []
 
-    def fake_pre_tool_call_block_message(function_name, function_args, **kwargs):
+    def fake_resolve_pre_tool_block(function_name, function_args, **kwargs):
         pre_calls.append((function_name, function_args, kwargs))
         return None
 
@@ -96,8 +99,8 @@ def test_sequential_direct_tool_hooks_receive_matching_ids(monkeypatch):
         return []
 
     monkeypatch.setattr(
-        "hermes_cli.plugins.get_pre_tool_call_block_message",
-        fake_pre_tool_call_block_message,
+        "hermes_cli.plugins.resolve_pre_tool_block",
+        fake_resolve_pre_tool_block,
     )
     monkeypatch.setattr("hermes_cli.plugins.invoke_hook", fake_invoke_hook)
 
@@ -144,7 +147,7 @@ def test_sequential_direct_tool_hooks_receive_matching_ids(monkeypatch):
 def test_sequential_direct_tool_transform_can_replace_result(monkeypatch):
     pre_calls = []
 
-    def fake_pre_tool_call_block_message(function_name, function_args, **kwargs):
+    def fake_resolve_pre_tool_block(function_name, function_args, **kwargs):
         pre_calls.append((function_name, function_args, kwargs))
         return None
 
@@ -154,8 +157,8 @@ def test_sequential_direct_tool_transform_can_replace_result(monkeypatch):
         return []
 
     monkeypatch.setattr(
-        "hermes_cli.plugins.get_pre_tool_call_block_message",
-        fake_pre_tool_call_block_message,
+        "hermes_cli.plugins.resolve_pre_tool_block",
+        fake_resolve_pre_tool_block,
     )
     monkeypatch.setattr("hermes_cli.plugins.invoke_hook", fake_invoke_hook)
 

@@ -16,6 +16,8 @@ import { EventEmitter } from 'node:events'
 import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
+import { fileURLToPath } from 'node:url'
+
 import { test } from 'vitest'
 
 import {
@@ -40,6 +42,7 @@ function makeFakeChild(): FakeChildProcess {
   const child = new EventEmitter() as FakeChildProcess
   child.stdout = new EventEmitter()
   child.stderr = new EventEmitter()
+
   return child
 }
 

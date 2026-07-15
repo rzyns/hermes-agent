@@ -43,6 +43,7 @@ function platform(patch: Partial<MessagingPlatformInfo> = {}): MessagingPlatform
 }
 
 beforeEach(() => {
+  vi.useRealTimers()
   updateMessagingPlatform.mockResolvedValue({ ok: true, platform: 'teams' })
 })
 

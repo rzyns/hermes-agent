@@ -20,7 +20,12 @@ vi.mock('@/lib/storage', () => ({
 
     return value === undefined ? fallback : value === 'true'
   },
-  storedString: (key: string) => storage.get(key) ?? null
+  storedString: (key: string) => storage.get(key) ?? null,
+  storedStringArray: (key: string) => {
+    const value = storage.get(key)
+
+    return value ? (JSON.parse(value) as string[]) : []
+  }
 }))
 
 const notifySpy = vi.fn()
