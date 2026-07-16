@@ -4025,7 +4025,9 @@ class TestHandleMaxIterations:
         kwargs = agent.client.chat.completions.create.call_args.kwargs
         from agent.portal_tags import nous_portal_tags
 
-        assert kwargs["extra_body"]["tags"] == nous_portal_tags()
+        assert kwargs["extra_body"]["tags"] == nous_portal_tags(
+            session_id=agent.session_id
+        )
         assert kwargs["extra_body"]["provider"] == {
             "only": ["deepseek"],
             "ignore": ["deepinfra"],
@@ -4047,7 +4049,9 @@ class TestHandleMaxIterations:
         kwargs = agent.client.chat.completions.create.call_args.kwargs
         from agent.portal_tags import nous_portal_tags
 
-        assert kwargs["extra_body"] == {"tags": nous_portal_tags()}
+        assert kwargs["extra_body"] == {
+            "tags": nous_portal_tags(session_id=agent.session_id)
+        }
 
     def test_summary_drops_invalid_provider_sort(self, agent):
         agent.base_url = "https://openrouter.ai/api/v1"
