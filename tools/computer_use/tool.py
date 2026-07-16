@@ -233,6 +233,10 @@ class _NoopBackend(ComputerUseBackend):  # pragma: no cover
         self.calls.append(("list_apps", {}))
         return []
 
+    def list_windows(self) -> List[Dict[str, Any]]:
+        self.calls.append(("list_windows", {}))
+        return []
+
     def focus_app(
         self,
         app: str,
@@ -368,16 +372,16 @@ def _dispatch(backend: ComputerUseBackend, action: str, args: Dict[str, Any]) ->
         mode = str(args.get("mode", "som"))
         if mode not in {"som", "vision", "ax"}:
             return json.dumps({"error": f"bad mode {mode!r}; use som|vision|ax"})
+        capture_kwargs: Dict[str, Any] = {"mode": mode, "app": args.get("app")}
         # Hermes-fix: when caller supplies pid + window_id, the backend's
-        # capture() bypasses list_windows. The wrapper just forwards the
-        # kwargs through; the backend is the one that decides to skip
-        # discovery.
-        cap = backend.capture(
-            mode=mode,
-            app=args.get("app"),
-            pid=args.get("pid"),
-            window_id=args.get("window_id"),
-        )
+        # capture() bypasses list_windows. Only pass them when at least one
+        # is supplied so backends that don't declare those kwargs still work.
+        if args.get("pid") is not None or args.get("window_id") is not None:
+            capture_kwargs.update({
+                "pid": args.get("pid"),
+                "window_id": args.get("window_id"),
+            })
+        cap = backend.capture(**capture_kwargs)
         return _capture_response(cap, max_elements=_coerce_max_elements(args.get("max_elements")))
 
     if action == "wait":
@@ -388,6 +392,10 @@ def _dispatch(backend: ComputerUseBackend, action: str, args: Dict[str, Any]) ->
     if action == "list_apps":
         apps = backend.list_apps()
         return json.dumps({"apps": apps, "count": len(apps)})
+
+    if action == "list_windows":
+        windows = backend.list_windows()
+        return json.dumps({"windows": windows, "count": len(windows)})
 
     if action == "focus_app":
         # pid + window_id path: skip the discovery dance entirely. Either
@@ -889,11 +897,16 @@ def _maybe_follow_capture(
     if not res.ok:
         return _text_response(res)
     try:
-        # Preserve the app context established by the preceding capture/focus_app so
-        # that capture_after=True re-captures the same app rather than the frontmost
-        # window (which may have changed if the action caused a focus shift).
-        last_app = getattr(backend, "_last_app", None)
-        cap = backend.capture(mode="som", app=last_app)
+        # Preserve the exact selected window when possible. Linux may expose a
+        # generic app name for several unrelated windows, so app-only recapture
+        # can silently switch targets after a successful action.
+        target = getattr(backend, "_last_target", None) or {}
+        pid = target.get("pid")
+        window_id = target.get("window_id")
+        if pid is not None and window_id is not None:
+            cap = backend.capture(mode="som", pid=pid, window_id=window_id)
+        else:
+            cap = backend.capture(mode="som", app=getattr(backend, "_last_app", None))
     except Exception as e:
         logger.warning("follow-up capture failed: %s", e)
         return _text_response(res)

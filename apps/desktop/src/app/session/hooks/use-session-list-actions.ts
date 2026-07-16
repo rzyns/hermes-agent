@@ -2,6 +2,7 @@ import { useStore } from '@nanostores/react'
 import { useCallback, useMemo, useRef } from 'react'
 
 import { getCronJobs, listAllProfileSessions, type SessionInfo } from '@/hermes'
+import { sameCronSignature } from '@/lib/session-signatures'
 import {
   isMessagingSource,
   LOCAL_SESSION_SOURCE_IDS,
@@ -32,8 +33,12 @@ import {
   setSessionsTotal
 } from '@/store/session'
 
-import { sameCronSignature } from '../../desktop-controller-utils'
-
+// The recents list is local-only: cron rows have their own section, and each
+// messaging platform (telegram, discord, …) is fetched separately into its own
+// self-managed sidebar section (refreshMessagingSessions). Excluding both here
+// keeps "Load more" paging through interactive local chats instead of
+// interleaving gateway threads that bury them.
+const SIDEBAR_EXCLUDED_SOURCES = ['cron', 'subagent', 'tool', ...MESSAGING_SESSION_SOURCE_IDS]
 // The messaging slice is the inverse: drop cron + every local source so only
 // external-platform conversations remain, then split per platform in the UI.
 const MESSAGING_EXCLUDED_SOURCES = ['cron', ...LOCAL_SESSION_SOURCE_IDS]
