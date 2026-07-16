@@ -4586,6 +4586,28 @@ class ArtifactPreservationError(RuntimeError):
     """Raised when a declared scratch deliverable cannot be preserved."""
 
 
+class CompletionResultRequiredError(ValueError):
+    """Raised by ``complete_task`` / ``edit_completed_task_result`` when the
+    effective result would be blank.
+
+    A completed task must carry a non-empty human-readable outcome so
+    downstream workers, dashboards, and the event log never see a null
+    handoff.  In ``complete_task``, ``summary`` is preferred and falls back
+    to ``result``; when both are blank (or whitespace-only) this error is
+    raised and the task is NOT transitioned to ``done``.
+
+    Kept as a ``ValueError`` subclass so existing tool-error handlers treat
+    it as a recoverable caller error.
+    """
+
+    def __init__(self, task_id: str):
+        self.task_id = task_id
+        super().__init__(
+            f"completion blocked: task {task_id} requires a non-blank "
+            f"result or summary — neither was provided"
+        )
+
+
 def complete_task(
     conn: sqlite3.Connection,
     task_id: str,
@@ -4627,6 +4649,15 @@ def complete_task(
     """
     now = int(time.time())
 
+    # Non-blank effective result guard. ``summary`` is the canonical
+    # handoff field; fall back to ``result`` for single-run callers. When
+    # both are blank/whitespace-only the task is NOT transitioned to done
+    # and a CompletionResultRequiredError is raised so a null handoff can
+    # never silently land on the board (P3.3e).
+    effective_result = (summary or result or "")
+    if not effective_result.strip():
+        raise CompletionResultRequiredError(task_id)
+
     # Gate: verify created_cards BEFORE the main write txn. A rejected
     # completion still needs an auditable event, so we emit it in a
     # tiny dedicated txn, then raise. The caller is responsible for
@@ -4644,8 +4675,8 @@ def complete_task(
                         "phantom_cards": phantom_cards,
                         "verified_cards": verified_cards,
                         "summary_preview": (
-                            (summary or result or "").strip().splitlines()[0][:200]
-                            if (summary or result)
+                            effective_result.strip().splitlines()[0][:200]
+                            if effective_result
                             else None
                         ),
                     },
@@ -4673,7 +4704,7 @@ def complete_task(
                  WHERE id = ?
                    AND status IN ('running', 'ready', 'blocked')
                 """,
-                (result, now, task_id),
+                (effective_result, now, task_id),
             )
         else:
             cur = conn.execute(
@@ -4691,7 +4722,7 @@ def complete_task(
                    AND status IN ('running', 'ready', 'blocked')
                    AND current_run_id = ?
                 """,
-                (result, now, task_id, int(expected_run_id)),
+                (effective_result, now, task_id, int(expected_run_id)),
             )
         if cur.rowcount != 1:
             return False
@@ -4710,28 +4741,27 @@ def complete_task(
         run_id = _end_run(
             conn, task_id,
             outcome="completed", status="done",
-            summary=summary if summary is not None else result,
+            summary=effective_result,
             metadata=metadata,
         )
         # If complete_task was called on a never-claimed task (ready or
         # blocked → done with no run in flight), synthesize a
         # zero-duration run so the handoff fields are persisted in
         # attempt history instead of silently lost.
-        if run_id is None and (summary or metadata or result):
+        if run_id is None and (effective_result or metadata):
             run_id = _synthesize_ended_run(
                 conn, task_id,
                 outcome="completed",
-                summary=summary if summary is not None else result,
+                summary=effective_result,
                 metadata=metadata,
             )
         # Carry the handoff summary in the event payload so gateway
         # notifiers and dashboard WS consumers can render it without a
         # second SQL round-trip. First line only, 400 char cap — the
         # full summary stays on the run row.
-        ev_summary = (summary if summary is not None else result) or ""
-        ev_summary = ev_summary.strip().splitlines()[0][:400] if ev_summary else ""
+        ev_summary = effective_result.strip().splitlines()[0][:400] if effective_result else ""
         completed_payload: dict = {
-            "result_len": len(result) if result else 0,
+            "result_len": len(effective_result) if effective_result else 0,
             "summary": ev_summary or None,
         }
         if verified_cards:
@@ -4810,7 +4840,7 @@ def complete_task(
         board=get_current_board(),
         assignee=_done_task.assignee if _done_task else None,
         run_id=run_id,
-        summary=(summary if summary is not None else result),
+        summary=effective_result,
     )
     return True
 
@@ -5328,7 +5358,15 @@ def edit_completed_task_result(
     summary: Optional[str] = None,
     metadata: Optional[dict] = None,
 ) -> bool:
-    """Backfill the user-visible result for an already completed task."""
+    """Backfill the user-visible result for an already completed task.
+
+    Rejects blank/whitespace-only ``result`` — editing a completed task
+    must never erase its outcome back to null (P3.3e). The effective
+    handoff summary falls back from ``summary`` to ``result`` just like
+    :func:`complete_task`.
+    """
+    if not (result or "").strip():
+        raise CompletionResultRequiredError(task_id)
     handoff_summary = summary if summary is not None else result
     with write_txn(conn):
         row = conn.execute(

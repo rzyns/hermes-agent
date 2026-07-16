@@ -2633,13 +2633,18 @@ def _cmd_complete(args: argparse.Namespace) -> int:
     failed: list[str] = []
     with kb.connect_closing() as conn:
         for tid in ids:
-            if not kb.complete_task(
-                conn, tid,
-                result=args.result,
-                summary=summary,
-                metadata=metadata,
-                expected_run_id=_worker_run_id_for(tid),
-            ):
+            try:
+                ok = kb.complete_task(
+                    conn, tid,
+                    result=args.result,
+                    summary=summary,
+                    metadata=metadata,
+                    expected_run_id=_worker_run_id_for(tid),
+                )
+            except kb.CompletionResultRequiredError as exc:
+                print(f"kanban: {exc}", file=sys.stderr)
+                return 2
+            if not ok:
                 failed.append(tid)
                 print(f"cannot complete {tid} (unknown id or terminal state)", file=sys.stderr)
             else:
@@ -2659,13 +2664,18 @@ def _cmd_edit(args: argparse.Namespace) -> int:
             print(f"kanban: --metadata: {exc}", file=sys.stderr)
             return 2
     with kb.connect_closing() as conn:
-        if not kb.edit_completed_task_result(
-            conn,
-            args.task_id,
-            result=args.result,
-            summary=getattr(args, "summary", None),
-            metadata=metadata,
-        ):
+        try:
+            edited = kb.edit_completed_task_result(
+                conn,
+                args.task_id,
+                result=args.result,
+                summary=getattr(args, "summary", None),
+                metadata=metadata,
+            )
+        except kb.CompletionResultRequiredError as exc:
+            print(f"kanban: {exc}", file=sys.stderr)
+            return 2
+        if not edited:
             print(
                 f"cannot edit {args.task_id} (unknown id or task is not done)",
                 file=sys.stderr,
