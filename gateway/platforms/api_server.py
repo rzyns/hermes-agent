@@ -1441,7 +1441,13 @@ class APIServerAdapter(BasePlatformAdapter):
         auth_header = request.headers.get("Authorization", "")
         if auth_header.startswith("Bearer "):
             token = auth_header[7:].strip()
-            if hmac.compare_digest(token, self._api_key):
+            # Compare as bytes: ``hmac.compare_digest`` raises TypeError on a
+            # str containing non-ASCII characters, and ``token`` is the raw
+            # client-supplied header. A stray non-ASCII byte in the key would
+            # otherwise crash this handler (500) instead of returning a clean
+            # 401. Encoding both sides keeps the timing-safe comparison and
+            # matches web_server.py's dashboard-token check.
+            if hmac.compare_digest(token.encode(), self._api_key.encode()):
                 return None  # Auth OK
 
         logger.warning(
@@ -1489,8 +1495,27 @@ class APIServerAdapter(BasePlatformAdapter):
 
     @staticmethod
     def _profile_scope(profile: Optional[str]):
-        """Enter the multiplex profile runtime scope, or a no-op when unset."""
+        """Enter the multiplex profile runtime scope, or a no-op when unset.
+
+        When no ``/p/<profile>/`` prefix was given AND multiplexing is active,
+        enter the DEFAULT profile's scope instead of a no-op: api_server is a
+        port-binding platform that lives on the default profile, and with
+        multiplex fail-closed ``get_secret`` active, an unscoped agent run
+        raises ``UnscopedSecretError`` on its first credential read (#61276).
+        Single-profile gateways keep the no-op — ``get_secret`` falls through
+        to ``os.environ`` there, unchanged.
+        """
         if not profile:
+            try:
+                from agent.secret_scope import is_multiplex_active
+
+                if is_multiplex_active():
+                    from gateway.run import _profile_runtime_scope
+                    from hermes_constants import get_hermes_home
+
+                    return _profile_runtime_scope(get_hermes_home())
+            except Exception:
+                pass
             return nullcontext()
         from gateway.run import _profile_runtime_scope
         from hermes_cli.profiles import get_profile_dir

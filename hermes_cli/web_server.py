@@ -2467,7 +2467,7 @@ async def git_branch_switch_route(body: GitBranchSwitchBody):
 
 # Host TCP ports each port-binding gateway platform listens on, as
 # ``platform-name -> (config port key, adapter default)``.  Mirrors
-# ``_PORT_BINDING_PLATFORM_VALUES`` in gateway/run.py and each adapter's
+# ``PORT_BINDING_PLATFORM_VALUES`` in gateway/config.py and each adapter's
 # DEFAULT_PORT / DEFAULT_WEBHOOK_PORT constant.  Used only for the dashboard's
 # gateway-topology readout — best-effort display data, not a bind source.
 _PORT_BINDING_PLATFORM_PORTS: Dict[str, Tuple[str, int]] = {
@@ -8100,6 +8100,57 @@ async def get_messaging_platforms(profile: Optional[str] = None):
         }
 
 
+def _multiplex_port_binding_conflict(
+    platform_id: str, requested_profile: Optional[str]
+) -> Optional[str]:
+    """Reason enabling ``platform_id`` on the target profile would break a
+    multiplexed gateway, or ``None`` when the change is allowed.
+
+    Mirrors the gateway's startup rule (``_start_one_profile_adapters`` in
+    gateway/run.py): with ``gateway.multiplex_profiles`` on, the default
+    profile owns the single shared HTTP listener and serves every profile via
+    the ``/p/<profile>/`` prefix, so a SECONDARY profile must never enable a
+    port-binding platform. Without this pre-write check the dashboard happily
+    persisted the invalid config and the shared gateway died with
+    ``MultiplexConfigError`` on its next start — for ALL profiles. Only
+    *enabling* is blocked; disabling/clearing stays allowed so users can
+    repair an already-invalid profile.
+    """
+    from gateway.config import PORT_BINDING_PLATFORM_VALUES, load_gateway_config
+
+    if platform_id not in PORT_BINDING_PLATFORM_VALUES:
+        return None
+
+    requested = (requested_profile or "").strip()
+    if not requested or requested.lower() == "current":
+        from hermes_cli.profiles import get_active_profile_name
+
+        # The dashboard's own profile. "custom" (an unrecognized HERMES_HOME)
+        # is outside the profiles tree, so a multiplexed gateway never serves
+        # it — nothing to guard.
+        target = get_active_profile_name()
+    else:
+        _resolve_profile_dir(requested)  # same 400/404 as _profile_scope
+        target = requested
+    if target in ("default", "custom"):
+        return None
+
+    # The multiplex flag that matters is the one the shared gateway reads at
+    # startup: the DEFAULT profile's gateway config (plus the process-wide
+    # GATEWAY_MULTIPLEX_PROFILES override, which load_gateway_config applies).
+    with _config_profile_scope("default"):
+        if not load_gateway_config().multiplex_profiles:
+            return None
+
+    return (
+        f"Cannot enable '{platform_id}' on profile '{target}': it binds its "
+        "own listener port, and gateway.multiplex_profiles is on, so the "
+        "default profile owns the single shared HTTP listener for every "
+        "profile. Configure this channel on the default profile instead "
+        "(disabling or clearing it here is still allowed)."
+    )
+
+
 @app.put("/api/messaging/platforms/{platform_id}")
 async def update_messaging_platform(
     platform_id: str, body: MessagingPlatformUpdate, profile: Optional[str] = None
@@ -8109,6 +8160,20 @@ async def update_messaging_platform(
         raise HTTPException(
             status_code=404, detail=f"Unknown messaging platform: {platform_id}"
         )
+
+    target_profile = body.profile or profile
+    if body.enabled:
+        conflict = _multiplex_port_binding_conflict(platform_id, target_profile)
+        if conflict:
+            # Reject BEFORE any .env/config.yaml write so the profile stays
+            # loadable by the multiplexed gateway.
+            _log.info(
+                "Rejected messaging platform update: platform=%s profile=%s "
+                "(multiplex port-binding conflict)",
+                platform_id,
+                target_profile or "current",
+            )
+            raise HTTPException(status_code=409, detail=conflict)
 
     allowed_env = set(entry["env_vars"])
     try:
@@ -8135,6 +8200,16 @@ async def update_messaging_platform(
             if body.enabled is not None:
                 _write_platform_enabled(platform_id, body.enabled)
 
+        # Audit trail for channel config mutations: names only, never values.
+        _log.info(
+            "Messaging platform updated: platform=%s profile=%s enabled=%s "
+            "env_keys=%s cleared_keys=%s",
+            platform_id,
+            target_profile or "current",
+            body.enabled,
+            sorted(body.env),
+            sorted(body.clear_env),
+        )
         return {"ok": True, "platform": platform_id}
     except HTTPException:
         raise
@@ -16244,6 +16319,77 @@ def _normalise_prefix(raw: Optional[str]) -> str:
     return normalise_prefix(raw)
 
 
+def _render_active_theme_bootstrap_css() -> str:
+    """Critical-CSS shim for the active user theme.
+
+    Returns a ``<style>`` block with the ``:root`` CSS variables that
+    ``ThemeProvider.applyTheme()`` installs once the
+    ``/api/dashboard/themes`` round-trip completes.  The goal is to
+    eliminate the green flash where the first paint shows the bundle's
+    default Hermes Teal canvas before the SPA flips the configured user
+    theme into place.
+
+    Built-in themes return an empty string — their full definitions live
+    in ``web/src/themes/presets.ts`` and are applied by the bundle
+    before paint, so no shim is needed for them.
+    """
+    try:
+        config = load_config()
+        active = cfg_get(config, "dashboard", "theme", default="default")
+        if not active or not isinstance(active, str):
+            return ""
+        # Built-in: the bundle already owns the definition, no flash.
+        if any(b["name"] == active for b in _BUILTIN_DASHBOARD_THEMES):
+            return ""
+        for theme in _discover_user_themes():
+            if theme.get("name") != active:
+                continue
+            palette = theme.get("palette") or {}
+            bg = palette.get("background") or {}
+            mg = palette.get("midground") or {}
+            bg_hex = bg.get("hex", "#0a0a0a") if isinstance(bg, dict) else "#0a0a0a"
+            mg_hex = mg.get("hex", "#e5e5e5") if isinstance(mg, dict) else "#e5e5e5"
+            typo = theme.get("typography") or {}
+            font_sans = typo.get("fontSans") or _THEME_DEFAULT_TYPOGRAPHY["fontSans"]
+            base_size = typo.get("baseSize") or _THEME_DEFAULT_TYPOGRAPHY["baseSize"]
+            # Defensive ``</style>`` escape — current values are well-known
+            # hex/font strings, but this keeps the helper safe if it is
+            # later extended to ship user-authored CSS literals.
+            def _esc(s: str) -> str:
+                return str(s).replace("</", "<\\/")
+            # Variable names MUST match what the bundle actually consumes:
+            #   - ``--background-base`` / ``--midground-base`` come from
+            #     ``layerVars()`` in ``web/src/themes/context.tsx``.
+            #   - ``--theme-font-sans`` / ``--theme-base-size`` come from
+            #     ``typographyVars()`` there, and ``index.css`` applies them
+            #     via ``html{font-family:var(--theme-font-sans);
+            #     font-size:var(--theme-base-size)}``.
+            # The ``html,body`` canvas rule references the SAME variables
+            # instead of literal values so runtime theme switches stay
+            # live: ``applyTheme()`` writes these vars as inline styles on
+            # ``documentElement``, which outrank this stylesheet block in
+            # the cascade — the rule below re-resolves automatically and
+            # never goes stale when the user picks a different theme.
+            return (
+                '<style id="hermes-theme-bootstrap">'
+                ":root{"
+                f"--background-base:{_esc(bg_hex)};"
+                f"--midground-base:{_esc(mg_hex)};"
+                f"--theme-font-sans:{_esc(font_sans)};"
+                f"--theme-base-size:{_esc(base_size)};"
+                "}"
+                "html,body{background-color:var(--background-base);"
+                "color:var(--midground-base);"
+                "font-family:var(--theme-font-sans);"
+                "font-size:var(--theme-base-size);}"
+                "</style>"
+            )
+        return ""
+    except Exception:
+        _log.debug("theme bootstrap render failed", exc_info=True)
+        return ""
+
+
 def mount_spa(application: FastAPI):
     """Mount the built SPA. Falls back to index.html for client-side routing.
 
@@ -16318,6 +16464,16 @@ def mount_spa(application: FastAPI):
             html = html.replace('href="/fonts/', f'href="{prefix}/fonts/')
             html = html.replace('href="/ds-assets/', f'href="{prefix}/ds-assets/')
             html = html.replace('src="/ds-assets/', f'src="{prefix}/ds-assets/')
+        # Theme flash mitigation: when the active theme is a user theme
+        # (``HERMES_HOME/dashboard-themes/<name>.yaml``), inject a minimal
+        # critical-CSS block so the first paint uses the target palette.
+        # Without this the SPA paints the default Hermes Teal canvas, then
+        # ``ThemeProvider`` flips the CSS variables once
+        # ``/api/dashboard/themes`` resolves.  Built-in themes are already
+        # in the bundle's ``presets.ts`` so no shim is needed for them.
+        theme_bootstrap = _render_active_theme_bootstrap_css()
+        if theme_bootstrap:
+            html = html.replace("</head>", f"{theme_bootstrap}</head>", 1)
         html = html.replace("</head>", f"{bootstrap_script}</head>", 1)
         return HTMLResponse(
             html,
