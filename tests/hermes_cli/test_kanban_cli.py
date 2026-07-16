@@ -124,7 +124,7 @@ def test_run_slash_create_with_parent_and_cascade(kanban_home):
     assert "todo" in out2  # child starts as todo
 
     # Complete parent; list should promote child to ready
-    kc.run_slash(f"complete {p}")
+    kc.run_slash(f"complete {p} --result 'parent done'")
     # Explicit filter: child should now be ready (was todo before complete).
     ready_list = kc.run_slash("list --status ready")
     assert "child" in ready_list
@@ -148,6 +148,10 @@ def test_run_slash_comment_max_len_trims_long_body(kanban_home):
     assert "trimmed to 20 chars by --max-len" in show
     assert "x" * 30 not in show
 
+
+# ---------------------------------------------------------------------------
+# Workspace flag parsing (parametrized unit tests of the parser)
+# ---------------------------------------------------------------------------
 
 def test_run_slash_block_unblock_cycle(kanban_home):
     out = kc.run_slash("create 'x' --assignee alice")

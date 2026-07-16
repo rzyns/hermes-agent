@@ -649,7 +649,7 @@ def test_patch_drag_drop_move_todo_to_ready(client):
     # Complete the parent.
     r = client.patch(
         f"/api/plugins/kanban/tasks/{parent['id']}",
-        json={"status": "done"},
+        json={"status": "done", "result": "parent done"},
     )
     assert r.status_code == 200
 
@@ -674,7 +674,7 @@ def test_reopening_parent_demotes_ready_child(client):
 
     r = client.patch(
         f"/api/plugins/kanban/tasks/{parent['id']}",
-        json={"status": "done"},
+        json={"status": "done", "result": "parent done"},
     )
     assert r.status_code == 200
 
@@ -940,7 +940,7 @@ def test_board_progress_rollup(client):
     # parent to done so children auto-promote to ready via recompute_ready.
     r = client.patch(
         f"/api/plugins/kanban/tasks/{parent['id']}",
-        json={"status": "done"},
+        json={"status": "done", "result": "parent done"},
     )
     assert r.status_code == 200
     # Verify children are now ready.
@@ -959,7 +959,7 @@ def test_board_progress_rollup(client):
     # Complete one child. 1/2.
     r = client.patch(
         f"/api/plugins/kanban/tasks/{child_a['id']}",
-        json={"status": "done"},
+        json={"status": "done", "result": "child a done"},
     )
     assert r.status_code == 200
     r = client.get("/api/plugins/kanban/board")

@@ -727,7 +727,7 @@ def test_gc_events_keeps_active_task_history(kanban_home):
     try:
         alive = kb.create_task(conn, title="a", assignee="w")
         done_id = kb.create_task(conn, title="b", assignee="w")
-        kb.complete_task(conn, done_id)
+        kb.complete_task(conn, done_id, result="b done")
 
         # Force all existing events to "old" by bumping created_at backwards.
         with kb.write_txn(conn):
@@ -1524,8 +1524,9 @@ def test_run_closed_on_complete_with_summary(kanban_home):
         assert ok is True
 
         task = kb.get_task(conn, tid)
+        assert task is not None
         assert task.current_run_id is None
-        assert task.result == "shipped"
+        assert task.result == "implemented rate limiter, tests pass"
 
         runs = kb.list_runs(conn, tid)
         assert len(runs) == 1
@@ -1970,7 +1971,7 @@ def test_cli_edit_backfills_result_on_done_task(kanban_home):
     conn = kb.connect()
     try:
         tid = kb.create_task(conn, title="x", assignee="worker")
-        kb.complete_task(conn, tid)
+        kb.complete_task(conn, tid, result="initially blank")
     finally:
         conn.close()
 
@@ -2135,8 +2136,9 @@ def test_cli_bulk_complete_with_summary_rejects(kanban_home):
         conn.close()
 
 
-def test_cli_bulk_complete_without_summary_still_works(kanban_home):
-    """Bulk close with no per-task handoff is allowed — the common case."""
+def test_cli_bulk_complete_without_result_is_blocked(kanban_home):
+    """Bulk close with no per-task result/summary is blocked by the
+    no-null-result guard (P3.3e). CLI must exit nonzero and name the reason."""
     conn = kb.connect()
     try:
         a = kb.create_task(conn, title="a", assignee="worker")
@@ -2145,8 +2147,8 @@ def test_cli_bulk_complete_without_summary_still_works(kanban_home):
     finally:
         conn.close()
     out = run_slash(f"complete {a} {b}")
-    assert f"Completed {a}" in out
-    assert f"Completed {b}" in out
+    assert "completion blocked" in out
+    assert "non-blank result or summary" in out
 
 
 def test_completed_event_payload_carries_summary(kanban_home):
@@ -2168,15 +2170,16 @@ def test_completed_event_payload_carries_summary(kanban_home):
 
 
 def test_completed_event_payload_summary_none_when_missing(kanban_home):
-    """If the caller passes no summary AND no result, payload.summary is None."""
+    """If the caller passes no summary AND no result, completion is blocked."""
     conn = kb.connect()
     try:
         tid = kb.create_task(conn, title="x", assignee="worker")
         kb.claim_task(conn, tid)
-        kb.complete_task(conn, tid)  # no summary, no result
-        events = kb.list_events(conn, tid)
-        comp = [e for e in events if e.kind == "completed"][0]
-        assert comp.payload.get("summary") is None
+        with pytest.raises(kb.CompletionResultRequiredError):
+            kb.complete_task(conn, tid)  # no summary, no result
+        task = kb.get_task(conn, tid)
+        assert task is not None
+        assert task.status != "done"
     finally:
         conn.close()
 
@@ -2240,15 +2243,16 @@ def test_block_never_claimed_task_synthesizes_run(kanban_home):
         conn.close()
 
 
-def test_complete_never_claimed_without_handoff_skips_synthesis(kanban_home):
-    """If a bulk-complete passes no summary/metadata/result, don't spam
-    the runs table with empty synthetic rows."""
+def test_complete_never_claimed_without_handoff_is_blocked(kanban_home):
+    """A ready task completed with no summary/metadata/result is blocked."""
     conn = kb.connect()
     try:
         tid = kb.create_task(conn, title="simple", assignee="worker")
-        ok = kb.complete_task(conn, tid)  # no handoff fields
-        assert ok is True
-        assert kb.list_runs(conn, tid) == []  # no synthetic row
+        with pytest.raises(kb.CompletionResultRequiredError):
+            kb.complete_task(conn, tid)  # no handoff fields
+        task = kb.get_task(conn, tid)
+        assert task is not None
+        assert task.status != "done"
     finally:
         conn.close()
 

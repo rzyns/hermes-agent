@@ -391,14 +391,14 @@ def _(home, kb):
         # Complete 499 parents
         for p in parents[:-1]:
             kb.claim_task(conn, p)
-            kb.complete_task(conn, p)
+            kb.complete_task(conn, p, result="parent done")
         kb.recompute_ready(conn)
         assert kb.get_task(conn, child).status == "todo", (
             "child should still be todo with 1/500 parents incomplete"
         )
         # Finish the last one
         kb.claim_task(conn, parents[-1])
-        kb.complete_task(conn, parents[-1])
+        kb.complete_task(conn, parents[-1], result="last parent done")
         kb.recompute_ready(conn)
         assert kb.get_task(conn, child).status == "ready"
         print("  500 parents → 1 child promotion works")
@@ -831,7 +831,7 @@ def _(home, kb):
         # Archived can be un-archived via direct status? No API for that intentionally
         # (archive is meant to be terminal). Verify this.
         # complete/block/unblock on archived should all refuse.
-        assert kb.complete_task(conn, tid) is False
+        assert kb.complete_task(conn, tid, result="nope") is False
         assert kb.block_task(conn, tid, reason="no") is False
         assert kb.unblock_task(conn, tid) is False
         print("  archived task cannot be resurrected via normal APIs")
@@ -949,7 +949,7 @@ def _(home, kb):
         kb.archive_task(conn, p_archived)
         p_done = kb.create_task(conn, title="p-done", assignee="w")
         kb.claim_task(conn, p_done)
-        kb.complete_task(conn, p_done)
+        kb.complete_task(conn, p_done, result="p done")
 
         # Child with just one parent, cycle it through each state
         for parent, expected in [

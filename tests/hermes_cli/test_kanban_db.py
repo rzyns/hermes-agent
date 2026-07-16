@@ -521,7 +521,7 @@ def test_link_demotes_ready_child_to_todo_when_parent_not_done(kanban_home):
 def test_link_keeps_ready_child_when_parent_already_done(kanban_home):
     with kb.connect() as conn:
         a = kb.create_task(conn, title="a")
-        kb.complete_task(conn, a)
+        kb.complete_task(conn, a, result="done")
         b = kb.create_task(conn, title="b")
         assert kb.get_task(conn, b).status == "ready"
         kb.link_tasks(conn, a, b)
@@ -553,9 +553,9 @@ def test_recompute_ready_cascades_through_chain(kanban_home):
         c = kb.create_task(conn, title="c", parents=[b])
         assert [kb.get_task(conn, x).status for x in (a, b, c)] == \
                ["ready", "todo", "todo"]
-        kb.complete_task(conn, a)
+        kb.complete_task(conn, a, result="a done")
         assert kb.get_task(conn, b).status == "ready"
-        kb.complete_task(conn, b)
+        kb.complete_task(conn, b, result="b done")
         assert kb.get_task(conn, c).status == "ready"
 
 
@@ -593,9 +593,9 @@ def test_recompute_ready_fan_in_waits_for_all_parents(kanban_home):
         a = kb.create_task(conn, title="a")
         b = kb.create_task(conn, title="b")
         c = kb.create_task(conn, title="c", parents=[a, b])
-        kb.complete_task(conn, a)
+        kb.complete_task(conn, a, result="a done")
         assert kb.get_task(conn, c).status == "todo"
-        kb.complete_task(conn, b)
+        kb.complete_task(conn, b, result="b done")
         assert kb.get_task(conn, c).status == "ready"
 
 
@@ -654,7 +654,7 @@ def test_unblock_scheduled_rechecks_parent_gate(kanban_home):
         assert kb.unblock_task(conn, child) is True
         assert kb.get_task(conn, child).status == "todo"
 
-        kb.complete_task(conn, parent)
+        kb.complete_task(conn, parent, result="parent done")
         assert kb.schedule_task(conn, child, reason="second timer") is True
         assert kb.unblock_task(conn, child) is True
         assert kb.get_task(conn, child).status == "ready"
@@ -1728,7 +1728,7 @@ def test_list_tasks_assignee_filter_case_insensitive(kanban_home):
 def test_archive_hides_from_default_list(kanban_home):
     with kb.connect() as conn:
         t = kb.create_task(conn, title="x")
-        kb.complete_task(conn, t)
+        kb.complete_task(conn, t, result="done")
         assert kb.archive_task(conn, t)
         assert len(kb.list_tasks(conn)) == 0
         assert len(kb.list_tasks(conn, include_archived=True)) == 1
@@ -1740,7 +1740,7 @@ def test_delete_archived_task_removes_related_rows(kanban_home):
         tid = kb.create_task(conn, title="child", parents=[parent], assignee="worker")
         kb.add_comment(conn, tid, "user", "cleanup me")
         kb.claim_task(conn, tid)
-        kb.complete_task(conn, tid, result="done")
+        kb.complete_task(conn, tid, result="child done")
         assert kb.archive_task(conn, tid)
         conn.execute(
             "INSERT INTO kanban_notify_subs(task_id, platform, chat_id, thread_id, user_id, created_at, last_event_id) "
@@ -1954,7 +1954,7 @@ def test_dispatch_promotes_ready_and_spawns(kanban_home, all_assignees_spawnable
         p = kb.create_task(conn, title="p", assignee="alice")
         c = kb.create_task(conn, title="c", assignee="bob", parents=[p])
         # Finish parent outside dispatch; promotion happens inside.
-        kb.complete_task(conn, p)
+        kb.complete_task(conn, p, result="p done")
         res = kb.dispatch_once(conn, spawn_fn=fake_spawn)
     # Spawned c (a was already done when dispatch was called).
     assert len(spawns) == 1
@@ -3537,7 +3537,7 @@ def test_unlink_tasks_triggers_recompute_ready(kanban_home):
     with kb.connect() as conn:
         # A is done.
         a = kb.create_task(conn, title="parent-done")
-        kb.complete_task(conn, a)
+        kb.complete_task(conn, a, result="parent done")
 
         # C is running (not done) — blocks child B.
         c = kb.create_task(conn, title="parent-running")
