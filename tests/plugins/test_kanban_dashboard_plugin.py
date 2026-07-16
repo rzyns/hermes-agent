@@ -2875,7 +2875,12 @@ def test_dashboard_bundle_contains_degraded_board_ui(repo_root=None):
 
 
 def test_task_detail_exposes_result_and_latest_summary_separately(client):
-    """The drawer receives both source fields without a duplicate alias."""
+    """The drawer receives both source fields without a duplicate alias.
+
+    With the P3.3e no-null-result guard, tasks.result stores the
+    effective_result (summary preferred, falling back to result). When
+    both are provided, result carries the summary text.
+    """
     r = client.post(
         "/api/plugins/kanban/tasks",
         json={"title": "Task with explicit result"},
@@ -2888,13 +2893,13 @@ def test_task_detail_exposes_result_and_latest_summary_separately(client):
     r = client.get(f"/api/plugins/kanban/tasks/{task_id}")
     assert r.status_code == 200
     data = r.json()["task"]
-    assert data["result"] == "The final answer is 42."
+    assert data["result"] == "short handoff"
     assert data["latest_summary"] == "short handoff"
     assert "final_result" not in data
 
 
 def test_task_detail_exposes_latest_summary_when_result_is_empty(client):
-    """Summary-only completions remain available to the drawer fallback."""
+    """Summary-only completions keep tasks.result populated with the summary."""
     conn = kb.connect()
     task_id = kb.create_task(conn, title="Task with only run summary")
     kb.claim_task(conn, task_id)
@@ -2905,7 +2910,7 @@ def test_task_detail_exposes_latest_summary_when_result_is_empty(client):
     assert r.status_code == 200
     data = r.json()["task"]
     assert data["status"] == "done"
-    assert not data["result"]
+    assert data["result"] == "Report written to /output/report.md"
     assert data["latest_summary"] == "Report written to /output/report.md"
 
 
@@ -2966,7 +2971,7 @@ def test_task_detail_includes_child_result_summaries(client):
             "title": "Collect sources",
             "status": "done",
             "latest_summary": "Collected five primary sources.",
-            "result": None,
+            "result": "Collected five primary sources.",
         }
     ]
 
