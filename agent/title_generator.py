@@ -24,6 +24,12 @@ logger = logging.getLogger(__name__)
 FailureCallback = Callable[[str, BaseException], None]
 TitleCallback = Callable[[str], None]
 
+# Validation callback: () -> bool. Called right before the LLM request in
+# generate_title(). Return False to skip — e.g. the user switched models
+# after this background thread captured its runtime snapshot, and sending
+# the request would reload a model the runtime already evicted (#19027).
+RuntimeValidator = Callable[[], bool]
+
 _TITLE_PROMPT = (
     "Generate a concise, human-browsable title for this Hermes session. "
     "Prefer the specific object, repo, bug, system, artifact, or decision over "
@@ -158,6 +164,23 @@ def build_title_context(
     return context
 
 
+def _auto_title_enabled() -> bool:
+    """Return whether automatic session title generation is enabled."""
+    try:
+        # Lazy imports, matching _title_language(): title_generator is imported
+        # from agent code paths where a module-level hermes_cli import risks
+        # circularity, and the read-only loader avoids config-migration writes.
+        from hermes_cli.config import load_config_readonly
+        from utils import is_truthy_value
+
+        config = load_config_readonly()
+        title_config = (config.get("auxiliary") or {}).get("title_generation") or {}
+        return is_truthy_value(title_config.get("enabled"), default=True)
+    except Exception:
+        logger.debug("Failed to read title_generation.enabled", exc_info=True)
+        return True
+
+
 def generate_title(
     user_message: str,
     assistant_response: str,
@@ -165,13 +188,38 @@ def generate_title(
     failure_callback: Optional[FailureCallback] = None,
     main_runtime: dict = None,
     title_context: str | None = None,
+    runtime_validator: Optional[RuntimeValidator] = None,
 ) -> Optional[str]:
     """Generate a session title.
 
     ``title_context`` is preferred when supplied.  The legacy
     ``user_message``/``assistant_response`` path remains for older callers and
     tests, but only includes short first-exchange snippets.
+
+    ``failure_callback`` is invoked with ``(task, exception)`` when the
+    auxiliary call raises — the caller typically wires this to
+    ``AIAgent._emit_auxiliary_failure`` so the user sees a warning instead
+    of silently accumulating untitled sessions.
+
+    ``runtime_validator`` is called right before the LLM request. If it
+    returns False (e.g. the user's model was switched since the background
+    thread captured its runtime snapshot), the call is skipped silently —
+    no request is sent, so a stale title request can't reload a model the
+    runtime already unloaded (#19027).
     """
+    if not _auto_title_enabled():
+        logger.debug("Auto-title skipped: auxiliary.title_generation.enabled=false")
+        return None
+
+    if runtime_validator is not None:
+        try:
+            if not runtime_validator():
+                logger.debug("Title generation skipped: runtime validator returned False")
+                return None
+        except Exception:
+            # Fail open: a broken validator must not disable titling.
+            logger.debug("Title runtime validator raised; proceeding", exc_info=True)
+
     if title_context:
         prompt_body = title_context[:_MAX_CONTEXT_CHARS]
     else:
@@ -244,6 +292,53 @@ def _session_allows_auto_retitle(session_db, session_id: str) -> bool:
     return revisions <= 1
 
 
+def _persist_session_title(session_db, session_id, title):
+    """Persist a generated title, recovering from duplicate-title collisions.
+
+    The write goes through ``set_auto_title_if_empty`` (predicate + write in
+    one transaction) so a manual ``/title`` set while LLM generation was in
+    flight is never overwritten — a plain ``set_session_title`` fallback keeps
+    older stores working. ``set_session_title`` raises ValueError when the
+    title would collide with another session (the unique-title index). Rather
+    than swallow it and leave the session untitled (#50537), append a #N
+    suffix via get_next_title_in_lineage() when the store supports lineage
+    dedup; otherwise re-raise so the caller can decide.
+
+    Returns the title actually persisted, or None when a concurrent manual
+    title won the race (nothing was written).
+    """
+    atomic_fn = getattr(session_db, "set_auto_title_if_empty", None)
+
+    def _set(t):
+        if atomic_fn is not None:
+            if not atomic_fn(session_id, t):
+                # Predicate failed: a title appeared while generation was in
+                # flight (manual /title wins), or the session vanished.
+                logger.debug(
+                    "Skipping auto-generated session title because a title "
+                    "was set while generation was in flight"
+                )
+                return None
+            return t
+        ok = session_db.set_session_title(session_id, t)
+        if ok is False:
+            raise RuntimeError(
+                f"session {session_id} not found when storing title"
+            )
+        return t
+
+    try:
+        return _set(title)
+    except ValueError:
+        next_title_fn = getattr(session_db, "get_next_title_in_lineage", None)
+        if next_title_fn is None:
+            raise
+        deduped = next_title_fn(title)
+        if not deduped or deduped == title:
+            raise
+        return _set(deduped)
+
+
 def auto_title_session(
     session_db,
     session_id: str,
@@ -254,6 +349,7 @@ def auto_title_session(
     title_callback: Optional[TitleCallback] = None,
     title_context: str | None = None,
     allow_retitle: bool = False,
+    runtime_validator: Optional[RuntimeValidator] = None,
 ) -> None:
     """Generate and set a session title if safe.
 
@@ -265,6 +361,7 @@ def auto_title_session(
     - session_db is None
     - session already has a title (user-set or previously auto-generated)
     - title generation fails
+    - runtime_validator returns False (model was switched)
 
     Never lets an exception escape: this is a daemon-thread target, and an
     escaping exception would spray a raw traceback into the user's terminal
@@ -286,6 +383,7 @@ def auto_title_session(
             title_callback=title_callback,
             title_context=title_context,
             allow_retitle=allow_retitle,
+            runtime_validator=runtime_validator,
         )
     except Exception as e:
         # WARNING (not debug) so operators see it in agent.log; the message
@@ -313,6 +411,7 @@ def _auto_title_session(
     title_callback: Optional[TitleCallback] = None,
     title_context: str | None = None,
     allow_retitle: bool = False,
+    runtime_validator: Optional[RuntimeValidator] = None,
 ) -> None:
     """Body of :func:`auto_title_session` — see its docstring."""
     if not session_db or not session_id:
@@ -351,26 +450,19 @@ def _auto_title_session(
         failure_callback=failure_callback,
         main_runtime=main_runtime,
         title_context=title_context,
+        runtime_validator=runtime_validator,
     )
     if not title:
         return
 
     try:
-        if hasattr(session_db, "set_auto_session_title"):
-            updated = session_db.set_auto_session_title(
-                session_id, title, allow_retitle=allow_retitle
-            )
-        else:
-            # Compatibility fallback for test doubles/older SessionDBs.  Modern
-            # SessionDB uses set_auto_session_title above for an atomic
-            # provenance guard against manual-title races.
-            updated = session_db.set_session_title(session_id, title, title_source="auto")
-        if not updated:
+        persisted = _persist_session_title(session_db, session_id, title)
+        if persisted is None:
             return
-        logger.debug("Auto-generated session title: %s", title)
+        logger.debug("Auto-generated session title: %s", persisted)
         if title_callback is not None:
             try:
-                title_callback(title)
+                title_callback(persisted)
             except Exception:
                 logger.debug("Auto-title callback failed", exc_info=True)
     except Exception as e:
@@ -386,6 +478,7 @@ def maybe_auto_title(
     failure_callback: Optional[FailureCallback] = None,
     main_runtime: dict = None,
     title_callback: Optional[TitleCallback] = None,
+    runtime_validator: Optional[RuntimeValidator] = None,
 ) -> None:
     """Fire-and-forget title generation after early exchanges.
 
@@ -420,6 +513,11 @@ def maybe_auto_title(
         current_assistant_response=assistant_response,
         session=session_meta,
     )
+    # Config read comes after the cheap first-exchange guard so the file
+    # isn't touched on every subsequent turn of a long session.
+    if not _auto_title_enabled():
+        logger.debug("Auto-title skipped: auxiliary.title_generation.enabled=false")
+        return
 
     thread = threading.Thread(
         target=auto_title_session,
@@ -430,6 +528,7 @@ def maybe_auto_title(
             "main_runtime": main_runtime,
             "title_callback": title_callback,
             "allow_retitle": allow_retitle,
+            "runtime_validator": runtime_validator,
         },
         daemon=True,
         name="auto-title",

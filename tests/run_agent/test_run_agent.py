@@ -6237,9 +6237,16 @@ class TestCredentialPoolRecovery:
             def current(self):
                 return current
 
-            def mark_exhausted_and_rotate(self, *, status_code, error_context=None):
+            def mark_exhausted_and_rotate(
+                self,
+                *,
+                status_code,
+                error_context=None,
+                api_key_hint=None,
+            ):
                 assert status_code == 402
                 assert error_context is None
+                assert api_key_hint == agent.api_key
                 return next_entry
 
         agent._credential_pool = _Pool()
@@ -6258,9 +6265,16 @@ class TestCredentialPoolRecovery:
         next_entry = SimpleNamespace(label="secondary")
 
         class _Pool:
-            def mark_exhausted_and_rotate(self, *, status_code, error_context=None):
+            def mark_exhausted_and_rotate(
+                self,
+                *,
+                status_code,
+                error_context=None,
+                api_key_hint=None,
+            ):
                 assert status_code == 400
                 assert error_context == {"reason": "out_of_extra_usage"}
+                assert api_key_hint == agent.api_key
                 return next_entry
 
         agent._credential_pool = _Pool()
