@@ -375,6 +375,7 @@ export function useGatewayBoot({
     })
 
     const sourceProfile = normalizeProfileKey($activeGatewayProfile.get())
+
     const offEvent = gateway.onEvent(event =>
       callbacksRef.current.handleGatewayEvent({ ...event, profile: sourceProfile })
     )
