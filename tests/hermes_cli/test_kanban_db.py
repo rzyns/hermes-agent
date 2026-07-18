@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import concurrent.futures
+import json
 import os
 import sqlite3
 import subprocess
@@ -588,6 +589,22 @@ def test_recompute_ready_promotes_blocked_with_done_parents(kanban_home):
         assert task.last_failure_error is None
 
 
+def test_recompute_ready_preserves_initially_blocked_task(kanban_home):
+    """``initial_status='blocked'`` is an explicit operator park, not a
+    dependency block that the dispatcher may immediately promote."""
+    with kb.connect() as conn:
+        tid = kb.create_task(
+            conn,
+            title="await operator approval",
+            assignee="ops",
+            initial_status="blocked",
+        )
+
+        assert kb.get_task(conn, tid).status == "blocked"
+        assert kb.recompute_ready(conn) == 0
+        assert kb.get_task(conn, tid).status == "blocked"
+
+
 def test_recompute_ready_fan_in_waits_for_all_parents(kanban_home):
     with kb.connect() as conn:
         a = kb.create_task(conn, title="a")
@@ -1123,6 +1140,50 @@ def test_classify_worker_exit_recognizes_rate_limit_sentinel(kanban_home):
     # Plain non-zero exit is still a normal crash, not rate-limited.
     _kb._record_worker_exit(pid + 1, _exited_status(1))
     assert _kb._classify_worker_exit(pid + 1) == ("nonzero_exit", 1)
+
+
+def test_classify_worker_exit_recognizes_startup_infra_sentinel(kanban_home):
+    import hermes_cli.kanban_db as _kb
+
+    pid = 31339
+    _kb._record_worker_exit(pid, _exited_status(_kb.KANBAN_INFRA_EXIT_CODE))
+
+    assert _kb._classify_worker_exit(pid) == (
+        "infra_blocked",
+        _kb.KANBAN_INFRA_EXIT_CODE,
+    )
+
+
+def test_startup_infra_exit_blocks_without_failure_or_protocol_strike(
+    kanban_home, monkeypatch,
+):
+    import hermes_cli.kanban_db as _kb
+
+    monkeypatch.setattr(_kb, "_pid_alive", lambda _pid: False)
+    monkeypatch.setenv("HERMES_KANBAN_CRASH_GRACE_SECONDS", "0")
+
+    with kb.connect() as conn:
+        host = _kb._claimer_id().split(":", 1)[0]
+        tid = kb.create_task(conn, title="bad provider config", assignee="a")
+        pid = 31340
+        kb.claim_task(conn, tid, claimer=f"{host}:infra")
+        conn.execute("UPDATE tasks SET worker_pid=? WHERE id=?", (pid, tid))
+        conn.commit()
+        _kb._record_worker_exit(pid, _exited_status(_kb.KANBAN_INFRA_EXIT_CODE))
+
+        crashed = kb.detect_crashed_workers(conn)
+
+        task = kb.get_task(conn, tid)
+        assert tid not in crashed
+        assert task.status == "blocked"
+        assert task.consecutive_failures == 0
+        assert _kb._protocol_violation_streak(conn, tid) == 0
+        run = conn.execute(
+            "SELECT outcome, metadata FROM task_runs WHERE task_id=? ORDER BY id DESC LIMIT 1",
+            (tid,),
+        ).fetchone()
+        assert run["outcome"] == "infra_blocked"
+        assert json.loads(run["metadata"])["infra_blocked"] is True
 
 
 def test_rate_limit_exit_requeues_without_counting_failure(

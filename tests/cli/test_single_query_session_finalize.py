@@ -268,3 +268,83 @@ def test_quiet_single_query_main_finalizes_while_preserving_exit_code(monkeypatc
     assert ("claim", "cli", True) in calls
     assert ("run", "hello", []) in calls
     assert calls[-1] == ("finalize", "quiet-session")
+
+
+def test_kanban_quiet_single_query_missing_credentials_uses_infra_exit(monkeypatch):
+    import cli as cli_mod
+
+    class FakeCLI:
+        def __init__(self, **_kwargs):
+            self.session_id = "missing-credentials"
+            self.agent = None
+
+        def _claim_active_session(self, _surface, *, stderr=False):
+            return True
+
+        def _ensure_runtime_credentials(self):
+            return False
+
+    monkeypatch.setenv("HERMES_KANBAN_TASK", "t_missing_auth")
+    monkeypatch.delenv("HERMES_KANBAN_GOAL_MODE", raising=False)
+    monkeypatch.setattr(cli_mod, "HermesCLI", FakeCLI)
+    monkeypatch.setattr(cli_mod.atexit, "register", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(cli_mod, "_finalize_single_query", lambda _fake_cli: None)
+
+    with pytest.raises(SystemExit) as exc_info:
+        cli_mod.main(query="work kanban task t_missing_auth", quiet=True)
+
+    from hermes_cli.kanban_db import KANBAN_INFRA_EXIT_CODE
+
+    assert exc_info.value.code == KANBAN_INFRA_EXIT_CODE
+
+
+def test_kanban_quiet_single_query_unknown_model_uses_infra_exit(monkeypatch):
+    import cli as cli_mod
+
+    class FakeCLI:
+        def __init__(self, **_kwargs):
+            self.provider = "openrouter"
+            self.model = "not-a-real-model"
+            self.session_id = "unknown-model"
+            self.conversation_history = []
+            self._active_agent_route_signature = "same-route"
+            self.agent = SimpleNamespace(
+                session_id="unknown-model",
+                platform="cli",
+                run_conversation=lambda **_kwargs: {
+                    "final_response": "",
+                    "failed": True,
+                    "error": "model not found",
+                    "failure_reason": "model_not_found",
+                },
+            )
+
+        def _claim_active_session(self, _surface, *, stderr=False):
+            return True
+
+        def _ensure_runtime_credentials(self):
+            return True
+
+        def _resolve_turn_agent_config(self, _query):
+            return {
+                "signature": "same-route",
+                "model": None,
+                "runtime": None,
+                "request_overrides": None,
+            }
+
+        def _init_agent(self, **_kwargs):
+            return True
+
+    monkeypatch.setenv("HERMES_KANBAN_TASK", "t_unknown_model")
+    monkeypatch.delenv("HERMES_KANBAN_GOAL_MODE", raising=False)
+    monkeypatch.setattr(cli_mod, "HermesCLI", FakeCLI)
+    monkeypatch.setattr(cli_mod.atexit, "register", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(cli_mod, "_finalize_single_query", lambda _fake_cli: None)
+
+    with pytest.raises(SystemExit) as exc_info:
+        cli_mod.main(query="work kanban task t_unknown_model", quiet=True)
+
+    from hermes_cli.kanban_db import KANBAN_INFRA_EXIT_CODE
+
+    assert exc_info.value.code == KANBAN_INFRA_EXIT_CODE

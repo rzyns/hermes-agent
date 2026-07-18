@@ -293,7 +293,7 @@ import shutil
 import stat
 import subprocess
 from pathlib import Path
-from typing import Optional
+from typing import Any, Callable, Optional
 
 
 from hermes_cli.subcommands._shared import add_accept_hooks_flag as _add_accept_hooks_flag
@@ -2271,6 +2271,40 @@ def _resolve_use_tui(args) -> bool:
         return False
 
 
+def _chat_startup_exit_code() -> int:
+    """Return a fail-closed exit code for fatal chat startup failures."""
+    if os.environ.get("HERMES_KANBAN_TASK"):
+        try:
+            from hermes_cli.kanban_db import KANBAN_INFRA_EXIT_CODE
+            return KANBAN_INFRA_EXIT_CODE
+        except ImportError:
+            pass
+    return 1
+
+
+def _load_root_cli_main() -> Callable[..., Any]:
+    """Load the root CLI by path and return its typed ``main`` entrypoint.
+
+    Profile plugins may prepend directories containing their own ``cli.py`` to
+    ``sys.path``.  Loading by path and registering the module canonically keeps
+    both this call and the root CLI's lazy ``from cli import ...`` lookups pinned
+    to Hermes core.
+    """
+    import importlib.util
+
+    cli_path = Path(__file__).resolve().parents[1] / "cli.py"
+    spec = importlib.util.spec_from_file_location("cli", cli_path)
+    if spec is None or spec.loader is None:
+        raise RuntimeError(f"Unable to load Hermes CLI entrypoint from {cli_path}")
+    cli_module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = cli_module
+    spec.loader.exec_module(cli_module)
+    cli_main = getattr(cli_module, "main", None)
+    if not callable(cli_main):
+        raise RuntimeError(f"Hermes CLI entrypoint {cli_path} has no callable main")
+    return cli_main
+
+
 def cmd_chat(args):
     """Run interactive chat CLI."""
     use_tui = _resolve_use_tui(args)
@@ -2374,7 +2408,7 @@ def cmd_chat(args):
             print_noninteractive_setup_guidance(
                 "No interactive TTY detected for the first-run setup prompt."
             )
-            sys.exit(1)
+            sys.exit(_chat_startup_exit_code())
 
         try:
             reply = input("Run setup now? [Y/n] ").strip().lower()
@@ -2385,7 +2419,7 @@ def cmd_chat(args):
             return
         print()
         print("You can run 'hermes setup' at any time to configure.")
-        sys.exit(1)
+        sys.exit(_chat_startup_exit_code())
 
     # Start update check in background (runs while other init happens).
     # On Termux this imports rich/prompt_toolkit in the foreground and then
@@ -2451,25 +2485,6 @@ def cmd_chat(args):
             accept_hooks=getattr(args, "accept_hooks", False),
         )
 
-    # Import and run the root Hermes CLI entrypoint by file path. Some profiles
-    # add plugin directories to sys.path, and plugins may have their own cli.py;
-    # a bare `from cli import main` can therefore resolve to a plugin module.
-    cli_path = Path(__file__).resolve().parents[1] / "cli.py"
-    import importlib.util
-
-    spec = importlib.util.spec_from_file_location("cli", cli_path)
-    if spec is None or spec.loader is None:
-        raise RuntimeError(f"Unable to load Hermes CLI entrypoint from {cli_path}")
-    cli_module = importlib.util.module_from_spec(spec)
-    # Register the file-loaded root CLI under the canonical module name before
-    # execution.  cli.py-decomposition mixins still perform lazy
-    # ``from cli import ...`` lookups at call time; if a profile/plugin directory
-    # is earlier on sys.path, those lookups can otherwise resolve to a plugin's
-    # cli.py instead of Hermes core.
-    sys.modules[spec.name] = cli_module
-    spec.loader.exec_module(cli_module)
-    cli_main = cli_module.main
-
     # Build kwargs from args
     kwargs = {
         "model": args.model,
@@ -2491,12 +2506,15 @@ def cmd_chat(args):
     }
     # Filter out None values
     kwargs = {k: v for k, v in kwargs.items() if v is not None}
-
     try:
+        # Import belongs inside this startup boundary: malformed provider/model
+        # configuration can fail while cli.py initializes, before cli_main is
+        # callable at all.
+        cli_main = _load_root_cli_main()
         cli_main(**kwargs)
     except ValueError as e:
         print(f"Error: {e}")
-        sys.exit(1)
+        sys.exit(_chat_startup_exit_code())
 
 
 def cmd_gateway(args):

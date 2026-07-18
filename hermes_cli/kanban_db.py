@@ -286,6 +286,12 @@ DEFAULT_CRASH_GRACE_SECONDS = 30
 # 0/1/2 codes the worker uses for success / generic failure / usage error.
 KANBAN_RATE_LIMIT_EXIT_CODE = 75
 
+# Fatal worker startup/configuration failure. 78 is BSD ``EX_CONFIG``: the
+# worker cannot make progress until its provider/model/auth configuration is
+# repaired. Unlike a task crash this must park the card immediately, without
+# consuming the task failure budget or entering a protocol-violation loop.
+KANBAN_INFRA_EXIT_CODE = 78
+
 
 def _resolve_crash_grace_seconds() -> int:
     """Return the crash-detection grace period in seconds.
@@ -2965,6 +2971,20 @@ def create_task(
                         "goal_mode": bool(goal_mode) or None,
                     },
                 )
+                if initial_status == "blocked":
+                    # Initial blocked is an explicit operator gate. Record the
+                    # same durable marker used by worker/operator blocks so
+                    # recompute_ready cannot reinterpret it as a dependency
+                    # block and immediately promote it.
+                    _append_event(
+                        conn,
+                        task_id,
+                        "blocked",
+                        {
+                            "reason": "initial_status=blocked",
+                            "initial_status": True,
+                        },
+                    )
             return task_id
         except sqlite3.IntegrityError:
             if attempt == 1:
@@ -7114,6 +7134,9 @@ def _classify_worker_exit(pid: int) -> "tuple[str, Optional[int]]":
       provider rate-limited / exhausted quota, NOT because the task failed.
       ``detect_crashed_workers`` releases the task back to ``ready`` without
       counting a failure, so a long quota window can't trip the breaker.
+    * ``"infra_blocked"`` — ``WIFEXITED`` with status
+      ``KANBAN_INFRA_EXIT_CODE``. Fatal provider/model/auth startup failure;
+      park the task without charging its failure or protocol budgets.
     * ``"nonzero_exit"`` — ``WIFEXITED`` with non-zero status. Real error.
     * ``"signaled"`` — ``WIFSIGNALED`` (OOM killer, SIGKILL, etc). Real crash.
     * ``"unknown"`` — pid was not in the reap registry (either reaped by
@@ -7135,6 +7158,8 @@ def _classify_worker_exit(pid: int) -> "tuple[str, Optional[int]]":
                 return ("clean_exit", 0)
             if code == KANBAN_RATE_LIMIT_EXIT_CODE:
                 return ("rate_limited", code)
+            if code == KANBAN_INFRA_EXIT_CODE:
+                return ("infra_blocked", code)
             return ("nonzero_exit", code)
         if os.WIFSIGNALED(raw):
             return ("signaled", os.WTERMSIG(raw))
@@ -7802,6 +7827,7 @@ def detect_crashed_workers(
             pid = int(row["worker_pid"])
             kind, code = _classify_worker_exit(pid)
             rate_limited_exit = False
+            infra_blocked_exit = False
             if kind == "clean_exit":
                 # Worker subprocess returned 0 but its task is still
                 # ``running`` in the DB — it exited without calling
@@ -7849,6 +7875,21 @@ def detect_crashed_workers(
                     "claimer": row["claim_lock"],
                     "exit_code": code,
                 }
+            elif kind == "infra_blocked":
+                protocol_violation = False
+                infra_blocked_exit = True
+                error_text = (
+                    f"pid {pid} could not start because provider/model/auth "
+                    "configuration is invalid; task parked for operator repair"
+                )
+                event_kind = "blocked"
+                event_payload = {
+                    "pid": pid,
+                    "claimer": row["claim_lock"],
+                    "exit_code": code,
+                    "infra_blocked": True,
+                    "reason": error_text,
+                }
             else:
                 protocol_violation = False
                 if kind == "nonzero_exit":
@@ -7863,18 +7904,24 @@ def detect_crashed_workers(
                     event_payload["exit_kind"] = kind
                     event_payload["exit_code"] = code
 
+            _released_status = "blocked" if infra_blocked_exit else "ready"
             cur = conn.execute(
-                "UPDATE tasks SET status = 'ready', claim_lock = NULL, "
+                "UPDATE tasks SET status = ?, claim_lock = NULL, "
                 "claim_expires = NULL, worker_pid = NULL "
                 "WHERE id = ? AND status = 'running' "
                 "  AND worker_pid = ? AND claim_lock IS ?",
-                (row["id"], pid, row["claim_lock"]),
+                (_released_status, row["id"], pid, row["claim_lock"]),
             )
             if cur.rowcount == 1:
                 # Rate-limited requeues are a clean release, not a crash —
                 # record the run outcome as ``rate_limited`` so the board
                 # history doesn't show a phantom crash for a quota wall.
-                _run_outcome = "rate_limited" if rate_limited_exit else "crashed"
+                if rate_limited_exit:
+                    _run_outcome = "rate_limited"
+                elif infra_blocked_exit:
+                    _run_outcome = "infra_blocked"
+                else:
+                    _run_outcome = "crashed"
                 run_id = _end_run(
                     conn, row["id"],
                     outcome=_run_outcome, status=_run_outcome,
@@ -7897,6 +7944,11 @@ def detect_crashed_workers(
                         (error_text[:500], row["id"]),
                     )
                     rate_limited.append(row["id"])
+                elif infra_blocked_exit:
+                    conn.execute(
+                        "UPDATE tasks SET last_failure_error = ? WHERE id = ?",
+                        (error_text[:500], row["id"]),
+                    )
                 else:
                     if protocol_violation:
                         # Stamp the failure error now: a below-budget

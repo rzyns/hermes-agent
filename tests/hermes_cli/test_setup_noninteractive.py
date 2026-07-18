@@ -144,6 +144,26 @@ class TestNonInteractiveSetup:
         out = capsys.readouterr().out
         assert "hermes config set model.provider custom" in out
 
+    def test_kanban_chat_first_run_headless_uses_infra_exit(
+        self, monkeypatch,
+    ):
+        from hermes_cli.kanban_db import KANBAN_INFRA_EXIT_CODE
+        from hermes_cli.main import cmd_chat
+
+        monkeypatch.setenv("HERMES_KANBAN_TASK", "t_no_provider")
+        args = _make_chat_args()
+
+        with (
+            patch("hermes_cli.main._has_any_provider_configured", return_value=False),
+            patch("hermes_cli.main.cmd_setup"),
+            patch("sys.stdin") as mock_stdin,
+        ):
+            mock_stdin.isatty.return_value = False
+            with pytest.raises(SystemExit) as exc:
+                cmd_chat(args)
+
+        assert exc.value.code == KANBAN_INFRA_EXIT_CODE
+
     def test_main_accepts_tts_setup_section(self, monkeypatch):
         """`hermes setup tts` should parse and dispatch like other setup sections."""
         from hermes_cli import main as main_mod

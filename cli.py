@@ -16415,9 +16415,10 @@ def main(
                         _exit_code = 0
                         if isinstance(result, dict) and result.get("failed"):
                             _exit_code = 1
-                            if os.environ.get("HERMES_KANBAN_TASK") and result.get(
-                                "failure_reason"
-                            ) in ("rate_limit", "billing"):
+                            _failure_reason = result.get("failure_reason")
+                            if os.environ.get("HERMES_KANBAN_TASK") and _failure_reason in (
+                                "rate_limit", "billing"
+                            ):
                                 try:
                                     from hermes_cli.kanban_db import (
                                         KANBAN_RATE_LIMIT_EXIT_CODE as _RL_CODE,
@@ -16425,9 +16426,26 @@ def main(
                                     _exit_code = _RL_CODE
                                 except Exception:
                                     _exit_code = 1
+                            elif os.environ.get("HERMES_KANBAN_TASK") and _failure_reason in (
+                                "auth_permanent",
+                                "model_not_found",
+                            ):
+                                try:
+                                    from hermes_cli.kanban_db import (
+                                        KANBAN_INFRA_EXIT_CODE as _INFRA_CODE,
+                                    )
+                                    _exit_code = _INFRA_CODE
+                                except Exception:
+                                    _exit_code = 1
                         sys.exit(_exit_code)
 
                 # Exit with error code if credentials or agent init fails
+                if os.environ.get("HERMES_KANBAN_TASK"):
+                    try:
+                        from hermes_cli.kanban_db import KANBAN_INFRA_EXIT_CODE
+                        sys.exit(KANBAN_INFRA_EXIT_CODE)
+                    except ImportError:
+                        pass
                 sys.exit(1)
             else:
                 # Single-query mode (`hermes chat -q "…"`): skip the welcome
