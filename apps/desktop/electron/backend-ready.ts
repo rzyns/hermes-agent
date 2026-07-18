@@ -66,8 +66,15 @@ function waitForDashboardPort(child, timeoutMs = resolvePortAnnounceTimeoutMs())
 
       done = true
       clearTimeout(timer)
-      if (child.stdout) child.stdout.off('data', onData)
-      if (child.stderr) child.stderr.off('data', onData)
+
+      if (child.stdout) {
+        child.stdout.off('data', onData)
+      }
+
+      if (child.stderr) {
+        child.stderr.off('data', onData)
+      }
+
       child.off('exit', onExit)
       child.off('error', onError)
     }
@@ -105,8 +112,14 @@ function waitForDashboardPort(child, timeoutMs = resolvePortAnnounceTimeoutMs())
       reject(new Error(`Timed out waiting for Hermes backend port announcement (${timeoutMs}ms)`))
     }, timeoutMs)
 
-    if (child.stdout) child.stdout.on('data', onData)
-    if (child.stderr) child.stderr.on('data', onData)
+    if (child.stdout) {
+      child.stdout.on('data', onData)
+    }
+
+    if (child.stderr) {
+      child.stderr.on('data', onData)
+    }
+
     child.on('exit', onExit)
     child.on('error', onError)
   })

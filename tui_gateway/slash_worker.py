@@ -49,14 +49,13 @@ _ORPHAN_GRACE_S = max(0.0, _env_float("HERMES_SLASH_WATCHDOG_GRACE_S", 5.0))
 _in_flight = threading.Event()  # set while a command is executing
 
 
-def _is_orphaned(original_ppid, parent_create_time, getppid=os.getppid) -> bool:
+def _is_orphaned(original_ppid, getppid=os.getppid) -> bool:
     """True once the spawning gateway is no longer this process's parent.
 
     ``getppid`` is kernel-maintained and changes on reparenting. Do not use
     ``psutil.create_time()`` as a second identity check: its epoch-derived
     value can drift on WSL while the parent remains alive.
     """
-    del parent_create_time  # retained in the argv contract for compatibility
     return getppid() != original_ppid
 
 
@@ -81,9 +80,9 @@ def _prepare_slash_worker_runtime() -> None:
     wait_for_mcp_discovery()
 
 
-def _start_parent_death_watchdog(original_ppid, parent_create_time) -> None:
+def _start_parent_death_watchdog(original_ppid) -> None:
     def _loop():
-        while not _is_orphaned(original_ppid, parent_create_time):
+        while not _is_orphaned(original_ppid):
             time.sleep(_WATCHDOG_POLL_S)
         deadline = time.monotonic() + _ORPHAN_GRACE_S
         while _in_flight.is_set() and time.monotonic() < deadline:
@@ -140,7 +139,7 @@ def main():
     # Start before the (hundreds-of-ms) HermesCLI build — that window is itself
     # an orphan risk if the gateway dies mid-spawn.
     orig_ppid = os.getppid()
-    _start_parent_death_watchdog(orig_ppid, 0.0)
+    _start_parent_death_watchdog(orig_ppid)
     _prepare_slash_worker_runtime()
 
     with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):

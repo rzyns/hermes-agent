@@ -12,7 +12,7 @@ from acp.schema import ClientCapabilities, FileSystemCapabilities
 
 from acp_adapter import filesystem as acp_filesystem
 from acp_adapter.server import HermesACPAgent
-from tools import file_tools as file_tools_module
+from tools import terminal_tool
 from tools.file_tools import patch_tool, read_file_tool, write_file_tool
 
 
@@ -66,12 +66,27 @@ async def _with_acp_context(fn, *, client, session_id, cwd, capabilities):
     return await asyncio.to_thread(run_in_tool_thread)
 
 
+@pytest.fixture
+def record_task_cwd():
+    recorded_task_ids: list[str] = []
+
+    def record(task_id: str, cwd) -> None:
+        terminal_tool.record_session_cwd(task_id, str(cwd))
+        recorded_task_ids.append(task_id)
+
+    yield record
+
+    for task_id in recorded_task_ids:
+        terminal_tool.clear_session_cwd(task_id)
+
+
 @pytest.mark.asyncio
-async def test_dirty_buffer_read_uses_acp_client(tmp_path):
+async def test_dirty_buffer_read_uses_acp_client(tmp_path, record_task_cwd):
     disk_file = tmp_path / "example.txt"
     disk_file.write_text("clean disk\n", encoding="utf-8")
     client = FakeACPClient(read_content="dirty buffer\nsecond line\n")
     task_id = f"acp-fs-read-{uuid.uuid4()}"
+    record_task_cwd(task_id, tmp_path)
 
     raw = await _with_acp_context(
         lambda: read_file_tool("example.txt", offset=1, limit=5, task_id=task_id),
@@ -95,18 +110,16 @@ async def test_dirty_buffer_read_uses_acp_client(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_dirty_buffer_read_uses_live_task_cwd_before_acp_cwd(tmp_path, monkeypatch):
+async def test_dirty_buffer_read_uses_live_task_cwd_before_acp_cwd(
+    tmp_path, record_task_cwd
+):
     acp_root = tmp_path / "editor-root"
     task_cwd = tmp_path / "terminal-cwd"
     acp_root.mkdir()
     task_cwd.mkdir()
     client = FakeACPClient(read_content="dirty task cwd\n")
     task_id = f"acp-fs-read-live-cwd-{uuid.uuid4()}"
-    monkeypatch.setattr(
-        file_tools_module,
-        "_get_live_tracking_cwd",
-        lambda task_id="default": str(task_cwd),
-    )
+    record_task_cwd(task_id, task_cwd)
 
     raw = await _with_acp_context(
         lambda: read_file_tool("example.txt", offset=1, limit=5, task_id=task_id),
@@ -299,7 +312,9 @@ async def test_patch_v4a_uses_acp_dirty_buffer_and_write(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_patch_v4a_uses_resolved_live_task_path_for_acp(tmp_path, monkeypatch):
+async def test_patch_v4a_uses_resolved_live_task_path_for_acp(
+    tmp_path, record_task_cwd
+):
     acp_root = tmp_path / "editor-root"
     task_cwd = tmp_path / "terminal-cwd"
     acp_root.mkdir()
@@ -307,11 +322,7 @@ async def test_patch_v4a_uses_resolved_live_task_path_for_acp(tmp_path, monkeypa
     client = FakeACPClient(read_content="old\n")
     task_id = f"acp-fs-patch-v4a-live-cwd-{uuid.uuid4()}"
     target = task_cwd / "example.txt"
-    monkeypatch.setattr(
-        file_tools_module,
-        "_get_live_tracking_cwd",
-        lambda task_id="default": str(task_cwd),
-    )
+    record_task_cwd(task_id, task_cwd)
     patch = """*** Begin Patch
 *** Update File: example.txt
 @@ old @@
@@ -366,7 +377,9 @@ async def test_patch_v4a_resource_not_found_falls_back_to_local_disk(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_patch_v4a_fallback_uses_resolved_live_task_path(tmp_path, monkeypatch):
+async def test_patch_v4a_fallback_uses_resolved_live_task_path(
+    tmp_path, record_task_cwd
+):
     acp_root = tmp_path / "editor-root"
     task_cwd = tmp_path / "terminal-cwd"
     acp_root.mkdir()
@@ -377,11 +390,7 @@ async def test_patch_v4a_fallback_uses_resolved_live_task_path(tmp_path, monkeyp
     acp_target.write_text("old in editor root\n", encoding="utf-8")
     client = FakeACPClient(fail=RuntimeError("Resource not found"))
     task_id = f"acp-fs-patch-v4a-fallback-live-cwd-{uuid.uuid4()}"
-    monkeypatch.setattr(
-        file_tools_module,
-        "_get_live_tracking_cwd",
-        lambda task_id="default": str(task_cwd),
-    )
+    record_task_cwd(task_id, task_cwd)
     patch = """*** Begin Patch
 *** Update File: example.txt
 @@ old @@
@@ -406,7 +415,9 @@ async def test_patch_v4a_fallback_uses_resolved_live_task_path(tmp_path, monkeyp
 
 
 @pytest.mark.asyncio
-async def test_patch_v4a_write_resource_not_found_falls_back_to_local_disk(tmp_path, monkeypatch):
+async def test_patch_v4a_write_resource_not_found_falls_back_to_local_disk(
+    tmp_path, record_task_cwd
+):
     disk_file = tmp_path / "example.txt"
     disk_file.write_text("alpha\nold\nomega\n", encoding="utf-8")
     client = FakeACPClient(
@@ -414,11 +425,7 @@ async def test_patch_v4a_write_resource_not_found_falls_back_to_local_disk(tmp_p
         write_fail=RuntimeError("Resource not found"),
     )
     task_id = f"acp-fs-patch-v4a-write-fallback-{uuid.uuid4()}"
-    monkeypatch.setattr(
-        file_tools_module,
-        "_get_live_tracking_cwd",
-        lambda task_id="default": str(tmp_path),
-    )
+    record_task_cwd(task_id, tmp_path)
     patch = """*** Begin Patch
 *** Update File: example.txt
 @@ old @@
@@ -445,15 +452,13 @@ async def test_patch_v4a_write_resource_not_found_falls_back_to_local_disk(tmp_p
 
 
 @pytest.mark.asyncio
-async def test_patch_v4a_add_uses_acp_write_without_local_disk(tmp_path, monkeypatch):
+async def test_patch_v4a_add_uses_acp_write_without_local_disk(
+    tmp_path, record_task_cwd
+):
     disk_file = tmp_path / "created.txt"
     client = FakeACPClient()
     task_id = f"acp-fs-patch-v4a-add-{uuid.uuid4()}"
-    monkeypatch.setattr(
-        file_tools_module,
-        "_get_live_tracking_cwd",
-        lambda task_id="default": str(tmp_path),
-    )
+    record_task_cwd(task_id, tmp_path)
     patch = """*** Begin Patch
 *** Add File: created.txt
 +alpha

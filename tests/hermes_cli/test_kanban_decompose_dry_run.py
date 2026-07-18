@@ -35,17 +35,10 @@ def _fake_aux_response(content: str):
     return resp
 
 
-def _mock_client_returning(content: str):
-    client = MagicMock()
-    client.chat.completions.create = MagicMock(return_value=_fake_aux_response(content))
-    return client
-
-
-def _patch_aux_client(content: str, *, model: str = "test-model"):
-    client = _mock_client_returning(content)
+def _patch_aux_client(content: str):
     return patch(
-        "agent.auxiliary_client.get_text_auxiliary_client",
-        return_value=(client, model),
+        "agent.auxiliary_client.call_llm",
+        return_value=_fake_aux_response(content),
     )
 
 
@@ -248,20 +241,17 @@ class TestDryRunPromptParity:
 
         calls = []
 
-        def capturing_create(*, messages, **kwargs):
+        def capturing_call_llm(*, messages, **kwargs):
             calls.append(messages)
             return _fake_aux_response(llm_payload)
-
-        client = MagicMock()
-        client.chat.completions.create = capturing_create
 
         patches = _patch_list_profiles(["orchestrator", "engineer"])
         for p in patches:
             p.start()
         try:
             with patch(
-                "agent.auxiliary_client.get_text_auxiliary_client",
-                return_value=(client, "test-model"),
+                "agent.auxiliary_client.call_llm",
+                side_effect=capturing_call_llm,
             ), _patch_extra_body(), patch(
                 "hermes_cli.kanban_decompose._load_config",
                 return_value={},

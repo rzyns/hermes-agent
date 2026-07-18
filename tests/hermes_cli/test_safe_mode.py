@@ -29,7 +29,6 @@ def test_cmd_chat_safe_mode_sets_env_before_startup(monkeypatch):
     chat_parser.set_defaults(func=main_mod.cmd_chat)
     args = parser.parse_args(["chat", "--safe-mode"])
     captured: dict[str, object] = {}
-    fake_cli = types.ModuleType("cli")
 
     def fake_has_provider() -> bool:
         assert os.environ["HERMES_SAFE_MODE"] == "1"
@@ -44,8 +43,7 @@ def test_cmd_chat_safe_mode_sets_env_before_startup(monkeypatch):
     monkeypatch.setattr(main_mod, "_pin_kanban_board_env", lambda: None)
     monkeypatch.setattr(main_mod, "_sync_bundled_skills_for_startup", lambda: None)
     monkeypatch.setattr(main_mod, "_termux_should_prefetch_update_check", lambda: False)
-    setattr(fake_cli, "main", fake_main)
-    monkeypatch.setitem(sys.modules, "cli", fake_cli)
+    monkeypatch.setattr(main_mod, "_load_root_cli_main", lambda: fake_main)
 
     main_mod.cmd_chat(args)
 

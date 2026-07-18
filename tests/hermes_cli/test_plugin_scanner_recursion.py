@@ -17,6 +17,12 @@ import yaml
 from hermes_cli.plugins import PluginManager
 
 
+@pytest.fixture(autouse=True)
+def _isolate_installed_entrypoint_plugins(monkeypatch):
+    """Keep directory-scanner tests independent of installed plugins."""
+    monkeypatch.setattr(PluginManager, "_scan_entry_points", lambda self: [])
+
+
 # ── Helpers ────────────────────────────────────────────────────────────────
 
 

@@ -35,6 +35,15 @@ def _make_category_plugin(
     return _make_plugin_dir(parent / category, name, manifest)
 
 
+@pytest.fixture(autouse=True)
+def _isolate_installed_entrypoint_plugins(monkeypatch):
+    """Keep directory-discovery tests independent of the host environment."""
+    monkeypatch.setattr(
+        "hermes_cli.plugins_cmd._discover_entrypoint_plugins",
+        lambda: [],
+    )
+
+
 # ---------------------------------------------------------------------------
 # _read_manifest_info
 # ---------------------------------------------------------------------------

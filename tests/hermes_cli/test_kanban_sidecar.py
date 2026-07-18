@@ -273,13 +273,22 @@ def test_real_block_unblock_and_manual_promote_rebuild_final_status(tmp_path, mo
     events = _load_events(board_dir)
     assert "BLOCK_REASON_SENTINEL" not in json.dumps(events, sort_keys=True)
     assert "PROMOTE_REASON_SENTINEL" not in json.dumps(events, sort_keys=True)
-    status_changes = [event["payload"]["new"] for event in events if event["kind"] == "task_status_changed"]
-    assert status_changes == ["blocked", "ready", "ready"]
+    status_changes = [
+        (event["task_id"], event["payload"]["new"])
+        for event in events
+        if event["kind"] == "task_status_changed"
+    ]
+    assert status_changes == [
+        (blocked_then_unblocked, "blocked"),
+        (blocked_then_unblocked, "ready"),
+        (manually_promoted, "blocked"),
+        (manually_promoted, "ready"),
+    ]
 
     target = tmp_path / "rebuilt-status-transitions.db"
     report = ks.rebuild_board(board_dir, target)
     assert report.tasks_created == 2
-    assert report.tasks_updated == 3
+    assert report.tasks_updated == 4
 
     rebuilt = sqlite3.connect(str(target))
     try:

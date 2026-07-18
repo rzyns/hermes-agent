@@ -395,11 +395,19 @@ class TestMountApiRoutesRefusesUntrusted:
             "GHSA-5qr3-c538-wm9j defence-in-depth regression"
         )
 
-    def test_user_source_api_imports_when_plugin_root_is_explicitly_trusted(
+    def test_enabled_user_source_api_imports_when_plugin_root_is_explicitly_trusted(
         self, tmp_path, monkeypatch
     ):
         plugin = self._payload_plugin(tmp_path, source="user")
         web_server._dashboard_plugins_cache = [plugin]
+        monkeypatch.setattr(
+            "hermes_cli.plugins_cmd._get_enabled_set",
+            lambda: {"synthetic"},
+        )
+        monkeypatch.setattr(
+            "hermes_cli.plugins_cmd._get_disabled_set",
+            lambda: set(),
+        )
         monkeypatch.setenv(
             "HERMES_DASHBOARD_TRUSTED_PLUGIN_API_ROOTS",
             str(tmp_path / "plug"),

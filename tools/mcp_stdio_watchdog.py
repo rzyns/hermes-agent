@@ -39,8 +39,7 @@ itself become a resource leak.
 Usage (see ``tools/mcp_tool.py::_run_stdio``)::
 
     python3 -m tools.mcp_stdio_watchdog \\
-        --ppid <original_parent_pid> --create-time <original_parent_create_time> \\
-        -- <real_command> <arg1> <arg2> ...
+        --ppid <original_parent_pid> -- <real_command> <arg1> <arg2> ...
 """
 
 from __future__ import annotations
@@ -57,11 +56,7 @@ _POLL_INTERVAL_S = 2.0
 _TERM_GRACE_S = 3.0
 
 
-def _is_orphaned(
-    original_ppid: int,
-    parent_create_time: float,  # retained for CLI compatibility/diagnostics
-    getppid=os.getppid,
-) -> bool:
+def _is_orphaned(original_ppid: int, getppid=os.getppid) -> bool:
     """Return whether the process that spawned this watchdog is gone.
 
     The kernel-maintained parent relationship is the identity check: once the
@@ -74,7 +69,6 @@ def _is_orphaned(
     PID reuse cannot preserve the old parent-child relationship: reparenting
     happens before the dead parent's numeric PID can be reused.
     """
-    del parent_create_time
     return getppid() != original_ppid
 
 
@@ -111,9 +105,9 @@ def _terminate_process_group(proc: subprocess.Popen) -> None:
             continue
 
 
-def _watchdog_loop(proc: subprocess.Popen, original_ppid: int, parent_create_time: float) -> None:
+def _watchdog_loop(proc: subprocess.Popen, original_ppid: int) -> None:
     while proc.poll() is None:
-        if _is_orphaned(original_ppid, parent_create_time):
+        if _is_orphaned(original_ppid):
             _terminate_process_group(proc)
             return
         time.sleep(_POLL_INTERVAL_S)
@@ -124,7 +118,6 @@ def main(argv: list[str] | None = None) -> int:
         description="Parent-death watchdog for a stdio MCP subprocess.",
     )
     parser.add_argument("--ppid", type=int, required=True)
-    parser.add_argument("--create-time", type=float, required=True)
     parser.add_argument("command", nargs=argparse.REMAINDER)
     args = parser.parse_args(argv)
 
@@ -161,7 +154,7 @@ def main(argv: list[str] | None = None) -> int:
 
     watchdog = threading.Thread(
         target=_watchdog_loop,
-        args=(proc, args.ppid, args.create_time),
+        args=(proc, args.ppid),
         daemon=True,
     )
     watchdog.start()

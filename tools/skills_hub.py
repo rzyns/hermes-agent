@@ -1173,7 +1173,14 @@ class GitHubSource(SkillSource):
             git_env = {**os.environ, "GIT_TERMINAL_PROMPT": "0"}
             for cmd in commands:
                 try:
-                    result = subprocess.run(cmd, capture_output=True, text=True, timeout=60, env=git_env)
+                    result = subprocess.run(
+                        cmd,
+                        stdin=subprocess.DEVNULL,
+                        capture_output=True,
+                        text=True,
+                        timeout=60,
+                        env=git_env,
+                    )
                 except (FileNotFoundError, subprocess.TimeoutExpired) as exc:
                     logger.debug("git fallback command failed for %s/%s: %s", repo, path, exc)
                     return {}
