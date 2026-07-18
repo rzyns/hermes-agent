@@ -2202,7 +2202,9 @@ class CredentialPool:
         available = self._available_entries(clear_expired=True, refresh=refresh)
         if not available:
             self._current_id = None
-            logger.info("credential pool: no available entries (all exhausted or empty)")
+            logger.info(
+                "credential pool: no available entries (all exhausted or empty)"
+            )
             return None
 
         if self._strategy == STRATEGY_RANDOM:
