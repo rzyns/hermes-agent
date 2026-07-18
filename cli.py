@@ -1236,6 +1236,51 @@ def _finalize_single_query(cli) -> None:
         cli._release_active_session()
 
 
+def _single_query_failure_exit_code(result: Any) -> int:
+    """Map a one-shot result to the worker/process exit contract.
+
+    A returned ``rate_limit`` result has already exhausted the provider retry
+    loop. If it preserves an HTTP 429 or quota-exhaustion detail, park kanban
+    work as infrastructure-blocked; only an otherwise-transient throttle uses
+    EX_TEMPFAIL for dispatcher requeue/backoff.
+    """
+    if not isinstance(result, dict) or not result.get("failed"):
+        return 0
+    if not os.environ.get("HERMES_KANBAN_TASK"):
+        return 1
+
+    failure_reason = result.get("failure_reason")
+    try:
+        from hermes_cli.kanban_db import (
+            KANBAN_INFRA_EXIT_CODE,
+            KANBAN_RATE_LIMIT_EXIT_CODE,
+        )
+    except Exception:
+        return 1
+
+    if failure_reason in {"auth_permanent", "model_not_found", "billing"}:
+        return KANBAN_INFRA_EXIT_CODE
+    if failure_reason != "rate_limit":
+        return 1
+
+    detail = " ".join(
+        str(result.get(key) or "") for key in ("error", "final_response")
+    ).lower()
+    quota_markers = (
+        "quota",
+        "usage limit",
+        "weekly limit",
+        "daily limit",
+        "monthly limit",
+        "credits exhausted",
+    )
+    if re.search(r"(?:http(?: status| error)?\s*)?429\b", detail) or any(
+        marker in detail for marker in quota_markers
+    ):
+        return KANBAN_INFRA_EXIT_CODE
+    return KANBAN_RATE_LIMIT_EXIT_CODE
+
+
 def _reset_terminal_input_modes_on_exit() -> None:
     """Best-effort: disable focus reporting + mouse tracking on TUI exit so they
     don't leak into the next shell session sharing the tab.
@@ -16402,41 +16447,14 @@ def main(
 
                         # Ensure proper exit code for automation wrappers.
                         #
-                        # Kanban workers get a special case: when the run failed
-                        # purely because the provider rate-limited / exhausted
-                        # quota (not because the task itself is broken), exit with
-                        # the EX_TEMPFAIL sentinel instead of the generic 1. The
-                        # dispatcher's reap classifier maps that code to a
-                        # ``rate_limited`` exit and releases the task back to
-                        # ``ready`` WITHOUT incrementing the failure counter, so a
-                        # 5-hour quota window can't trip the circuit breaker and
-                        # permanently block the card. Non-kanban runs keep the
-                        # plain 0/1 contract automation wrappers expect.
-                        _exit_code = 0
-                        if isinstance(result, dict) and result.get("failed"):
-                            _exit_code = 1
-                            _failure_reason = result.get("failure_reason")
-                            if os.environ.get("HERMES_KANBAN_TASK") and _failure_reason in (
-                                "rate_limit", "billing"
-                            ):
-                                try:
-                                    from hermes_cli.kanban_db import (
-                                        KANBAN_RATE_LIMIT_EXIT_CODE as _RL_CODE,
-                                    )
-                                    _exit_code = _RL_CODE
-                                except Exception:
-                                    _exit_code = 1
-                            elif os.environ.get("HERMES_KANBAN_TASK") and _failure_reason in (
-                                "auth_permanent",
-                                "model_not_found",
-                            ):
-                                try:
-                                    from hermes_cli.kanban_db import (
-                                        KANBAN_INFRA_EXIT_CODE as _INFRA_CODE,
-                                    )
-                                    _exit_code = _INFRA_CODE
-                                except Exception:
-                                    _exit_code = 1
+                        # Kanban workers split provider throttles here. A
+                        # transient rate limit uses EX_TEMPFAIL so the dispatcher
+                        # requeues with cooldown and no strike. Billing, explicit
+                        # quota exhaustion, and a 429 still present after the
+                        # provider retry budget use EX_CONFIG so the task parks
+                        # sticky as infra_blocked. Non-kanban runs keep the plain
+                        # 0/1 contract automation wrappers expect.
+                        _exit_code = _single_query_failure_exit_code(result)
                         sys.exit(_exit_code)
 
                 # Exit with error code if credentials or agent init fails

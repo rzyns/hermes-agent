@@ -348,3 +348,54 @@ def test_kanban_quiet_single_query_unknown_model_uses_infra_exit(monkeypatch):
     from hermes_cli.kanban_db import KANBAN_INFRA_EXIT_CODE
 
     assert exc_info.value.code == KANBAN_INFRA_EXIT_CODE
+
+
+def test_kanban_transient_rate_limit_uses_tempfail_exit(monkeypatch):
+    monkeypatch.setenv("HERMES_KANBAN_TASK", "t_transient_429")
+
+    exit_code = cli._single_query_failure_exit_code({
+        "failed": True,
+        "failure_reason": "rate_limit",
+        "error": "provider temporarily throttled; retry later",
+    })
+
+    from hermes_cli.kanban_db import KANBAN_RATE_LIMIT_EXIT_CODE
+
+    assert exit_code == KANBAN_RATE_LIMIT_EXIT_CODE
+
+
+@pytest.mark.parametrize(
+    "error",
+    [
+        "HTTP 429: reached your weekly usage limit",
+        "429 Too Many Requests after provider retry budget exhausted",
+    ],
+)
+def test_kanban_persistent_or_quota_rate_limit_uses_infra_exit(
+    monkeypatch, error,
+):
+    monkeypatch.setenv("HERMES_KANBAN_TASK", "t_quota_429")
+
+    exit_code = cli._single_query_failure_exit_code({
+        "failed": True,
+        "failure_reason": "rate_limit",
+        "error": error,
+    })
+
+    from hermes_cli.kanban_db import KANBAN_INFRA_EXIT_CODE
+
+    assert exit_code == KANBAN_INFRA_EXIT_CODE
+
+
+def test_kanban_billing_failure_uses_infra_exit(monkeypatch):
+    monkeypatch.setenv("HERMES_KANBAN_TASK", "t_billing")
+
+    exit_code = cli._single_query_failure_exit_code({
+        "failed": True,
+        "failure_reason": "billing",
+        "error": "credits exhausted",
+    })
+
+    from hermes_cli.kanban_db import KANBAN_INFRA_EXIT_CODE
+
+    assert exit_code == KANBAN_INFRA_EXIT_CODE

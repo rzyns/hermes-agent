@@ -4297,8 +4297,9 @@ def run_conversation(
                         # Surface the classified reason so callers (notably the
                         # kanban worker path in cli.py) can distinguish a
                         # transient throttle from a real failure and choose a
-                        # different exit code. ``rate_limit`` / ``billing`` here
-                        # mean "quota wall, not a task error".
+                        # different exit code. Keep the provider's error detail
+                        # alongside the broad reason so the caller can split a
+                        # transient throttle from quota exhaustion.
                         "failure_reason": classified.reason.value,
                     }
 

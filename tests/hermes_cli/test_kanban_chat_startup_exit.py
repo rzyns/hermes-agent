@@ -1,5 +1,6 @@
 """Kanban workers must fail closed on fatal chat startup configuration errors."""
 
+import sys
 from types import SimpleNamespace
 
 import pytest
@@ -31,6 +32,43 @@ def _chat_args():
         max_turns=None,
         compact=False,
     )
+
+
+def test_root_cli_loader_uses_core_path_and_registers_canonical_module(
+    monkeypatch,
+):
+    import importlib.util
+
+    loaded = SimpleNamespace()
+    calls = []
+
+    def fake_main(**_kwargs):
+        return None
+
+    class Loader:
+        def exec_module(self, module):
+            assert sys.modules["cli"] is module
+            module.main = fake_main
+            calls.append("executed")
+
+    spec = SimpleNamespace(name="cli", loader=Loader())
+    monkeypatch.setitem(sys.modules, "cli", SimpleNamespace())
+
+    def fake_spec_from_file_location(name, path):
+        calls.append((name, path))
+        return spec
+
+    monkeypatch.setattr(
+        importlib.util, "spec_from_file_location", fake_spec_from_file_location
+    )
+    monkeypatch.setattr(importlib.util, "module_from_spec", lambda _spec: loaded)
+
+    assert main_mod._load_root_cli_main() is fake_main
+    assert calls[0] == (
+        "cli",
+        main_mod.Path(main_mod.__file__).resolve().parents[1] / "cli.py",
+    )
+    assert calls[1] == "executed"
 
 
 @pytest.mark.parametrize(

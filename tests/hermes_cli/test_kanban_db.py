@@ -1115,11 +1115,9 @@ def test_resolve_crash_grace_seconds_handles_bad_env(monkeypatch):
 
 
 # ---------------------------------------------------------------------------
-# Rate-limit requeue: a worker that bails on a provider quota wall must be
-# released back to ``ready`` WITHOUT counting a failure, so a long (e.g.
-# 5-hour) quota window can't trip the circuit breaker and permanently block
-# the card. The respawn guard then defers it on a cooldown until quota
-# returns. Regression coverage for the kanban-rate-limit-failure report.
+# Transient rate-limit requeue: a worker that bails on provider throttling must
+# be released back to ``ready`` WITHOUT counting a failure. The respawn guard
+# then defers it on a cooldown until capacity returns.
 # ---------------------------------------------------------------------------
 
 
@@ -1186,12 +1184,50 @@ def test_startup_infra_exit_blocks_without_failure_or_protocol_strike(
         assert json.loads(run["metadata"])["infra_blocked"] is True
 
 
+def test_quota_429_exit_blocks_sticky_without_failure_or_protocol_strike(
+    kanban_home, monkeypatch,
+):
+    import cli as cli_mod
+    import hermes_cli.kanban_db as _kb
+
+    monkeypatch.setenv("HERMES_KANBAN_TASK", "t_quota_429")
+    exit_code = cli_mod._single_query_failure_exit_code({
+        "failed": True,
+        "failure_reason": "rate_limit",
+        "error": "HTTP 429: reached your weekly usage limit",
+    })
+    assert exit_code == _kb.KANBAN_INFRA_EXIT_CODE
+
+    monkeypatch.setattr(_kb, "_pid_alive", lambda _pid: False)
+    monkeypatch.setenv("HERMES_KANBAN_CRASH_GRACE_SECONDS", "0")
+    with kb.connect() as conn:
+        host = _kb._claimer_id().split(":", 1)[0]
+        tid = kb.create_task(conn, title="quota exhausted", assignee="a")
+        pid = 31341
+        kb.claim_task(conn, tid, claimer=f"{host}:quota")
+        conn.execute("UPDATE tasks SET worker_pid=? WHERE id=?", (pid, tid))
+        conn.commit()
+        _kb._record_worker_exit(pid, _exited_status(exit_code))
+
+        assert tid not in kb.detect_crashed_workers(conn)
+        task = kb.get_task(conn, tid)
+        assert task.status == "blocked"
+        assert task.consecutive_failures == 0
+        assert _kb._protocol_violation_streak(conn, tid) == 0
+        run = conn.execute(
+            "SELECT outcome, metadata FROM task_runs WHERE task_id=? ORDER BY id DESC LIMIT 1",
+            (tid,),
+        ).fetchone()
+        assert run["outcome"] == "infra_blocked"
+        assert json.loads(run["metadata"])["infra_blocked"] is True
+
+
 def test_rate_limit_exit_requeues_without_counting_failure(
     kanban_home, monkeypatch,
 ):
     """A rate-limit sentinel exit releases the task to ``ready`` and leaves
     ``consecutive_failures`` untouched — the breaker must never trip on a
-    transient throttle, even across many quota-wall hits."""
+    transient throttle, even across many hits."""
     import hermes_cli.kanban_db as _kb
 
     monkeypatch.setattr(_kb, "_pid_alive", lambda _pid: False)
@@ -1201,7 +1237,7 @@ def test_rate_limit_exit_requeues_without_counting_failure(
         host = _kb._claimer_id().split(":", 1)[0]
         tid = kb.create_task(conn, title="rl", assignee="a")
 
-        # Simulate FAR more quota-wall hits than DEFAULT_FAILURE_LIMIT (2).
+        # Simulate FAR more throttle hits than DEFAULT_FAILURE_LIMIT (2).
         # If any of these counted as a failure the task would be blocked.
         for i in range(6):
             pid = 70000 + i
@@ -1235,7 +1271,7 @@ def test_rate_limit_exit_requeues_without_counting_failure(
             )
 
         # Last failure error stamped so the respawn guard recognizes the
-        # quota wall.
+        # transient rate limit.
         assert task.last_failure_error and "rate-limited" in task.last_failure_error
 
         # A ``rate_limited`` run outcome was recorded (not ``crashed``).

@@ -276,8 +276,8 @@ def _resolve_claim_ttl_seconds(ttl_seconds: Optional[int] = None) -> int:
 DEFAULT_CRASH_GRACE_SECONDS = 30
 
 
-# Sentinel exit code a kanban worker uses to signal "I bailed because the
-# provider rate-limited / exhausted quota, not because the task failed."
+# Sentinel exit code a kanban worker uses to signal a transient provider
+# throttle, not a task failure.
 # The dispatcher's reap classifier maps this to a ``rate_limited`` exit kind
 # so ``detect_crashed_workers`` can release the task back to ``ready``
 # WITHOUT counting a failure (the circuit breaker must never trip on a
@@ -286,10 +286,10 @@ DEFAULT_CRASH_GRACE_SECONDS = 30
 # 0/1/2 codes the worker uses for success / generic failure / usage error.
 KANBAN_RATE_LIMIT_EXIT_CODE = 75
 
-# Fatal worker startup/configuration failure. 78 is BSD ``EX_CONFIG``: the
-# worker cannot make progress until its provider/model/auth configuration is
-# repaired. Unlike a task crash this must park the card immediately, without
-# consuming the task failure budget or entering a protocol-violation loop.
+# Sticky worker infrastructure failure. 78 is BSD ``EX_CONFIG``: the worker
+# cannot make progress until provider/model/auth configuration, billing, or
+# quota capacity is repaired. Unlike a task crash this parks the card
+# immediately without consuming failure or protocol-violation budgets.
 KANBAN_INFRA_EXIT_CODE = 78
 
 
@@ -7001,11 +7001,11 @@ _RESPAWN_BLOCKER_RE = re.compile(
 # Within this window a completed run counts as "recent proof"; don't re-spawn.
 _RESPAWN_GUARD_SUCCESS_WINDOW = 3600  # 1 hour
 
-# Cooldown after a rate-limited (quota-wall) requeue before the dispatcher
+# Cooldown after a transient rate-limit requeue before the dispatcher
 # re-spawns the worker. Without this, a task released by the rate-limit path
 # would be re-spawned on the very next tick and immediately bounce off the
-# same quota wall, burning a worker slot every tick for hours. The cooldown
-# spaces retries out so the board keeps cheaply probing whether quota is back
+# same throttle, burning a worker slot every tick. The cooldown spaces retries
+# out so the board keeps cheaply probing whether provider capacity is back
 # without thrashing. Overridable via ``HERMES_KANBAN_RATE_LIMIT_COOLDOWN_SECONDS``
 # for operators who want a tighter/looser probe cadence.
 DEFAULT_RATE_LIMIT_COOLDOWN_SECONDS = 300  # 5 minutes
@@ -7068,10 +7068,10 @@ class DispatchResult:
     ``"recent_success"`` (completed run within guard window),
     ``"active_pr"`` (GitHub PR URL in a recent comment)."""
     rate_limited: list[str] = field(default_factory=list)
-    """Task ids whose workers bailed on a provider rate-limit / quota wall
+    """Task ids whose workers bailed on a transient provider rate limit
     (EX_TEMPFAIL sentinel exit) and were released back to ``ready`` WITHOUT
-    counting a failure. These never trip the circuit breaker — a long quota
-    window just makes the task bounce cheaply until the window clears."""
+    counting a failure. These never trip the circuit breaker; the cooldown
+    keeps retries cheap until provider capacity returns."""
     skipped_external: list[tuple[str, list[dict[str, Any]]]] = field(default_factory=list)
     """Tasks deferred because unsatisfied external (cross-board) blockers exist.
     Each entry is ``(task_id, blocker_dicts)``.  Separate bucket so dry-run
@@ -7131,12 +7131,13 @@ def _classify_worker_exit(pid: int) -> "tuple[str, Optional[int]]":
       and should be auto-blocked immediately — retrying will just loop.
     * ``"rate_limited"`` — ``WIFEXITED`` with status
       ``KANBAN_RATE_LIMIT_EXIT_CODE``. The worker bailed because the
-      provider rate-limited / exhausted quota, NOT because the task failed.
+      provider transiently rate-limited, NOT because the task failed.
       ``detect_crashed_workers`` releases the task back to ``ready`` without
-      counting a failure, so a long quota window can't trip the breaker.
+      counting a failure, so a throttle can't trip the breaker.
     * ``"infra_blocked"`` — ``WIFEXITED`` with status
-      ``KANBAN_INFRA_EXIT_CODE``. Fatal provider/model/auth startup failure;
-      park the task without charging its failure or protocol budgets.
+      ``KANBAN_INFRA_EXIT_CODE``. Fatal provider/model/auth startup failure or
+      exhausted billing/quota capacity; park the task without charging its
+      failure or protocol budgets.
     * ``"nonzero_exit"`` — ``WIFEXITED`` with non-zero status. Real error.
     * ``"signaled"`` — ``WIFSIGNALED`` (OOM killer, SIGKILL, etc). Real crash.
     * ``"unknown"`` — pid was not in the reap registry (either reaped by
@@ -7714,7 +7715,7 @@ def _protocol_violation_streak(conn: sqlite3.Connection, task_id: str) -> int:
     ``detect_crashed_workers`` just closed — and counts how many in a row were
     clean-exit protocol violations:
 
-    * ``rate_limited`` runs are neutral and skipped: a quota wall says nothing
+    * ``rate_limited`` runs are neutral and skipped: a transient throttle says nothing
       about the task, exactly as it is neutral for the unified
       ``consecutive_failures`` counter.
     * Any other closed run (completed, plain crash, timeout, spawn failure,
@@ -7785,9 +7786,9 @@ def detect_crashed_workers(
 
     When the reap registry shows the worker exited with the rate-limit
     sentinel (``KANBAN_RATE_LIMIT_EXIT_CODE``), the worker bailed on a
-    provider quota wall, NOT a task failure. Such tasks are released back
-    to ``ready`` WITHOUT counting a failure (so a long quota window can't
-    trip the breaker) and stamped with a quota-blocker error so
+    transient provider throttle, NOT a task failure. Such tasks are released
+    back to ``ready`` WITHOUT counting a failure and stamped with a rate-limit
+    error so
     ``check_respawn_guard`` defers their respawn until the window clears.
     The ids are returned via the ``_last_rate_limited`` function attribute
     (the public return stays the crashed-only ``list[str]``).
@@ -7856,17 +7857,15 @@ def detect_crashed_workers(
                     "protocol_violation": True,
                 }
             elif kind == "rate_limited":
-                # Worker bailed because the provider rate-limited / exhausted
-                # quota (EX_TEMPFAIL sentinel). This is NOT a task failure —
-                # the task is fine, the account just hit a wall. Release it
-                # back to ``ready`` so the respawn guard defers it until the
-                # quota window clears, and crucially do NOT count a failure
-                # (skip ``_record_task_failure``) so a long quota window can't
-                # trip the circuit breaker and permanently block the card.
+                # Worker bailed because the provider transiently rate-limited
+                # (EX_TEMPFAIL sentinel). This is NOT a task failure. Release it
+                # back to ``ready`` so the respawn guard applies cooldown, and
+                # crucially do NOT count a failure (skip
+                # ``_record_task_failure``).
                 protocol_violation = False
                 rate_limited_exit = True
                 error_text = (
-                    f"pid {pid} exited rate-limited (quota wall) — "
+                    f"pid {pid} exited transiently rate-limited — "
                     f"requeued without counting a failure"
                 )
                 event_kind = "rate_limited"
@@ -7879,8 +7878,9 @@ def detect_crashed_workers(
                 protocol_violation = False
                 infra_blocked_exit = True
                 error_text = (
-                    f"pid {pid} could not start because provider/model/auth "
-                    "configuration is invalid; task parked for operator repair"
+                    f"pid {pid} hit a sticky provider infrastructure failure "
+                    "(configuration/auth/billing/quota); task parked for "
+                    "operator repair"
                 )
                 event_kind = "blocked"
                 event_payload = {
@@ -7915,7 +7915,7 @@ def detect_crashed_workers(
             if cur.rowcount == 1:
                 # Rate-limited requeues are a clean release, not a crash —
                 # record the run outcome as ``rate_limited`` so the board
-                # history doesn't show a phantom crash for a quota wall.
+                # history doesn't show a phantom crash for a throttle.
                 if rate_limited_exit:
                     _run_outcome = "rate_limited"
                 elif infra_blocked_exit:
