@@ -5363,6 +5363,13 @@ def complete_task(
     that exist only on another board are recorded separately as
     ``unqualified_cross_board_references`` so workers can qualify them as
     ``board/task_id``. This pass is advisory and never blocks.
+
+    A worker completion is compare-and-swapped against ``expected_run_id``.
+    If that run already ended by blocking the task as ``needs_input``, the
+    kernel cannot safely infer whether the block became stale or represents a
+    principal-only decision gate. Completion therefore remains fail-closed,
+    but a structured ``stale_block_completion_wedge`` event is emitted so an
+    operator can distinguish this state from an unknown-id/terminal rejection.
     """
     now = int(time.time())
 
@@ -5457,6 +5464,54 @@ def complete_task(
                 conn, task_id, int(expected_run_id), now=now
             )
             if budget_run is None:
+                # A worker process can continue executing after ``kanban_block``
+                # closed its run. A later completion from that same process then
+                # carries the ended run id while the task remains blocked with
+                # no current run. The persisted shape is indistinguishable from
+                # a legitimate human-decision gate, so do not auto-complete it.
+                # Emit a diagnostic only for the exact observed signature and
+                # otherwise preserve the existing fail-closed CAS behavior.
+                # This branch is mutually exclusive with the budget-bench grace
+                # path above, which only accepts ``block_kind == "budget"`` runs
+                # ending in ``timed_out``/``gave_up``; a ``needs_input`` block
+                # ends its run with ``outcome == "blocked"`` and never matches.
+                if expected_run_id is not None:
+                    blocked = conn.execute(
+                        "SELECT status, block_kind, block_recurrences, current_run_id "
+                        "FROM tasks WHERE id = ?",
+                        (task_id,),
+                    ).fetchone()
+                    ended_run = conn.execute(
+                        "SELECT outcome, ended_at FROM task_runs "
+                        "WHERE id = ? AND task_id = ?",
+                        (int(expected_run_id), task_id),
+                    ).fetchone()
+                    if (
+                        blocked is not None
+                        and blocked["status"] == "blocked"
+                        and blocked["block_kind"] == "needs_input"
+                        and blocked["current_run_id"] is None
+                        and ended_run is not None
+                        and ended_run["outcome"] == "blocked"
+                        and ended_run["ended_at"] is not None
+                    ):
+                        _append_event(
+                            conn,
+                            task_id,
+                            "stale_block_completion_wedge",
+                            {
+                                "attempted_run_id": int(expected_run_id),
+                                "block_kind": blocked["block_kind"],
+                                "block_recurrences": int(
+                                    blocked["block_recurrences"] or 0
+                                ),
+                                "current_run_id": None,
+                                "reason": (
+                                    "ended_run_attempted_completion_while_blocked"
+                                ),
+                            },
+                            run_id=int(expected_run_id),
+                        )
                 return False
             cur = conn.execute(
                 """

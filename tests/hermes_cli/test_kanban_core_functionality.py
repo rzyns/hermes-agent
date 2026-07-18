@@ -1647,6 +1647,8 @@ def test_stale_run_cannot_complete_new_attempt(kanban_home, monkeypatch):
         conn.close()
 
 
+
+
 def test_budget_failure_cas_cannot_bench_completed_task(kanban_home):
     with kb.connect() as conn:
         tid = kb.create_task(conn, title="race guarded", assignee="worker")
@@ -1792,6 +1794,91 @@ def test_completion_grace_rejects_non_budget_or_expired_run(
         )
         assert kb.get_task(conn, tid).status == "ready"
         assert [r.outcome for r in kb.list_runs(conn, tid)] == ["timed_out"]
+
+
+def test_stale_needs_input_block_completion_emits_structured_wedge_event(kanban_home):
+    """A post-block completion stays fail-closed but leaves a detectable event.
+
+    A worker can keep executing after ``kanban_block`` has closed its run.  Its
+    later completion call carries that ended run id while the task remains in
+    ``blocked`` with no current run.  That shape is indistinguishable from a
+    real human-decision gate, so the kernel must not complete it automatically;
+    it must make the otherwise silent wedge observable to operators instead.
+    """
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(conn, title="retry after stale needs-input block", assignee="worker")
+        kb.claim_task(conn, tid)
+        blocked_run = kb.latest_run(conn, tid)
+        assert kb.block_task(
+            conn,
+            tid,
+            reason="waiting for input that later proved unnecessary",
+            kind="needs_input",
+            expected_run_id=blocked_run.id,
+        )
+
+        assert not kb.complete_task(
+            conn,
+            tid,
+            summary="work completed and verified after the stale block",
+            expected_run_id=blocked_run.id,
+        )
+        task = kb.get_task(conn, tid)
+        assert task.status == "blocked"
+        assert task.current_run_id is None
+
+        event = conn.execute(
+            "SELECT payload, run_id FROM task_events "
+            "WHERE task_id = ? AND kind = 'stale_block_completion_wedge' "
+            "ORDER BY id DESC LIMIT 1",
+            (tid,),
+        ).fetchone()
+        assert event is not None
+        assert event["run_id"] == blocked_run.id
+        assert json.loads(event["payload"]) == {
+            "attempted_run_id": blocked_run.id,
+            "block_kind": "needs_input",
+            "block_recurrences": 1,
+            "current_run_id": None,
+            "reason": "ended_run_attempted_completion_while_blocked",
+        }
+    finally:
+        conn.close()
+
+
+def test_principal_gate_block_refuses_agent_completion(kanban_home):
+    """An inert principal-only decision gate remains non-completable by agents."""
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(
+            conn,
+            title="INERT HUMAN-DECISION GATE: approve external publication",
+            body="Principal approval is required; agents must not close this card.",
+            assignee="principal-reviewer",
+            initial_status="blocked",
+        )
+
+        assert not kb.complete_task(
+            conn,
+            tid,
+            summary="agent attempted to bypass the principal gate",
+            expected_run_id=987654,
+        )
+        task = kb.get_task(conn, tid)
+        assert task.status == "blocked"
+        assert task.current_run_id is None
+        assert conn.execute(
+            "SELECT 1 FROM task_events WHERE task_id = ? AND kind = 'completed'",
+            (tid,),
+        ).fetchone() is None
+        assert conn.execute(
+            "SELECT 1 FROM task_events "
+            "WHERE task_id = ? AND kind = 'stale_block_completion_wedge'",
+            (tid,),
+        ).fetchone() is None
+    finally:
+        conn.close()
 
 
 def test_stale_run_cannot_block_or_heartbeat_new_attempt(kanban_home, monkeypatch):
