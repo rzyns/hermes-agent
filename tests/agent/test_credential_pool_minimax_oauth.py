@@ -351,6 +351,43 @@ def test_minimax_oauth_load_pool_hydrates_and_refreshes_owned_source(
         assert "refresh_token" not in persisted
 
 
+def test_minimax_oauth_borrowed_refresh_fails_closed_when_source_write_fails(
+    profile_and_root, monkeypatch
+):
+    """A consumed root refresh grant must not look successfully persisted."""
+    profile_path, root_path = profile_and_root
+    root_state = _minimax_state(expires_in_future_seconds=-10)
+    _write_store(profile_path, {"version": 1, "providers": {}})
+    _write_store(
+        root_path,
+        {"version": 1, "providers": {"minimax-oauth": dict(root_state)}},
+    )
+    _patch_refresh_pure(monkeypatch)
+
+    real_persist = A._persist_provider_state_to_store
+
+    def fail_root_write(provider, state, store_path, **kwargs):
+        if provider == "minimax-oauth" and Path(store_path) == root_path:
+            raise OSError("injected root write failure")
+        return real_persist(provider, state, store_path, **kwargs)
+
+    monkeypatch.setattr(A, "_persist_provider_state_to_store", fail_root_write)
+
+    pool = CP.load_pool("minimax-oauth")
+    with pytest.raises(CP.MiniMaxOAuthSourcePersistenceError):
+        pool.select()
+
+    # The authoritative source still contains its old, now-consumed grant, so
+    # the operation must be visible as a hard failure and the local pool must
+    # not lease or persist the rotated pair as though write-through succeeded.
+    root = _read_store(root_path)
+    assert root["providers"]["minimax-oauth"]["refresh_token"] == "old-refresh"
+    assert pool.peek() is None
+    serialized_profile = profile_path.read_text(encoding="utf-8")
+    assert "rotated-access" not in serialized_profile
+    assert "rotated-refresh" not in serialized_profile
+
+
 # ---------------------------------------------------------------------------
 # 2. Profile-local shadow is NOT promoted to root
 # ---------------------------------------------------------------------------
@@ -969,6 +1006,50 @@ def test_minimax_oauth_terminal_refresh_quarantines_root_and_profile(
     assert root.get("active_provider") == "openrouter", (
         f"active_provider flipped to {root.get('active_provider')} during quarantine"
     )
+
+
+def test_minimax_oauth_borrowed_quarantine_write_failure_is_not_silent(
+    profile_and_root, monkeypatch
+):
+    """A failed root quarantine must surface and fail the local entry closed."""
+    profile_path, root_path = profile_and_root
+    root_state = _minimax_state()
+    _write_store(profile_path, {"version": 1, "providers": {}})
+    _write_store(
+        root_path,
+        {"version": 1, "providers": {"minimax-oauth": dict(root_state)}},
+    )
+
+    def terminal_refresh(state, **kwargs):
+        raise AuthError(
+            "invalid_grant",
+            provider="minimax-oauth",
+            code="refresh_failed",
+            relogin_required=True,
+        )
+
+    monkeypatch.setattr(A, "refresh_minimax_oauth_pure", terminal_refresh)
+    monkeypatch.setattr(CP, "refresh_minimax_oauth_pure", terminal_refresh)
+    monkeypatch.setattr(A, "get_provider_auth_state", lambda _pid: dict(root_state))
+
+    real_persist = A._persist_provider_state_to_store
+
+    def fail_root_write(provider, state, store_path, **kwargs):
+        if provider == "minimax-oauth" and Path(store_path) == root_path:
+            raise OSError("injected root quarantine failure")
+        return real_persist(provider, state, store_path, **kwargs)
+
+    monkeypatch.setattr(A, "_persist_provider_state_to_store", fail_root_write)
+
+    pool = CredentialPool("minimax-oauth", [_entry()])
+    with pytest.raises(CP.MiniMaxOAuthSourcePersistenceError):
+        pool._refresh_entry(pool._entries[0], force=True)
+
+    # Root remains unchanged because the injected write failed, but the local
+    # process must neither report successful quarantine nor keep leasing it.
+    root = _read_store(root_path)
+    assert root["providers"]["minimax-oauth"]["refresh_token"] == "old-refresh"
+    assert pool.peek() is None
 
 
 # ---------------------------------------------------------------------------

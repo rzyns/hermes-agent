@@ -49,6 +49,10 @@ from hermes_cli.auth import (
 logger = logging.getLogger(__name__)
 
 
+class MiniMaxOAuthSourcePersistenceError(RuntimeError):
+    """Raised when refreshed or quarantined OAuth state cannot reach its owner."""
+
+
 def _load_config_safe() -> Optional[dict]:
     """Load config.yaml, returning None on any error."""
     try:
@@ -1259,17 +1263,13 @@ class CredentialPool:
             source_path, active_path
         ):
             # Borrowed-from-root grant: persist to root directly, never shadow
-            # it locally.
-            try:
-                auth_mod._persist_provider_state_to_store(
-                    "minimax-oauth", state, source_path, set_active=False
-                )
-            except Exception as exc:  # pragma: no cover - best effort
-                logger.debug(
-                    "MiniMax OAuth pool: write-through to source %s failed: %s",
-                    source_path,
-                    exc,
-                )
+            # it locally.  This write is authoritative, not best-effort: the
+            # token endpoint has already consumed the old single-use refresh
+            # token, so returning success without storing the rotated pair
+            # would strand every other borrower on a dead grant.
+            auth_mod._persist_provider_state_to_store(
+                "minimax-oauth", state, source_path, set_active=False
+            )
         else:
             _store_provider_state(auth_store, "minimax-oauth", state, set_active=False)
             _save_auth_store(auth_store)
@@ -1384,9 +1384,26 @@ class CredentialPool:
                 if updated is None:
                     return None
                 # Persist back to the source we read from (profile or root).
-                self._sync_minimax_oauth_entry_to_source(
-                    updated, _auth_store, source_path
-                )
+                try:
+                    self._sync_minimax_oauth_entry_to_source(
+                        updated, _auth_store, source_path
+                    )
+                except Exception as persist_exc:
+                    # _refresh_entry_impl has already installed the rotated
+                    # pair in memory and serialized the profile pool.  Fail it
+                    # closed before surfacing the authoritative-store error;
+                    # borrowed-entry sanitization also ensures the consumed
+                    # rotated secret cannot survive in the profile pool file.
+                    self._entries = [
+                        item for item in self._entries if item.id != updated.id
+                    ]
+                    if self._current_id == updated.id:
+                        self._current_id = None
+                    self._persist(removed_ids=[updated.id])
+                    raise MiniMaxOAuthSourcePersistenceError(
+                        "MiniMax OAuth refresh succeeded but authoritative "
+                        "credential persistence failed"
+                    ) from persist_exc
                 return updated
         if self.provider in ("openai-codex", "xai-oauth"):
             if self.provider == "openai-codex":
@@ -1915,6 +1932,7 @@ class CredentialPool:
                         "MiniMax OAuth refresh token is terminally invalid; "
                         "clearing local token state"
                     )
+                    quarantine_persist_error: Optional[Exception] = None
                     try:
                         with _provider_state_transaction(
                             "minimax-oauth",
@@ -1951,20 +1969,12 @@ class CredentialPool:
                                 if source_path is not None and not auth_mod._same_path(
                                     source_path, active_path
                                 ):
-                                    try:
-                                        auth_mod._persist_provider_state_to_store(
-                                            "minimax-oauth",
-                                            quarantined,
-                                            source_path,
-                                            set_active=False,
-                                        )
-                                    except Exception as exc2:  # pragma: no cover
-                                        logger.debug(
-                                            "MiniMax OAuth quarantine write-through "
-                                            "to source %s failed: %s",
-                                            source_path,
-                                            exc2,
-                                        )
+                                    auth_mod._persist_provider_state_to_store(
+                                        "minimax-oauth",
+                                        quarantined,
+                                        source_path,
+                                        set_active=False,
+                                    )
                                 else:
                                     _store_provider_state(
                                         _auth_store,
@@ -1974,7 +1984,8 @@ class CredentialPool:
                                     )
                                     _save_auth_store(_auth_store)
                     except Exception as clear_exc:
-                        logger.debug(
+                        quarantine_persist_error = clear_exc
+                        logger.warning(
                             "Failed to clear terminal MiniMax OAuth state: %s",
                             clear_exc,
                         )
@@ -1987,6 +1998,16 @@ class CredentialPool:
                     if self._current_id == entry.id:
                         self._current_id = None
                     self._persist(removed_ids=removed_ids)
+                    if quarantine_persist_error is not None:
+                        # Never represent a local removal as successful durable
+                        # quarantine while the authoritative owner still holds
+                        # the terminal grant.  Remove it locally first so this
+                        # process cannot lease it, then surface a typed hard
+                        # failure requiring source repair or re-login.
+                        raise MiniMaxOAuthSourcePersistenceError(
+                            "MiniMax OAuth terminal grant could not be "
+                            "quarantined in the authoritative credential store"
+                        ) from quarantine_persist_error
                     return None
             self._mark_exhausted(entry, None)
             return None
