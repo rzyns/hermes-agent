@@ -672,6 +672,25 @@ def strip_think_blocks(agent, content: str) -> str:
     """
     if not content:
         return ""
+    # Multimodal messages carry list-of-parts content (e.g. vision tool
+    # results that inject image parts natively).  Callers such as
+    # ``_interim_assistant_visible_text`` route arbitrary message content
+    # through here -- join the text parts instead of letting ``re.sub``
+    # raise ``TypeError: expected string or bytes-like object, got 'list'``.
+    # Seen 2026-07-18 (webui session 0781e96df6ef): three vision_analyze
+    # results left a list-content tool message as messages[-1]; every
+    # subsequent model call crashed in the interim-text pre-pass until the
+    # turn gave up at the iteration budget (~110 repeated errors).
+    if isinstance(content, list):
+        content = "\n".join(
+            part.get("text", "")
+            for part in content
+            if isinstance(part, dict) and part.get("type") == "text"
+        )
+        if not content:
+            return ""
+    elif not isinstance(content, str):
+        content = str(content)
     # 1. Closed tag pairs — case-insensitive for all variants so
     #    mixed-case tags (<THINK>, <Thinking>) don't slip through to
     #    the unterminated-tag pass and take trailing content with them.
