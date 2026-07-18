@@ -313,6 +313,7 @@ export const zh: Translations = {
       mcp: 'MCP',
       archivedChats: '会话',
       about: '关于',
+      billing: '账单',
       notifications: '通知',
       plugins: '插件'
     },
