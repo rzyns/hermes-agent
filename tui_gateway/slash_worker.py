@@ -50,12 +50,7 @@ _in_flight = threading.Event()  # set while a command is executing
 
 
 def _is_orphaned(original_ppid, getppid=os.getppid) -> bool:
-    """True once the spawning gateway is no longer this process's parent.
-
-    ``getppid`` is kernel-maintained and changes on reparenting. Do not use
-    ``psutil.create_time()`` as a second identity check: its epoch-derived
-    value can drift on WSL while the parent remains alive.
-    """
+    """Return whether this worker no longer has its original POSIX parent."""
     return getppid() != original_ppid
 
 
