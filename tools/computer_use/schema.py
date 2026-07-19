@@ -87,16 +87,21 @@ COMPUTER_USE_SCHEMA: Dict[str, Any] = {
             "pid": {
                 "type": "integer",
                 "description": (
-                    "Optional exact process target for action='capture'. Pair "
-                    "with window_id when discovery cannot resolve an X11 app."
+                    "Optional. Process ID of the target window. Use with "
+                    "`window_id` to bypass `list_windows` when discovery is "
+                    "broken. The cua-driver daemon (`cua-driver list_windows`) "
+                    "and PowerShell `(Get-Process | Where MainWindowHandle)` "
+                    "are reliable sources for both values when discovery "
+                    "returns empty."
                 ),
             },
             "window_id": {
                 "type": "integer",
                 "description": (
-                    "Optional exact native window target for action='capture'. "
-                    "Pair with pid when an external cua-driver list_windows "
-                    "lookup has already identified the window."
+                    "Optional. Window handle (HWND on Windows, "
+                    "CGWindowID on macOS) of the target window. Required "
+                    "when `pid` is provided so the backend can disambiguate "
+                    "a window within a process."
                 ),
             },
             "max_elements": {
@@ -220,39 +225,33 @@ COMPUTER_USE_SCHEMA: Dict[str, Any] = {
                     "matching the background co-work model."
                 ),
             },
-            # ── direct targeting (bypass list_windows) ────────────
-            #
-            # When cua-driver's discovery (list_apps / list_windows) returns
-            # empty for transient or environmental reasons, the wrapper
-            # historically had no fallback — every capture() / focus_app()
-            # returned 0x0 / "no on-screen window." Allowing callers to
-            # supply pid + window_id directly lets the backend skip the
-            # list_windows round-trip and target a window the caller has
-            # already resolved via cua-driver's daemon directly (CLI or
-            # process inspection).
-            #
-            # Both fields are optional; omitting them preserves the original
-            # capture-frontmost / focus-by-app-name behavior. When pid is
-            # provided, window_id should also be provided — the backend uses
-            # (pid, window_id) as the unique key.
-            "pid": {
-                "type": "integer",
+            # ── delivery (verify → escalate ladder) ────────────────
+            "delivery_mode": {
+                "type": "string",
+                "enum": ["background", "foreground"],
                 "description": (
-                    "Optional. Process ID of the target window. Use with "
-                    "`window_id` to bypass `list_windows` when discovery is "
-                    "broken. The cua-driver daemon (`cua-driver list_windows`) "
-                    "and PowerShell `(Get-Process | Where MainWindowHandle)` "
-                    "are reliable sources for both values when discovery "
-                    "returns empty."
+                    "How input is delivered, for the input actions (click, "
+                    "double_click, right_click, drag, scroll, type, key). "
+                    "`background` (DEFAULT) routes input to the target without "
+                    "raising it or stealing focus — the co-work model. "
+                    "`foreground` briefly fronts the window, acts, then "
+                    "restores the prior frontmost app. Only escalate to "
+                    "`foreground` when a background attempt did NOT land — i.e. "
+                    "a prior result had `effect: 'suspected_noop'`, "
+                    "`code: 'background_unavailable'`, or "
+                    "`escalation.recommended: 'foreground'`. Do not predict it "
+                    "from the app being Electron/Chromium; react to the "
+                    "returned signal. Foreground is a visible focus change and "
+                    "needs its own approval."
                 ),
             },
-            "window_id": {
-                "type": "integer",
+            "bring_to_front": {
+                "type": "boolean",
                 "description": (
-                    "Optional. Window handle (HWND on Windows, "
-                    "CGWindowID on macOS) of the target window. Required "
-                    "when `pid` is provided so the backend can disambiguate "
-                    "a window within a process."
+                    "Optional, pairs with delivery_mode='foreground'. Keep the "
+                    "target fronted after the action instead of restoring the "
+                    "previous app, to avoid a per-call flash across a short "
+                    "sequence of foreground actions. Default false."
                 ),
             },
             # ── return shape ───────────────────────────────────────
