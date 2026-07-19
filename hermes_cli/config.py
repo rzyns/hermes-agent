@@ -2868,17 +2868,6 @@ DEFAULT_CONFIG = {
         # worker process (if still running host-locally) is terminated
         # before the reclaim.  0 disables stale detection entirely.
         "dispatch_stale_timeout_seconds": 14400,
-        # Append-only JSONL semantic event sidecar — disabled by default.
-        # See hermes_cli/kanban_sidecar.py for implementation.
-        "sidecar": {
-            "enabled": False,
-            "max_bytes": 104857600,
-            "rotate_daily": True,
-            "sync_mode": "O_DSYNC",
-            "retention_days": 90,
-            "archive_path": None,
-            "hash_verification": True,
-        },
     },
 
     # execute_code settings — controls the tool used for programmatic tool calls.
