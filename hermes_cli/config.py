@@ -5686,15 +5686,8 @@ def warn_deprecated_cwd_env_vars(config: Optional[Dict[str, Any]] = None) -> Non
     if config is None:
         try:
             config = load_config()
-        except Exception as _exc:
-            # Config load failure shouldn't silence the deprecation warning entirely —
-            # the warning may be the only signal the user has about a stale .env.
-            logger.warning(
-                "Could not load config while checking deprecated CWD env vars: %s",
-                _exc,
-                exc_info=logger.isEnabledFor(logging.DEBUG),
-            )
-            config = {}
+        except Exception:
+            return
 
     terminal_cfg = config.get("terminal", {})
     config_cwd = terminal_cfg.get("cwd", ".") if isinstance(terminal_cfg, dict) else "."

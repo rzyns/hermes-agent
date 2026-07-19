@@ -4393,13 +4393,6 @@ def cmd_slack(args):
 
 
 
-def cmd_governance(args):
-    """Governance evaluation (dry-run/report-only)."""
-    from hermes_cli.governance import governance_command
-
-    return governance_command(args)
-
-
 def cmd_kanban(args):
     """Multi-profile collaboration board."""
     from hermes_cli.kanban import kanban_command
@@ -12833,7 +12826,7 @@ _BUILTIN_SUBCOMMANDS = frozenset(
         "acp", "auth", "backup", "bundles", "checkpoints", "claw", "completion",
         "computer-use",
         "config", "console", "cron", "curator", "dashboard", "serve", "debug", "doctor",
-        "dump", "fallback", "gateway", "governance", "hooks", "import", "insights",
+        "dump", "fallback", "gateway", "hooks", "import", "insights",
         "gui", "desktop", "kanban", "login", "logout", "logs", "lsp", "mcp", "memory", "migrate", "moa",
         "journey", "memory-graph", "learning",
         "model", "pairing", "pets", "plugins", "portal", "postinstall", "profile",
@@ -13640,14 +13633,6 @@ def main():
     # webhook command  (parser built in hermes_cli/subcommands/webhook.py)
     # =========================================================================
     build_webhook_parser(subparsers, cmd_webhook=cmd_webhook)
-
-    # =========================================================================
-    # governance command — governance evaluation (dry-run/report-only)
-    # =========================================================================
-    from hermes_cli.governance import build_parser as _build_governance_parser
-
-    governance_parser = _build_governance_parser(subparsers)
-    governance_parser.set_defaults(func=cmd_governance)
 
     # =========================================================================
     # portal command — Nous Portal status + Tool Gateway routing
