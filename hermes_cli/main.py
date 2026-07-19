@@ -2568,6 +2568,7 @@ def cmd_whatsapp(args):
     """Set up WhatsApp: choose mode, configure, install bridge, pair via QR."""
     _require_tty("whatsapp")
     from hermes_cli.config import get_env_value, save_env_value
+    from hermes_constants import find_node_executable, with_hermes_node_path
 
     print()
     print("⚕ WhatsApp Setup")
@@ -2682,7 +2683,7 @@ def cmd_whatsapp(args):
         print(
             "\n→ Installing WhatsApp bridge dependencies (this can take a few minutes)..."
         )
-        npm = shutil.which("npm")
+        npm = find_node_executable("npm")
         if not npm:
             print("  ✗ npm not found on PATH — install Node.js first")
             return
@@ -2695,6 +2696,7 @@ def cmd_whatsapp(args):
                 text=True,
                 encoding="utf-8",
                 errors="replace",
+                env=with_hermes_node_path(),
             )
         except KeyboardInterrupt:
             print("\n  ✗ Install cancelled")
@@ -2751,8 +2753,15 @@ def cmd_whatsapp(args):
 
     try:
         subprocess.run(
-            ["node", str(bridge_script), "--pair-only", "--session", str(session_dir)],
+            [
+                find_node_executable("node") or "node",
+                str(bridge_script),
+                "--pair-only",
+                "--session",
+                str(session_dir),
+            ],
             cwd=str(bridge_dir),
+            env=with_hermes_node_path(),
         )
     except KeyboardInterrupt:
         pass
@@ -4755,6 +4764,7 @@ def _run_with_idle_timeout(
     *,
     idle_timeout_seconds: int = 180,
     indent: str = "    ",
+    env: dict[str, str] | None = None,
 ) -> subprocess.CompletedProcess:
     """Run a subprocess that streams output, with an idle-output timeout.
 
@@ -4789,6 +4799,7 @@ def _run_with_idle_timeout(
             encoding="utf-8",
             errors="replace",
             bufsize=1,
+            env=env,
         )
     except OSError as exc:
         # E.g. npm not on PATH between the which() check and now.
@@ -5007,6 +5018,7 @@ def _build_web_ui(web_dir: Path, *, fatal: bool = False) -> bool:
             _say("Web UI frontend not built and npm is not available.")
             _say("Install Node.js, then run:  cd web && npm install && npm run build")
         return not fatal
+    build_env = with_hermes_node_path()
     _say("→ Building web UI...")
 
     def _relay(result: "subprocess.CompletedProcess") -> None:
@@ -5038,6 +5050,7 @@ def _build_web_ui(web_dir: Path, *, fatal: bool = False) -> bool:
         npm,
         npm_cwd,
         extra_args=(*npm_workspace_args, "--silent"),
+        env=build_env,
     )
     if r1.returncode != 0:
         _say(
@@ -5053,13 +5066,13 @@ def _build_web_ui(web_dir: Path, *, fatal: bool = False) -> bool:
     # users react by rebooting, which leaves the editable install in a
     # half-state. Streaming + idle-kill makes failures observable AND
     # recoverable (the stale-dist fallback below handles the kill path).
-    r2 = _run_with_idle_timeout([npm, "run", "build"], cwd=web_dir)
+    r2 = _run_with_idle_timeout([npm, "run", "build"], cwd=web_dir, env=build_env)
     if r2.returncode != 0:
         # Retry once after a short delay — covers boot-time races on Windows
         # (antivirus scanning Node.js binaries, npm cache not ready, transient
         # I/O when launched via Scheduled Task at logon). See issue #23817.
         _time.sleep(3)
-        r2 = _run_with_idle_timeout([npm, "run", "build"], cwd=web_dir)
+        r2 = _run_with_idle_timeout([npm, "run", "build"], cwd=web_dir, env=build_env)
 
     if r2.returncode != 0:
         # _run_with_idle_timeout merges stderr into stdout; older callers
@@ -5438,7 +5451,9 @@ def _redownload_electron_dist(
     installer = electron_dir / "install.js"
     if not installer.is_file():
         return False
-    node = shutil.which("node")
+    from hermes_constants import find_node_executable, with_hermes_node_path
+
+    node = find_node_executable("node")
     if not node:
         return False
 
@@ -5449,7 +5464,7 @@ def _redownload_electron_dist(
     except OSError:
         pass
 
-    dl_env = dict(env)
+    dl_env = with_hermes_node_path(env)
     if mirror:
         dl_env["ELECTRON_MIRROR"] = mirror
     try:
