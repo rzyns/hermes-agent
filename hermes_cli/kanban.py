@@ -690,54 +690,12 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
     )
 
     # --- link / unlink ---
-    try:
-        from plugins.kanban_cross_deps.models import VALID_EDGE_KINDS
-        cross_board_edge_kinds = sorted(VALID_EDGE_KINDS)
-    except Exception:  # pragma: no cover - defensive import fallback
-        cross_board_edge_kinds = [
-            "blocks",
-            "depends_on",
-            "depends_on_decision",
-            "derived_from_research",
-            "feeds",
-            "informed_by",
-            "related",
-            "supersedes",
-        ]
-
     p_link = sub.add_parser("link", help="Add a parent->child dependency")
-    p_link.add_argument("parent_id", nargs="?")
-    p_link.add_argument("child_id", nargs="?")
-    p_link.add_argument("--parent-board", default=None, help="Cross-board parent board slug")
-    p_link.add_argument("--parent", dest="cross_parent_id", default=None, help="Cross-board parent task id")
-    p_link.add_argument("--child-board", default=None, help="Cross-board child board slug")
-    p_link.add_argument("--child", dest="cross_child_id", default=None, help="Cross-board child task id")
-    p_link.add_argument("--kind", default=None, choices=cross_board_edge_kinds, help="Cross-board edge kind")
-    p_link.add_argument(
-        "--blocking",
-        action=argparse.BooleanOptionalAction,
-        default=False,
-        help="Whether the cross-board edge blocks scheduler promotion (default: false)",
-    )
-    p_link.add_argument(
-        "--required-parent-statuses",
-        default=None,
-        help="Comma-separated or JSON list of parent statuses that satisfy the edge",
-    )
-    p_link.add_argument("--source", default=None, help="Cross-board provenance source label")
-    p_link.add_argument("--created-by", default=None, help="Cross-board actor/provenance label")
-    p_link.add_argument("--metadata", default=None, help="Cross-board edge metadata as a JSON object")
-    p_link.add_argument("--json", action="store_true", help="Emit machine-readable JSON")
-
+    p_link.add_argument("parent_id")
+    p_link.add_argument("child_id")
     p_unlink = sub.add_parser("unlink", help="Remove a parent->child dependency")
-    p_unlink.add_argument("parent_id", nargs="?")
-    p_unlink.add_argument("child_id", nargs="?")
-    p_unlink.add_argument("--parent-board", default=None, help="Cross-board parent board slug")
-    p_unlink.add_argument("--parent", dest="cross_parent_id", default=None, help="Cross-board parent task id")
-    p_unlink.add_argument("--child-board", default=None, help="Cross-board child board slug")
-    p_unlink.add_argument("--child", dest="cross_child_id", default=None, help="Cross-board child task id")
-    p_unlink.add_argument("--kind", default=None, choices=cross_board_edge_kinds, help="Cross-board edge kind")
-    p_unlink.add_argument("--json", action="store_true", help="Emit machine-readable JSON")
+    p_unlink.add_argument("parent_id")
+    p_unlink.add_argument("child_id")
 
     # --- claim ---
     p_claim = sub.add_parser(
@@ -2392,169 +2350,7 @@ def _cmd_arg_error(args: argparse.Namespace, message: str, *, stream=None) -> No
         print(message, file=stream or sys.stderr)
 
 
-def _cross_board_link_mode_requested(args: argparse.Namespace) -> bool:
-    """Return True when the link/unlink invocation used cross-board flags."""
-    cross_fields = (
-        "parent_board",
-        "cross_parent_id",
-        "child_board",
-        "cross_child_id",
-        "kind",
-        "required_parent_statuses",
-        "source",
-        "created_by",
-        "metadata",
-    )
-    if any(getattr(args, field, None) is not None for field in cross_fields):
-        return True
-    return bool(getattr(args, "blocking", False))
-
-
-def _validate_link_argument_mode(args: argparse.Namespace) -> tuple[bool, bool]:
-    """Validate local-vs-cross-board link/unlink mode.
-
-    Returns ``(ok, cross_board_mode)``.  The legacy board-local form is the
-    positional pair ``parent_id child_id``.  The cross-board registry form is
-    all-flagged and must not be mixed with positional ids.
-    """
-    has_positional = args.parent_id is not None or args.child_id is not None
-    wants_cross_board = _cross_board_link_mode_requested(args)
-    if has_positional and wants_cross_board:
-        _cmd_arg_error(args, "choose either positional parent_id child_id OR cross-board flags, not both")
-        return False, wants_cross_board
-    if wants_cross_board:
-        missing = [
-            flag
-            for attr, flag in (
-                ("parent_board", "--parent-board"),
-                ("cross_parent_id", "--parent"),
-                ("child_board", "--child-board"),
-                ("cross_child_id", "--child"),
-                ("kind", "--kind"),
-            )
-            if not getattr(args, attr, None)
-        ]
-        if missing:
-            _cmd_arg_error(args, f"cross-board link/unlink requires {', '.join(missing)}")
-            return False, True
-        return True, True
-    if not args.parent_id or not args.child_id:
-        _cmd_arg_error(args, "positional parent_id and child_id are required")
-        return False, False
-    return True, False
-
-
-def _parse_cross_board_required_statuses(raw: str | None) -> list[str]:
-    if raw is None:
-        return ["done", "archived"]
-    text = raw.strip()
-    if not text:
-        raise ValueError("--required-parent-statuses must not be empty")
-    if text.startswith("["):
-        parsed = json.loads(text)
-        if not isinstance(parsed, list):
-            raise ValueError("--required-parent-statuses JSON must be a list")
-        statuses = [str(value).strip() for value in parsed]
-    else:
-        statuses = [part.strip() for part in text.split(",")]
-    statuses = [status for status in statuses if status]
-    if not statuses:
-        raise ValueError("--required-parent-statuses must contain at least one status")
-    return statuses
-
-
-def _parse_cross_board_metadata(raw: str | None) -> dict[str, Any]:
-    if raw is None:
-        return {}
-    try:
-        parsed = json.loads(raw)
-    except json.JSONDecodeError as exc:
-        raise ValueError(f"--metadata must be a JSON object: {exc}") from exc
-    if not isinstance(parsed, dict):
-        raise ValueError("--metadata must be a JSON object")
-    return dict(parsed)
-
-
-def _cross_board_edge_identity(args: argparse.Namespace) -> dict[str, str]:
-    return {
-        "parent_board": str(args.parent_board),
-        "parent_id": str(args.cross_parent_id),
-        "child_board": str(args.child_board),
-        "child_id": str(args.cross_child_id),
-        "kind": str(args.kind),
-    }
-
-
-def _cmd_cross_board_link(args: argparse.Namespace) -> int:
-    from plugins.kanban_cross_deps.store import CrossBoardRegistry
-
-    try:
-        required_statuses = _parse_cross_board_required_statuses(
-            getattr(args, "required_parent_statuses", None)
-        )
-        metadata = _parse_cross_board_metadata(getattr(args, "metadata", None))
-        edge = CrossBoardRegistry().add(
-            parent_board=args.parent_board,
-            parent_id=args.cross_parent_id,
-            child_board=args.child_board,
-            child_id=args.cross_child_id,
-            kind=args.kind,
-            blocking=bool(getattr(args, "blocking", False)),
-            required_parent_statuses=required_statuses,
-            source=getattr(args, "source", None) or "canonical",
-            created_by=getattr(args, "created_by", None),
-            metadata=metadata,
-        )
-    except (ValueError, json.JSONDecodeError) as exc:
-        _cmd_arg_error(args, str(exc))
-        return 1
-
-    if getattr(args, "json", False):
-        print(json.dumps({"ok": True, "linked": True, "edge": edge.to_dict()}, indent=2, ensure_ascii=False))
-    else:
-        print(
-            f"Linked cross-board {edge.parent_board}/{edge.parent_id} "
-            f"--[{edge.kind}]{' (blocking)' if edge.blocking else ''}--> "
-            f"{edge.child_board}/{edge.child_id}"
-        )
-    return 0
-
-
-def _cmd_cross_board_unlink(args: argparse.Namespace) -> int:
-    from plugins.kanban_cross_deps.store import CrossBoardRegistry
-
-    reg = CrossBoardRegistry()
-    identity = _cross_board_edge_identity(args)
-    existing = reg.list_edges(**identity, limit=1)
-    if not existing:
-        _cmd_arg_error(
-            args,
-            "No such cross-board edge: "
-            f"{args.parent_board}/{args.cross_parent_id} -> {args.child_board}/{args.cross_child_id} kind={args.kind}",
-        )
-        return 1
-    edge = existing[0]
-    removed = reg.remove(edge.id)
-    if not removed:
-        _cmd_arg_error(args, f"Could not remove cross-board edge {edge.id}")
-        return 1
-
-    if getattr(args, "json", False):
-        print(json.dumps({"ok": True, "unlinked": True, "edge_id": edge.id, "edge": identity}, indent=2, ensure_ascii=False))
-    else:
-        print(
-            f"Unlinked cross-board {edge.parent_board}/{edge.parent_id} "
-            f"--[{edge.kind}]--> {edge.child_board}/{edge.child_id}"
-        )
-    return 0
-
-
 def _cmd_link(args: argparse.Namespace) -> int:
-    ok, cross_board = _validate_link_argument_mode(args)
-    if not ok:
-        return 2
-    if cross_board:
-        return _cmd_cross_board_link(args)
     with kb.connect_closing() as conn:
         kb.link_tasks(conn, args.parent_id, args.child_id)
     print(f"Linked {args.parent_id} -> {args.child_id}")
@@ -2562,11 +2358,6 @@ def _cmd_link(args: argparse.Namespace) -> int:
 
 
 def _cmd_unlink(args: argparse.Namespace) -> int:
-    ok, cross_board = _validate_link_argument_mode(args)
-    if not ok:
-        return 2
-    if cross_board:
-        return _cmd_cross_board_unlink(args)
     with kb.connect_closing() as conn:
         ok = kb.unlink_tasks(conn, args.parent_id, args.child_id)
     if not ok:
