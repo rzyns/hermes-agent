@@ -518,6 +518,17 @@ class TestGeneratedSystemdUnits:
         assert "/mnt/c/WINDOWS/system32" in unit
         assert "/mnt/c/WINDOWS/System32/WindowsPowerShell/v1.0/" in unit
 
+    def test_wsl_interop_paths_deduplicate_trailing_slash_variants(self, monkeypatch):
+        powershell_dir = "/mnt/c/WINDOWS/System32/WindowsPowerShell/v1.0"
+        monkeypatch.setattr(gateway_cli, "is_wsl", lambda: True)
+        monkeypatch.setenv("PATH", f"{powershell_dir}:{powershell_dir}/")
+        monkeypatch.setattr(gateway_cli.shutil, "which", lambda cmd: None)
+        monkeypatch.setattr(gateway_cli.Path, "exists", lambda self: False)
+
+        paths = gateway_cli._build_wsl_interop_paths([])
+
+        assert paths == [powershell_dir]
+
     def test_user_unit_omits_windows_interop_paths_outside_wsl(self, monkeypatch):
         monkeypatch.setattr(gateway_cli, "is_wsl", lambda: False)
         monkeypatch.setenv("PATH", "/usr/local/bin:/mnt/c/WINDOWS/system32")

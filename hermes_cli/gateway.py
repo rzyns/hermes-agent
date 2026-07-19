@@ -2582,10 +2582,15 @@ def _build_wsl_interop_paths(path_entries: list[str]) -> list[str]:
             candidates.append(entry)
 
     result: list[str] = []
-    seen = set(path_entries)
+    # A gateway boot inherits the PATH stored in its own unit, then regenerates
+    # that unit as part of the self-heal check.  Treat trailing-slash variants as
+    # the same directory so an inherited ``.../v1.0/`` and a discovered
+    # ``.../v1.0`` cannot make the service definition oscillate forever.
+    seen = {os.path.normpath(entry) for entry in path_entries if entry}
     for entry in candidates:
-        if entry and entry not in seen:
-            seen.add(entry)
+        normalized = os.path.normpath(entry) if entry else ""
+        if entry and normalized not in seen:
+            seen.add(normalized)
             result.append(entry)
     return result
 
