@@ -3,8 +3,15 @@ import subprocess
 from pathlib import Path
 from types import SimpleNamespace
 
+import pytest
+
 
 PLUGIN_CLI = Path('/home/openclaw/.hermes/plugins/hermes-update-guard/cli.py')
+
+pytestmark = pytest.mark.skipif(
+    not PLUGIN_CLI.exists(),
+    reason='hermes-update-guard plugin not installed at its live path (homelab-only test)',
+)
 
 
 def _load_cli():

@@ -1846,6 +1846,13 @@ try:
 except Exception as _bootstrap_exc:
     print(f"  Warning: config validation failed: {_bootstrap_exc}", file=sys.stderr)
 
+# Warn if user has deprecated MESSAGING_CWD / TERMINAL_CWD in .env
+try:
+    from hermes_cli.config import warn_deprecated_cwd_env_vars
+    warn_deprecated_cwd_env_vars()
+except Exception as _bootstrap_exc:
+    print(f"  Warning: deprecation check failed: {_bootstrap_exc}", file=sys.stderr)
+
 # Gateway runs in quiet mode - suppress debug output and use cwd directly (no temp dirs)
 os.environ["HERMES_QUIET"] = "1"
 
@@ -3015,20 +3022,6 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         self._profile_adapters: Dict[str, Dict[Platform, BasePlatformAdapter]] = {}
         self._warn_if_docker_media_delivery_is_risky()
         _gateway_runner_ref = _weakref.ref(self)
-
-        # Warn if user has deprecated MESSAGING_CWD / TERMINAL_CWD in .env
-        try:
-            from hermes_cli.config import warn_deprecated_cwd_env_vars
-
-            warn_deprecated_cwd_env_vars()
-        except Exception as _exc:
-            # Don't block gateway startup, but don't silently swallow either —
-            # the warning may be the only signal the user has about a config issue.
-            logger.warning(
-                "Deprecated CWD env-var warning suppressed after error: %s",
-                _exc,
-                exc_info=logger.isEnabledFor(logging.DEBUG),
-            )
 
         # Load ephemeral config from config.yaml / env vars.
         # Both are injected at API-call time only and never persisted.

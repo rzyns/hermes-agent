@@ -2868,17 +2868,6 @@ DEFAULT_CONFIG = {
         # worker process (if still running host-locally) is terminated
         # before the reclaim.  0 disables stale detection entirely.
         "dispatch_stale_timeout_seconds": 14400,
-        # Append-only JSONL semantic event sidecar — disabled by default.
-        # See hermes_cli/kanban_sidecar.py for implementation.
-        "sidecar": {
-            "enabled": False,
-            "max_bytes": 104857600,
-            "rotate_daily": True,
-            "sync_mode": "O_DSYNC",
-            "retention_days": 90,
-            "archive_path": None,
-            "hash_verification": True,
-        },
     },
 
     # execute_code settings — controls the tool used for programmatic tool calls.
@@ -5697,15 +5686,8 @@ def warn_deprecated_cwd_env_vars(config: Optional[Dict[str, Any]] = None) -> Non
     if config is None:
         try:
             config = load_config()
-        except Exception as _exc:
-            # Config load failure shouldn't silence the deprecation warning entirely —
-            # the warning may be the only signal the user has about a stale .env.
-            logger.warning(
-                "Could not load config while checking deprecated CWD env vars: %s",
-                _exc,
-                exc_info=logger.isEnabledFor(logging.DEBUG),
-            )
-            config = {}
+        except Exception:
+            return
 
     terminal_cfg = config.get("terminal", {})
     config_cwd = terminal_cfg.get("cwd", ".") if isinstance(terminal_cfg, dict) else "."
