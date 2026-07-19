@@ -18,6 +18,13 @@ from hermes_cli.proxy.adapters.subscription import SubscriptionProxyAdapter
 from hermes_cli.proxy.adapters.xai import XAIGrokAdapter
 
 
+_VALID_PNG_BYTES = bytes.fromhex(
+    "89504e470d0a1a0a0000000d4948445200000001000000010802000000907753"
+    "de0000000c49444154789c63606060000000040001f61738550000000049454e"
+    "44ae426082"
+)
+
+
 # ---------------------------------------------------------------------------
 # Adapter registry
 # ---------------------------------------------------------------------------
@@ -599,6 +606,25 @@ def test_subscription_adapter_raw_chat_route_for_gpt_models(tmp_path, monkeypatc
     assert adapter.raw_chat_route_for_model("MiniMax-M2.7") is None
 
 
+def test_subscription_adapter_routes_gpt_image_models_to_codex_provider():
+    adapter = SubscriptionProxyAdapter()
+
+    assert "/images/generations" in adapter.allowed_paths
+    assert adapter.image_generation_route_for_model("gpt-image-2") == {
+        "provider": "openai-codex",
+        "model": "gpt-image-2-medium",
+    }
+    assert adapter.image_generation_route_for_model("gpt-image-2-low") == {
+        "provider": "openai-codex",
+        "model": "gpt-image-2-low",
+    }
+    assert adapter.image_generation_route_for_model("openai/gpt-image-2-high") == {
+        "provider": "openai-codex",
+        "model": "gpt-image-2-high",
+    }
+    assert adapter.image_generation_route_for_model("dall-e-3") is None
+
+
 def test_subscription_adapter_glm_model_routes_to_zai(tmp_path, monkeypatch):
     """glm-* models must route to the zai provider, not MiniMax or Codex."""
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
@@ -794,6 +820,19 @@ class RawRouteAdapter(FakeAdapter):
         return self._route
 
 
+class ImageRouteAdapter(FakeAdapter):
+    """Fake adapter that delegates OpenAI Images requests to an image provider."""
+
+    def __init__(self, base_url: str, *, route: dict[str, str]):
+        super().__init__(base_url, allowed=["/images/generations"])
+        self._route = route
+        self.image_route_model_hints = []
+
+    def image_generation_route_for_model(self, model):
+        self.image_route_model_hints.append(model)
+        return self._route
+
+
 async def _start_runner(app: "web.Application"):
     """Spin up an aiohttp app on an ephemeral localhost port. Returns (runner, base_url)."""
     runner = web.AppRunner(app, access_log=None)
@@ -925,6 +964,256 @@ def test_server_delegates_raw_chat_route_before_upstream_passthrough():
             assert captured["body"]["model"] == "gpt-5.5"
             assert captured["route"] == {"provider": "openai-codex", "model": "gpt-5.5"}
             assert captured["idempotency_key"] == "idem-123"
+        finally:
+            await proxy_runner.cleanup()
+
+    asyncio.run(run())
+
+
+def test_server_adapts_khoj_image_generation_to_openai_b64_response(tmp_path):
+    async def run():
+        captured: Dict[str, Any] = {}
+        generated = tmp_path / "generated.png"
+        generated.write_bytes(_VALID_PNG_BYTES)
+        adapter = ImageRouteAdapter(
+            "http://unused.example/v1",
+            route={"provider": "openai-codex", "model": "gpt-image-2-medium"},
+        )
+
+        class FakeImageProvider:
+            def is_available(self):
+                return True
+
+            def generate(self, prompt, aspect_ratio="landscape", **kwargs):
+                captured["prompt"] = prompt
+                captured["aspect_ratio"] = aspect_ratio
+                captured["kwargs"] = kwargs
+                return {
+                    "success": True,
+                    "image": str(generated),
+                    "model": kwargs["model"],
+                }
+
+        proxy_runner, proxy_base = await _start_runner(create_app(adapter))
+        try:
+            with patch(
+                "agent.image_gen_registry.get_provider",
+                return_value=FakeImageProvider(),
+            ):
+                async with aiohttp.ClientSession() as session:
+                    async with session.post(
+                        f"{proxy_base}/v1/images/generations",
+                        json={
+                            "model": "gpt-image-2",
+                            "prompt": "A single black circle on white",
+                            "n": 1,
+                            "size": "1024x1024",
+                            "response_format": "b64_json",
+                            "style": "vivid",
+                        },
+                    ) as resp:
+                        assert resp.status == 200
+                        body = await resp.json()
+
+            assert adapter.calls == 0
+            assert adapter.image_route_model_hints == ["gpt-image-2"]
+            assert captured == {
+                "prompt": "A single black circle on white",
+                "aspect_ratio": "square",
+                "kwargs": {"model": "gpt-image-2-medium"},
+            }
+            assert isinstance(body["created"], int)
+            assert len(body["data"]) == 1
+            import base64
+
+            assert body["data"][0]["b64_json"] == base64.b64encode(
+                _VALID_PNG_BYTES
+            ).decode("ascii")
+        finally:
+            await proxy_runner.cleanup()
+
+    asyncio.run(run())
+
+
+def test_server_rejects_non_loopback_image_generation_before_provider_lookup():
+    async def run():
+        from aiohttp.test_utils import make_mocked_request
+
+        adapter = ImageRouteAdapter(
+            "http://unused.example/v1",
+            route={"provider": "openai-codex", "model": "gpt-image-2-medium"},
+        )
+        app = create_app(adapter)
+        handler = next(
+            route.handler
+            for route in app.router.routes()
+            if route.resource.canonical == "/v1/{tail}"
+        )
+        body = json.dumps({
+            "model": "gpt-image-2",
+            "prompt": "A lighthouse",
+        }).encode()
+        protocol = MagicMock(_reading_paused=False)
+        payload = aiohttp.StreamReader(protocol, limit=2**16)
+        payload.feed_data(body)
+        payload.feed_eof()
+        transport = MagicMock()
+        transport.get_extra_info.return_value = ("203.0.113.8", 41234)
+        request = make_mocked_request(
+            "POST",
+            "/v1/images/generations",
+            headers={
+                "Content-Type": "application/json",
+                "X-Forwarded-For": "127.0.0.1",
+            },
+            match_info={"tail": "images/generations"},
+            app=app,
+            protocol=protocol,
+            transport=transport,
+            payload=payload,
+        )
+
+        with patch("agent.image_gen_registry.get_provider") as get_provider:
+            response = await handler(request)
+
+        assert response.status == 403
+        assert json.loads(response.text)["error"] == {
+            "message": "Image generation is restricted to loopback clients",
+            "type": "permission_error",
+            "code": "image_route_forbidden",
+        }
+        assert adapter.image_route_model_hints == []
+        get_provider.assert_not_called()
+
+    asyncio.run(run())
+
+
+def test_server_maps_openai_quality_to_codex_image_tier(tmp_path):
+    async def run():
+        captured: Dict[str, Any] = {}
+        generated = tmp_path / "generated.png"
+        generated.write_bytes(_VALID_PNG_BYTES)
+        adapter = ImageRouteAdapter(
+            "http://unused.example/v1",
+            route={"provider": "openai-codex", "model": "gpt-image-2-medium"},
+        )
+
+        class FakeImageProvider:
+            def is_available(self):
+                return True
+
+            def generate(self, prompt, aspect_ratio="landscape", **kwargs):
+                captured["model"] = kwargs["model"]
+                return {
+                    "success": True,
+                    "image": str(generated),
+                    "model": kwargs["model"],
+                }
+
+        proxy_runner, proxy_base = await _start_runner(create_app(adapter))
+        try:
+            with patch(
+                "agent.image_gen_registry.get_provider",
+                return_value=FakeImageProvider(),
+            ):
+                async with aiohttp.ClientSession() as session:
+                    async with session.post(
+                        f"{proxy_base}/v1/images/generations",
+                        json={
+                            "model": "gpt-image-2",
+                            "prompt": "A lighthouse",
+                            "quality": "high",
+                        },
+                    ) as resp:
+                        assert resp.status == 200
+                        await resp.read()
+
+            assert captured["model"] == "gpt-image-2-high"
+        finally:
+            await proxy_runner.cleanup()
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize(
+    "override",
+    [
+        {"n": 2},
+        {"n": True},
+        {"size": "512x512"},
+        {"response_format": "url"},
+        {"quality": "ultra"},
+        {"style": "cinematic"},
+        {"background": "transparent"},
+        {"stream": True},
+        {"output_format": "jpeg"},
+    ],
+)
+def test_server_rejects_unsupported_image_generation_options(override):
+    async def run():
+        adapter = ImageRouteAdapter(
+            "http://unused.example/v1",
+            route={"provider": "openai-codex", "model": "gpt-image-2-medium"},
+        )
+
+        class ProviderMustNotRun:
+            def is_available(self):
+                return True
+
+            def generate(self, *args, **kwargs):
+                raise AssertionError("invalid requests must not reach the provider")
+
+        payload = {
+            "model": "gpt-image-2",
+            "prompt": "A lighthouse",
+            **override,
+        }
+        proxy_runner, proxy_base = await _start_runner(create_app(adapter))
+        try:
+            with patch(
+                "agent.image_gen_registry.get_provider",
+                return_value=ProviderMustNotRun(),
+            ):
+                async with aiohttp.ClientSession() as session:
+                    async with session.post(
+                        f"{proxy_base}/v1/images/generations",
+                        json=payload,
+                    ) as resp:
+                        assert resp.status == 400
+                        body = await resp.json()
+                        assert body["error"]["type"] == "invalid_request_error"
+        finally:
+            await proxy_runner.cleanup()
+
+    asyncio.run(run())
+
+
+def test_server_image_generation_requires_post_with_json_object():
+    async def run():
+        adapter = ImageRouteAdapter(
+            "http://unused.example/v1",
+            route={"provider": "openai-codex", "model": "gpt-image-2-medium"},
+        )
+        proxy_runner, proxy_base = await _start_runner(create_app(adapter))
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.get(
+                    f"{proxy_base}/v1/images/generations",
+                ) as resp:
+                    assert resp.status == 405
+                    assert (await resp.json())["error"]["type"] == (
+                        "invalid_request_error"
+                    )
+
+                async with session.post(
+                    f"{proxy_base}/v1/images/generations",
+                    data=b"not-json",
+                    headers={"Content-Type": "application/json"},
+                ) as resp:
+                    assert resp.status == 400
+                    assert (await resp.json())["error"]["type"] == (
+                        "invalid_request_error"
+                    )
         finally:
             await proxy_runner.cleanup()
 

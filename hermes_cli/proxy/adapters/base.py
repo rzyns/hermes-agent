@@ -108,6 +108,14 @@ class UpstreamAdapter(ABC):
         _ = model
         return None
 
+    def image_generation_route_for_model(
+        self,
+        model: Optional[str],
+    ) -> Optional[dict[str, str]]:
+        """Return an image-provider route for OpenAI Images compatibility."""
+        _ = model
+        return None
+
     def list_models(self) -> Optional[list[dict[str, Any]]]:
         """Return aggregated model list for ``GET /v1/models``, or ``None``
         to forward the request to the upstream.

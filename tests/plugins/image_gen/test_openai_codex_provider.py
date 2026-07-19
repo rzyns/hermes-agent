@@ -20,11 +20,11 @@ import pytest
 codex_plugin = importlib.import_module("plugins.image_gen.openai-codex")
 
 
-# 1×1 transparent PNG — valid bytes for save_b64_image()
+# 1×1 opaque PNG — valid bytes for save_b64_image()
 _PNG_HEX = (
     "89504e470d0a1a0a0000000d49484452000000010000000108060000001f15c4"
-    "890000000d49444154789c6300010000000500010d0a2db40000000049454e44"
-    "ae426082"
+    "890000000d49444154789c63606060f80f00010401005fe5c34b000000004945"
+    "4e44ae426082"
 )
 
 
@@ -124,6 +124,23 @@ class TestGenerate:
         # Filename prefix differs from the API-key plugin so cache audits can
         # tell the two backends apart.
         assert saved.name.startswith("openai_codex_")
+
+    def test_generate_honors_explicit_quality_tier(self, provider, monkeypatch):
+        monkeypatch.setattr(codex_plugin, "_read_codex_access_token", lambda: "codex-token")
+        captured = {}
+
+        def _collect(token, *, prompt, size, quality, input_images=None):
+            captured["quality"] = quality
+            return _b64_png()
+
+        monkeypatch.setattr(codex_plugin, "_collect_image_b64", _collect)
+
+        result = provider.generate("a cat", model="gpt-image-2-high")
+
+        assert result["success"] is True
+        assert result["model"] == "gpt-image-2-high"
+        assert result["quality"] == "high"
+        assert captured["quality"] == "high"
 
     def test_codex_stream_request_shape(self, provider, monkeypatch):
         monkeypatch.setattr(codex_plugin, "_read_codex_access_token", lambda: "codex-token")

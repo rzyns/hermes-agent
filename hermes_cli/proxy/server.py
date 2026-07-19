@@ -12,6 +12,7 @@ or rewrite request/response bodies. It's a credential-attaching forwarder.
 from __future__ import annotations
 
 import asyncio
+import ipaddress
 import json
 import logging
 import signal
@@ -57,10 +58,35 @@ DEFAULT_HOST = "127.0.0.1"
 MAX_REQUEST_BYTES = 10_000_000
 
 
-def _json_error(status: int, message: str, code: str = "proxy_error") -> "web.Response":
+def _json_error(
+    status: int,
+    message: str,
+    code: str = "proxy_error",
+    error_type: Optional[str] = None,
+) -> "web.Response":
     """Return an OpenAI-style error JSON response."""
-    body = {"error": {"message": message, "type": code, "code": code}}
+    body = {
+        "error": {
+            "message": message,
+            "type": error_type or code,
+            "code": code,
+        }
+    }
     return web.json_response(body, status=status)
+
+
+def _request_peer_is_loopback(request: "web.Request") -> bool:
+    """Fail closed unless the transport peer is a numeric loopback address."""
+    transport = request.transport
+    if transport is None:
+        return False
+    peer = transport.get_extra_info("peername")
+    if not isinstance(peer, (tuple, list)) or not peer:
+        return False
+    try:
+        return ipaddress.ip_address(peer[0]).is_loopback
+    except (TypeError, ValueError):
+        return False
 
 
 def _filter_request_headers(headers: "aiohttp.typedefs.LooseHeaders") -> dict:
@@ -116,6 +142,7 @@ def create_app(adapter: UpstreamAdapter) -> "web.Application":
         )
 
     app = web.Application(client_max_size=MAX_REQUEST_BYTES)
+    image_generation_semaphore = asyncio.Semaphore(1)
     # AppKey ensures forward-compat with future aiohttp versions that strip
     # bare-string keys.
     _adapter_key = web.AppKey("adapter", UpstreamAdapter)
@@ -180,6 +207,51 @@ def create_app(adapter: UpstreamAdapter) -> "web.Application":
                         "raw chat route failed",
                         code="raw_route_failed",
                     )
+
+        if rel_path == "/images/generations":
+            if not _request_peer_is_loopback(request):
+                return _json_error(
+                    403,
+                    "Image generation is restricted to loopback clients",
+                    code="image_route_forbidden",
+                    error_type="permission_error",
+                )
+            if request.method != "POST":
+                response = _json_error(
+                    405,
+                    "POST is required for /v1/images/generations",
+                    code="invalid_request_error",
+                )
+                response.headers["Allow"] = "POST"
+                return response
+            if request.content_type != "application/json" or parsed_body is None:
+                return _json_error(
+                    400,
+                    "POST /v1/images/generations requires a JSON object body",
+                    code="invalid_request_error",
+                )
+            image_route = adapter.image_generation_route_for_model(model_hint)
+            if image_route is None:
+                return _json_error(
+                    400,
+                    f"No image-generation route is configured for model {model_hint!r}",
+                    code="unsupported_image_model",
+                )
+            try:
+                from hermes_cli.proxy.images import handle_image_generation
+
+                return await handle_image_generation(
+                    parsed_body,
+                    image_route,
+                    image_generation_semaphore,
+                )
+            except Exception as exc:
+                logger.warning("proxy: image generation route failed: %s", exc)
+                return _json_error(
+                    502,
+                    "image generation route failed",
+                    code="image_route_failed",
+                )
 
         try:
             cred = adapter.get_credential(model=model_hint)

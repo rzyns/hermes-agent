@@ -52,6 +52,18 @@ def cmd_proxy_start(args: Any) -> int:
         )
         return 2
 
+    # Proxy routes may delegate to plugin-registered media providers. The
+    # standalone proxy process does not initialize the normal agent runtime,
+    # so perform the same idempotent discovery explicitly before serving.
+    try:
+        from hermes_cli.plugins import discover_plugins
+
+        discover_plugins()
+    except Exception as exc:
+        logger.exception("proxy plugin discovery failed")
+        print(f"proxy: plugin discovery failed: {exc}", file=sys.stderr)
+        return 1
+
     host = getattr(args, "host", None) or DEFAULT_HOST
     port = getattr(args, "port", None) or DEFAULT_PORT
 

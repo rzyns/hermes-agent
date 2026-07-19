@@ -45,6 +45,7 @@ _ALLOWED_PATHS: FrozenSet[str] = frozenset({
     "/responses",
     "/completions",
     "/embeddings",
+    "/images/generations",
     "/models",
 })
 
@@ -218,6 +219,22 @@ def _raw_chat_route_for_model(model: Optional[str]) -> Optional[dict[str, str]]:
     return None
 
 
+def _image_generation_route_for_model(
+    model: Optional[str],
+) -> Optional[dict[str, str]]:
+    """Map OpenAI image model IDs to the Codex image-provider quality tiers."""
+    bare = _bare_model_name(model)
+    if bare == "gpt-image-2":
+        bare = "gpt-image-2-medium"
+    if bare in {
+        "gpt-image-2-low",
+        "gpt-image-2-medium",
+        "gpt-image-2-high",
+    }:
+        return {"provider": "openai-codex", "model": bare}
+    return None
+
+
 class SubscriptionProxyAdapter(UpstreamAdapter):
     """Proxy upstream that routes to the user's active subscription provider.
 
@@ -278,6 +295,12 @@ class SubscriptionProxyAdapter(UpstreamAdapter):
 
     def raw_chat_route_for_model(self, model: Optional[str]) -> Optional[dict[str, str]]:
         return _raw_chat_route_for_model(model)
+
+    def image_generation_route_for_model(
+        self,
+        model: Optional[str],
+    ) -> Optional[dict[str, str]]:
+        return _image_generation_route_for_model(model)
 
     def list_models(self) -> list[dict[str, Any]]:
         """Aggregate models from all credentialed providers.

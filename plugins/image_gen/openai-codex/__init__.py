@@ -140,9 +140,13 @@ def _load_image_gen_config() -> Dict[str, Any]:
         return {}
 
 
-def _resolve_model() -> Tuple[str, Dict[str, Any]]:
+def _resolve_model(explicit: Optional[str] = None) -> Tuple[str, Dict[str, Any]]:
     """Decide which tier to use and return ``(model_id, meta)``."""
     import os
+
+    if isinstance(explicit, str) and explicit.strip() in _MODELS:
+        model_id = explicit.strip()
+        return model_id, _MODELS[model_id]
 
     env_override = os.environ.get("OPENAI_IMAGE_MODEL")
     if env_override and env_override in _MODELS:
@@ -537,7 +541,7 @@ class OpenAICodexImageGenProvider(ImageGenProvider):
                 aspect_ratio=aspect,
             )
 
-        tier_id, meta = _resolve_model()
+        tier_id, meta = _resolve_model(kwargs.get("model"))
         size = _SIZES.get(aspect, _SIZES["square"])
 
         token = _read_codex_access_token()
