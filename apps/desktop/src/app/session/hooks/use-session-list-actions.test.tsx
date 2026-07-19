@@ -232,4 +232,25 @@ describe('refreshSessions batches slices into one request', () => {
     )
     expect($sessions.get().map(session => session.id)).toEqual(['cli-row'])
   })
+
+  it('scopes the cron-jobs fetch to the active profile (all → unified view)', async () => {
+    const { getCronJobs } = await import('@/hermes')
+    listSidebarSessions.mockResolvedValue(sidebar({ sessions: [], total: 0, profile_totals: {} }))
+
+    const scoped = renderHook(() => useSessionListActions({ profileScope: 'work' }))
+
+    await act(async () => {
+      await scoped.result.current.refreshCronJobs()
+    })
+
+    expect(getCronJobs).toHaveBeenLastCalledWith('work')
+
+    const unified = renderHook(() => useSessionListActions({ profileScope: '__all__' }))
+
+    await act(async () => {
+      await unified.result.current.refreshCronJobs()
+    })
+
+    expect(getCronJobs).toHaveBeenLastCalledWith('all')
+  })
 })
