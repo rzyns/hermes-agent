@@ -143,6 +143,40 @@ VALID_BLOCK_KINDS = {
     "budget",
 }
 
+VALID_BLOCK_ERROR_TYPES = {
+    "provider_quota",
+    "provider_auth",
+    "model_missing",
+    "rate_limit",
+    "crash",
+    "timeout",
+    "budget_exhausted",
+    "judgment",
+    "unknown",
+}
+
+_BLOCK_KIND_BY_ERROR_TYPE = {
+    "provider_quota": "infra",
+    "provider_auth": "infra",
+    "model_missing": "infra",
+    "rate_limit": "transient",
+    "budget_exhausted": "budget",
+}
+
+_BLOCK_DEFAULT_DEADLINE_SECONDS = {
+    "transient": 30 * 60,
+    "infra": 4 * 60 * 60,
+    "budget": 24 * 60 * 60,
+    "triage": 48 * 60 * 60,
+}
+
+
+def resolve_block_kind(
+    kind: Optional[str], error_type: Optional[str] = None
+) -> Optional[str]:
+    """Honor an explicit block kind, otherwise classify a structured error."""
+    return kind or _BLOCK_KIND_BY_ERROR_TYPE.get(error_type or "")
+
 # After a task has been blocked, unblocked, and re-blocked this many times for
 # the same (truly-blocked) reason, the unblock-loop breaker stops trusting the
 # unblocker (usually a cron) and routes the task to ``triage`` instead of back
@@ -4717,7 +4751,11 @@ def complete_task(
                        claim_expires= NULL,
                        worker_pid   = NULL,
                        block_kind   = NULL,
-                       block_recurrences = 0
+                       block_recurrences = 0,
+                       block_fingerprint = NULL,
+                       block_deadline = NULL,
+                       block_retry_after = NULL,
+                       block_error_type = NULL
                  WHERE id = ?
                    AND status IN ('running', 'ready', 'blocked')
                 """,
@@ -4734,7 +4772,11 @@ def complete_task(
                        claim_expires= NULL,
                        worker_pid   = NULL,
                        block_kind   = NULL,
-                       block_recurrences = 0
+                       block_recurrences = 0,
+                       block_fingerprint = NULL,
+                       block_deadline = NULL,
+                       block_retry_after = NULL,
+                       block_error_type = NULL
                  WHERE id = ?
                    AND status IN ('running', 'ready', 'blocked')
                    AND current_run_id = ?
@@ -5442,12 +5484,82 @@ def edit_completed_task_result(
     return True
 
 
+def _normalize_block_contract(
+    *,
+    reason: Optional[str],
+    kind: Optional[str],
+    contract: Optional[dict[str, Any]],
+) -> tuple[Optional[str], dict[str, Any], Optional[int]]:
+    """Validate and normalize the structured failure contract for a block."""
+    if contract is not None and not isinstance(contract, dict):
+        raise ValueError("block contract must be an object or None")
+    raw = contract or {}
+
+    error_type = raw.get("error_type", "judgment")
+    if error_type not in VALID_BLOCK_ERROR_TYPES:
+        raise ValueError(
+            f"block error_type must be one of {sorted(VALID_BLOCK_ERROR_TYPES)}"
+        )
+
+    resolved_kind = resolve_block_kind(kind, error_type)
+    if resolved_kind is not None and resolved_kind not in VALID_BLOCK_KINDS:
+        raise ValueError(
+            f"block kind must be one of {sorted(VALID_BLOCK_KINDS)} or None"
+        )
+
+    fingerprint = raw.get("fingerprint")
+    if fingerprint is not None and not isinstance(fingerprint, str):
+        raise ValueError("block fingerprint must be a string or None")
+    detail = raw.get("detail", reason)
+    if detail is not None and not isinstance(detail, str):
+        raise ValueError("block detail must be a string or None")
+
+    retryable = raw.get("retryable", error_type == "rate_limit")
+    needs_authority = raw.get("needs_authority", False)
+    if not isinstance(retryable, bool):
+        raise ValueError("block retryable must be a boolean")
+    if not isinstance(needs_authority, bool):
+        raise ValueError("block needs_authority must be a boolean")
+
+    retry_after = raw.get("retry_after")
+    if retry_after is None and resolved_kind == "transient":
+        retry_after = _BLOCK_DEFAULT_DEADLINE_SECONDS["transient"]
+    if (
+        retry_after is not None
+        and (isinstance(retry_after, bool) or not isinstance(retry_after, int))
+    ):
+        raise ValueError("block retry_after must be a non-negative integer or None")
+    if retry_after is not None and retry_after < 0:
+        raise ValueError("block retry_after must be a non-negative integer or None")
+
+    normalized = {
+        "error_type": error_type,
+        "fingerprint": fingerprint,
+        "retryable": retryable,
+        "retry_after": retry_after,
+        "needs_authority": needs_authority,
+        "detail": detail,
+    }
+    deadline_seconds = (
+        retry_after
+        if resolved_kind == "transient"
+        else _BLOCK_DEFAULT_DEADLINE_SECONDS.get(resolved_kind or "")
+    )
+    deadline = (
+        int(time.time()) + deadline_seconds
+        if deadline_seconds is not None
+        else None
+    )
+    return resolved_kind, normalized, deadline
+
+
 def block_task(
     conn: sqlite3.Connection,
     task_id: str,
     *,
     reason: Optional[str] = None,
     kind: Optional[str] = None,
+    contract: Optional[dict[str, Any]] = None,
     expected_run_id: Optional[int] = None,
 ) -> bool:
     """Transition ``running``/``ready`` → ``blocked`` (or route elsewhere).
@@ -5477,10 +5589,19 @@ def block_task(
     Returns True on any successful transition (to ``blocked``, ``todo``, or
     ``triage``), False when the task wasn't in a blockable state.
     """
-    if kind is not None and kind not in VALID_BLOCK_KINDS:
-        raise ValueError(
-            f"block kind must be one of {sorted(VALID_BLOCK_KINDS)} or None"
-        )
+    kind, contract_payload, block_deadline = _normalize_block_contract(
+        reason=reason,
+        kind=kind,
+        contract=contract,
+    )
+    if reason is None:
+        reason = contract_payload["detail"]
+    block_values = (
+        contract_payload["fingerprint"],
+        block_deadline,
+        contract_payload["retry_after"],
+        contract_payload["error_type"],
+    )
     routed_to = "blocked"
     recurrences = 0
     with write_txn(conn):
@@ -5510,12 +5631,16 @@ def block_task(
                        claim_lock    = NULL,
                        claim_expires = NULL,
                        worker_pid    = NULL,
-                       block_kind    = ?
+                       block_kind    = ?,
+                       block_fingerprint = ?,
+                       block_deadline = ?,
+                       block_retry_after = ?,
+                       block_error_type = ?
                  WHERE id = ?
                    AND status IN ('running', 'ready')
                 """ + ("" if expected_run_id is None else " AND current_run_id = ?"),
-                (kind, task_id) if expected_run_id is None
-                else (kind, task_id, int(expected_run_id)),
+                (kind, *block_values, task_id) if expected_run_id is None
+                else (kind, *block_values, task_id, int(expected_run_id)),
             )
             if cur.rowcount != 1:
                 return False
@@ -5530,7 +5655,8 @@ def block_task(
                 )
             _append_event(
                 conn, task_id, "dependency_wait",
-                {"reason": reason, "kind": kind}, run_id=run_id,
+                {"reason": reason, "kind": kind, "contract": contract_payload},
+                run_id=run_id,
             )
             routed_to = "todo"
             _blocked_task = get_task(conn, task_id)
@@ -5556,6 +5682,15 @@ def block_task(
         if recurrences >= BLOCK_RECURRENCE_LIMIT:
             # Loop detected — stop letting the unblocker spin this task. Route
             # to triage for a human-in-the-loop decision instead of blocked.
+            block_deadline = (
+                int(time.time()) + _BLOCK_DEFAULT_DEADLINE_SECONDS["triage"]
+            )
+            block_values = (
+                contract_payload["fingerprint"],
+                block_deadline,
+                contract_payload["retry_after"],
+                contract_payload["error_type"],
+            )
             cur = conn.execute(
                 """
                 UPDATE tasks
@@ -5564,12 +5699,17 @@ def block_task(
                        claim_expires = NULL,
                        worker_pid    = NULL,
                        block_kind    = ?,
-                       block_recurrences = ?
+                       block_recurrences = ?,
+                       block_fingerprint = ?,
+                       block_deadline = ?,
+                       block_retry_after = ?,
+                       block_error_type = ?
                  WHERE id = ?
                    AND status IN ('running', 'ready')
                 """ + ("" if expected_run_id is None else " AND current_run_id = ?"),
-                (kind, recurrences, task_id) if expected_run_id is None
-                else (kind, recurrences, task_id, int(expected_run_id)),
+                (kind, recurrences, *block_values, task_id)
+                if expected_run_id is None
+                else (kind, recurrences, *block_values, task_id, int(expected_run_id)),
             )
             if cur.rowcount != 1:
                 return False
@@ -5589,6 +5729,7 @@ def block_task(
                     "kind": kind,
                     "recurrences": recurrences,
                     "limit": BLOCK_RECURRENCE_LIMIT,
+                    "contract": contract_payload,
                 },
                 run_id=run_id,
             )
@@ -5603,11 +5744,15 @@ def block_task(
                            claim_expires = NULL,
                            worker_pid    = NULL,
                            block_kind    = ?,
-                           block_recurrences = ?
+                           block_recurrences = ?,
+                           block_fingerprint = ?,
+                           block_deadline = ?,
+                           block_retry_after = ?,
+                           block_error_type = ?
                      WHERE id = ?
                        AND status IN ('running', 'ready')
                     """,
-                    (kind, recurrences, task_id),
+                    (kind, recurrences, *block_values, task_id),
                 )
             else:
                 cur = conn.execute(
@@ -5618,12 +5763,22 @@ def block_task(
                            claim_expires = NULL,
                            worker_pid    = NULL,
                            block_kind    = ?,
-                           block_recurrences = ?
+                           block_recurrences = ?,
+                           block_fingerprint = ?,
+                           block_deadline = ?,
+                           block_retry_after = ?,
+                           block_error_type = ?
                      WHERE id = ?
                        AND status IN ('running', 'ready')
                        AND current_run_id = ?
                     """,
-                    (kind, recurrences, task_id, int(expected_run_id)),
+                    (
+                        kind,
+                        recurrences,
+                        *block_values,
+                        task_id,
+                        int(expected_run_id),
+                    ),
                 )
             if cur.rowcount != 1:
                 return False
@@ -5642,7 +5797,12 @@ def block_task(
                 )
             _append_event(
                 conn, task_id, "blocked",
-                {"reason": reason, "kind": kind, "recurrences": recurrences},
+                {
+                    "reason": reason,
+                    "kind": kind,
+                    "recurrences": recurrences,
+                    "contract": contract_payload,
+                },
                 run_id=run_id,
             )
         _blocked_task = get_task(conn, task_id)

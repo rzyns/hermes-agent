@@ -170,7 +170,17 @@ def test_dependency_then_parent_done_promotes(kanban_home: Path) -> None:
 def test_completion_clears_block_memory(kanban_home: Path) -> None:
     with kb.connect_closing() as conn:
         tid = _running_task(conn)
-        kb.block_task(conn, tid, reason="x", kind="capability")
+        kb.block_task(
+            conn,
+            tid,
+            reason="x",
+            kind="capability",
+            contract={
+                "error_type": "provider_auth",
+                "fingerprint": "auth:provider-a",
+                "retry_after": 60,
+            },
+        )
         kb.unblock_task(conn, tid)
         assert kb.get_task(conn, tid).block_recurrences == 1
         kb.complete_task(conn, tid, result="done")
@@ -178,6 +188,12 @@ def test_completion_clears_block_memory(kanban_home: Path) -> None:
         assert t.status == "done"
         assert t.block_recurrences == 0
         assert t.block_kind is None
+        row = conn.execute(
+            "SELECT block_fingerprint, block_deadline, block_retry_after, "
+            "block_error_type FROM tasks WHERE id = ?",
+            (tid,),
+        ).fetchone()
+        assert tuple(row) == (None, None, None, None)
 
 
 # ---------------------------------------------------------------------------
@@ -200,3 +216,124 @@ def test_block_without_kind_is_backward_compatible(kanban_home: Path) -> None:
         t = kb.get_task(conn, tid)
         assert t.status == "blocked"
         assert t.block_kind is None
+
+
+# ---------------------------------------------------------------------------
+# Structured failure contract
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("error_type", "expected_kind", "expected_retry_after", "deadline_delta"),
+    [
+        ("provider_quota", "infra", None, 4 * 60 * 60),
+        ("provider_auth", "infra", None, 4 * 60 * 60),
+        ("model_missing", "infra", None, 4 * 60 * 60),
+        ("rate_limit", "transient", 30 * 60, 30 * 60),
+        ("budget_exhausted", "budget", None, 24 * 60 * 60),
+    ],
+)
+def test_failure_contract_maps_error_type_and_stamps_class_deadline(
+    kanban_home: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    error_type: str,
+    expected_kind: str,
+    expected_retry_after: int | None,
+    deadline_delta: int,
+) -> None:
+    now = 1_800_000_000
+    monkeypatch.setattr(kb.time, "time", lambda: now)
+    with kb.connect_closing() as conn:
+        tid = _running_task(conn)
+        assert kb.block_task(
+            conn,
+            tid,
+            contract={"error_type": error_type, "detail": "structured failure"},
+        )
+
+        row = conn.execute(
+            "SELECT block_kind, block_error_type, block_retry_after, "
+            "block_deadline FROM tasks WHERE id = ?",
+            (tid,),
+        ).fetchone()
+        assert row["block_kind"] == expected_kind
+        assert row["block_error_type"] == error_type
+        assert row["block_retry_after"] == expected_retry_after
+        assert row["block_deadline"] == now + deadline_delta
+
+        event = [e for e in kb.list_events(conn, tid) if e.kind == "blocked"][-1]
+        assert event.payload["contract"]["error_type"] == error_type
+        assert event.payload["contract"]["detail"] == "structured failure"
+
+
+def test_rate_limit_contract_honors_explicit_retry_after(
+    kanban_home: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    now = 1_800_000_000
+    monkeypatch.setattr(kb.time, "time", lambda: now)
+    with kb.connect_closing() as conn:
+        tid = _running_task(conn)
+        assert kb.block_task(
+            conn,
+            tid,
+            contract={
+                "error_type": "rate_limit",
+                "retryable": True,
+                "retry_after": 90,
+                "detail": "provider asked us to wait",
+            },
+        )
+        row = conn.execute(
+            "SELECT block_retry_after, block_deadline FROM tasks WHERE id = ?",
+            (tid,),
+        ).fetchone()
+        assert row["block_retry_after"] == 90
+        assert row["block_deadline"] == now + 90
+        event = [e for e in kb.list_events(conn, tid) if e.kind == "blocked"][-1]
+        assert event.payload["contract"] == {
+            "error_type": "rate_limit",
+            "fingerprint": None,
+            "retryable": True,
+            "retry_after": 90,
+            "needs_authority": False,
+            "detail": "provider asked us to wait",
+        }
+
+
+def test_explicit_kind_wins_over_failure_contract_mapping(kanban_home: Path) -> None:
+    with kb.connect_closing() as conn:
+        tid = _running_task(conn)
+        assert kb.block_task(
+            conn,
+            tid,
+            reason="human must choose",
+            kind="needs_input",
+            contract={"error_type": "provider_quota"},
+        )
+        row = conn.execute(
+            "SELECT block_kind, block_deadline FROM tasks WHERE id = ?",
+            (tid,),
+        ).fetchone()
+        assert row["block_kind"] == "needs_input"
+        assert row["block_deadline"] is None
+
+
+def test_bare_reason_is_recorded_as_judgment_contract(kanban_home: Path) -> None:
+    with kb.connect_closing() as conn:
+        tid = _running_task(conn)
+        assert kb.block_task(conn, tid, reason="legacy judgment")
+        row = conn.execute(
+            "SELECT block_error_type, block_deadline FROM tasks WHERE id = ?",
+            (tid,),
+        ).fetchone()
+        assert row["block_error_type"] == "judgment"
+        assert row["block_deadline"] is None
+        event = [e for e in kb.list_events(conn, tid) if e.kind == "blocked"][-1]
+        assert event.payload["contract"] == {
+            "error_type": "judgment",
+            "fingerprint": None,
+            "retryable": False,
+            "retry_after": None,
+            "needs_authority": False,
+            "detail": "legacy judgment",
+        }

@@ -741,6 +741,22 @@ def test_block_rejects_empty_reason(worker_env):
         assert json.loads(out).get("error")
 
 
+def test_block_schema_exposes_structured_failure_contract_fields():
+    from tools import kanban_tools as kt
+
+    properties = kt.KANBAN_BLOCK_SCHEMA["parameters"]["properties"]
+    assert {
+        "error_type",
+        "fingerprint",
+        "retryable",
+        "retry_after",
+        "needs_authority",
+        "detail",
+    } <= properties.keys()
+    assert "infra" in properties["kind"]["enum"]
+    assert "budget" in properties["kind"]["enum"]
+
+
 def _make_goal_mode_worker_env(monkeypatch, tmp_path):
     """Set up an isolated HERMES_HOME with one claimed goal_mode task,
     matching the pattern used by the kanban_complete judge gate tests."""
@@ -843,6 +859,61 @@ def test_block_goal_mode_allows_needs_input_kind(monkeypatch, tmp_path):
     conn = kb.connect()
     try:
         assert kb.get_task(conn, tid).status == "blocked"
+    finally:
+        conn.close()
+
+
+def test_block_goal_mode_allows_infra_kind(monkeypatch, tmp_path):
+    from tools import kanban_tools as kt
+    from hermes_cli import kanban_db as kb
+
+    tid = _make_goal_mode_worker_env(monkeypatch, tmp_path)
+    out = kt._handle_block(
+        {
+            "reason": "provider quota exhausted",
+            "kind": "infra",
+            "error_type": "provider_quota",
+            "fingerprint": "quota:provider-a",
+            "retryable": False,
+            "needs_authority": True,
+        }
+    )
+    assert json.loads(out).get("ok") is True
+
+    conn = kb.connect()
+    try:
+        task = kb.get_task(conn, tid)
+        assert task.status == "blocked"
+        assert task.block_kind == "infra"
+        row = conn.execute(
+            "SELECT block_error_type, block_fingerprint, block_deadline "
+            "FROM tasks WHERE id = ?",
+            (tid,),
+        ).fetchone()
+        assert row["block_error_type"] == "provider_quota"
+        assert row["block_fingerprint"] == "quota:provider-a"
+        assert row["block_deadline"] is not None
+    finally:
+        conn.close()
+
+
+def test_block_structured_error_type_can_infer_infra_for_goal_mode(
+    monkeypatch, tmp_path
+):
+    from tools import kanban_tools as kt
+    from hermes_cli import kanban_db as kb
+
+    tid = _make_goal_mode_worker_env(monkeypatch, tmp_path)
+    out = kt._handle_block(
+        {"reason": "model is unavailable", "error_type": "model_missing"}
+    )
+    result = json.loads(out)
+    assert result.get("ok") is True
+    assert result["block_kind"] == "infra"
+
+    conn = kb.connect()
+    try:
+        assert kb.get_task(conn, tid).block_kind == "infra"
     finally:
         conn.close()
 

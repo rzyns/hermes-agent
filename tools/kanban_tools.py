@@ -262,7 +262,9 @@ def _connect(board: Optional[str] = None):
     return kb, kb.connect(board=board)
 
 
-_GOAL_MODE_BLOCK_ALLOWED_KINDS = frozenset({"dependency", "needs_input"})
+_GOAL_MODE_BLOCK_ALLOWED_KINDS = frozenset(
+    {"dependency", "needs_input", "infra"}
+)
 
 
 def _goal_judge_available() -> bool:
@@ -781,6 +783,20 @@ def _handle_block(args: dict, **kw) -> str:
         return git_guard
     kind = args.get("kind")
     board = args.get("board")
+    contract_fields = (
+        "error_type",
+        "fingerprint",
+        "retryable",
+        "retry_after",
+        "needs_authority",
+        "detail",
+    )
+    contract = {key: args[key] for key in contract_fields if key in args}
+    for text_field in ("fingerprint", "detail"):
+        text_value = contract.get(text_field)
+        if isinstance(text_value, str):
+            contract[text_field] = redact_sensitive_text(text_value, force=True)
+    contract_arg = contract or None
     try:
         kb, conn = _connect(board=board)
         if kind is not None and kind not in kb.VALID_BLOCK_KINDS:
@@ -794,20 +810,23 @@ def _handle_block(args: dict, **kw) -> str:
         # as terminal, identically to `done`, regardless of kind. Without
         # this, a worker that learns kanban_complete is gated can just call
         # kanban_block(reason="anything") to escape the loop instead.
-        # Restrict goal_mode tasks to the kinds that represent a genuine
-        # external blocker the worker cannot resolve itself; `capability`
-        # and `transient` (or an unset kind) route back through
+        # Restrict goal_mode tasks to kinds that represent a genuine external
+        # blocker the worker cannot resolve itself. Infrastructure failures
+        # may be explicit or inferred from the structured error type;
+        # capability/transient/budget (or an unset kind) route back through
         # kanban_complete, which the judge now gates.
+        resolved_kind = kb.resolve_block_kind(kind, contract.get("error_type"))
         task = kb.get_task(conn, tid)
         if (
             task
             and task.goal_mode
-            and kind not in _GOAL_MODE_BLOCK_ALLOWED_KINDS
+            and resolved_kind not in _GOAL_MODE_BLOCK_ALLOWED_KINDS
         ):
             conn.close()
             return tool_error(
                 f"goal_mode tasks can only block with kind in "
-                f"{sorted(_GOAL_MODE_BLOCK_ALLOWED_KINDS)} (got {kind!r}). "
+                f"{sorted(_GOAL_MODE_BLOCK_ALLOWED_KINDS)} "
+                f"(got {resolved_kind!r}). "
                 f"If the task is actually finished or cannot proceed for "
                 f"another reason, call kanban_complete instead — the "
                 f"completion judge will evaluate it."
@@ -817,6 +836,7 @@ def _handle_block(args: dict, **kw) -> str:
                 conn, tid,
                 reason=reason,
                 kind=kind,
+                contract=contract_arg,
                 expected_run_id=_worker_run_id(tid),
             )
             if not ok:
@@ -832,7 +852,7 @@ def _handle_block(args: dict, **kw) -> str:
                 task_id=tid,
                 run_id=run.id if run else None,
                 status=landed.status if landed else "blocked",
-                block_kind=kind,
+                block_kind=landed.block_kind if landed else resolved_kind,
             )
         finally:
             conn.close()
@@ -1689,8 +1709,9 @@ KANBAN_BLOCK_SCHEMA = {
         "Set ``kind`` to say which: 'dependency' (waiting on another task — "
         "goes to todo and auto-resumes when that task finishes, no human "
         "needed), 'needs_input' (you need a human decision/answer), "
-        "'capability' (a hard wall: no access, missing credentials, an action "
-        "no agent can do), or 'transient' (a flaky failure that may clear). "
+        "'capability' (a hard wall the agent cannot cross), 'transient' (a "
+        "flaky failure that may clear), 'infra' (provider/auth/model/quota "
+        "infrastructure), or 'budget' (iteration/turn budget exhausted). "
         "``reason`` is shown to the human on the board. If a task keeps "
         "getting unblocked and re-blocked for the same reason, it is "
         "auto-escalated to triage. Use for genuine blockers only — don't "
@@ -1713,11 +1734,62 @@ KANBAN_BLOCK_SCHEMA = {
             },
             "kind": {
                 "type": "string",
-                "enum": ["dependency", "needs_input", "capability", "transient"],
+                "enum": [
+                    "dependency",
+                    "needs_input",
+                    "capability",
+                    "transient",
+                    "infra",
+                    "budget",
+                ],
                 "description": (
                     "Why you're blocked. 'dependency' waits in todo and "
                     "resumes automatically; the others surface to a human. "
                     "Omit only if none apply."
+                ),
+            },
+            "error_type": {
+                "type": "string",
+                "enum": [
+                    "provider_quota",
+                    "provider_auth",
+                    "model_missing",
+                    "rate_limit",
+                    "crash",
+                    "timeout",
+                    "budget_exhausted",
+                    "judgment",
+                    "unknown",
+                ],
+                "description": (
+                    "Optional machine-readable cause. When kind is omitted, "
+                    "provider quota/auth/model errors infer infra, rate_limit "
+                    "infers transient, and budget_exhausted infers budget."
+                ),
+            },
+            "fingerprint": {
+                "type": "string",
+                "description": "Optional stable fingerprint for the failure.",
+            },
+            "retryable": {
+                "type": "boolean",
+                "description": "Whether the underlying failure may be retried.",
+            },
+            "retry_after": {
+                "type": "integer",
+                "minimum": 0,
+                "description": (
+                    "Optional seconds before retry; transient defaults to 1800."
+                ),
+            },
+            "needs_authority": {
+                "type": "boolean",
+                "description": "Whether recovery requires human authority.",
+            },
+            "detail": {
+                "type": "string",
+                "description": (
+                    "Optional structured detail; defaults to the human reason."
                 ),
             },
             "board": _board_schema_prop(),
