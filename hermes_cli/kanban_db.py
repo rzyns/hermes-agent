@@ -9132,6 +9132,24 @@ def _resolve_worker_cli_toolsets(hermes_home: Optional[str]) -> Optional[list[st
         return None
 
 
+def _sanitize_worker_execution_context(env: dict[str, str]) -> None:
+    """Remove parent-process execution identity from a Kanban worker env.
+
+    The gateway runs cron and Kanban dispatch in one process, so cloning its
+    environment can otherwise classify a headless worker as cron, gateway, or
+    interactive.  Kanban identity is injected explicitly by ``_default_spawn``
+    after this boundary.
+    """
+    for marker in (
+        "HERMES_CRON_SESSION",
+        "HERMES_GATEWAY_SESSION",
+        "HERMES_INTERACTIVE",
+        "HERMES_EXEC_ASK",
+        "HERMES_TUI",
+    ):
+        env.pop(marker, None)
+
+
 def _default_spawn(
     task: Task,
     workspace: str,
@@ -9160,6 +9178,7 @@ def _default_spawn(
 
     prompt = f"work kanban task {task.id}"
     env = dict(os.environ)
+    _sanitize_worker_execution_context(env)
 
     # Inject HERMES_HOME so the worker reads the profile-scoped config.yaml
     # (fallback_providers, toolsets, agent settings, etc.) instead of the root
@@ -9241,13 +9260,13 @@ def _default_spawn(
     # attributed correctly regardless of how the child loads config.
     env["HERMES_PROFILE"] = profile_arg
 
-    # A worker must NEVER boot the interactive TUI: an inherited HERMES_TUI=1
-    # or a `display.interface: tui` in the profile's config would send the
+    # A worker must NEVER boot the interactive TUI: a
+    # `display.interface: tui` in the profile's config would send the
     # quiet chat run into the Ink TUI, whose no-TTY bail-out exits 0 without
     # doing the task → "protocol violation" on every attempt. `--cli` is the
-    # highest-precedence interface override; dropping the env var covers
-    # older hermes builds on PATH that predate the flag's precedence.
-    env.pop("HERMES_TUI", None)
+    # highest-precedence interface override; the execution-context sanitizer
+    # above drops the inherited env var for older builds that predate the
+    # flag's precedence.
 
     cmd = [
         *_resolve_hermes_argv(),

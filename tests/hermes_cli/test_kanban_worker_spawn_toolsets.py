@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import os
 import subprocess
+from unittest.mock import patch
 
 
 def _make_task(kb, *, assignee: str):
@@ -123,6 +125,56 @@ def test_default_spawn_never_boots_the_tui(monkeypatch, tmp_path):
 
     assert "--cli" in captured["cmd"]
     assert "HERMES_TUI" not in captured["env"]
+
+
+def test_default_spawn_clears_parent_approval_context(monkeypatch, tmp_path):
+    """A headless worker must not inherit the dispatcher's approval identity."""
+    root = tmp_path / ".hermes"
+    (root / "profiles" / "elias").mkdir(parents=True)
+    root.joinpath("config.yaml").write_text("{}\n", encoding="utf-8")
+    monkeypatch.setenv("HERMES_HOME", str(root))
+    for marker in (
+        "HERMES_CRON_SESSION",
+        "HERMES_GATEWAY_SESSION",
+        "HERMES_INTERACTIVE",
+        "HERMES_EXEC_ASK",
+    ):
+        monkeypatch.setenv(marker, "1")
+
+    from hermes_cli import kanban_db as kb
+    from tools import approval
+
+    monkeypatch.setattr(kb, "_resolve_hermes_argv", lambda: ["hermes"])
+    monkeypatch.setattr(approval, "_get_approval_mode", lambda: "manual")
+    monkeypatch.setattr(approval, "_YOLO_MODE_FROZEN", False)
+    captured = {}
+
+    class FakeProc:
+        pid = 4245
+
+    def fake_popen(cmd, *args, **kwargs):
+        captured["env"] = dict(kwargs.get("env") or {})
+        return FakeProc()
+
+    monkeypatch.setattr(subprocess, "Popen", fake_popen)
+
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    kb._default_spawn(_make_task(kb, assignee="elias"), str(workspace))
+
+    assert captured["env"]["HERMES_KANBAN_TASK"] == "t_spawn_tools"
+    for marker in (
+        "HERMES_CRON_SESSION",
+        "HERMES_GATEWAY_SESSION",
+        "HERMES_INTERACTIVE",
+        "HERMES_EXEC_ASK",
+    ):
+        assert marker not in captured["env"]
+
+    with patch.dict(os.environ, captured["env"], clear=True):
+        result = approval.check_execute_code_guard("print('ok')", "local")
+    assert result["approved"] is True
+    assert result["message"] is None
 
 
 def test_default_spawn_model_override_survives_real_cli_parse(monkeypatch, tmp_path):
