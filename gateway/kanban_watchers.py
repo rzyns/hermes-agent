@@ -1079,6 +1079,10 @@ class GatewayKanbanWatchersMixin:
                     stale_timeout_seconds=stale_timeout_seconds,
                     default_assignee=default_assignee,
                     max_in_progress_per_profile=max_in_progress_per_profile,
+                    retry_enabled=(
+                        isinstance(kanban_cfg.get("retry"), dict)
+                        and kanban_cfg["retry"].get("enabled") is True
+                    ),
                 )
             except sqlite3.DatabaseError as exc:
                 if _is_corrupt_board_db_error(exc):

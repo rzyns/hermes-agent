@@ -169,6 +169,7 @@ _BLOCK_DEFAULT_DEADLINE_SECONDS = {
     "budget": 24 * 60 * 60,
     "triage": 48 * 60 * 60,
 }
+_TRANSIENT_RETRY_MAX_SECONDS = 4 * 60 * 60
 
 
 def resolve_block_kind(
@@ -5677,7 +5678,28 @@ def block_task(
         # means: blocked → unblocked → about-to-re-block for the same cause.
         # An un-typed (None) block compares as "same" to a prior un-typed block.
         same_cause = prev_kind == kind
-        recurrences = prev_recurrences + 1 if same_cause else 1
+        if kind == "transient":
+            # The retry sweep owns this counter. Keeping block_task neutral
+            # avoids counting a requeue and its following re-block as two
+            # separate retry cycles.
+            recurrences = prev_recurrences if same_cause else 0
+            base_retry_after = contract_payload["retry_after"]
+            if base_retry_after is None:
+                base_retry_after = _BLOCK_DEFAULT_DEADLINE_SECONDS["transient"]
+            retry_after = min(
+                int(base_retry_after) * (2 ** min(recurrences, 14)),
+                _TRANSIENT_RETRY_MAX_SECONDS,
+            )
+            contract_payload["retry_after"] = retry_after
+            block_deadline = int(time.time()) + retry_after
+            block_values = (
+                contract_payload["fingerprint"],
+                block_deadline,
+                retry_after,
+                contract_payload["error_type"],
+            )
+        else:
+            recurrences = prev_recurrences + 1 if same_cause else 1
 
         if recurrences >= BLOCK_RECURRENCE_LIMIT:
             # Loop detected — stop letting the unblocker spin this task. Route
@@ -5946,6 +5968,136 @@ def promote_task(
         )
 
     return True, None
+
+
+def requeue_due_transients(
+    conn: sqlite3.Connection,
+    *,
+    now: Optional[int] = None,
+) -> tuple[list[str], list[str]]:
+    """Requeue due transient blocks and escalate exhausted retry cycles.
+
+    The selection is deliberately fail-closed: only ``blocked/transient``
+    rows with an elapsed deadline qualify. NULL-kind and human-input blocks
+    can never be selected. Returns ``(requeued_ids, escalated_ids)``.
+    """
+    effective_now = int(time.time()) if now is None else int(now)
+    requeued: list[str] = []
+    escalated: list[str] = []
+    with write_txn(conn):
+        rows = conn.execute(
+            """
+            SELECT id, block_recurrences, block_retry_after, current_run_id
+              FROM tasks
+             WHERE status = 'blocked'
+               AND block_kind = 'transient'
+               AND block_deadline IS NOT NULL
+               AND block_deadline <= ?
+             ORDER BY block_deadline ASC, id ASC
+            """,
+            (effective_now,),
+        ).fetchall()
+        for row in rows:
+            task_id = row["id"]
+            recurrences = int(row["block_recurrences"] or 0) + 1
+            retry_after = int(
+                row["block_retry_after"]
+                or _BLOCK_DEFAULT_DEADLINE_SECONDS["transient"]
+            )
+            if row["current_run_id"]:
+                # block_task normally closes the run. Preserve the runs
+                # invariant if an older/external writer left a stale pointer.
+                conn.execute(
+                    """
+                    UPDATE task_runs
+                       SET status = 'reclaimed', outcome = 'reclaimed',
+                           summary = COALESCE(
+                               summary, 'invariant recovery on transient requeue'
+                           ),
+                           ended_at = ?, claim_lock = NULL,
+                           claim_expires = NULL, worker_pid = NULL
+                     WHERE id = ? AND ended_at IS NULL
+                    """,
+                    (effective_now, int(row["current_run_id"])),
+                )
+            if recurrences >= BLOCK_RECURRENCE_LIMIT:
+                conn.execute(
+                    """
+                    UPDATE tasks
+                       SET status = 'triage',
+                           block_recurrences = ?,
+                           block_deadline = ?,
+                           claim_lock = NULL,
+                           claim_expires = NULL,
+                           worker_pid = NULL,
+                           current_run_id = NULL
+                     WHERE id = ?
+                       AND status = 'blocked'
+                       AND block_kind = 'transient'
+                    """,
+                    (
+                        recurrences,
+                        effective_now + _BLOCK_DEFAULT_DEADLINE_SECONDS["triage"],
+                        task_id,
+                    ),
+                )
+                _append_event(
+                    conn,
+                    task_id,
+                    "block_loop_detected",
+                    {
+                        "kind": "transient",
+                        "recurrences": recurrences,
+                        "limit": BLOCK_RECURRENCE_LIMIT,
+                        "source": "transient_retry_sweep",
+                    },
+                )
+                escalated.append(task_id)
+                continue
+
+            undone_parents = conn.execute(
+                "SELECT 1 FROM task_links l "
+                "JOIN tasks p ON p.id = l.parent_id "
+                "WHERE l.child_id = ? AND p.status != 'done' LIMIT 1",
+                (task_id,),
+            ).fetchone()
+            new_status = "todo" if undone_parents else "ready"
+            conn.execute(
+                """
+                UPDATE tasks
+                   SET status = ?,
+                       block_recurrences = ?,
+                       block_deadline = NULL,
+                       current_run_id = NULL,
+                       consecutive_failures = 0,
+                       last_failure_error = NULL,
+                       claim_lock = NULL,
+                       claim_expires = NULL,
+                       worker_pid = NULL
+                 WHERE id = ?
+                   AND status = 'blocked'
+                   AND block_kind = 'transient'
+                """,
+                (new_status, recurrences, task_id),
+            )
+            _append_event(
+                conn,
+                task_id,
+                "unblocked",
+                {"status": new_status, "source": "transient_retry_sweep"},
+            )
+            _append_event(
+                conn,
+                task_id,
+                "transient_requeued",
+                {
+                    "status": new_status,
+                    "recurrences": recurrences,
+                    "retry_after": retry_after,
+                },
+            )
+            requeued.append(task_id)
+    return requeued, escalated
 
 
 def unblock_task(conn: sqlite3.Connection, task_id: str) -> bool:
@@ -7072,6 +7224,10 @@ class DispatchResult:
 
     reclaimed: int = 0
     promoted: int = 0
+    requeued_transients: list[str] = field(default_factory=list)
+    """Due transient blocks returned to ready/todo this tick."""
+    escalated_transients: list[str] = field(default_factory=list)
+    """Due transient blocks routed to triage after exhausting retries."""
     spawned: list[tuple[str, str, str]] = field(default_factory=list)
     """List of ``(task_id, assignee, workspace_path)`` triples."""
     skipped_unassigned: list[str] = field(default_factory=list)
@@ -8707,6 +8863,7 @@ def dispatch_once(
     board: Optional[str] = None,
     default_assignee: Optional[str] = None,
     max_in_progress_per_profile: Optional[int] = None,
+    retry_enabled: bool = False,
 ) -> DispatchResult:
     """Run one dispatcher tick under the board's single-writer lock.
 
@@ -8741,6 +8898,7 @@ def dispatch_once(
             board=board,
             default_assignee=default_assignee,
             max_in_progress_per_profile=max_in_progress_per_profile,
+            retry_enabled=retry_enabled,
         )
     with _dispatch_tick_lock(db_path) as held:
         if not held:
@@ -8757,6 +8915,7 @@ def dispatch_once(
             board=board,
             default_assignee=default_assignee,
             max_in_progress_per_profile=max_in_progress_per_profile,
+            retry_enabled=retry_enabled,
         )
 
 
@@ -8773,6 +8932,7 @@ def _dispatch_once_locked(
     board: Optional[str] = None,
     default_assignee: Optional[str] = None,
     max_in_progress_per_profile: Optional[int] = None,
+    retry_enabled: bool = False,
 ) -> DispatchResult:
     """Run one dispatcher tick.
 
@@ -8829,6 +8989,11 @@ def _dispatch_once_locked(
     if _crash_rate_limited:
         result.rate_limited.extend(_crash_rate_limited)
     result.timed_out = enforce_max_runtime(conn)
+    if retry_enabled:
+        (
+            result.requeued_transients,
+            result.escalated_transients,
+        ) = requeue_due_transients(conn)
     result.promoted = recompute_ready(
         conn,
         failure_limit=failure_limit,

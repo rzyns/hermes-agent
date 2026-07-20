@@ -2826,6 +2826,11 @@ DEFAULT_CONFIG = {
         # Seconds between dispatcher ticks (idle or not). Lower = snappier
         # pickup of newly-ready tasks; higher = less SQL pressure.
         "dispatch_interval_seconds": 60,
+        # Automated retry of blocked transient tasks. Disabled by default so
+        # existing boards remain sticky until an operator explicitly opts in.
+        "retry": {
+            "enabled": False,
+        },
         # Emergency/maintenance brake. When true, gateway/CLI dispatchers skip
         # claiming or spawning work while leaving read-only list/status commands
         # available. Use per-board metadata (``hermes kanban boards maintenance``)
