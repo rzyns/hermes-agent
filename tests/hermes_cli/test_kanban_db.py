@@ -5291,3 +5291,159 @@ def test_bare_connect_does_not_close_on_context_exit(tmp_path):
     # Still usable after with-block exit (the leak).
     conn.execute("SELECT 1").fetchone()
     conn.close()  # explicit close to avoid leaking THIS test
+
+
+def test_exit_78_stamps_infra_failure_contract(kanban_home, monkeypatch):
+    import hermes_cli.kanban_db as _kb
+
+    monkeypatch.setattr(_kb, "_pid_alive", lambda _pid: False)
+    monkeypatch.setenv("HERMES_KANBAN_CRASH_GRACE_SECONDS", "0")
+
+    with kb.connect() as conn:
+        host = _kb._claimer_id().split(":", 1)[0]
+        tid = kb.create_task(conn, title="bad provider config", assignee="a")
+        pid = 31342
+        kb.claim_task(conn, tid, claimer=f"{host}:infra-contract")
+        conn.execute("UPDATE tasks SET worker_pid=? WHERE id=?", (pid, tid))
+        conn.commit()
+        _kb._record_worker_exit(pid, _exited_status(_kb.KANBAN_INFRA_EXIT_CODE))
+
+        assert tid not in kb.detect_crashed_workers(conn)
+        task = kb.get_task(conn, tid)
+        assert task is not None
+        row = conn.execute(
+            "SELECT block_kind, block_error_type, block_fingerprint, "
+            "block_deadline FROM tasks WHERE id=?",
+            (tid,),
+        ).fetchone()
+        assert row["block_kind"] == "infra"
+        assert row["block_error_type"] == "unknown"
+        assert row["block_fingerprint"] == _kb._error_fingerprint(
+            task.last_failure_error
+        )
+        assert row["block_deadline"] is not None
+
+        event = conn.execute(
+            "SELECT payload FROM task_events "
+            "WHERE task_id=? AND kind='blocked' ORDER BY id DESC LIMIT 1",
+            (tid,),
+        ).fetchone()
+        payload = json.loads(event["payload"])
+        assert payload["kind"] == "infra"
+        assert payload["contract"]["error_type"] == "unknown"
+        assert payload["contract"]["fingerprint"] == row["block_fingerprint"]
+
+
+def test_exit_75_requeues_without_structured_block_contract(kanban_home, monkeypatch):
+    import hermes_cli.kanban_db as _kb
+
+    monkeypatch.setattr(_kb, "_pid_alive", lambda _pid: False)
+    monkeypatch.setenv("HERMES_KANBAN_CRASH_GRACE_SECONDS", "0")
+
+    with kb.connect() as conn:
+        host = _kb._claimer_id().split(":", 1)[0]
+        tid = kb.create_task(conn, title="transient quota", assignee="a")
+        pid = 31343
+        kb.claim_task(conn, tid, claimer=f"{host}:tempfail-contract")
+        conn.execute("UPDATE tasks SET worker_pid=? WHERE id=?", (pid, tid))
+        conn.commit()
+        _kb._record_worker_exit(pid, _exited_status(_kb.KANBAN_RATE_LIMIT_EXIT_CODE))
+
+        assert tid not in kb.detect_crashed_workers(conn)
+        row = conn.execute(
+            "SELECT status, block_kind, block_error_type, block_fingerprint "
+            "FROM tasks WHERE id=?",
+            (tid,),
+        ).fetchone()
+        assert row["status"] == "ready"
+        assert row["block_kind"] is None
+        assert row["block_error_type"] is None
+        assert row["block_fingerprint"] is None
+
+
+def test_budget_exhaustion_breaker_stamps_budget_contract(kanban_home, monkeypatch):
+    import hermes_cli.kanban_db as _kb
+
+    now = 7_000_000
+    monkeypatch.setattr(_kb.time, "time", lambda: now)
+
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="iteration budget", assignee="a")
+        kb.claim_task(conn, tid)
+
+        tripped = kb._record_task_failure(
+            conn,
+            tid,
+            error="max_iterations_reached(90/90): iteration budget exhausted",
+            outcome="crashed",
+            failure_limit=1,
+            release_claim=True,
+            end_run=True,
+        )
+
+        assert tripped is True
+        row = conn.execute(
+            "SELECT status, block_kind, block_error_type, block_fingerprint, "
+            "block_deadline FROM tasks WHERE id=?",
+            (tid,),
+        ).fetchone()
+        assert row["status"] == "blocked"
+        assert row["block_kind"] == "budget"
+        assert row["block_error_type"] == "budget_exhausted"
+        assert row["block_fingerprint"] == _kb._error_fingerprint(
+            "max_iterations_reached(90/90): iteration budget exhausted"
+        )
+        assert row["block_deadline"] == now + 24 * 60 * 60
+
+
+def test_second_identical_failure_fingerprint_short_circuits_retries(kanban_home):
+    with kb.connect() as conn:
+        tid = kb.create_task(
+            conn, title="repeat crash", assignee="a", max_retries=5
+        )
+
+        kb.claim_task(conn, tid)
+        first = kb._record_task_failure(
+            conn,
+            tid,
+            error="pid 12345 exited with code 1",
+            outcome="crashed",
+            failure_limit=5,
+            release_claim=True,
+            end_run=True,
+        )
+        assert first is False
+        first_task = kb.get_task(conn, tid)
+        assert first_task is not None
+        assert first_task.status == "ready"
+
+        kb.claim_task(conn, tid)
+        second = kb._record_task_failure(
+            conn,
+            tid,
+            error="pid 67890 exited with code 1",
+            outcome="crashed",
+            failure_limit=5,
+            release_claim=True,
+            end_run=True,
+        )
+
+        assert second is True
+        row = conn.execute(
+            "SELECT status, consecutive_failures, block_error_type, "
+            "block_fingerprint FROM tasks WHERE id=?",
+            (tid,),
+        ).fetchone()
+        assert row["status"] == "blocked"
+        assert row["consecutive_failures"] == 2
+        assert row["block_error_type"] == "crash"
+        assert row["block_fingerprint"] == "pid n exited with code 1"
+
+        event = conn.execute(
+            "SELECT payload FROM task_events "
+            "WHERE task_id=? AND kind='gave_up' ORDER BY id DESC LIMIT 1",
+            (tid,),
+        ).fetchone()
+        payload = json.loads(event["payload"])
+        assert payload["fingerprint_short_circuit"] is True
+        assert payload["contract"]["fingerprint"] == row["block_fingerprint"]

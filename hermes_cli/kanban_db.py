@@ -7733,6 +7733,39 @@ def _error_fingerprint(error_text: str) -> str:
     return fp.lower().strip()
 
 
+_BUDGET_EXHAUSTION_PATTERNS = (
+    "budget exhausted",
+    "budget_exhausted",
+    "iteration budget",
+    "turn budget",
+    "max_iterations_reached",
+    "max iterations reached",
+)
+
+
+def _failure_contract(
+    *, error: str, outcome: str, kind: Optional[str] = None
+) -> tuple[Optional[str], dict[str, Any], Optional[int]]:
+    """Classify an operational failure into the shared block contract."""
+    normalized_error = error.lower()
+    if any(marker in normalized_error for marker in _BUDGET_EXHAUSTION_PATTERNS):
+        error_type = "budget_exhausted"
+    elif outcome == "timed_out":
+        error_type = "timeout"
+    else:
+        error_type = "crash"
+    return _normalize_block_contract(
+        reason=error,
+        kind=kind,
+        contract={
+            "error_type": error_type,
+            "fingerprint": _error_fingerprint(error),
+            "retryable": False,
+            "detail": error,
+        },
+    )
+
+
 # Empirically ~96% of "clean exit without a terminal tool call" tasks complete
 # on a later run (a goal-mode finalize nudge, or the model simply emitting the
 # tool call next time), so a protocol violation is NOT deterministic — give it a
@@ -7875,6 +7908,9 @@ def detect_crashed_workers(
             kind, code = _classify_worker_exit(pid)
             rate_limited_exit = False
             infra_blocked_exit = False
+            block_kind: Optional[str] = None
+            block_contract: dict[str, Any] = {}
+            block_deadline: Optional[int] = None
             if kind == "clean_exit":
                 # Worker subprocess returned 0 but its task is still
                 # ``running`` in the DB — it exited without calling
@@ -7928,6 +7964,18 @@ def detect_crashed_workers(
                     "(configuration/auth/billing/quota); task parked for "
                     "operator repair"
                 )
+                block_kind, block_contract, block_deadline = (
+                    _normalize_block_contract(
+                        reason=error_text,
+                        kind="infra",
+                        contract={
+                            "error_type": "unknown",
+                            "fingerprint": _error_fingerprint(error_text),
+                            "retryable": False,
+                            "detail": error_text,
+                        },
+                    )
+                )
                 event_kind = "blocked"
                 event_payload = {
                     "pid": pid,
@@ -7935,6 +7983,8 @@ def detect_crashed_workers(
                     "exit_code": code,
                     "infra_blocked": True,
                     "reason": error_text,
+                    "kind": block_kind,
+                    "contract": block_contract,
                 }
             else:
                 protocol_violation = False
@@ -7992,8 +8042,18 @@ def detect_crashed_workers(
                     rate_limited.append(row["id"])
                 elif infra_blocked_exit:
                     conn.execute(
-                        "UPDATE tasks SET last_failure_error = ? WHERE id = ?",
-                        (error_text[:500], row["id"]),
+                        "UPDATE tasks SET last_failure_error = ?, block_kind = ?, "
+                        "block_fingerprint = ?, block_deadline = ?, "
+                        "block_retry_after = ?, block_error_type = ? WHERE id = ?",
+                        (
+                            error_text[:500],
+                            block_kind,
+                            block_contract["fingerprint"],
+                            block_deadline,
+                            block_contract["retry_after"],
+                            block_contract["error_type"],
+                            row["id"],
+                        ),
                     )
                 else:
                     if protocol_violation:
@@ -8197,16 +8257,28 @@ def _record_task_failure(
     """
     if failure_limit is None:
         failure_limit = DEFAULT_FAILURE_LIMIT
+    block_kind, contract_payload, block_deadline = _failure_contract(
+        error=error,
+        outcome=outcome,
+    )
+    fingerprint = contract_payload["fingerprint"]
     blocked = False
     with write_txn(conn):
         row = conn.execute(
-            "SELECT consecutive_failures, status, max_retries "
+            "SELECT consecutive_failures, status, max_retries, "
+            "last_failure_error "
             "FROM tasks WHERE id = ?", (task_id,),
         ).fetchone()
         if row is None:
             return False
         failures = int(row["consecutive_failures"]) + 1
         cur_status = row["status"]
+        previous_error = row["last_failure_error"]
+        fingerprint_short_circuit = bool(
+            failures >= 2
+            and previous_error
+            and _error_fingerprint(previous_error) == fingerprint
+        )
 
         # Per-task override wins over both caller-supplied and default
         # thresholds. None (the common case) falls through.
@@ -8220,16 +8292,28 @@ def _record_task_failure(
             effective_limit = int(failure_limit)
             limit_source = "dispatcher"
 
-        if force_trip or failures >= effective_limit:
+        if force_trip or fingerprint_short_circuit or failures >= effective_limit:
             # Trip the breaker.
             if release_claim:
                 # Spawn path: still running, also clear claim state.
                 conn.execute(
                     "UPDATE tasks SET status = 'blocked', claim_lock = NULL, "
                     "claim_expires = NULL, worker_pid = NULL, "
-                    "consecutive_failures = ?, last_failure_error = ? "
+                    "consecutive_failures = ?, last_failure_error = ?, "
+                    "block_kind = ?, block_fingerprint = ?, "
+                    "block_deadline = ?, block_retry_after = ?, "
+                    "block_error_type = ? "
                     "WHERE id = ? AND status IN ('running', 'ready')",
-                    (failures, error[:500], task_id),
+                    (
+                        failures,
+                        error[:500],
+                        block_kind,
+                        fingerprint,
+                        block_deadline,
+                        contract_payload["retry_after"],
+                        contract_payload["error_type"],
+                        task_id,
+                    ),
                 )
             else:
                 # Timeout/crash path: task is already at ``ready``
@@ -8237,9 +8321,21 @@ def _record_task_failure(
                 # counter fields.
                 conn.execute(
                     "UPDATE tasks SET status = 'blocked', "
-                    "consecutive_failures = ?, last_failure_error = ? "
+                    "consecutive_failures = ?, last_failure_error = ?, "
+                    "block_kind = ?, block_fingerprint = ?, "
+                    "block_deadline = ?, block_retry_after = ?, "
+                    "block_error_type = ? "
                     "WHERE id = ? AND status IN ('ready', 'running')",
-                    (failures, error[:500], task_id),
+                    (
+                        failures,
+                        error[:500],
+                        block_kind,
+                        fingerprint,
+                        block_deadline,
+                        contract_payload["retry_after"],
+                        contract_payload["error_type"],
+                        task_id,
+                    ),
                 )
             run_id = None
             if end_run:
@@ -8253,6 +8349,8 @@ def _record_task_failure(
                         "trigger_outcome": outcome,
                         "effective_limit": effective_limit,
                         "limit_source": limit_source,
+                        "fingerprint_short_circuit": fingerprint_short_circuit,
+                        "contract": contract_payload,
                     },
                 )
             payload = {
@@ -8261,12 +8359,33 @@ def _record_task_failure(
                 "limit_source": limit_source,
                 "error": error[:500],
                 "trigger_outcome": outcome,
+                "kind": block_kind,
+                "contract": contract_payload,
+                "fingerprint_short_circuit": fingerprint_short_circuit,
             }
             if event_payload_extra:
                 payload.update(event_payload_extra)
             _append_event(
                 conn, task_id, "gave_up", payload, run_id=run_id,
             )
+            if fingerprint_short_circuit:
+                # Unlike an ordinary threshold trip, an identical second
+                # failure has already proved that another blind retry is not
+                # useful. Mark it as a sticky structured block so
+                # ``recompute_ready`` cannot immediately undo the short-circuit
+                # merely because the configured numeric retry limit is higher.
+                _append_event(
+                    conn,
+                    task_id,
+                    "blocked",
+                    {
+                        "reason": error[:500],
+                        "kind": block_kind,
+                        "contract": contract_payload,
+                        "fingerprint_short_circuit": True,
+                    },
+                    run_id=run_id,
+                )
             blocked = True
         else:
             # Below threshold.

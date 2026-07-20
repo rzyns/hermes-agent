@@ -217,7 +217,9 @@ def test_successful_spawn_does_not_reset_failure_counter(kanban_home, all_assign
     def _flaky_spawn(task, ws):
         calls[0] += 1
         if calls[0] <= 2:
-            raise RuntimeError("transient")
+            # Distinct fingerprints exercise the numeric failure counter;
+            # identical failures now intentionally short-circuit on attempt 2.
+            raise RuntimeError(f"transient-{calls[0]}")
         return 99999  # pid value — harmless; crash detection will clear it
 
     conn = kb.connect()
@@ -437,11 +439,11 @@ def test_workspace_resolution_failure_also_counts(kanban_home, all_assignees_spa
         assert task.consecutive_failures == 1
         assert task.status == "ready"
         assert task.last_failure_error and "workspace" in task.last_failure_error
-        # Run twice more → auto-blocked.
-        kb.dispatch_once(conn, failure_limit=3)
+        # The identical second fingerprint skips the final numeric retry.
         res = kb.dispatch_once(conn, failure_limit=3)
         assert tid in res.auto_blocked
         task = kb.get_task(conn, tid)
+        assert task is not None
         assert task.status == "blocked"
     finally:
         conn.close()
@@ -1694,8 +1696,8 @@ def test_run_on_block_with_reason(kanban_home):
 
 
 def test_run_on_spawn_failure_records_failed_runs(kanban_home, all_assignees_spawnable):
-    """Each spawn_failed event closes a run with outcome='spawn_failed',
-    and the Nth failure closes a run with outcome='gave_up'."""
+    """A repeated spawn fingerprint closes the second run as ``gave_up``
+    and suppresses the remaining configured retries."""
     def _bad(task, ws):
         raise RuntimeError("no PATH")
 
@@ -1706,11 +1708,17 @@ def test_run_on_spawn_failure_records_failed_runs(kanban_home, all_assignees_spa
             kb.dispatch_once(conn, spawn_fn=_bad, failure_limit=5)
 
         runs = kb.list_runs(conn, tid)
-        # 5 claim attempts → 5 runs. Final one is gave_up, earlier ones
-        # are spawn_failed.
-        assert len(runs) == 5
+        # The first failure is retryable. The identical second fingerprint
+        # short-circuits the remaining three attempts despite failure_limit=5.
+        assert len(runs) == 2
+        assert runs[0].outcome == "spawn_failed"
         assert runs[-1].outcome == "gave_up"
-        assert all(r.outcome == "spawn_failed" for r in runs[:-1])
+        task = kb.get_task(conn, tid)
+        assert task is not None
+        assert task.status == "blocked"
+        gave_up = [e for e in kb.list_events(conn, tid) if e.kind == "gave_up"]
+        assert len(gave_up) == 1
+        assert (gave_up[0].payload or {})["fingerprint_short_circuit"] is True
         assert runs[-1].error and "no PATH" in runs[-1].error
     finally:
         conn.close()
