@@ -6100,6 +6100,177 @@ def requeue_due_transients(
     return requeued, escalated
 
 
+def sweep_block_propagation_and_deadlines(
+    conn: sqlite3.Connection,
+    *,
+    now: Optional[int] = None,
+) -> tuple[list[str], list[str]]:
+    """Reconcile frozen DAG annotations and elapsed block deadlines.
+
+    Active ``infra``/``budget`` blockers and ``triage`` cards are roots of a
+    frozen subtree.  Descendants remain in their existing scheduler state; the
+    event stream is the read-side contract for consumers.  Reconciliation is
+    level-triggered: only descendants without a matching ``frozen_by``
+    annotation are emitted, and a new root summary records the current total
+    whenever that set grows.
+
+    Deadline handling is likewise event-only in Phase 1.  Infra deadlines
+    escalate once, while budget and triage deadlines are advanced to their
+    next re-notification interval.  No task is cancelled or otherwise moved.
+    Returns ``(roots_with_freeze_deltas, tasks_with_expired_deadlines)``.
+    """
+    effective_now = int(time.time()) if now is None else int(now)
+    frozen_roots: list[str] = []
+    expired_deadlines: list[str] = []
+
+    with write_txn(conn):
+        causes = conn.execute(
+            """
+            SELECT id,
+                   CASE WHEN status = 'triage' THEN 'triage' ELSE block_kind END
+                       AS block_class
+              FROM tasks
+             WHERE (status = 'blocked' AND block_kind IN ('infra', 'budget'))
+                OR status = 'triage'
+             ORDER BY id ASC
+            """
+        ).fetchall()
+
+        for cause in causes:
+            cause_task = cause["id"]
+            block_class = cause["block_class"]
+            descendants = conn.execute(
+                """
+                WITH RECURSIVE descendants(id) AS (
+                    SELECT child_id
+                      FROM task_links
+                     WHERE parent_id = ?
+                    UNION
+                    SELECT links.child_id
+                      FROM task_links AS links
+                      JOIN descendants ON descendants.id = links.parent_id
+                )
+                SELECT tasks.id
+                  FROM descendants
+                  JOIN tasks ON tasks.id = descendants.id
+                 WHERE tasks.status IN ('todo', 'scheduled')
+                 ORDER BY tasks.id ASC
+                """,
+                (cause_task,),
+            ).fetchall()
+            descendant_ids = [row["id"] for row in descendants]
+
+            annotated: set[str] = set()
+            if descendant_ids:
+                placeholders = ",".join("?" for _ in descendant_ids)
+                rows = conn.execute(
+                    f"""
+                    SELECT task_id, payload
+                      FROM task_events
+                     WHERE kind = 'frozen_by'
+                       AND task_id IN ({placeholders})
+                    """,
+                    descendant_ids,
+                ).fetchall()
+                for row in rows:
+                    try:
+                        payload = json.loads(row["payload"]) if row["payload"] else {}
+                    except (TypeError, ValueError):
+                        continue
+                    if (
+                        payload.get("cause_task") == cause_task
+                        and payload.get("class") == block_class
+                    ):
+                        annotated.add(row["task_id"])
+
+            missing = [task_id for task_id in descendant_ids if task_id not in annotated]
+            prior_root = conn.execute(
+                """
+                SELECT payload
+                  FROM task_events
+                 WHERE task_id = ? AND kind = 'subtree_frozen'
+                 ORDER BY id DESC
+                 LIMIT 1
+                """,
+                (cause_task,),
+            ).fetchone()
+            root_matches = False
+            if prior_root is not None:
+                try:
+                    payload = (
+                        json.loads(prior_root["payload"])
+                        if prior_root["payload"]
+                        else {}
+                    )
+                except (TypeError, ValueError):
+                    payload = {}
+                root_matches = (
+                    payload.get("cause_task") == cause_task
+                    and payload.get("class") == block_class
+                )
+
+            if missing or not root_matches:
+                _append_event(
+                    conn,
+                    cause_task,
+                    "subtree_frozen",
+                    {
+                        "cause_task": cause_task,
+                        "class": block_class,
+                        "frozen_count": len(descendant_ids),
+                    },
+                )
+                for task_id in missing:
+                    _append_event(
+                        conn,
+                        task_id,
+                        "frozen_by",
+                        {"cause_task": cause_task, "class": block_class},
+                    )
+                frozen_roots.append(cause_task)
+
+        due = conn.execute(
+            """
+            SELECT id, status, block_kind, block_deadline
+              FROM tasks
+             WHERE block_deadline IS NOT NULL
+               AND block_deadline <= ?
+               AND (
+                    (status = 'blocked' AND block_kind IN ('infra', 'budget'))
+                    OR status = 'triage'
+               )
+             ORDER BY id ASC
+            """,
+            (effective_now,),
+        ).fetchall()
+        for row in due:
+            block_class = "triage" if row["status"] == "triage" else row["block_kind"]
+            disposition = "escalate" if block_class == "infra" else "re-notify"
+            deadline = int(row["block_deadline"])
+            _append_event(
+                conn,
+                row["id"],
+                "deadline_expired",
+                {
+                    "class": block_class,
+                    "disposition": disposition,
+                    "deadline": deadline,
+                },
+            )
+            next_deadline = None
+            if disposition == "re-notify":
+                next_deadline = (
+                    effective_now + _BLOCK_DEFAULT_DEADLINE_SECONDS[block_class]
+                )
+            conn.execute(
+                "UPDATE tasks SET block_deadline = ? WHERE id = ?",
+                (next_deadline, row["id"]),
+            )
+            expired_deadlines.append(row["id"])
+
+    return frozen_roots, expired_deadlines
+
+
 def unblock_task(conn: sqlite3.Connection, task_id: str) -> bool:
     """Transition ``blocked``/``scheduled`` -> ready or todo.
 
@@ -7228,6 +7399,10 @@ class DispatchResult:
     """Due transient blocks returned to ready/todo this tick."""
     escalated_transients: list[str] = field(default_factory=list)
     """Due transient blocks routed to triage after exhausting retries."""
+    frozen_subtrees: list[str] = field(default_factory=list)
+    """Active block roots whose frozen descendant annotations changed."""
+    expired_deadlines: list[str] = field(default_factory=list)
+    """Blocked/triage task ids whose deadline event fired this tick."""
     spawned: list[tuple[str, str, str]] = field(default_factory=list)
     """List of ``(task_id, assignee, workspace_path)`` triples."""
     skipped_unassigned: list[str] = field(default_factory=list)
@@ -8994,6 +9169,10 @@ def _dispatch_once_locked(
             result.requeued_transients,
             result.escalated_transients,
         ) = requeue_due_transients(conn)
+    (
+        result.frozen_subtrees,
+        result.expired_deadlines,
+    ) = sweep_block_propagation_and_deadlines(conn)
     result.promoted = recompute_ready(
         conn,
         failure_limit=failure_limit,
