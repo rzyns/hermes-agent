@@ -1667,8 +1667,12 @@ class TestKanbanGuidanceV2:
 
     def test_default_off_keeps_v1_guidance(self):
         from agent.prompt_builder import KANBAN_GUIDANCE, KANBAN_GUIDANCE_V2
+        from hermes_cli.config import DEFAULT_CONFIG
 
-        prompt = self._make_agent({})._build_system_prompt()
+        agent_config = DEFAULT_CONFIG["agent"]
+        assert agent_config["kanban_guidance_v2"] is False
+
+        prompt = self._make_agent(agent_config)._build_system_prompt()
 
         assert KANBAN_GUIDANCE in prompt
         assert KANBAN_GUIDANCE_V2 not in prompt
