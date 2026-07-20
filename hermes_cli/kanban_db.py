@@ -134,7 +134,14 @@ VALID_INITIAL_STATUSES = {"running", "blocked"}
 # ``BLOCK_RECURRENCE_LIMIT``) escalates them to ``triage`` if a cron keeps
 # unblocking them only to have the worker re-block for the same reason.
 # ``None`` = legacy/un-typed block (treated as a generic human blocker).
-VALID_BLOCK_KINDS = {"dependency", "needs_input", "capability", "transient"}
+VALID_BLOCK_KINDS = {
+    "dependency",
+    "needs_input",
+    "capability",
+    "transient",
+    "infra",
+    "budget",
+}
 
 # After a task has been blocked, unblocked, and re-blocked this many times for
 # the same (truly-blocked) reason, the unblock-loop breaker stops trusting the
@@ -1349,7 +1356,13 @@ CREATE TABLE IF NOT EXISTS tasks (
     -- ``blocked`` so a cron can't spin it forever. Reset to 0 only on a
     -- successful completion — NOT on unblock (resetting on unblock is exactly
     -- the amnesia that let the loop run unbounded).
-    block_recurrences    INTEGER NOT NULL DEFAULT 0
+    block_recurrences    INTEGER NOT NULL DEFAULT 0,
+    -- Nullable structured failure metadata. Phase 1 adds storage first; later
+    -- steps populate these fields at the point a task becomes blocked.
+    block_fingerprint    TEXT,
+    block_deadline       INTEGER,
+    block_retry_after    INTEGER,
+    block_error_type     TEXT
 );
 
 CREATE TABLE IF NOT EXISTS task_links (
@@ -2272,6 +2285,19 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
             "block_recurrences",
             "block_recurrences INTEGER NOT NULL DEFAULT 0",
         )
+
+    # Structured block metadata is deliberately nullable. Existing rows carry
+    # no trustworthy structured cause until the operator-side backfill has
+    # classified them, and unknown legacy blocks must remain NULL so consumers
+    # treat them as needs_input-safe.
+    for column_name, column_sql in (
+        ("block_fingerprint", "block_fingerprint TEXT"),
+        ("block_deadline", "block_deadline INTEGER"),
+        ("block_retry_after", "block_retry_after INTEGER"),
+        ("block_error_type", "block_error_type TEXT"),
+    ):
+        if column_name not in cols:
+            _add_column_if_missing(conn, "tasks", column_name, column_sql)
 
     # Indexes over additive ``tasks`` columns must be created after the
     # columns exist. Keeping them in SCHEMA_SQL breaks legacy boards: SQLite
