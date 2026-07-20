@@ -562,6 +562,81 @@ def test_patch_block_then_unblock(client):
     assert r.json()["task"]["status"] == "ready"
 
 
+def test_patch_structured_block_contract_round_trips_on_task_and_board(client):
+    task = client.post(
+        "/api/plugins/kanban/tasks", json={"title": "quota failure"}
+    ).json()["task"]
+
+    response = client.patch(
+        f"/api/plugins/kanban/tasks/{task['id']}",
+        json={
+            "status": "blocked",
+            "block_reason": "provider quota exhausted",
+            "block_kind": "infra",
+            "error_type": "provider_quota",
+            "fingerprint": "quota:provider-a",
+            "retryable": False,
+            "retry_after": 120,
+            "needs_authority": True,
+            "detail": "repair provider quota before retrying",
+        },
+    )
+
+    assert response.status_code == 200, response.text
+    patched = response.json()["task"]
+    assert patched["block_kind"] == "infra"
+    assert patched["block_fingerprint"] == "quota:provider-a"
+    assert patched["block_retry_after"] == 120
+    assert patched["block_error_type"] == "provider_quota"
+    assert isinstance(patched["block_deadline"], int)
+
+    detail = client.get(
+        f"/api/plugins/kanban/tasks/{task['id']}"
+    ).json()["task"]
+    board_tasks = [
+        board_task
+        for column in client.get("/api/plugins/kanban/board").json()["columns"]
+        for board_task in column["tasks"]
+    ]
+    board_task = next(item for item in board_tasks if item["id"] == task["id"])
+    for field in (
+        "block_fingerprint",
+        "block_deadline",
+        "block_retry_after",
+        "block_error_type",
+    ):
+        assert detail[field] == patched[field]
+        assert board_task[field] == patched[field]
+
+
+@pytest.mark.parametrize("field", ["fingerprint", "block_kind"])
+def test_patch_rejects_structured_block_fields_when_status_will_not_honor_them(
+    client, field
+):
+    task = client.post("/api/plugins/kanban/tasks", json={"title": "x"}).json()["task"]
+
+    response = client.patch(
+        f"/api/plugins/kanban/tasks/{task['id']}",
+        json={field: "value"},
+    )
+
+    assert response.status_code == 400
+    assert field in response.json()["detail"]
+    assert "status='blocked'" in response.json()["detail"]
+
+
+def test_patch_rejects_unknown_fields_instead_of_silently_dropping_them(client):
+    task = client.post("/api/plugins/kanban/tasks", json={"title": "x"}).json()["task"]
+
+    response = client.patch(
+        f"/api/plugins/kanban/tasks/{task['id']}",
+        json={"block_fignerprint": "typo"},
+    )
+
+    assert response.status_code == 422
+    assert "block_fignerprint" in response.text
+
+
 def test_dashboard_refuses_ready_for_materialize_only_route_target(client):
     kb.init_db(board="attention-intake")
     kb.init_db(board="agent-research-intake")

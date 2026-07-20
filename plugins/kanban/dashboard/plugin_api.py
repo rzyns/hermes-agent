@@ -46,7 +46,7 @@ from typing import Any, Optional
 
 from fastapi import APIRouter, File, Form, HTTPException, Query, UploadFile, WebSocket, WebSocketDisconnect, status as http_status
 from fastapi.responses import FileResponse
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 
 from hermes_cli import kanban_db
 from hermes_cli import kanban_diagnostics as kd
@@ -1060,6 +1060,8 @@ def get_intake_link_health(
 # ---------------------------------------------------------------------------
 
 class UpdateTaskBody(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
     status: Optional[str] = None
     assignee: Optional[str] = None
     priority: Optional[int] = None
@@ -1073,6 +1075,27 @@ class UpdateTaskBody(BaseModel):
     summary: Optional[str] = None
     metadata: Optional[dict] = None
 
+    # Structured failure contract. These canonical producer-side names map
+    # onto the ``block_*`` read fields exposed by Task.
+    block_kind: Optional[str] = None
+    error_type: Optional[str] = None
+    fingerprint: Optional[str] = None
+    retryable: Optional[bool] = None
+    retry_after: Optional[int] = None
+    needs_authority: Optional[bool] = None
+    detail: Optional[str] = None
+
+
+_BLOCK_PATCH_FIELDS = frozenset({
+    "block_kind",
+    "error_type",
+    "fingerprint",
+    "retryable",
+    "retry_after",
+    "needs_authority",
+    "detail",
+})
+
 
 @router.patch("/tasks/{task_id}")
 def update_task(task_id: str, payload: UpdateTaskBody, board: Optional[str] = Query(None)):
@@ -1082,6 +1105,16 @@ def update_task(task_id: str, payload: UpdateTaskBody, board: Optional[str] = Qu
         task = kanban_db.get_task(conn, task_id)
         if task is None:
             raise HTTPException(status_code=404, detail=f"task {task_id} not found")
+
+        supplied_block_fields = sorted(payload.model_fields_set & _BLOCK_PATCH_FIELDS)
+        if supplied_block_fields and payload.status != "blocked":
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    f"{', '.join(supplied_block_fields)} only applies when "
+                    "status='blocked'; request rejected instead of dropping fields"
+                ),
+            )
 
         if payload.status == "ready" and task.status in ("blocked", "scheduled"):
             # Validate authorization-bound unblock attempts before applying
@@ -1116,7 +1149,21 @@ def update_task(task_id: str, payload: UpdateTaskBody, board: Optional[str] = Qu
                 except kanban_db.CompletionResultRequiredError as exc:
                     raise HTTPException(status_code=400, detail=str(exc))
             elif s == "blocked":
-                ok = kanban_db.block_task(conn, task_id, reason=payload.block_reason)
+                contract = {
+                    field: getattr(payload, field)
+                    for field in _BLOCK_PATCH_FIELDS - {"block_kind"}
+                    if field in payload.model_fields_set
+                }
+                try:
+                    ok = kanban_db.block_task(
+                        conn,
+                        task_id,
+                        reason=payload.block_reason,
+                        kind=payload.block_kind,
+                        contract=contract or None,
+                    )
+                except ValueError as exc:
+                    raise HTTPException(status_code=400, detail=str(exc))
             elif s == "scheduled":
                 ok = kanban_db.schedule_task(conn, task_id, reason=payload.block_reason)
             elif s == "ready":

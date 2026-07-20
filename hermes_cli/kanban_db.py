@@ -1130,6 +1130,13 @@ class Task:
     # Unblock-loop counter. See the column comment in SCHEMA_SQL and
     # ``BLOCK_RECURRENCE_LIMIT``. Reset only on successful completion.
     block_recurrences: int = 0
+    # Queryable projection of the structured failure contract stored on the
+    # latest block. Keep these on the typed Task view so every read surface
+    # observes the same row rather than silently omitting contract metadata.
+    block_fingerprint: Optional[str] = None
+    block_deadline: Optional[int] = None
+    block_retry_after: Optional[int] = None
+    block_error_type: Optional[str] = None
 
     @classmethod
     def from_row(cls, row: sqlite3.Row) -> "Task":
@@ -1213,6 +1220,22 @@ class Task:
                 int(row["block_recurrences"])
                 if "block_recurrences" in keys and row["block_recurrences"] is not None
                 else 0
+            ),
+            block_fingerprint=(
+                row["block_fingerprint"] if "block_fingerprint" in keys else None
+            ),
+            block_deadline=(
+                int(row["block_deadline"])
+                if "block_deadline" in keys and row["block_deadline"] is not None
+                else None
+            ),
+            block_retry_after=(
+                int(row["block_retry_after"])
+                if "block_retry_after" in keys and row["block_retry_after"] is not None
+                else None
+            ),
+            block_error_type=(
+                row["block_error_type"] if "block_error_type" in keys else None
             ),
         )
 
