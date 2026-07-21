@@ -1,11 +1,14 @@
 """Regression tests for iteration-limit exit normalization (#61631)."""
 
+import json
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 import pytest
 
 from agent.turn_finalizer import finalize_turn
+from hermes_cli import kanban_db as kb
 
 
 class _LimitAgent:
@@ -112,6 +115,190 @@ def _finalize(
         _turn_exit_reason=exit_reason,
         _pending_verification_response=pending_verification_response,
     )
+
+
+def _claimed_worker(tmp_path, monkeypatch, **task_kwargs):
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    kb.init_db()
+    with kb.connect() as conn:
+        task_id = kb.create_task(
+            conn,
+            title="boundary worker",
+            assignee="worker",
+            **task_kwargs,
+        )
+        kb.claim_task(conn, task_id)
+        run = kb.latest_run(conn, task_id)
+        assert run is not None
+    monkeypatch.setenv("HERMES_KANBAN_TASK", task_id)
+    monkeypatch.setenv("HERMES_KANBAN_RUN_ID", str(run.id))
+    monkeypatch.setenv("HERMES_PROFILE", "worker")
+    monkeypatch.setattr("hermes_cli.plugins.invoke_hook", lambda *_a, **_kw: [])
+    return task_id, run.id
+
+
+def _complete_worker(summary):
+    from tools import kanban_tools as kt
+
+    return json.loads(kt._handle_complete({"summary": summary}))
+
+
+def test_successful_kanban_complete_at_iteration_boundary_survives_finalizer(
+    tmp_path, monkeypatch
+):
+    task_id, _run_id = _claimed_worker(tmp_path, monkeypatch)
+    completion = _complete_worker("finished on the final tool call")
+    assert completion["ok"] is True
+
+    _finalize(
+        _LimitAgent(max_iterations=1),
+        final_response=None,
+        exit_reason="unknown",
+        api_call_count=1,
+    )
+
+    with kb.connect() as conn:
+        task = kb.get_task(conn, task_id)
+        runs = kb.list_runs(conn, task_id)
+        events = kb.list_events(conn, task_id)
+    assert task is not None
+    assert task.status == "done"
+    assert [run.outcome for run in runs] == ["completed"]
+    assert not [event for event in events if event.kind in {"timed_out", "gave_up"}]
+
+
+def test_post_finalizer_completion_requires_grace_for_same_latest_run(
+    tmp_path, monkeypatch
+):
+    task_id, run_id = _claimed_worker(tmp_path, monkeypatch)
+    monkeypatch.setattr(
+        "hermes_cli.config.load_config",
+        lambda: {"kanban": {"terminal_completion_grace_seconds": 30}},
+    )
+
+    _finalize(
+        _LimitAgent(max_iterations=1),
+        final_response=None,
+        exit_reason="unknown",
+        api_call_count=1,
+    )
+    completion = _complete_worker("finished while finalizer benched the run")
+
+    assert completion["ok"] is True
+    assert completion["accepted_terminal_after_budget_bench"] is True
+    assert completion["budget_run_id"] == run_id
+    with kb.connect() as conn:
+        task = kb.get_task(conn, task_id)
+    assert task is not None
+    assert task.status == "done"
+
+
+def test_post_finalizer_completion_grace_defaults_to_zero(tmp_path, monkeypatch):
+    task_id, _run_id = _claimed_worker(tmp_path, monkeypatch)
+    monkeypatch.setattr("hermes_cli.config.load_config", lambda: {"kanban": {}})
+    assert kb._terminal_completion_grace_seconds() == 0
+
+    _finalize(
+        _LimitAgent(max_iterations=1),
+        final_response=None,
+        exit_reason="unknown",
+        api_call_count=1,
+    )
+    completion = _complete_worker("too late without configured grace")
+
+    assert "error" in completion
+    with kb.connect() as conn:
+        task = kb.get_task(conn, task_id)
+    assert task is not None
+    assert task.status == "ready"
+
+
+def test_grace_rejects_completion_after_newer_run_starts(tmp_path, monkeypatch):
+    task_id, stale_run_id = _claimed_worker(tmp_path, monkeypatch)
+    monkeypatch.setattr(
+        "hermes_cli.config.load_config",
+        lambda: {"kanban": {"terminal_completion_grace_seconds": 30}},
+    )
+    _finalize(
+        _LimitAgent(max_iterations=1),
+        final_response=None,
+        exit_reason="unknown",
+        api_call_count=1,
+    )
+    with kb.connect() as conn:
+        kb.claim_task(conn, task_id)
+        newer_run = kb.latest_run(conn, task_id)
+        assert newer_run is not None
+    assert newer_run.id != stale_run_id
+
+    completion = _complete_worker("stale completion after retry started")
+
+    assert "error" in completion
+    with kb.connect() as conn:
+        task = kb.get_task(conn, task_id)
+    assert task is not None
+    assert task.status == "running"
+    assert task.current_run_id == newer_run.id
+
+
+def test_worker_override_prevents_profile_budget_failure_on_first_tool_turn(
+    tmp_path, monkeypatch
+):
+    captured = {}
+
+    class _FakeProc:
+        pid = 4246
+
+    monkeypatch.setattr(
+        "subprocess.Popen",
+        lambda cmd, **kwargs: captured.update(cmd=cmd) or _FakeProc(),
+    )
+    monkeypatch.setattr(
+        "hermes_cli.config.load_config",
+        lambda: {
+            "agent": {"max_turns": 1},
+            "kanban": {"terminal_completion_grace_seconds": 0},
+        },
+    )
+    task_id, _run_id = _claimed_worker(
+        tmp_path,
+        monkeypatch,
+        goal_mode=True,
+        goal_max_turns=30,
+        worker_max_turns=4,
+    )
+    with kb.connect() as conn:
+        task = kb.get_task(conn, task_id)
+        assert task is not None
+    kb._default_spawn(task, str(tmp_path))
+    worker_budget = int(captured["cmd"][captured["cmd"].index("--max-turns") + 1])
+
+    _finalize(
+        _LimitAgent(max_iterations=worker_budget, budget_remaining=3),
+        final_response="tool turn complete",
+        exit_reason="text_response(finish_reason=stop)",
+        api_call_count=1,
+    )
+
+    from hermes_cli.config import load_config
+
+    assert load_config()["agent"]["max_turns"] == 1
+    assert task.goal_max_turns == 30
+    assert captured["cmd"][captured["cmd"].index("--max-turns") + 1] == "4"
+    assert worker_budget == 4
+    with kb.connect() as conn:
+        task = kb.get_task(conn, task_id)
+        events = kb.list_events(conn, task_id)
+    assert task is not None
+    assert task.status == "running"
+    assert not [
+        event
+        for event in events
+        if event.payload and "Iteration budget exhausted (1/1)" in str(event.payload)
+    ]
 
 
 def test_pending_verify_response_is_preserved_for_cron_delivery(monkeypatch):

@@ -3174,6 +3174,7 @@
     // = backend default.
     const [goalMode, setGoalMode] = useState(false);
     const [goalMaxTurns, setGoalMaxTurns] = useState("");
+    const [workerMaxTurns, setWorkerMaxTurns] = useState("");
 
     const submit = function () {
       const trimmed = title.trim();
@@ -3207,10 +3208,12 @@
         const gmt = parseInt(goalMaxTurns, 10);
         if (Number.isFinite(gmt) && gmt > 0) body.goal_max_turns = gmt;
       }
+      const wmt = parseInt(workerMaxTurns, 10);
+      if (Number.isFinite(wmt) && wmt > 0) body.worker_max_turns = wmt;
       props.onSubmit(body);
       setTitle(""); setAssignee(""); setPriority(0); setParent(""); setSkills("");
       setWorkspaceKind(defaultWorkspaceKind); setWorkspacePath(defaultWorkspacePath);
-      setGoalMode(false); setGoalMaxTurns("");
+      setGoalMode(false); setGoalMaxTurns(""); setWorkerMaxTurns("");
     };
 
     const showPathInput = workspaceKind !== "scratch";
@@ -3364,6 +3367,19 @@
               title: "Turn budget for the goal loop. Blank = backend default (20).",
               min: 1,
             }) : null,
+          ),
+          h("div", { className: "flex flex-col gap-1" },
+            fieldLabel(tx(t, "workerMaxTurns", "Worker max turns"),
+              tx(t, "workerMaxTurnsHint", "(optional, overrides profile budget)")),
+            h(Input, {
+              type: "number",
+              value: workerMaxTurns,
+              onChange: function (e) { setWorkerMaxTurns(e.target.value); },
+              placeholder: tx(t, "workerMaxTurnsPlaceholder", "worker max turns"),
+              className: "h-8 text-sm",
+              title: "Per-conversation API/tool iteration budget. Blank uses the worker profile or goal-worker config.",
+              min: 1,
+            }),
           ),
         ),
         h("div", { className: "hermes-kanban-dialog-actions" },
@@ -3842,6 +3858,10 @@
           value: t.goal_max_turns
             ? `on (max ${t.goal_max_turns} turns)`
             : "on",
+        }) : null,
+        t.worker_max_turns ? h(MetaRow, {
+          label: tx(i18n, "workerMaxTurns", "Worker max turns"),
+          value: String(t.worker_max_turns),
         }) : null,
         t.created_by ? h(MetaRow, { label: tx(i18n, "createdBy", "Created by"), value: t.created_by }) : null,
       ),

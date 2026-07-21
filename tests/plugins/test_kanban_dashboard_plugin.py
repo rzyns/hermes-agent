@@ -140,6 +140,26 @@ def test_create_task_rejects_non_positive_worker_max_turns(client):
     assert response.status_code == 422
 
 
+def test_dashboard_create_and_details_surface_worker_max_turns():
+    """The committed dashboard bundle must expose the backend budget knob."""
+    bundle = (
+        Path(__file__).resolve().parents[2]
+        / "plugins"
+        / "kanban"
+        / "dashboard"
+        / "dist"
+        / "index.js"
+    ).read_text(encoding="utf-8")
+
+    assert 'const [workerMaxTurns, setWorkerMaxTurns] = useState("");' in bundle
+    assert "body.worker_max_turns = wmt;" in bundle
+    assert 'setWorkerMaxTurns("");' in bundle
+    assert 'value: workerMaxTurns,' in bundle
+    assert 'min: 1,' in bundle
+    assert 'label: tx(i18n, "workerMaxTurns", "Worker max turns")' in bundle
+    assert 'value: String(t.worker_max_turns)' in bundle
+
+
 def test_board_list_recommends_persistent_workspace_for_configured_workdir(
     client, tmp_path
 ):
