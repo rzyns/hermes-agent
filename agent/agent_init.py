@@ -1374,6 +1374,17 @@ def init_agent(
     except Exception:
         _agent_cfg = {}
 
+    # KANBAN_GUIDANCE v2 is opt-in while its behavior is being gated. Keep the
+    # existing v1 block when the flag is absent/false so live defaults do not
+    # change. Normal chat sessions retain the empty block resolved above.
+    if agent._kanban_worker_guidance:
+        from agent.prompt_builder import KANBAN_GUIDANCE_V2
+        _kanban_agent_section = _agent_cfg.get("agent", {})
+        if not isinstance(_kanban_agent_section, dict):
+            _kanban_agent_section = {}
+        if bool(_kanban_agent_section.get("kanban_guidance_v2", False)):
+            agent._kanban_worker_guidance = KANBAN_GUIDANCE_V2
+
     # Codex commentary visibility (display.show_commentary, default true).
     # When true, completed Codex phase=commentary messages are delivered as
     # visible mid-turn updates through the interim message path. When false,

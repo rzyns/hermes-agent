@@ -1639,6 +1639,56 @@ class TestToolUseEnforcementConfig:
             assert TOOL_USE_ENFORCEMENT_GUIDANCE not in prompt
 
 
+class TestKanbanGuidanceV2:
+    """Config-gated selection of the Kanban worker guidance revision."""
+
+    def _make_agent(self, agent_config):
+        with (
+            patch(
+                "run_agent.get_tool_definitions",
+                return_value=_make_tool_defs("kanban_show"),
+            ),
+            patch("run_agent.check_toolset_requirements", return_value={}),
+            patch("run_agent.OpenAI"),
+            patch(
+                "hermes_cli.config.load_config",
+                return_value={"agent": agent_config},
+            ),
+        ):
+            agent = AIAgent(
+                api_key="test-key-1234567890",
+                base_url="https://openrouter.ai/api/v1",
+                quiet_mode=True,
+                skip_context_files=True,
+                skip_memory=True,
+            )
+            agent.client = MagicMock()
+            return agent
+
+    def test_default_off_keeps_v1_guidance(self):
+        from agent.prompt_builder import KANBAN_GUIDANCE, KANBAN_GUIDANCE_V2
+        from hermes_cli.config import DEFAULT_CONFIG
+
+        agent_config = DEFAULT_CONFIG["agent"]
+        assert agent_config["kanban_guidance_v2"] is False
+
+        prompt = self._make_agent(agent_config)._build_system_prompt()
+
+        assert KANBAN_GUIDANCE in prompt
+        assert KANBAN_GUIDANCE_V2 not in prompt
+
+    def test_enabled_uses_marker_free_v2_guidance(self):
+        from agent.prompt_builder import KANBAN_GUIDANCE, KANBAN_GUIDANCE_V2
+
+        prompt = self._make_agent({"kanban_guidance_v2": True})._build_system_prompt()
+
+        assert KANBAN_GUIDANCE_V2 in prompt
+        assert KANBAN_GUIDANCE not in prompt
+        assert "‹NEW›" not in KANBAN_GUIDANCE_V2
+        assert "‹CHANGED›" not in KANBAN_GUIDANCE_V2
+        assert "‹PENDING-SURFACE" not in KANBAN_GUIDANCE_V2
+
+
 class TestTaskCompletionGuidance:
     """Tests for the universal task-completion / no-fabrication guidance
     (config.yaml ``agent.task_completion_guidance``).
