@@ -1647,6 +1647,153 @@ def test_stale_run_cannot_complete_new_attempt(kanban_home, monkeypatch):
         conn.close()
 
 
+def test_budget_failure_cas_cannot_bench_completed_task(kanban_home):
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="race guarded", assignee="worker")
+        kb.claim_task(conn, tid)
+        run = kb.latest_run(conn, tid)
+        assert kb.complete_task(
+            conn, tid, summary="finished", expected_run_id=run.id
+        )
+
+        tripped = kb._record_task_failure(
+            conn,
+            tid,
+            error="Iteration budget exhausted (1/1)",
+            outcome="timed_out",
+            release_claim=True,
+            end_run=True,
+            expected_run_id=run.id,
+        )
+
+        task = kb.get_task(conn, tid)
+        assert tripped is False
+        assert task.status == "done"
+        assert task.consecutive_failures == 0
+        assert [r.outcome for r in kb.list_runs(conn, tid)] == ["completed"]
+        assert not [
+            e for e in kb.list_events(conn, tid)
+            if e.kind in {"timed_out", "gave_up"}
+        ]
+
+
+def test_budget_failure_cas_cannot_mutate_newer_run(kanban_home):
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="retry guarded", assignee="worker")
+        kb.claim_task(conn, tid)
+        run1 = kb.latest_run(conn, tid)
+        kb._record_task_failure(
+            conn,
+            tid,
+            error="first budget exhaustion",
+            outcome="timed_out",
+            release_claim=True,
+            end_run=True,
+            expected_run_id=run1.id,
+            failure_limit=3,
+        )
+        kb.claim_task(conn, tid)
+        run2 = kb.latest_run(conn, tid)
+
+        assert not kb._record_task_failure(
+            conn,
+            tid,
+            error="stale budget exhaustion",
+            outcome="timed_out",
+            release_claim=True,
+            end_run=True,
+            expected_run_id=run1.id,
+            failure_limit=3,
+        )
+
+        task = kb.get_task(conn, tid)
+        assert task.status == "running"
+        assert task.current_run_id == run2.id
+        assert task.consecutive_failures == 1
+        assert run2.outcome is None
+
+
+@pytest.mark.parametrize(
+    ("failure_limit", "budget_outcome"), [(3, "timed_out"), (1, "gave_up")]
+)
+def test_completion_grace_accepts_same_budget_benched_run(
+    kanban_home, monkeypatch, failure_limit, budget_outcome
+):
+    monkeypatch.setattr(
+        "hermes_cli.config.load_config",
+        lambda: {"kanban": {"terminal_completion_grace_seconds": 30}},
+    )
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="finished at budget", assignee="worker")
+        kb.claim_task(conn, tid)
+        run = kb.latest_run(conn, tid)
+        kb._record_task_failure(
+            conn,
+            tid,
+            error="Iteration budget exhausted (4/4)",
+            outcome="timed_out",
+            release_claim=True,
+            end_run=True,
+            expected_run_id=run.id,
+            failure_limit=failure_limit,
+        )
+
+        assert kb.complete_task(
+            conn,
+            tid,
+            summary="work was already finished",
+            expected_run_id=run.id,
+        )
+
+        runs = kb.list_runs(conn, tid)
+        assert [r.outcome for r in runs] == [budget_outcome, "completed"]
+        assert runs[-1].metadata["accepted_after_budget_run_id"] == run.id
+        accepted = [
+            e for e in kb.list_events(conn, tid)
+            if e.kind == "accepted_terminal_after_budget_bench"
+        ]
+        assert len(accepted) == 1
+        assert accepted[0].payload["budget_run_id"] == run.id
+
+
+@pytest.mark.parametrize("failure_error", ["worker crashed", "Iteration budget exhausted (4/4)"])
+def test_completion_grace_rejects_non_budget_or_expired_run(
+    kanban_home, monkeypatch, failure_error
+):
+    monkeypatch.setattr(
+        "hermes_cli.config.load_config",
+        lambda: {"kanban": {"terminal_completion_grace_seconds": 5}},
+    )
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="late completion", assignee="worker")
+        kb.claim_task(conn, tid)
+        run = kb.latest_run(conn, tid)
+        kb._record_task_failure(
+            conn,
+            tid,
+            error=failure_error,
+            outcome="timed_out",
+            release_claim=True,
+            end_run=True,
+            expected_run_id=run.id,
+            failure_limit=3,
+        )
+        if failure_error.startswith("Iteration budget"):
+            conn.execute(
+                "UPDATE task_runs SET ended_at = ended_at - 10 WHERE id = ?",
+                (run.id,),
+            )
+
+        assert not kb.complete_task(
+            conn,
+            tid,
+            summary="too late or wrong cause",
+            expected_run_id=run.id,
+        )
+        assert kb.get_task(conn, tid).status == "ready"
+        assert [r.outcome for r in kb.list_runs(conn, tid)] == ["timed_out"]
+
+
 def test_stale_run_cannot_block_or_heartbeat_new_attempt(kanban_home, monkeypatch):
     """Stale retry attempts cannot mutate the active run lifecycle."""
     import hermes_cli.kanban_db as _kb
@@ -3592,11 +3739,40 @@ def _make_create_ns(**overrides):
         created_by="user", workspace="scratch", tenant=None,
         priority=0, parent=None, triage=False,
         idempotency_key=None, max_runtime=None, skills=None,
+        worker_max_turns=None,
         json=False,
     )
     for k, v in overrides.items():
         setattr(ns, k, v)
     return ns
+
+
+def test_cli_create_forwards_worker_max_turns(kanban_home, monkeypatch, capsys):
+    from hermes_cli import kanban as kb_cli
+
+    monkeypatch.setattr("gateway.status.get_running_pid", lambda: 4242)
+    ns = _make_create_ns(title="budgeted", worker_max_turns=13)
+
+    assert kb_cli._cmd_create(ns) == 0
+    with kb.connect() as conn:
+        task = next(t for t in kb.list_tasks(conn) if t.title == "budgeted")
+    assert task.worker_max_turns == 13
+    capsys.readouterr()
+
+
+@pytest.mark.parametrize("worker_max_turns", [0, -1])
+def test_cli_create_rejects_non_positive_worker_max_turns(
+    kanban_home, monkeypatch, capsys, worker_max_turns
+):
+    from hermes_cli import kanban as kb_cli
+
+    monkeypatch.setattr("gateway.status.get_running_pid", lambda: 4242)
+    ns = _make_create_ns(title="bad budget", worker_max_turns=worker_max_turns)
+
+    assert kb_cli._cmd_create(ns) == 2
+    assert "--worker-max-turns must be >= 1" in capsys.readouterr().err
+    with kb.connect() as conn:
+        assert not [t for t in kb.list_tasks(conn) if t.title == "bad budget"]
 
 
 def test_cli_create_warns_when_no_gateway(kanban_home, monkeypatch, capsys):

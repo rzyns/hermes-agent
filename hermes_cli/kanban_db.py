@@ -1117,6 +1117,10 @@ class Task:
     # Goal-loop turn budget for ``goal_mode`` workers. ``None`` falls
     # through to the goals engine default (``goals.DEFAULT_MAX_TURNS``).
     goal_max_turns: Optional[int] = None
+    # Per-conversation API/tool iteration budget for this worker. This is
+    # deliberately independent from ``goal_max_turns`` (outer conversations).
+    # ``None`` preserves the assignee profile's ``agent.max_turns`` setting.
+    worker_max_turns: Optional[int] = None
     # Originating chat/agent session id, when the task was created from
     # within an agent loop that propagated ``HERMES_SESSION_ID``. NULL for
     # tasks created from the CLI, the dashboard, or any path that doesn't
@@ -1209,6 +1213,11 @@ class Task:
             ),
             goal_max_turns=(
                 row["goal_max_turns"] if "goal_max_turns" in keys and row["goal_max_turns"] else None
+            ),
+            worker_max_turns=(
+                row["worker_max_turns"]
+                if "worker_max_turns" in keys and row["worker_max_turns"]
+                else None
             ),
             session_id=(
                 row["session_id"] if "session_id" in keys else None
@@ -1396,6 +1405,9 @@ CREATE TABLE IF NOT EXISTS tasks (
     -- Goal-loop turn budget for ``goal_mode`` workers. NULL = use the
     -- goals-engine default.
     goal_max_turns       INTEGER,
+    -- Per-conversation API/tool iteration budget passed to the worker CLI as
+    -- ``--max-turns``. NULL = preserve the assignee profile's setting.
+    worker_max_turns     INTEGER,
     -- Originating chat/agent session id when the task was created from
     -- inside an agent loop that propagated ``HERMES_SESSION_ID``. NULL
     -- for tasks created from the CLI, dashboard, or any path that doesn't
@@ -2319,6 +2331,13 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
             conn, "tasks", "goal_max_turns", "goal_max_turns INTEGER"
         )
 
+    if "worker_max_turns" not in cols:
+        # Per-conversation API/tool iteration budget. NULL preserves the
+        # worker profile's existing ``agent.max_turns`` behavior.
+        _add_column_if_missing(
+            conn, "tasks", "worker_max_turns", "worker_max_turns INTEGER"
+        )
+
     if "session_id" not in cols:
         # Originating agent/chat session id, populated when the task is
         # created from within an agent loop that propagated
@@ -2778,6 +2797,7 @@ def create_task(
     max_retries: Optional[int] = None,
     goal_mode: bool = False,
     goal_max_turns: Optional[int] = None,
+    worker_max_turns: Optional[int] = None,
     initial_status: str = "running",
     session_id: Optional[str] = None,
     board: Optional[str] = None,
@@ -2822,6 +2842,8 @@ def create_task(
         branch_name = str(branch_name).strip() or None
     if branch_name and workspace_kind != "worktree":
         raise ValueError("branch_name is only valid for worktree workspaces")
+    if worker_max_turns is not None and int(worker_max_turns) < 1:
+        raise ValueError("worker_max_turns must be >= 1")
 
     # Resolve an optional first-class Project link. A project-linked task is
     # anchored to the project's primary repo as a git worktree, so its branch
@@ -3010,8 +3032,9 @@ def create_task(
                         created_by, created_at, workspace_kind, workspace_path,
                         branch_name, project_id, tenant, idempotency_key,
                         max_runtime_seconds,
-                        skills, max_retries, goal_mode, goal_max_turns, session_id
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        skills, max_retries, goal_mode, goal_max_turns,
+                        worker_max_turns, session_id
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         task_id,
@@ -3033,6 +3056,7 @@ def create_task(
                         int(max_retries) if max_retries is not None else None,
                         1 if goal_mode else 0,
                         int(goal_max_turns) if goal_max_turns is not None else None,
+                        int(worker_max_turns) if worker_max_turns is not None else None,
                         session_id,
                     ),
                 )
@@ -4683,6 +4707,66 @@ class CompletionResultRequiredError(ValueError):
         )
 
 
+def _terminal_completion_grace_seconds() -> int:
+    """Return the default-off budget-bench completion grace window."""
+    try:
+        from hermes_cli.config import load_config
+
+        raw = (load_config().get("kanban") or {}).get(
+            "terminal_completion_grace_seconds", 0
+        )
+        return max(0, int(raw or 0))
+    except Exception:  # pragma: no cover - config loading must fail closed
+        return 0
+
+
+def _eligible_budget_bench_run(
+    conn: sqlite3.Connection,
+    task_id: str,
+    expected_run_id: int,
+    *,
+    now: int,
+) -> Optional[sqlite3.Row]:
+    """Return the same latest budget-benched run when grace may accept it."""
+    grace = _terminal_completion_grace_seconds()
+    if grace <= 0:
+        return None
+    row = conn.execute(
+        """
+        SELECT r.*, t.status AS task_status,
+               t.block_kind AS task_block_kind,
+               t.block_error_type AS task_block_error_type
+          FROM task_runs r
+          JOIN tasks t ON t.id = r.task_id
+         WHERE r.task_id = ? AND r.id = ?
+           AND r.id = (SELECT MAX(id) FROM task_runs WHERE task_id = ?)
+           AND t.current_run_id IS NULL
+           AND t.status IN ('ready', 'blocked')
+           AND r.ended_at IS NOT NULL
+           AND r.outcome IN ('timed_out', 'gave_up')
+        """,
+        (task_id, int(expected_run_id), task_id),
+    ).fetchone()
+    if row is None:
+        return None
+    age = now - int(row["ended_at"])
+    if age < 0 or age > grace:
+        return None
+    block_kind, contract, _ = _failure_contract(
+        error=str(row["error"] or ""),
+        outcome=str(row["outcome"] or ""),
+    )
+    if block_kind != "budget" or contract.get("error_type") != "budget_exhausted":
+        return None
+    if row["task_status"] == "blocked" and (
+        row["outcome"] != "gave_up"
+        or row["task_block_kind"] != "budget"
+        or row["task_block_error_type"] != "budget_exhausted"
+    ):
+        return None
+    return row
+
+
 def complete_task(
     conn: sqlite3.Connection,
     task_id: str,
@@ -4763,6 +4847,7 @@ def complete_task(
     metadata = _merge_completion_prose_artifacts(
         conn, task_id, metadata, summary=summary, result=result,
     )
+    accepted_budget_run_id: Optional[int] = None
     with write_txn(conn):
         if expected_run_id is None:
             cur = conn.execute(
@@ -4808,7 +4893,37 @@ def complete_task(
                 (effective_result, now, task_id, int(expected_run_id)),
             )
         if cur.rowcount != 1:
-            return False
+            if expected_run_id is None:
+                return False
+            budget_run = _eligible_budget_bench_run(
+                conn, task_id, int(expected_run_id), now=now
+            )
+            if budget_run is None:
+                return False
+            cur = conn.execute(
+                """
+                UPDATE tasks
+                   SET status       = 'done',
+                       result       = ?,
+                       completed_at = ?,
+                       claim_lock   = NULL,
+                       claim_expires= NULL,
+                       worker_pid   = NULL,
+                       block_kind   = NULL,
+                       block_recurrences = 0,
+                       block_fingerprint = NULL,
+                       block_deadline = NULL,
+                       block_retry_after = NULL,
+                       block_error_type = NULL
+                 WHERE id = ?
+                   AND status IN ('ready', 'blocked')
+                   AND current_run_id IS NULL
+                """,
+                (effective_result, now, task_id),
+            )
+            if cur.rowcount != 1:
+                return False
+            accepted_budget_run_id = int(budget_run["id"])
         if isinstance(metadata, dict):
             _persist_scratch_completion_artifacts(conn, task_id, metadata)
             for stored_path in metadata.pop("_staged_artifacts", []):
@@ -4821,11 +4936,15 @@ def complete_task(
                     size=path.stat().st_size,
                     created_at=now,
                 )
+        run_metadata = metadata
+        if accepted_budget_run_id is not None:
+            run_metadata = dict(metadata) if isinstance(metadata, dict) else {}
+            run_metadata["accepted_after_budget_run_id"] = accepted_budget_run_id
         run_id = _end_run(
             conn, task_id,
             outcome="completed", status="done",
             summary=effective_result,
-            metadata=metadata,
+            metadata=run_metadata,
         )
         # If complete_task was called on a never-claimed task (ready or
         # blocked → done with no run in flight), synthesize a
@@ -4836,7 +4955,15 @@ def complete_task(
                 conn, task_id,
                 outcome="completed",
                 summary=effective_result,
-                metadata=metadata,
+                metadata=run_metadata,
+            )
+        if accepted_budget_run_id is not None:
+            _append_event(
+                conn,
+                task_id,
+                "accepted_terminal_after_budget_bench",
+                {"budget_run_id": accepted_budget_run_id},
+                run_id=run_id,
             )
         # Carry the handoff summary in the event payload so gateway
         # notifiers and dashboard WS consumers can render it without a
@@ -8564,6 +8691,7 @@ def _record_task_failure(
     force_trip: bool = False,
     release_claim: bool = False,
     end_run: bool = False,
+    expected_run_id: Optional[int] = None,
     event_payload_extra: Optional[dict] = None,
 ) -> bool:
     """Record a non-success outcome (spawn_failed / crashed / timed_out)
@@ -8618,11 +8746,24 @@ def _record_task_failure(
     fingerprint = contract_payload["fingerprint"]
     blocked = False
     with write_txn(conn):
-        row = conn.execute(
-            "SELECT consecutive_failures, status, max_retries, "
-            "last_failure_error "
-            "FROM tasks WHERE id = ?", (task_id,),
-        ).fetchone()
+        if expected_run_id is None:
+            row = conn.execute(
+                "SELECT consecutive_failures, status, max_retries, "
+                "last_failure_error, current_run_id "
+                "FROM tasks WHERE id = ? AND status IN ('running', 'ready')",
+                (task_id,),
+            ).fetchone()
+        else:
+            # Active-run CAS: a stale finalizer must never mutate a completed
+            # task or a newer retry. The write transaction makes this guarded
+            # read + the subsequent transition atomic against completion.
+            row = conn.execute(
+                "SELECT consecutive_failures, status, max_retries, "
+                "last_failure_error, current_run_id "
+                "FROM tasks WHERE id = ? "
+                "AND status IN ('running', 'ready') AND current_run_id = ?",
+                (task_id, int(expected_run_id)),
+            ).fetchone()
         if row is None:
             return False
         failures = int(row["consecutive_failures"]) + 1
@@ -9818,6 +9959,8 @@ def _sanitize_worker_execution_context(env: dict[str, str]) -> None:
         "HERMES_INTERACTIVE",
         "HERMES_EXEC_ASK",
         "HERMES_TUI",
+        "HERMES_KANBAN_GOAL_MODE",
+        "HERMES_KANBAN_GOAL_MAX_TURNS",
     ):
         env.pop(marker, None)
 
@@ -9961,6 +10104,20 @@ def _default_spawn(
                 cmd.extend(["--skills", sk])
     if task.model_override:
         cmd.extend(["-m", task.model_override])
+    worker_max_turns = task.worker_max_turns
+    if worker_max_turns is None and task.goal_mode:
+        try:
+            from hermes_cli.config import load_config
+
+            configured = (load_config().get("kanban") or {}).get(
+                "goal_worker_max_turns"
+            )
+            if configured is not None and int(configured) >= 1:
+                worker_max_turns = int(configured)
+        except (TypeError, ValueError):
+            worker_max_turns = None
+    if worker_max_turns is not None:
+        cmd.extend(["--max-turns", str(int(worker_max_turns))])
     worker_toolsets = _resolve_worker_cli_toolsets(env.get("HERMES_HOME"))
     if worker_toolsets:
         cmd.extend(["--toolsets", ",".join(worker_toolsets)])

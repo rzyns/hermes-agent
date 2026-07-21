@@ -121,6 +121,25 @@ def test_create_task_appears_on_board(client):
     assert "researcher" in data["assignees"]
 
 
+def test_create_task_round_trips_worker_max_turns(client):
+    response = client.post(
+        "/api/plugins/kanban/tasks",
+        json={"title": "long eval", "assignee": "researcher", "worker_max_turns": 14},
+    )
+
+    assert response.status_code == 200, response.text
+    assert response.json()["task"]["worker_max_turns"] == 14
+
+
+def test_create_task_rejects_non_positive_worker_max_turns(client):
+    response = client.post(
+        "/api/plugins/kanban/tasks",
+        json={"title": "bad eval", "worker_max_turns": 0},
+    )
+
+    assert response.status_code == 422
+
+
 def test_board_list_recommends_persistent_workspace_for_configured_workdir(
     client, tmp_path
 ):

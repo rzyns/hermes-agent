@@ -41,6 +41,7 @@ def test_goal_mode_defaults_off(kanban_home):
         task = kb.get_task(conn, tid)
     assert task.goal_mode is False
     assert task.goal_max_turns is None
+    assert task.worker_max_turns is None
 
 
 def test_goal_mode_persists(kanban_home):
@@ -51,10 +52,24 @@ def test_goal_mode_persists(kanban_home):
             assignee="worker",
             goal_mode=True,
             goal_max_turns=7,
+            worker_max_turns=11,
         )
         task = kb.get_task(conn, tid)
     assert task.goal_mode is True
     assert task.goal_max_turns == 7
+    assert task.worker_max_turns == 11
+
+
+@pytest.mark.parametrize("value", [0, -1])
+def test_worker_max_turns_must_be_positive(kanban_home, value):
+    with kb.connect() as conn:
+        with pytest.raises(ValueError, match="worker_max_turns must be >= 1"):
+            kb.create_task(
+                conn,
+                title="invalid worker budget",
+                assignee="worker",
+                worker_max_turns=value,
+            )
 
 
 def test_goal_mode_without_max_turns(kanban_home):
@@ -111,10 +126,12 @@ def test_legacy_db_migrates_goal_columns(tmp_path, monkeypatch):
         cols = {r["name"] for r in conn.execute("PRAGMA table_info(tasks)")}
         assert "goal_mode" in cols
         assert "goal_max_turns" in cols
+        assert "worker_max_turns" in cols
         task = kb.get_task(conn, "legacy1")
     # Existing row keeps the safe default.
     assert task.goal_mode is False
     assert task.goal_max_turns is None
+    assert task.worker_max_turns is None
 
 
 # ---------------------------------------------------------------------------
@@ -147,6 +164,68 @@ def test_spawn_sets_goal_env_only_when_enabled(kanban_home, monkeypatch):
     env = captured["env"]
     assert env.get("HERMES_KANBAN_GOAL_MODE") == "1"
     assert env.get("HERMES_KANBAN_GOAL_MAX_TURNS") == "5"
+
+
+def test_spawn_per_card_worker_budget_wins_goal_config(kanban_home, monkeypatch):
+    captured = {}
+
+    class _FakeProc:
+        pid = 4244
+
+    monkeypatch.setattr(
+        "subprocess.Popen",
+        lambda cmd, **kwargs: captured.update(cmd=cmd, env=kwargs.get("env", {})) or _FakeProc(),
+    )
+    monkeypatch.setattr(
+        "hermes_cli.config.load_config",
+        lambda: {"kanban": {"goal_worker_max_turns": 6}},
+    )
+    with kb.connect() as conn:
+        tid = kb.create_task(
+            conn,
+            title="goal task",
+            assignee="default",
+            goal_mode=True,
+            goal_max_turns=30,
+            worker_max_turns=4,
+        )
+        task = kb.get_task(conn, tid)
+
+    kb._default_spawn(task, str(kanban_home))
+
+    assert captured["cmd"][captured["cmd"].index("--max-turns") + 1] == "4"
+    assert captured["env"]["HERMES_KANBAN_GOAL_MAX_TURNS"] == "30"
+
+
+@pytest.mark.parametrize("goal_mode, expected", [(True, "6"), (False, None)])
+def test_spawn_goal_worker_budget_config_only_applies_to_goal_cards(
+    kanban_home, monkeypatch, goal_mode, expected
+):
+    captured = {}
+
+    class _FakeProc:
+        pid = 4245
+
+    monkeypatch.setattr(
+        "subprocess.Popen",
+        lambda cmd, **kwargs: captured.update(cmd=cmd) or _FakeProc(),
+    )
+    monkeypatch.setattr(
+        "hermes_cli.config.load_config",
+        lambda: {"kanban": {"goal_worker_max_turns": 6}},
+    )
+    with kb.connect() as conn:
+        tid = kb.create_task(
+            conn, title="task", assignee="default", goal_mode=goal_mode
+        )
+        task = kb.get_task(conn, tid)
+
+    kb._default_spawn(task, str(kanban_home))
+
+    if expected is None:
+        assert "--max-turns" not in captured["cmd"]
+    else:
+        assert captured["cmd"][captured["cmd"].index("--max-turns") + 1] == expected
 
 
 def test_spawn_no_goal_env_for_plain_task(kanban_home, monkeypatch):

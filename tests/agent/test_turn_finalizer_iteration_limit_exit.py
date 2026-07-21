@@ -270,6 +270,7 @@ def test_pending_response_does_not_mask_later_terminal_exit(
 def test_pending_response_records_kanban_timeout(monkeypatch):
     monkeypatch.setattr("hermes_cli.plugins.invoke_hook", lambda *_a, **_kw: [])
     monkeypatch.setenv("HERMES_KANBAN_TASK", "task-123")
+    monkeypatch.setenv("HERMES_KANBAN_RUN_ID", "456")
     record = MagicMock(name="record_task_failure")
     conn = SimpleNamespace(close=lambda: None)
     monkeypatch.setattr("hermes_cli.kanban_db.connect", lambda: conn)
@@ -294,5 +295,6 @@ def test_pending_response_records_kanban_timeout(monkeypatch):
         outcome="timed_out",
         release_claim=True,
         end_run=True,
+        expected_run_id=456,
         event_payload_extra={"budget_used": 60, "budget_max": 60},
     )

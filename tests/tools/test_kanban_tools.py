@@ -314,6 +314,35 @@ def test_complete_happy_path(worker_env):
         conn.close()
 
 
+def test_complete_reports_budget_bench_grace(monkeypatch, worker_env):
+    from hermes_cli import kanban_db as kb
+    from tools import kanban_tools as kt
+
+    monkeypatch.setattr(
+        "hermes_cli.config.load_config",
+        lambda: {"kanban": {"terminal_completion_grace_seconds": 30}},
+    )
+    with kb.connect() as conn:
+        run = kb.latest_run(conn, worker_env)
+        assert run is not None
+        kb._record_task_failure(
+            conn,
+            worker_env,
+            error="Iteration budget exhausted (4/4)",
+            outcome="timed_out",
+            release_claim=True,
+            end_run=True,
+            expected_run_id=run.id,
+            failure_limit=3,
+        )
+    monkeypatch.setenv("HERMES_KANBAN_RUN_ID", str(run.id))
+
+    result = json.loads(kt._handle_complete({"summary": "finished at the limit"}))
+    assert result["ok"] is True
+    assert result["accepted_terminal_after_budget_bench"] is True
+    assert result["budget_run_id"] == run.id
+
+
 def test_complete_metadata_round_trips_through_show(worker_env):
     """Structured completion metadata should be visible to downstream agents."""
     from tools import kanban_tools as kt
@@ -1076,6 +1105,25 @@ def test_create_happy_path(worker_env):
         assert child.assignee == "peer"
     finally:
         conn.close()
+
+
+def test_create_forwards_worker_max_turns(worker_env):
+    from tools import kanban_tools as kt
+    from hermes_cli import kanban_db as kb
+
+    result = json.loads(kt._handle_create({
+        "title": "long child",
+        "assignee": "peer",
+        "parents": [worker_env],
+        "worker_max_turns": 12,
+    }))
+
+    assert result["ok"] is True
+    with kb.connect() as conn:
+        assert kb.get_task(conn, result["task_id"]).worker_max_turns == 12
+    assert kt.KANBAN_CREATE_SCHEMA["parameters"]["properties"][
+        "worker_max_turns"
+    ]["minimum"] == 1
 
 
 def test_create_inherits_worker_dir_workspace(monkeypatch, worker_env):

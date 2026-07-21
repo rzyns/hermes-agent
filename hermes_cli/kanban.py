@@ -375,6 +375,11 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
                           metavar="N", dest="goal_max_turns",
                           help="Turn budget for --goal workers (default 20). "
                                "Ignored without --goal.")
+    p_create.add_argument("--worker-max-turns", type=int, default=None,
+                          metavar="N", dest="worker_max_turns",
+                          help="Per-conversation API/tool iteration budget for "
+                               "the worker (minimum 1). Independent of "
+                               "--goal-max-turns; omit to use profile/config.")
     p_create.add_argument("--initial-status",
                           choices=sorted(kb.VALID_INITIAL_STATUSES),
                           default="running",
@@ -1585,6 +1590,13 @@ def _cmd_create(args: argparse.Namespace) -> int:
             file=sys.stderr,
         )
         return 2
+    worker_max_turns = getattr(args, "worker_max_turns", None)
+    if worker_max_turns is not None and worker_max_turns < 1:
+        print(
+            f"kanban: --worker-max-turns must be >= 1 (got {worker_max_turns})",
+            file=sys.stderr,
+        )
+        return 2
     with kb.connect_closing() as conn:
         task_id = kb.create_task(
             conn,
@@ -1606,6 +1618,7 @@ def _cmd_create(args: argparse.Namespace) -> int:
             max_retries=max_retries,
             goal_mode=bool(getattr(args, "goal_mode", False)),
             goal_max_turns=getattr(args, "goal_max_turns", None),
+            worker_max_turns=worker_max_turns,
             initial_status=getattr(args, "initial_status", "running"),
         )
         task = kb.get_task(conn, task_id)

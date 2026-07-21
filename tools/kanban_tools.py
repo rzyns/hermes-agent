@@ -752,7 +752,19 @@ def _handle_complete(args: dict, **kw) -> str:
                     f"could not complete {tid} (unknown id or already terminal)"
                 )
             run = kb.latest_run(conn, tid)
-            return _ok(task_id=tid, run_id=run.id if run else None)
+            accepted_budget_run_id = None
+            if run and isinstance(run.metadata, dict):
+                accepted_budget_run_id = run.metadata.get(
+                    "accepted_after_budget_run_id"
+                )
+            return _ok(
+                task_id=tid,
+                run_id=run.id if run else None,
+                accepted_terminal_after_budget_bench=(
+                    accepted_budget_run_id is not None
+                ),
+                budget_run_id=accepted_budget_run_id,
+            )
         finally:
             conn.close()
     except ValueError as e:
@@ -1224,6 +1236,7 @@ def _handle_create(args: dict, **kw) -> str:
     if goal_bool_error:
         return tool_error(goal_bool_error)
     goal_max_turns = args.get("goal_max_turns")
+    worker_max_turns = args.get("worker_max_turns")
     if isinstance(parents, str):
         parents = [parents]
     if not isinstance(parents, (list, tuple)):
@@ -1268,6 +1281,9 @@ def _handle_create(args: dict, **kw) -> str:
                 goal_mode=goal_mode,
                 goal_max_turns=(
                     int(goal_max_turns) if goal_max_turns is not None else None
+                ),
+                worker_max_turns=(
+                    int(worker_max_turns) if worker_max_turns is not None else None
                 ),
                 initial_status=str(initial_status),
                 created_by=os.environ.get("HERMES_PROFILE") or "worker",
@@ -2102,6 +2118,15 @@ KANBAN_CREATE_SCHEMA = {
                     "continuation turns the worker may take before the task "
                     "is blocked for review. Ignored unless goal_mode is "
                     "true. Defaults to the goal-engine default (20)."
+                ),
+            },
+            "worker_max_turns": {
+                "type": "integer",
+                "minimum": 1,
+                "description": (
+                    "Per-conversation API/tool iteration budget passed to the "
+                    "worker CLI as --max-turns. This is independent of "
+                    "goal_max_turns; omit it to preserve profile/config behavior."
                 ),
             },
             "board": _board_schema_prop(),

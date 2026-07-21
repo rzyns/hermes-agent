@@ -180,6 +180,11 @@ def finalize_turn(
         if _kanban_task:
             try:
                 from hermes_cli import kanban_db as _kb
+                _kanban_run_id = None
+                try:
+                    _kanban_run_id = int(os.environ.get("HERMES_KANBAN_RUN_ID", ""))
+                except (TypeError, ValueError):
+                    pass
                 _conn = _kb.connect()
                 try:
                     _kb._record_task_failure(
@@ -194,6 +199,7 @@ def finalize_turn(
                         outcome="timed_out",
                         release_claim=True,
                         end_run=True,
+                        expected_run_id=_kanban_run_id,
                         event_payload_extra={
                             "budget_used": api_call_count,
                             "budget_max": agent.max_iterations,
