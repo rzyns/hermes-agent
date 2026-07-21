@@ -48,6 +48,7 @@ import type { RpcEvent } from '@/types/hermes'
 const RECONNECT_ESCALATE_AFTER = 6
 
 interface GatewayBootOptions {
+  beforeConnectionSwitch: () => void
   handleGatewayEvent: (event: RpcEvent) => void
   onConnectionReady: (
     connection: Awaited<ReturnType<NonNullable<typeof window.hermesDesktop>['getConnection']>> | null
@@ -58,6 +59,7 @@ interface GatewayBootOptions {
 }
 
 export function useGatewayBoot({
+  beforeConnectionSwitch,
   handleGatewayEvent,
   onConnectionReady,
   onGatewayReady,
@@ -65,6 +67,7 @@ export function useGatewayBoot({
   refreshSessions
 }: GatewayBootOptions) {
   const callbacksRef = useRef({
+    beforeConnectionSwitch,
     handleGatewayEvent,
     onConnectionReady,
     onGatewayReady,
@@ -73,6 +76,7 @@ export function useGatewayBoot({
   })
 
   callbacksRef.current = {
+    beforeConnectionSwitch,
     handleGatewayEvent,
     onConnectionReady,
     onGatewayReady,
@@ -280,6 +284,7 @@ export function useGatewayBoot({
       reconnectAttempt = 0
       reconnectRecoveryRaised = false
       reauthNotified = false
+      callbacksRef.current.beforeConnectionSwitch()
       wipeSessionListsForGatewaySwitch()
 
       try {
