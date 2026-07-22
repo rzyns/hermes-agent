@@ -2433,6 +2433,29 @@ def terminal_tool(
                     "status": "blocked"
                 }, ensure_ascii=False)
 
+        # ACP editor terminal routing: when the active ACP session's
+        # workspace lives on the editor's host (VS Code Remote-SSH /
+        # containers / Kubernetes with Hermes running elsewhere), run the
+        # command through the editor via ACP terminal/* instead of a local
+        # environment. Placed AFTER the guard/approval and workdir checks so
+        # routed commands inherit the same security policy.
+        try:
+            from acp_adapter import terminal_bridge as _acp_terminal_bridge
+        except Exception:
+            _acp_terminal_bridge = None
+        if _acp_terminal_bridge is not None and _acp_terminal_bridge.acp_terminal_active():
+            acp_result = _acp_terminal_bridge.run_command(
+                command,
+                timeout=effective_timeout,
+                workdir=workdir,
+                background=background,
+                pty=pty,
+            )
+            if acp_result is not None:
+                if approval_note:
+                    acp_result["approval_note"] = approval_note
+                return json.dumps(acp_result, ensure_ascii=False)
+
         # Prepare command for execution
         pty_disabled_reason = None
         effective_pty = pty

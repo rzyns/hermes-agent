@@ -75,6 +75,7 @@ from acp_adapter.provenance import session_provenance_meta
 from acp_adapter.session import SessionManager, SessionState, _expand_acp_enabled_toolsets
 from acp_adapter.tools import build_tool_complete, build_tool_start
 from acp_adapter import filesystem as acp_filesystem
+from acp_adapter import terminal_bridge as acp_terminal_bridge
 from tools.approval import (
     reset_hermes_interactive_context,
     set_hermes_interactive_context,
@@ -1531,6 +1532,12 @@ class HermesACPAgent(acp.Agent):
             try:
                 if conn and self._client_capabilities:
                     with acp_filesystem.use_acp_filesystem(
+                        client=conn,
+                        session_id=session_id,
+                        loop=loop,
+                        cwd=getattr(state, "cwd", None),
+                        capabilities=self._client_capabilities,
+                    ), acp_terminal_bridge.use_acp_terminal(
                         client=conn,
                         session_id=session_id,
                         loop=loop,
