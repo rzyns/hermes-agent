@@ -1913,6 +1913,23 @@ def search_tool(pattern: str, target: str = "content", path: str = ".",
                 task_id: str = "default") -> str:
     """Search for content or files."""
     try:
+        # In an ACP session whose workspace lives on the editor's remote
+        # host, local search cannot see the workspace at all — it would
+        # silently return empty results from a same-named local path (or
+        # nothing). Fail loudly and steer to the terminal tool, which routes
+        # to the editor's workspace.
+        if acp_filesystem is not None and acp_filesystem.acp_remote_workspace_active():
+            return json.dumps({
+                "error": (
+                    "search_files runs locally, but this session's workspace "
+                    "is on the editor's remote host and is not visible here. "
+                    "Use the terminal tool instead — it runs in the editor's "
+                    "workspace — e.g. "
+                    "terminal(command=\"grep -rn 'PATTERN' PATH\") or rg."
+                ),
+                "pattern": pattern,
+            }, ensure_ascii=False)
+
         offset, limit = normalize_search_pagination(offset, limit)
 
         # Track searches to detect *consecutive* repeated search loops.

@@ -32,6 +32,12 @@ class ACPFilesystemContext:
     can_read: bool = False
     can_write: bool = False
     timeout: float = 30.0
+    # True when the session cwd does not exist on this machine — i.e. the
+    # editor's workspace is remote to Hermes (VS Code Remote-SSH / containers
+    # / Kubernetes). In that mode the local-disk fallback is disabled: a
+    # "resource not found" from the client must surface as an error instead
+    # of silently reading/writing a same-named local path.
+    remote_workspace: bool = False
 
 
 _context: contextvars.ContextVar[ACPFilesystemContext | None] = contextvars.ContextVar(
@@ -69,6 +75,12 @@ def use_acp_filesystem(
 ) -> Iterator[None]:
     """Bind ACP editor filesystem access for file tools in this context."""
 
+    remote_workspace = False
+    if cwd:
+        try:
+            remote_workspace = not os.path.isdir(cwd)
+        except OSError:
+            remote_workspace = True
     ctx = ACPFilesystemContext(
         client=client,
         session_id=session_id,
@@ -77,6 +89,7 @@ def use_acp_filesystem(
         can_read=supports_read(capabilities),
         can_write=supports_write(capabilities),
         timeout=timeout,
+        remote_workspace=remote_workspace,
     )
     token = _context.set(ctx)
     try:
@@ -116,6 +129,13 @@ def acp_read_active() -> bool:
 
     ctx = current_context()
     return bool(ctx and ctx.can_read)
+
+
+def acp_remote_workspace_active() -> bool:
+    """True when the active ACP session's workspace is remote to Hermes."""
+
+    ctx = current_context()
+    return bool(ctx and ctx.remote_workspace)
 
 
 def _should_fallback_to_local_filesystem(exc: Exception) -> bool:
@@ -165,7 +185,7 @@ def read_text_file(path: str, offset: int = 1, limit: int = 500) -> ReadResult |
             truncated=False,
         )
     except Exception as exc:
-        if _should_fallback_to_local_filesystem(exc):
+        if _should_fallback_to_local_filesystem(exc) and not ctx.remote_workspace:
             return None
         return ReadResult(error=f"ACP editor filesystem read failed for '{abs_path}': {exc}")
 
@@ -197,7 +217,7 @@ def read_text_file_raw(path: str) -> ReadResult | None:
             truncated=False,
         )
     except Exception as exc:
-        if _should_fallback_to_local_filesystem(exc):
+        if _should_fallback_to_local_filesystem(exc) and not ctx.remote_workspace:
             return None
         return ReadResult(error=f"ACP editor filesystem read failed for '{abs_path}': {exc}")
 
@@ -227,7 +247,7 @@ def write_text_file(path: str, content: str) -> WriteResult | None:
             dirs_created=False,
         )
     except Exception as exc:
-        if _should_fallback_to_local_filesystem(exc):
+        if _should_fallback_to_local_filesystem(exc) and not ctx.remote_workspace:
             return None
         return WriteResult(error=f"ACP editor filesystem write failed for '{abs_path}': {exc}")
 
@@ -331,12 +351,26 @@ def patch_v4a(
                 if resolved_new:
                     op.new_path = resolved_new
     if any(op.operation in {OperationType.DELETE, OperationType.MOVE} for op in operations):
+        if ctx.remote_workspace:
+            return PatchResult(error=(
+                "Delete/Move patch operations are not supported through the "
+                "ACP editor filesystem, and this session's workspace is on "
+                "the editor's remote host (no local fallback). Use the "
+                "terminal tool (rm / mv) instead."
+            ))
         return None
     if len(operations) != 1:
         # ACP editor writes are not transactional. Avoid partially applying a
         # multi-file patch if a later editor write reports a resource miss;
         # file_tools will retry the whole patch through its local fallback with
         # the same resolved paths.
+        if ctx.remote_workspace:
+            return PatchResult(error=(
+                "Multi-file patches are not supported through the ACP editor "
+                "filesystem (writes are not transactional), and this "
+                "session's workspace is on the editor's remote host (no "
+                "local fallback). Apply the patch one file at a time."
+            ))
         return None
 
     op = operations[0]
