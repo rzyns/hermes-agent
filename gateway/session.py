@@ -17,7 +17,7 @@ import threading
 import uuid
 from pathlib import Path
 from datetime import datetime, timedelta
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Any
 
 logger = logging.getLogger(__name__)
@@ -526,6 +526,13 @@ def build_session_context_prompt(
             "current message's Slack block/attachment payload when available, but "
             "you still cannot call Slack APIs yourself."
         )
+        if context.shared_multi_user_session:
+            lines.append(
+                "In shared Slack threads, use the current turn's sender prefix "
+                "as the only verified current-author mention target. Do not "
+                "guess or reuse `<@U...>` mentions from names, memory, or prior "
+                "conversation history."
+            )
     elif context.source.platform == Platform.DISCORD:
         # Inject the Discord IDs block only when the agent actually has
         # Discord tools loaded this session — i.e. the user opted into
@@ -691,6 +698,11 @@ class SessionEntry:
     display_name: Optional[str] = None
     platform: Optional[Platform] = None
     chat_type: str = "dm"
+
+    # Lightweight persisted key/value state scoped to this session entry
+    # (e.g. Slack thread-context watermarks). Survives gateway restarts via
+    # the routing index; must stay small and JSON-serializable.
+    metadata: Dict[str, Any] = field(default_factory=dict)
     
     # Token tracking
     input_tokens: int = 0
@@ -760,6 +772,7 @@ class SessionEntry:
             "display_name": self.display_name,
             "platform": self.platform.value if self.platform else None,
             "chat_type": self.chat_type,
+            "metadata": self.metadata,
             "input_tokens": self.input_tokens,
             "output_tokens": self.output_tokens,
             "cache_read_tokens": self.cache_read_tokens,
@@ -839,6 +852,7 @@ class SessionEntry:
             display_name=data.get("display_name"),
             platform=platform,
             chat_type=data.get("chat_type", "dm"),
+            metadata=dict(data.get("metadata") or {}),
             input_tokens=data.get("input_tokens", 0),
             output_tokens=data.get("output_tokens", 0),
             cache_read_tokens=data.get("cache_read_tokens", 0),
@@ -2148,6 +2162,42 @@ class SessionStore:
                     entry.origin,
                     display_name=entry.display_name,
                 )
+
+    def get_session_metadata(
+        self,
+        session_key: str,
+        key: str,
+        default: Any = None,
+    ) -> Any:
+        """Return a metadata value stored on a live session entry."""
+        with self._lock:
+            self._ensure_loaded_locked()
+            entry = self._entries.get(session_key)
+            if entry is None:
+                return default
+            return entry.metadata.get(key, default)
+
+    def set_session_metadata(
+        self,
+        session_key: str,
+        key: str,
+        value: Any,
+    ) -> bool:
+        """Persist a metadata value on a live session entry.
+
+        Values must be small and JSON-serializable — they are written into
+        the routing index (state.db gateway_routing table + the legacy
+        sessions.json mirror) so they survive gateway restarts.
+        """
+        with self._lock:
+            self._ensure_loaded_locked()
+            entry = self._entries.get(session_key)
+            if entry is None:
+                return False
+            entry.metadata[key] = value
+            entry.updated_at = _now()
+            self._save()
+            return True
 
     def set_model_override(
         self, session_key: str, override: Optional[Dict[str, Any]]
