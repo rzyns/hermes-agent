@@ -633,7 +633,17 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
     # --- repair ---
     p_repair = sub.add_parser(
         "repair",
-        help="Repair-candidate creation and approval-gated board swap",
+        help="Check DB integrity or manage approval-gated repair candidates",
+        description=(
+            "With no subcommand, run PRAGMA integrity_check and narrowly "
+            "auto-repair index-only corruption after preserving a quarantine "
+            "copy. Candidate subcommands retain the approval-gated board "
+            "recovery workflow."
+        ),
+    )
+    p_repair.add_argument(
+        "--json", action="store_true",
+        help="Emit the bare integrity-repair report as JSON",
     )
     repair_sub = p_repair.add_subparsers(dest="repair_action")
 
@@ -1155,6 +1165,14 @@ def kanban_command(args: argparse.Namespace) -> int:
     # schema creation; `create` / `list` / every other command would
     # error out on a fresh install.
     with board_scope:
+        # `repair` must dispatch BEFORE auto-init: on a corrupt DB init_db()
+        # itself raises KanbanDbCorruptError, so pre-initializing would make the
+        # repair command unreachable.
+        if action == "repair" and getattr(args, "repair_action", None) is None:
+            return _cmd_repair(args)
+
+        # Dispatchers and daemons own their initialization lifecycle. Keep that
+        # local behavior while auto-initializing every ordinary CLI handler.
         init_before_handler = action not in {"dispatch", "daemon"}
         if init_before_handler:
             try:
@@ -2289,7 +2307,7 @@ def _cmd_backup(args: argparse.Namespace) -> int:
     return exit_code
 
 
-def _cmd_repair(args: argparse.Namespace) -> int:
+def _cmd_repair_candidates(args: argparse.Namespace) -> int:
     """Dispatch repair subcommands."""
     from hermes_cli import kanban_health as kh
 
@@ -3544,6 +3562,79 @@ def _cmd_gc(args: argparse.Namespace) -> int:
     print(f"GC complete: {removed_ws} workspace(s), "
           f"{removed_events} event row(s), {removed_logs} log file(s) removed")
     return 0
+
+
+def _cmd_repair(args: argparse.Namespace) -> int:
+    """Dispatch candidate recovery or apply the narrow index-REINDEX repair.
+
+    Bare ``hermes kanban repair`` is dispatched BEFORE auto-init (init itself
+    refuses corrupt DBs), so it remains reachable on exactly the boards that
+    need it. Existing repair-candidate subcommands retain their initialized
+    handler path. Exit codes: 0 = healthy / repaired / no DB file, 1 = still
+    corrupt, and candidate subcommands retain their existing contracts.
+    """
+    if getattr(args, "repair_action", None) is not None:
+        return _cmd_repair_candidates(args)
+
+    try:
+        report = kb.repair_db()
+    except Exception as exc:  # locked/busy probe, unexpected I/O
+        print(f"kanban repair: {exc}", file=sys.stderr)
+        return 1
+
+    if getattr(args, "json", False):
+        print(json.dumps({
+            "status": report.status,
+            "db_path": str(report.db_path),
+            "messages": report.messages,
+            "post_repair_messages": report.post_repair_messages,
+            "backup_path": (
+                str(report.backup_path) if report.backup_path else None
+            ),
+            "reindexed": report.reindexed,
+        }, indent=2))
+        return 0 if report.status in {"ok", "repaired", "missing"} else 1
+
+    if report.status == "missing":
+        print(f"No kanban DB at {report.db_path} — nothing to repair.")
+        return 0
+    if report.status == "ok":
+        print(f"{report.db_path}: integrity_check ok — no repair needed.")
+        return 0
+    if report.status == "repaired":
+        print(f"{report.db_path}: repaired.")
+        print(f"  reindexed: {', '.join(report.reindexed)}")
+        if report.backup_path:
+            print(f"  pre-repair backup: {report.backup_path}")
+        print("  integrity_check now ok.")
+        return 0
+    # still corrupt
+    print(f"{report.db_path}: CORRUPT.", file=sys.stderr)
+    for line in (report.messages or [])[:10]:
+        print(f"  {line}", file=sys.stderr)
+    if report.reindexed:
+        print(
+            f"  REINDEX ({', '.join(report.reindexed)}) attempted but "
+            f"integrity_check is still failing:",
+            file=sys.stderr,
+        )
+        for line in (report.post_repair_messages or [])[:10]:
+            print(f"    {line}", file=sys.stderr)
+    else:
+        print(
+            "  Not an index-only failure — automatic REINDEX repair does "
+            "not apply (fail-closed).",
+            file=sys.stderr,
+        )
+    if report.backup_path:
+        print(f"  corrupt copy quarantined at: {report.backup_path}",
+              file=sys.stderr)
+    print(
+        "  Recover manually (e.g. `sqlite3 kanban.db \".recover\"` into a "
+        "fresh file) or move the file aside to start a new board.",
+        file=sys.stderr,
+    )
+    return 1
 
 
 # ---------------------------------------------------------------------------

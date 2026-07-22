@@ -217,8 +217,8 @@ def test_integrity_guard_treats_short_read_rows_as_transient(tmp_path, monkeypat
                 def __init__(self, value: str):
                     self.value = value
 
-                def fetchone(self):
-                    return (self.value,)
+                def fetchall(self):
+                    return [(self.value,)]
 
             if "integrity_check" in sql:
                 return FakeCursor(self.integrity_result)
@@ -268,8 +268,8 @@ def test_integrity_guard_reuses_backup_for_unchanged_corrupt_db(tmp_path, monkey
     class FakeProbe:
         def execute(self, _sql):
             class FakeCursor:
-                def fetchone(self):
-                    return ("bad btree",)
+                def fetchall(self):
+                    return [("bad btree",)]
             return FakeCursor()
 
         def close(self):
@@ -322,8 +322,8 @@ def test_integrity_guard_rechecks_initialized_path_when_file_changes(
     class FakeProbe:
         def execute(self, _sql):
             class FakeCursor:
-                def fetchone(self):
-                    return ("bad btree",)
+                def fetchall(self):
+                    return [("bad btree",)]
             return FakeCursor()
 
         def close(self):
