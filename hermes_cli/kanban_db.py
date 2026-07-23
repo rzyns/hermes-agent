@@ -10476,13 +10476,15 @@ def _default_spawn(
                 worker_max_turns = int(configured)
         except (TypeError, ValueError):
             worker_max_turns = None
-    if worker_max_turns is not None:
-        cmd.extend(["--max-turns", str(int(worker_max_turns))])
     worker_toolsets = _resolve_worker_cli_toolsets(env.get("HERMES_HOME"))
     if worker_toolsets:
         cmd.extend(["--toolsets", ",".join(worker_toolsets)])
+    cmd.append("chat")
+    # Unlike the shared model/toolset flags above, --max-turns is defined only
+    # on the chat subparser and must follow the subcommand.
+    if worker_max_turns is not None:
+        cmd.extend(["--max-turns", str(int(worker_max_turns))])
     cmd.extend([
-        "chat",
         "-q", prompt,
     ])
     if task.goal_mode:

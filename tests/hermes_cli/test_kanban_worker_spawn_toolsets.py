@@ -222,6 +222,43 @@ def test_default_spawn_model_override_survives_real_cli_parse(monkeypatch, tmp_p
     assert args.query == "work kanban task t_spawn_tools"
 
 
+def test_default_spawn_worker_max_turns_survives_real_cli_parse(monkeypatch, tmp_path):
+    """The worker budget must follow ``chat``, where the CLI defines it."""
+    root = tmp_path / ".hermes"
+    (root / "profiles" / "elias").mkdir(parents=True)
+    root.joinpath("config.yaml").write_text("{}\n", encoding="utf-8")
+    monkeypatch.setenv("HERMES_HOME", str(root))
+
+    from hermes_cli import kanban_db as kb
+    from hermes_cli._parser import build_top_level_parser
+
+    monkeypatch.setattr(kb, "_resolve_hermes_argv", lambda: ["hermes"])
+    captured = {}
+
+    class FakeProc:
+        pid = 4246
+
+    def fake_popen(cmd, *args, **kwargs):
+        captured["cmd"] = list(cmd)
+        return FakeProc()
+
+    monkeypatch.setattr(subprocess, "Popen", fake_popen)
+
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    task = _make_task(kb, assignee="elias")
+    task.worker_max_turns = 60
+    kb._default_spawn(task, str(workspace))
+
+    parser, _subparsers, _chat_parser = build_top_level_parser()
+    assert captured["cmd"][1:3] == ["-p", "elias"]
+    args = parser.parse_args(captured["cmd"][3:])
+
+    assert args.command == "chat"
+    assert args.max_turns == 60
+    assert args.query == "work kanban task t_spawn_tools"
+
+
 def test_resolve_worker_cli_toolsets_uses_profile_home_not_parent_config(monkeypatch, tmp_path):
     root = tmp_path / ".hermes"
     profile = root / "profiles" / "elias"
