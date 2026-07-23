@@ -49,6 +49,72 @@ def test_noauth_lmstudio_still_resolves(monkeypatch):
     assert resolved["api_key"]
 
 
+def test_external_provider_factory_preempts_conflicting_builtin_auth_alias(monkeypatch):
+    """A discovered external provider must route before auth alias inference."""
+    import providers
+    from providers.base import ProviderProfile
+
+    monkeypatch.setattr(providers, "_REGISTRY", {})
+    monkeypatch.setattr(providers, "_ALIASES", {})
+    monkeypatch.setattr(providers, "_CLIENT_FACTORIES", {})
+    monkeypatch.setattr(providers, "_discovered", True)
+
+    profile = ProviderProfile(
+        name="test-external",
+        aliases=("claude-code",),
+        base_url="test-external://local",
+        api_mode="chat_completions",
+        auth_type="external_process",
+    )
+    providers.register_provider(profile)
+    providers.register_provider_client_factory(profile.name, lambda **kwargs: kwargs)
+
+    def forbidden_builtin_resolution(*_args, **_kwargs):
+        raise AssertionError("external provider fell through to built-in auth inference")
+
+    monkeypatch.setattr(rp, "resolve_provider", forbidden_builtin_resolution)
+
+    resolved = rp.resolve_runtime_provider(requested="claude-code")
+
+    assert resolved == {
+        "provider": "test-external",
+        "api_mode": "chat_completions",
+        "base_url": "test-external://local",
+        "api_key": "test-external-external-process",
+        "source": "external-provider-factory",
+        "requested_provider": "claude-code",
+    }
+
+
+def test_external_provider_alias_honors_canonical_disabled_config(monkeypatch):
+    """Aliases must not bypass providers.<canonical>.enabled: false."""
+    import hermes_cli.config as config_module
+    import providers
+    from providers.base import ProviderProfile
+
+    monkeypatch.setattr(providers, "_REGISTRY", {})
+    monkeypatch.setattr(providers, "_ALIASES", {})
+    monkeypatch.setattr(providers, "_CLIENT_FACTORIES", {})
+    monkeypatch.setattr(providers, "_discovered", True)
+
+    profile = ProviderProfile(
+        name="test-external",
+        aliases=("claude-code",),
+        base_url="test-external://local",
+        api_mode="chat_completions",
+        auth_type="external_process",
+    )
+    providers.register_provider(profile)
+    providers.register_provider_client_factory(profile.name, lambda **kwargs: kwargs)
+
+    config = {"providers": {profile.name: {"enabled": False}}}
+    monkeypatch.setattr(rp, "load_config", lambda: config)
+    monkeypatch.setattr(config_module, "load_config", lambda: config)
+
+    with pytest.raises(ValueError, match="providers.test-external.enabled: false"):
+        rp.resolve_runtime_provider(requested="claude-code")
+
+
 def _fake_invoke_jwt(ttl_seconds=3600):
     header = base64.urlsafe_b64encode(b'{"alg":"none","typ":"JWT"}').decode().rstrip("=")
     payload = base64.urlsafe_b64encode(

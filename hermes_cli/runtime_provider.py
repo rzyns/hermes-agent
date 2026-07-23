@@ -1559,6 +1559,50 @@ def resolve_runtime_provider(
                 f"(providers.{requested_provider}.enabled: false)"
             )
 
+    # Provider plugins can own the transport through a registered client
+    # factory (for example, an external process exposed behind a marker URL).
+    # Resolve that identity before the built-in auth alias table: a plugin's
+    # canonical name or alias may intentionally overlap a bundled alias, and
+    # allowing auth inference to run first would silently select the wrong
+    # HTTP provider.
+    from providers import get_provider_client_factory, resolve_provider_profile
+
+    _external_profile = resolve_provider_profile(requested_provider)
+    _external_factory = get_provider_client_factory(requested_provider)
+    if (
+        _external_profile is not None
+        and _external_profile.auth_type == "external_process"
+        and _external_factory is not None
+    ):
+        # A caller may select the provider through an alias. Honour the
+        # canonical provider block as well so aliases cannot bypass an
+        # explicit providers.<canonical>.enabled: false policy.
+        if isinstance(_provs_cfg, dict):
+            _canonical_block = _provs_cfg.get(_external_profile.name)
+            if isinstance(_canonical_block, dict) and not is_provider_enabled(
+                _canonical_block
+            ):
+                raise ValueError(
+                    f"provider {_external_profile.name!r} is disabled in config "
+                    f"(providers.{_external_profile.name}.enabled: false)"
+                )
+
+        _external_base_url = str(_external_profile.base_url or "").strip().rstrip("/")
+        if not _external_base_url:
+            raise AuthError(
+                f"External-process provider {_external_profile.name!r} has no base URL."
+            )
+        return {
+            "provider": _external_profile.name,
+            "api_mode": _external_profile.api_mode or "chat_completions",
+            "base_url": _external_base_url,
+            # External-process factories own authentication. Keep a non-secret
+            # placeholder for client interfaces that require a non-empty key.
+            "api_key": f"{_external_profile.name}-external-process",
+            "source": "external-provider-factory",
+            "requested_provider": requested_provider,
+        }
+
     if requested_provider == "moa":
         return {
             "provider": "moa",
