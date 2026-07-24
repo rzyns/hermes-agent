@@ -1,14 +1,14 @@
 ---
-title: "Pinecone — Managed vector database for production AI applications"
+title: "Pinecone — Managed vector DB for production RAG and search"
 sidebar_label: "Pinecone"
-description: "Managed vector database for production AI applications"
+description: "Managed vector DB for production RAG and search"
 ---
 
 {/* This page is auto-generated from the skill's SKILL.md by website/scripts/generate-skill-docs.py. Edit the source SKILL.md, not this page. */}
 
 # Pinecone
 
-Managed vector database for production AI applications. Fully managed, auto-scaling, with hybrid search (dense + sparse), metadata filtering, and namespaces. Low latency (&lt;100ms p95). Use for production RAG, recommendation systems, or semantic search at scale. Best for serverless, managed infrastructure.
+Managed vector DB for production RAG and search.
 
 ## Skill metadata
 
