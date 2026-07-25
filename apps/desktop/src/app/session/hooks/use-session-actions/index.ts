@@ -82,6 +82,7 @@ import {
   patchSessionWorkspace,
   preserveLocalPendingTurnMessages,
   reconcileResumeMessages,
+  resolveSessionProfile,
   resolveStoredSession,
   sessionMatchesStoredId,
   sessionShouldHaveTranscript,
@@ -155,7 +156,14 @@ function reconcileAuthoritativeMessages(
 // A no-op for single-profile/local-pooled users (a backend resolves its own launch
 // profile to None). The sticky UI model/effort/fast ride as per-session overrides,
 // never the profile default (that lives in Settings → Model).
-async function desktopSessionCreateParams(cwd: string): Promise<Record<string, unknown>> {
+interface DesktopSessionCreateParamsOptions {
+  profile?: null | string
+}
+
+async function desktopSessionCreateParams(
+  cwd: string,
+  options?: DesktopSessionCreateParamsOptions
+): Promise<Record<string, unknown>> {
   // Treat Send as the linearization point for the visible selector state. The
   // profile handshake below can yield long enough for background config/model
   // refreshes to finish; reading atoms afterward would silently create the
@@ -167,7 +175,10 @@ async function desktopSessionCreateParams(cwd: string): Promise<Record<string, u
     provider: $currentProvider.get().trim()
   }
 
-  const profile = $newChatProfile.get() ?? normalizeProfileKey($activeGatewayProfile.get())
+  const profile = options
+    ? options.profile?.trim() || null
+    : ($newChatProfile.get() ?? normalizeProfileKey($activeGatewayProfile.get()))
+
   await ensureGatewayProfile(profile)
 
   return {
@@ -1056,12 +1067,27 @@ export function useSessionActions({
   // `parentStoredId` so it nests under its parent, then open it as its own tab
   // and switch to it — the parent chat stays put (mirrors openNewSessionTile).
   const forkBranch = useCallback(
-    async (branchMessages: BranchMessage[], parentStoredId: null | string, cwd?: string): Promise<boolean> => {
+    async (
+      branchMessages: BranchMessage[],
+      parentStoredId: null | string,
+      cwd?: string,
+      profile?: null | string
+    ): Promise<boolean> => {
       creatingSessionRef.current = true
 
       try {
+        // A branch belongs to its parent's OWNING profile. Swapping the live
+        // gateway first AND passing `profile` on the create mirrors
+        // desktopSessionCreateParams/resumeSession: in app-global remote mode
+        // one backend serves every profile, so an omitted profile silently
+        // lands the branch on the launch (default) profile — the "session
+        // jumps between profiles after branching" bug. The swap also makes
+        // upsertOptimisticSession's $activeGatewayProfile stamp correct.
+        await ensureGatewayProfile(profile)
+
         // No title: the backend auto-names the branch from its parent's lineage.
-        const params = await desktopSessionCreateParams(cwd || '')
+        const params = await desktopSessionCreateParams(cwd || '', { profile })
+
         const branched = await requestGateway<SessionCreateResponse>('session.create', {
           ...params,
           messages: branchMessages.map(({ content, role }) => ({ content, role })),
@@ -1164,7 +1190,12 @@ export function useSessionActions({
 
       clearNotifications()
 
-      return forkBranch(branchMessages, selectedStoredSessionIdRef.current, $currentCwd.get().trim())
+      // The open chat's owning profile, NOT the picker's / launch profile —
+      // /profile only retargets new chats, so a branch of an existing thread
+      // must stay on that thread's backend (cache hit for an open session).
+      const profile = await resolveSessionProfile(selectedStoredSessionIdRef.current)
+
+      return forkBranch(branchMessages, selectedStoredSessionIdRef.current, $currentCwd.get().trim(), profile)
     },
     [activeSessionIdRef, busyRef, copy, forkBranch, selectedStoredSessionIdRef]
   )
@@ -1196,7 +1227,7 @@ export function useSessionActions({
           return false
         }
 
-        return await forkBranch(branchMessages, stored?.id ?? storedSessionId, stored?.cwd?.trim())
+        return await forkBranch(branchMessages, stored?.id ?? storedSessionId, stored?.cwd?.trim(), profile)
       } catch (err) {
         notifyError(err, copy.branchFailed)
 
