@@ -259,6 +259,49 @@ def test_default_spawn_worker_max_turns_survives_real_cli_parse(monkeypatch, tmp
     assert args.query == "work kanban task t_spawn_tools"
 
 
+def test_default_spawn_uses_quiet_capital_Q_for_all_workers(monkeypatch, tmp_path):
+    """Every dispatcher-spawned worker, not only goal-mode workers, must use
+    the fully-quiet single-query path (`-Q`) so quota/429 failures reach
+    _single_query_failure_exit_code and exit with the sticky infra code."""
+    root = tmp_path / ".hermes"
+    (root / "profiles" / "elias").mkdir(parents=True)
+    root.joinpath("config.yaml").write_text("{}\n", encoding="utf-8")
+    monkeypatch.setenv("HERMES_HOME", str(root))
+
+    from hermes_cli import kanban_db as kb
+
+    monkeypatch.setattr(kb, "_resolve_hermes_argv", lambda: ["hermes"])
+    captured: list[list[str]] = []
+
+    class FakeProc:
+        pid = 4247
+
+    def fake_popen(cmd, *args, **kwargs):
+        captured.append(list(cmd))
+        return FakeProc()
+
+    monkeypatch.setattr(subprocess, "Popen", fake_popen)
+
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+
+    ordinary = _make_task(kb, assignee="elias")
+    ordinary.goal_mode = False
+    kb._default_spawn(ordinary, str(workspace))
+
+    goal = _make_task(kb, assignee="elias")
+    goal.goal_mode = True
+    goal.goal_max_turns = 10
+    kb._default_spawn(goal, str(workspace))
+
+    assert len(captured) == 2
+    for cmd in captured:
+        assert cmd.count("-Q") == 1, f"expected exactly one -Q, got {cmd}"
+        assert cmd.count("-q") == 1, f"expected exactly one -q, got {cmd}"
+        q_idx = cmd.index("-q")
+        assert cmd[q_idx + 1] == "work kanban task t_spawn_tools"
+
+
 def test_resolve_worker_cli_toolsets_uses_profile_home_not_parent_config(monkeypatch, tmp_path):
     root = tmp_path / ".hermes"
     profile = root / "profiles" / "elias"

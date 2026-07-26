@@ -3489,6 +3489,131 @@ class TestSharedBoardPaths:
         assert env["HERMES_KANBAN_TASK"] == "t_dispatch_env"
         assert env["HERMES_KANBAN_BRANCH"] == "wt/t_dispatch_env"
 
+    def test_dispatcher_spawn_uses_fully_quiet_flag_for_all_workers(
+        self, tmp_path, monkeypatch
+    ):
+        # Regression: ordinary (non-goal) workers must take the fully-quiet
+        # `-Q` path so provider quota / HTTP 429 failures reach the exit
+        # classifier and park as infra_blocked, not exit 0 as a protocol
+        # violation. Goal-mode workers must also still receive exactly one -Q.
+        default_home = tmp_path / ".hermes"
+        default_home.mkdir()
+        self._set_home(monkeypatch, tmp_path, default_home)
+
+        captured = {"spawns": []}
+
+        class _FakePopen:
+            def __init__(self, cmd, **kwargs):
+                captured["spawns"].append({"cmd": cmd, "env": kwargs.get("env", {})})
+                self.pid = 4243
+                self.returncode = None
+
+        monkeypatch.setattr("subprocess.Popen", _FakePopen)
+
+        base_task = dict(
+            id="t_quiet_flag",
+            title="x",
+            body=None,
+            assignee="coder",
+            status="ready",
+            priority=0,
+            created_by=None,
+            created_at=0,
+            started_at=None,
+            completed_at=None,
+            workspace_kind="scratch",
+            workspace_path=str(tmp_path / "ws"),
+            claim_lock=None,
+            claim_expires=None,
+            tenant=None,
+            branch_name=None,
+        )
+
+        # Ordinary worker.
+        task = kb.Task(**{**base_task, "id": "t_quiet_flag_ord", "goal_mode": False})
+        kb._default_spawn(task, str(tmp_path / "ws"))
+        last = captured["spawns"][-1]
+        assert last["cmd"].count("-Q") == 1
+        chat_idx = last["cmd"].index("chat")
+        assert last["cmd"][chat_idx + 1] == "-q"
+        assert last["cmd"][chat_idx + 3] == "-Q"
+
+        # Goal-mode worker.
+        task = kb.Task(**{**base_task, "id": "t_quiet_flag_goal", "goal_mode": True})
+        kb._default_spawn(task, str(tmp_path / "ws"))
+        last = captured["spawns"][-1]
+        assert last["cmd"].count("-Q") == 1
+        assert "HERMES_KANBAN_GOAL_MODE" in last["env"]
+
+    def test_spawn_retains_popen_handle_for_reap(
+        self, tmp_path, monkeypatch
+    ):
+        # Regression: dropping the Popen object lets Python's subprocess
+        # cleanup consume the child's exit status before the dispatcher reap
+        # loop runs, leading to ``unknown`` classification. _default_spawn
+        # must register the handle so reap_worker_zombies() records it.
+        default_home = tmp_path / ".hermes"
+        default_home.mkdir()
+        self._set_home(monkeypatch, tmp_path, default_home)
+
+        captured_proc = {}
+
+        class _FakePopen:
+            def __init__(self, cmd, **kwargs):
+                self.pid = 4244
+                self.returncode = None
+                self._closed = False
+                captured_proc["proc"] = self
+
+            def poll(self):
+                # Simulate child already exited with the infra sentinel.
+                self.returncode = kb.KANBAN_INFRA_EXIT_CODE
+                return self.returncode
+
+            def close(self):
+                self._closed = True
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *args):
+                self.close()
+
+        monkeypatch.setattr("subprocess.Popen", _FakePopen)
+
+        task = kb.Task(
+            id="t_retain_popen",
+            title="x",
+            body=None,
+            assignee="coder",
+            status="ready",
+            priority=0,
+            created_by=None,
+            created_at=0,
+            started_at=None,
+            completed_at=None,
+            workspace_kind="scratch",
+            workspace_path=str(tmp_path / "ws"),
+            claim_lock=None,
+            claim_expires=None,
+            tenant=None,
+            branch_name=None,
+        )
+        pid = kb._default_spawn(task, str(tmp_path / "ws"))
+        assert pid == 4244
+        assert pid in kb._active_worker_procs
+
+        # A subsequent Popen (e.g. another spawn or cleanup) should not steal
+        # the first child's wait status because we retained the handle.
+        reaped = kb.reap_worker_zombies()
+        assert pid in reaped
+        assert pid not in kb._active_worker_procs
+        assert kb._classify_worker_exit(pid) == (
+            "infra_blocked",
+            kb.KANBAN_INFRA_EXIT_CODE,
+        )
+        assert captured_proc["proc"]._closed
+
 
 # ---------------------------------------------------------------------------
 # latest_summary / latest_summaries — surface task_runs.summary handoffs

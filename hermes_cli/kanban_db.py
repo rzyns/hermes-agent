@@ -8288,6 +8288,11 @@ def reap_worker_zombies() -> "list[int]":
     children (returns []). No-op on Windows.
     """
     reaped: "list[int]" = []
+    # First, poll the dispatcher's retained Popen handles so we can record
+    # exact return codes before Python's subprocess cleanup consumes them.
+    for pid, raw_status in _poll_active_workers():
+        _record_worker_exit(pid, raw_status)
+        reaped.append(pid)
     if os.name != "nt":
         try:
             while True:
@@ -9894,6 +9899,11 @@ def _dispatch_once_locked(
     # reap_worker_zombies() for the full rationale.
     reap_worker_zombies()
 
+    # Trim stale retained handles on every dispatch tick so a long-running
+    # daemon with many workers doesn't leak Popen objects if any child
+    # somehow escapes normal completion.
+    _active_workers_age_trim()
+
     result = DispatchResult()
     result.reclaimed = release_stale_claims(conn)
     result.stale = detect_stale_running(
@@ -10722,14 +10732,18 @@ def _default_spawn(
         cmd.extend(["--max-turns", str(int(worker_max_turns))])
     cmd.extend([
         "-q", prompt,
+        # Every dispatcher-spawned worker must take the fully-quiet
+        # single-query path. That is the only branch in cli.py that calls
+        # _single_query_failure_exit_code(), which maps provider quota /
+        # HTTP 429 failures to the sticky KANBAN_INFRA_EXIT_CODE (78).  The
+        # partial-quiet (`-q` without `-Q`) path calls HermesCLI.chat(),
+        # discards the structured result, and exits 0 on quota walls —
+        # masquerading as a protocol violation and consuming retry budget.
+        "-Q",
     ])
-    if task.goal_mode:
-        # Goal-mode workers must take the fully-quiet single-query path:
-        # the kanban goal-loop hook (_run_kanban_goal_loop_q) only runs in
-        # cli.py's quiet branch. Without -Q the worker gets exactly one
-        # turn, prints text, exits rc=0, and the dispatcher records a
-        # protocol violation (incident 2026-06-09 t_d9cbe312).
-        cmd.append("-Q")
+    # Goal-loop mode is gated by the env vars set below, not by the
+    # presence of -Q. Both ordinary and goal workers now use the same
+    # structured-result exit contract.
     # Redirect output to a per-task log under <board-root>/logs/.
     # Anchored at the board root (not the shared kanban root), so
     # `hermes kanban log` on a specific board reads its own file and
@@ -10759,17 +10773,135 @@ def _default_spawn(
             "`hermes` executable not found on PATH. "
             "Install Hermes Agent or activate its venv before running the kanban dispatcher."
         )
-    # NOTE: we intentionally do NOT close log_f here — we want Popen's
-    # child process to keep writing after this function returns.  The
-    # handle is kept alive by the child's inheritance.  The parent's
-    # reference goes out of scope and is GC'd, but the OS-level FD stays
-    # open in the child until the child exits.
+    # Retain the Popen handle until we can reap the child ourselves.  If the
+    # parent's reference is dropped, subprocess._cleanup() may call waitpid()
+    # on the zombie before Hermes's reap loop runs; the exit status is then
+    # gone and _classify_worker_exit() returns ``unknown``.  Registering the
+    # handle lets dispatch_once record its returncode in the recent-exit
+    # registry and only then close the handle.
+    _register_active_worker(proc)
     return proc.pid
+
+
+# Bounded registry of in-flight dispatcher-spawned worker Popen handles.
+# Keyed by PID so reap_worker_zombies() can poll them explicitly, record
+# their exact exit status, and close the handle.  Entries are evicted on
+# completion or after a generous TTL to prevent unbounded growth on hosts
+# that spawn many short workers.
+_active_worker_procs: "dict[int, subprocess.Popen]" = {}
+_ACTIVE_WORKER_MAX_AGE_SECONDS = 3600
+
+
+def _register_active_worker(proc: "subprocess.Popen") -> None:
+    """Retain a spawned worker's Popen handle for later explicit reap."""
+    pid = proc.pid
+    if not pid:
+        return
+    proc._spawned_at = time.time()  # type: ignore[attr-defined]
+    _active_worker_procs[int(pid)] = proc
+
+
+def _close_active_worker(pid: int) -> None:
+    """Evict a worker Popen handle and close it without blocking."""
+    proc = _active_worker_procs.pop(int(pid), None)
+    if proc is None:
+        return
+    # Only close the parent's file descriptors; the child's copy stays
+    # open until the child exits. Each cleanup step is independent so a
+    # test fake missing one attribute does not swallow the rest.
+    for attr in ("stdin", "stdout", "stderr"):
+        stream = getattr(proc, attr, None)
+        if stream is not None:
+            try:
+                stream.close()
+            except Exception:
+                pass
+    # Real subprocess.Popen objects manage resources via __exit__; some
+    # test fakes / wrappers expose an explicit close(). Invoke it as a
+    # best-effort cleanup fallback without blocking.
+    close_fn = getattr(proc, "close", None)
+    if callable(close_fn):
+        try:
+            close_fn()
+        except Exception:
+            pass
+
+
+def _poll_active_workers() -> "list[tuple[int, int]]":
+    """Poll retained worker Popen handles and return reaped (pid, raw_status).
+
+    Each completed handle is evicted and closed.  Handles whose child has
+    not yet exited are left in the registry.  Return value is a list of
+    ``(pid, raw_wait_status)`` tuples suitable for ``_record_worker_exit``.
+    """
+    import subprocess
+    now = time.time()
+    reaped: "list[tuple[int, int]]" = []
+    completed_pids: "list[int]" = []
+    stale_pids: "list[int]" = []
+    for pid, proc in list(_active_worker_procs.items()):
+        returncode = getattr(proc, "returncode", None)
+        if returncode is None:
+            # poll() is non-blocking; returncode becomes set once the child
+            # has been waited on by Popen internals.
+            poll_fn = getattr(proc, "poll", None)
+            if callable(poll_fn):
+                try:
+                    poll_fn()
+                except Exception:
+                    pass
+            returncode = getattr(proc, "returncode", None)
+        if returncode is not None:
+            # Popen already waited this child; translate returncode to a raw
+            # wait-status shape so _classify_worker_exit can use WIFEXITED.
+            code = returncode
+            # Emulate the raw POSIX status: lower byte is exit code; signal
+            # deaths are encoded as negative returncode by Python.  We keep
+            # the registry entry format consistent with os.waitpid output.
+            if code >= 0:
+                raw_status = code << 8
+            else:
+                raw_status = 128 - code  # e.g. -9 -> 137 (128 + 9)
+            reaped.append((pid, raw_status))
+            completed_pids.append(pid)
+        elif (
+            getattr(proc, "_spawned_at", None) is not None
+            and now - proc._spawned_at > _ACTIVE_WORKER_MAX_AGE_SECONDS
+        ):
+            # Defensive: handle older than TTL but still not complete.
+            stale_pids.append(pid)
+    for pid in completed_pids + stale_pids:
+        _close_active_worker(pid)
+    return reaped
+
+
+def _active_workers_age_trim() -> None:
+    """Drop very old retained handles even if they haven't polled complete."""
+    now = time.time()
+    stale = [
+        pid
+        for pid, proc in _active_worker_procs.items()
+        if getattr(proc, "_spawned_at", None) is not None
+        and now - proc._spawned_at > _ACTIVE_WORKER_MAX_AGE_SECONDS
+    ]
+    for pid in stale:
+        _close_active_worker(pid)
+
+
+# Bounded registry of recently-reaped worker child exits, populated by the
+# reap loop at the top of ``dispatch_once`` and consulted by
+# ``detect_crashed_workers`` to classify a dead-pid task.
+#
+# Entry: ``pid -> (raw_wait_status, reaped_at_epoch)``. We keep raw status
+# so both ``os.WIFEXITED`` / ``os.WEXITSTATUS`` and ``os.WIFSIGNALED`` can
+# be consulted. Entries are trimmed by age (and total size cap as a
+# belt-and-braces against unbounded growth on exotic platforms).
 
 
 # ---------------------------------------------------------------------------
 # Long-lived dispatcher daemon
 # ---------------------------------------------------------------------------
+
 
 def run_daemon(
     *,
