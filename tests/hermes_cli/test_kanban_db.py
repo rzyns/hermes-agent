@@ -541,6 +541,112 @@ def test_link_keeps_ready_child_when_parent_already_done(kanban_home):
         assert kb.get_task(conn, b).status == "ready"
 
 
+def test_archived_parent_without_completion_blocks_recompute_ready(kanban_home):
+    """A parent archived but never completed (no completed_at) must not unblock children."""
+    with kb.connect() as conn:
+        parent = kb.create_task(conn, title="parent")
+        child = kb.create_task(conn, title="child", parents=[parent])
+        # Simulate a 'never-completed archived' parent.
+        conn.execute(
+            "UPDATE tasks SET status='archived', completed_at=NULL, result=NULL WHERE id=?",
+            (parent,),
+        )
+        conn.commit()
+        assert kb.recompute_ready(conn) == 0
+        assert kb.get_task(conn, child).status == "todo"
+
+
+def test_archived_parent_with_completion_satisfies_recompute_ready(kanban_home):
+    """A parent archived after a real completion still satisfies child dependencies."""
+    with kb.connect() as conn:
+        parent = kb.create_task(conn, title="parent")
+        child = kb.create_task(conn, title="child", parents=[parent])
+        kb.claim_task(conn, parent)
+        kb.complete_task(conn, parent, result="done")
+        # complete_task already promoted the child to ready.
+        assert kb.get_task(conn, child).status == "ready"
+        # Archiving the completed parent must not demote the child.
+        kb.archive_task(conn, parent)
+        assert kb.recompute_ready(conn) == 0  # already ready
+        assert kb.get_task(conn, child).status == "ready"
+        # And a fresh claim should succeed because the dependency is satisfied.
+        claimed = kb.claim_task(conn, child, claimer="host:1")
+    assert claimed is not None
+    assert claimed.status == "running"
+
+
+def test_claim_rejects_archived_parent_without_completion(kanban_home):
+    """claim_task must refuse a racy ready child when parent is archived-but-never-completed."""
+    with kb.connect() as conn:
+        parent = kb.create_task(conn, title="parent", assignee="a")
+        child = kb.create_task(
+            conn, title="child", assignee="a", parents=[parent],
+        )
+        # Force parent into never-completed archived.
+        conn.execute(
+            "UPDATE tasks SET status='archived', completed_at=NULL, result=NULL WHERE id=?",
+            (parent,),
+        )
+        # Simulate racy writer that promoted child despite the broken parent gate.
+        conn.execute("UPDATE tasks SET status='ready' WHERE id=?", (child,))
+        conn.commit()
+        result = kb.claim_task(conn, child, claimer="host:1")
+    assert result is None
+    with kb.connect() as conn:
+        assert kb.get_task(conn, child).status == "todo"
+
+
+def test_claim_succeeds_archived_parent_with_completion(kanban_home):
+    """claim_task succeeds when parent is archived after real completion."""
+    with kb.connect() as conn:
+        parent = kb.create_task(conn, title="parent", assignee="a")
+        child = kb.create_task(
+            conn, title="child", assignee="a", parents=[parent],
+        )
+        kb.claim_task(conn, parent)
+        kb.complete_task(conn, parent, result="ok")
+        kb.archive_task(conn, parent)
+        kb.recompute_ready(conn)
+        assert kb.get_task(conn, child).status == "ready"
+        claimed = kb.claim_task(conn, child, claimer="host:1")
+    assert claimed is not None
+    assert claimed.status == "running"
+
+
+def test_promote_task_rejects_archived_parent_without_completion(kanban_home):
+    """Manual promotion must refuse a never-completed archived parent."""
+    with kb.connect() as conn:
+        parent = kb.create_task(conn, title="parent")
+        child = kb.create_task(conn, title="child", parents=[parent])
+        conn.execute(
+            "UPDATE tasks SET status='archived', completed_at=NULL, result=NULL WHERE id=?",
+            (parent,),
+        )
+        conn.commit()
+        ok, reason = kb.promote_task(conn, child, actor="test")
+        assert not ok
+        assert "unsatisfied parent dependencies" in reason
+        assert parent in reason
+
+
+def test_promote_task_accepts_archived_parent_with_completion(kanban_home):
+    """Manual promotion works when parent is archived after real completion."""
+    with kb.connect() as conn:
+        parent = kb.create_task(conn, title="parent")
+        child = kb.create_task(conn, title="child", parents=[parent])
+        kb.claim_task(conn, parent)
+        kb.complete_task(conn, parent, result="ok")
+        # complete_task already promoted child to ready via recompute_ready; archive_task
+        # also calls recompute_ready, so demote child AFTER archiving to test manual path.
+        kb.archive_task(conn, parent)
+        conn.execute("UPDATE tasks SET status='todo' WHERE id=?", (child,))
+        conn.commit()
+        ok, reason = kb.promote_task(conn, child, actor="test")
+        assert ok
+        assert reason is None
+        assert kb.get_task(conn, child).status == "ready"
+
+
 def test_link_rejects_self_loop(kanban_home):
     with kb.connect() as conn:
         a = kb.create_task(conn, title="a")
@@ -3807,23 +3913,41 @@ def test_unlink_tasks_triggers_recompute_ready(kanban_home):
 
 
 def test_archive_task_triggers_recompute_ready_for_dependents(kanban_home):
-    """Archiving a parent must immediately unblock its children.
+    """Archiving a completed parent must immediately unblock its children.
 
-    ``recompute_ready()`` already treats ``archived`` parents as satisfied
-    dependencies, just like ``done``. Regression: ``archive_task()`` updated
-    the parent row but never ran the ready-promotion pass, so children stayed
-    stuck in ``todo`` until a later dispatcher tick.
+    A parent that is archived after a real completion satisfies child
+    dependencies the same as ``done``. Regression: ``archive_task()``
+    updated the parent row but never ran the ready-promotion pass, so
+    children stayed stuck in ``todo`` until a later dispatcher tick.
     """
     with kb.connect() as conn:
         parent = kb.create_task(conn, title="obsolete parent")
         child = kb.create_task(conn, title="child", parents=[parent])
 
-        assert kb.get_task(conn, child).status == "todo"
-        assert kb.archive_task(conn, parent) is True
+        # Archive without completion is NOT a satisfied dependency.
+        # Simulate the old "bare archived" state, then verify the fix.
+        conn.execute(
+            "UPDATE tasks SET status='archived', completed_at=NULL, result=NULL WHERE id=?",
+            (parent,),
+        )
+        conn.commit()
+        kb.recompute_ready(conn)
+        assert kb.get_task(conn, child).status == "todo", (
+            "bare archived parent without completion must not unblock child"
+        )
 
+        # Complete the parent, then archive: child should now be ready.
+        conn.execute(
+            "UPDATE tasks SET status='running', completed_at=NULL, result=NULL, "
+            "claim_lock='test:1', claim_expires=? WHERE id=?",
+            (int(time.time()) + 1000, parent),
+        )
+        conn.commit()
+        kb.complete_task(conn, parent, result="parent done")
+        assert kb.get_task(conn, child).status == "ready"
+        assert kb.archive_task(conn, parent) is True
         assert kb.get_task(conn, child).status == "ready", (
-            "child should promote to ready immediately after its last blocking "
-            "parent is archived"
+            "child should remain ready after its completed parent is archived"
         )
 
 # ---------------------------------------------------------------------------

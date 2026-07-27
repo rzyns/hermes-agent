@@ -107,6 +107,28 @@ def _kanban_dependencies():
     return _kd
 
 
+def _parent_dependency_satisfied(parent: sqlite3.Row) -> bool:
+    """Return True when a parent row satisfies child dependency gating.
+
+    A dependency is satisfied when the parent is genuinely terminal:
+    * status == "done", or
+    * status == "archived" AND completed_at IS NOT NULL.
+
+    An archived parent that never actually completed (completed_at IS NULL
+    and result IS NULL) does NOT satisfy the dependency. This prevents
+    tasks that were archived as stale / abandoned / never-started from
+    silently unblocking their children.
+    """
+    status = parent["status"]
+    if status == "done":
+        return True
+    if status == "archived":
+        completed_at = parent["completed_at"]
+        # completed_at is stored as INTEGER (unix timestamp) or NULL.
+        return completed_at is not None and completed_at != 0
+    return False
+
+
 # ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------
@@ -4412,12 +4434,12 @@ def recompute_ready(
                 # this predicate back).
                 continue
             parents = conn.execute(
-                "SELECT t.status FROM tasks t "
+                "SELECT t.status, t.completed_at FROM tasks t "
                 "JOIN task_links l ON l.parent_id = t.id "
                 "WHERE l.child_id = ?",
                 (task_id,),
             ).fetchall()
-            if all(p["status"] in ("done", "archived") for p in parents):
+            if all(_parent_dependency_satisfied(p) for p in parents):
                 external_blockers = _kanban_dependencies().unsatisfied_blockers_for(
                     board=effective_board,
                     task_id=task_id,
@@ -4485,13 +4507,13 @@ def claim_task(
         # 'todo' here — recompute_ready will re-promote when the parents
         # actually finish. See RCA at
         # kanban/boards/cookai/workspaces/t_a6acd07d/root-cause.md.
-        undone = conn.execute(
-            "SELECT 1 FROM task_links l "
+        parents = conn.execute(
+            "SELECT p.* FROM task_links l "
             "JOIN tasks p ON p.id = l.parent_id "
-            "WHERE l.child_id = ? AND p.status NOT IN ('done', 'archived') LIMIT 1",
+            "WHERE l.child_id = ?",
             (task_id,),
-        ).fetchone()
-        if undone:
+        ).fetchall()
+        if any(not _parent_dependency_satisfied(p) for p in parents):
             conn.execute(
                 "UPDATE tasks SET status = 'todo' "
                 "WHERE id = ? AND status = 'ready'",
@@ -6681,14 +6703,14 @@ def promote_task(
 
     if not force:
         parents = conn.execute(
-            "SELECT t.id, t.status FROM tasks t "
+            "SELECT t.id, t.status, t.completed_at FROM tasks t "
             "JOIN task_links l ON l.parent_id = t.id "
             "WHERE l.child_id = ?",
             (task_id,),
         ).fetchall()
         unsatisfied = [
             p["id"] for p in parents
-            if p["status"] not in ("done", "archived")
+            if not _parent_dependency_satisfied(p)
         ]
         if unsatisfied:
             return False, (
@@ -7442,9 +7464,9 @@ def archive_task(conn: sqlite3.Connection, task_id: str) -> bool:
             summary="task archived with run still active",
         )
         _append_event(conn, task_id, "archived", None, run_id=run_id)
-    # ``archived`` parents no longer block children, same as ``done``.
-    # Promote newly-unblocked dependents immediately instead of waiting
-    # for a later dispatcher tick.
+    # ``archived`` parents only unblock children if the parent actually
+    # completed before being archived (completed_at IS NOT NULL). A bare
+    # archived parent without a completion does not satisfy dependencies.
     recompute_ready(conn)
     return True
 
