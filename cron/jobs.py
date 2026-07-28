@@ -102,6 +102,46 @@ OUTPUT_DIR = CRON_DIR / "output"
 ONESHOT_GRACE_SECONDS = 120
 
 
+class _JobList(list):
+    """A job list that remembers which store generation it was loaded from.
+
+    ``load_jobs()`` returns one of these; ``_save_jobs_unlocked()`` uses the
+    recorded generation to refuse a write derived from a snapshot that is no
+    longer current (see ``_STALE_WRITE_NOTE``).
+
+    It is a plain ``list`` subclass on purpose. Every existing caller keeps
+    working unchanged, in-place mutation (``append``/``remove``/item assignment)
+    preserves the tag, and any caller that builds a *new* list — including every
+    ``save_jobs([...])`` literal and list comprehension in the tree — simply
+    carries no tag and is written without a freshness check. The guard therefore
+    fails OPEN for lists whose provenance it cannot establish, which keeps this
+    change additive rather than a behavioural break across ~2,900 call sites.
+    """
+
+    hermes_generation: Optional[str] = None
+
+
+# Why a freshness check exists at all, and why it is not a merge.
+#
+# The cross-process flock (#60703, see tests/cron/test_jobs_crossprocess_lock.py)
+# gives mutual exclusion: two writers cannot interleave. It does not give
+# freshness: a process that loaded jobs.json hours ago and then saves takes the
+# lock entirely legitimately and writes its stale list over everything that
+# landed in between. Observed 2026-07-28 — a gateway ~11 hours into its life
+# flushed its snapshot over a cron job a CLI worker had registered minutes
+# earlier, and the job ceased to exist.
+#
+# Merging on save is NOT viable as a fix. Under the lock we can re-read the
+# file, but we cannot distinguish "the caller deleted job X" from "the caller
+# never knew about job X" — a bare list carries no deletion signal. Merging
+# would resurrect deleted jobs and silently break ``hermes cron remove``, which
+# is a worse failure than the one being fixed. So we refuse the write instead,
+# and leave recovery to the caller's next load.
+_STALE_WRITE_NOTE = (
+    "refusing to write a stale jobs.json snapshot; reload before saving"
+)
+
+
 @dataclass(frozen=True)
 class _CronStorePaths:
     cron_dir: Path
@@ -1006,26 +1046,79 @@ def load_jobs() -> List[Dict[str, Any]]:
         jobs = data.get("jobs", [])
         if _strict_retry and jobs:
             # Hit control-character corruption — rewrite with proper escaping.
-            save_jobs(jobs)
+            # Pass an untagged copy: this is a repair of whatever is on disk
+            # right now, not a write derived from an earlier generation.
+            save_jobs(list(jobs))
             logger.warning("Auto-repaired jobs.json (had invalid control characters)")
-        return jobs
+            return _tagged_jobs(jobs, _read_store_generation())
+        return _tagged_jobs(jobs, data.get("updated_at"))
     if isinstance(data, list):
         # Bare array — likely saved/edited outside save_jobs(). Wrap it back
         # into the expected {"jobs": [...]} structure.
         if data:
-            save_jobs(data)
+            save_jobs(list(data))
             logger.warning("Auto-repaired jobs.json (bare list wrapped as dict)")
-        return data
+            return _tagged_jobs(data, _read_store_generation())
+        return _tagged_jobs(data, None)
 
     raise RuntimeError(
         f"Cron database corrupted: expected {{'jobs': [...]}}, got {type(data).__name__}"
     )
 
 
+def _tagged_jobs(jobs: Any, generation: Optional[str]) -> "_JobList":
+    """Wrap a job list so its store generation travels with it."""
+    tagged = _JobList(jobs or [])
+    tagged.hermes_generation = generation
+    return tagged
+
+
+def _read_store_generation() -> Optional[str]:
+    """Return the ``updated_at`` currently on disk, or None if unavailable.
+
+    None means "no generation to compare against" — a missing, empty, or
+    unparseable store. In every one of those cases there is nothing to protect,
+    so the caller is allowed to write.
+    """
+    jobs_file = _current_cron_store().jobs_file
+    try:
+        with open(jobs_file, "r", encoding="utf-8-sig") as f:
+            data = json.load(f)
+    except Exception:
+        return None
+    if isinstance(data, dict):
+        value = data.get("updated_at")
+        return value if isinstance(value, str) else None
+    return None
+
+
 def _save_jobs_unlocked(jobs: List[Dict[str, Any]]):
-    """Save all jobs to storage. Caller must hold _jobs_lock()."""
+    """Save all jobs to storage. Caller must hold _jobs_lock().
+
+    Refuses the write if ``jobs`` carries a store generation that is no longer
+    the one on disk — see ``_STALE_WRITE_NOTE``. Untagged lists are written
+    unconditionally, preserving historical behaviour.
+    """
     jobs_file = _current_cron_store().jobs_file
     ensure_dirs()
+
+    expected_generation = getattr(jobs, "hermes_generation", None)
+    if expected_generation is not None:
+        on_disk = _read_store_generation()
+        if on_disk is not None and on_disk != expected_generation:
+            # Loud on purpose: this is silent data loss being converted into a
+            # visible event. The write is abandoned; the caller recovers by
+            # calling load_jobs() again on its next cycle.
+            logger.error(
+                "%s (loaded generation %s, on-disk generation %s, store %s). "
+                "%d job(s) in the rejected snapshot were NOT written.",
+                _STALE_WRITE_NOTE,
+                expected_generation,
+                on_disk,
+                jobs_file,
+                len(jobs),
+            )
+            return
     # Snapshot the current owner BEFORE the atomic replace so a privileged
     # writer (root CLI in Docker) can hand ownership back to the gateway user
     # afterwards instead of locking its ticker out (#68483). When the file is
@@ -1041,13 +1134,19 @@ def _save_jobs_unlocked(jobs: List[Dict[str, Any]]):
             _stat_before = None
     fd, tmp_path = tempfile.mkstemp(dir=str(jobs_file.parent), suffix='.tmp', prefix='.jobs_')
     try:
+        _written_generation = _hermes_now().isoformat()
         with os.fdopen(fd, 'w', encoding='utf-8') as f:
-            json.dump({"jobs": jobs, "updated_at": _hermes_now().isoformat()}, f, indent=2)
+            json.dump({"jobs": list(jobs), "updated_at": _written_generation}, f, indent=2)
             f.flush()
             os.fsync(f.fileno())
         atomic_replace(tmp_path, jobs_file)
         _secure_file(jobs_file)
         _preserve_file_ownership(jobs_file, _stat_before)
+        # Re-tag the caller's list with the generation it just produced, so a
+        # legitimate save → mutate → save sequence on the same object is not
+        # mistaken for a stale write on the second call.
+        if isinstance(jobs, _JobList):
+            jobs.hermes_generation = _written_generation
     except BaseException:
         try:
             os.unlink(tmp_path)
