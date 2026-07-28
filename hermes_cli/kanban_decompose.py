@@ -32,6 +32,12 @@ Design notes
 * If the LLM picks an assignee that doesn't exist as a profile, we
   rewrite it to the configured ``default_assignee`` (or the default
   profile if unset). A child task NEVER ends up with ``assignee=None``.
+
+* ``triage`` has two populations and only one of them belongs to us.
+  Cards a person dropped in as a rough idea are ours to fan out. Cards
+  the unblock-loop breaker escalated (``block_task`` at
+  ``BLOCK_RECURRENCE_LIMIT``) are *explicitly* waiting on a human and
+  must be skipped — see ``_is_loop_escalated``.
 """
 
 from __future__ import annotations
@@ -41,7 +47,7 @@ import logging
 import os
 import re
 from dataclasses import dataclass
-from typing import Optional
+from typing import Any, Optional
 
 from hermes_cli import kanban_db as kb
 from hermes_cli import profiles as profiles_mod
@@ -298,6 +304,8 @@ def decompose_task(
         return DecomposeOutcome(
             task_id, False, f"task is not in triage (status={task.status!r})"
         )
+    if _is_loop_escalated(task):
+        return DecomposeOutcome(task_id, False, _LOOP_ESCALATED_REASON)
 
     cfg = _load_config()
     orchestrator = _resolve_orchestrator_profile(cfg)
@@ -487,8 +495,49 @@ def decompose_task(
     )
 
 
+# The unblock-loop breaker in ``kanban_db.block_task`` routes a task to
+# ``status='triage'`` once it has been blocked / unblocked / re-blocked for the
+# same cause ``BLOCK_RECURRENCE_LIMIT`` times. Its own comment states the intent:
+# "Route to triage for a human-in-the-loop decision instead of blocked."
+#
+# That lands the card in the auto-decomposer's intake queue, which is the
+# opposite of asking a human. Observed 2026-07-28: a root card waiting on a
+# release decision was escalated, decomposed into six children, flipped to
+# ``todo``, re-dispatched, re-blocked, escalated again — three times — and one
+# synthesised child was a mutating commit card aimed at a deliberately paused
+# lane. The person was never asked.
+#
+# Escalated cards are distinguishable: the loop breaker preserves
+# ``block_kind`` and leaves ``block_recurrences`` at or above the limit, while a
+# card created with ``triage=True`` has never been blocked and carries 0.
+_LOOP_ESCALATED_REASON = (
+    "task was escalated to triage by the unblock-loop breaker and is awaiting a "
+    "human-in-the-loop decision; auto-decomposition would answer it with a plan "
+    "instead of a person"
+)
+
+
+def _is_loop_escalated(task: Any) -> bool:
+    """True when a triage card got there via the unblock-loop breaker.
+
+    Reads defensively: callers pass both full task records and list rows, and a
+    missing counter must not be read as "escalated" — failing that way would
+    silently disable auto-decompose for ordinary triage cards.
+    """
+    try:
+        recurrences = int(getattr(task, "block_recurrences", 0) or 0)
+    except (TypeError, ValueError):
+        return False
+    return recurrences >= kb.BLOCK_RECURRENCE_LIMIT
+
+
 def list_triage_ids(*, tenant: Optional[str] = None) -> list[str]:
-    """Return task ids currently in the triage column."""
+    """Return task ids in the triage column that are eligible for decomposition.
+
+    Excludes cards the unblock-loop breaker escalated — see
+    ``_is_loop_escalated``. They occupy ``triage`` but are waiting on a person,
+    not on a plan.
+    """
     with kb.connect_closing() as conn:
         rows = kb.list_tasks(
             conn,
@@ -496,4 +545,4 @@ def list_triage_ids(*, tenant: Optional[str] = None) -> list[str]:
             tenant=tenant,
             limit=1000,
         )
-    return [row.id for row in rows]
+    return [row.id for row in rows if not _is_loop_escalated(row)]
