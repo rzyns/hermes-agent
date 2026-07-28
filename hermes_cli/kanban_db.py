@@ -129,6 +129,33 @@ def _parent_dependency_satisfied(parent: sqlite3.Row) -> bool:
     return False
 
 
+def _dependency_fingerprint(conn: sqlite3.Connection, task_id: str) -> str:
+    """Compute a stable fingerprint of the task's current dependency state.
+
+    Captures the material signals that determine whether a dependency_wait
+    can clear: each parent's id, status, and completed_at. When any of these
+    change (parent completes, parent re-opens, link removed, link added),
+    the fingerprint changes and the sticky gate releases. When nothing has
+    changed since the last dependency_wait block, the fingerprint matches
+    and the task stays parked.
+
+    We include the parent id in the hash (not just status/completed_at) so
+    adding or removing a link is itself a material change.
+    """
+    rows = conn.execute(
+        "SELECT t.id, t.status, t.completed_at FROM tasks t "
+        "JOIN task_links l ON l.parent_id = t.id "
+        "WHERE l.child_id = ? "
+        "ORDER BY t.id",
+        (task_id,),
+    ).fetchall()
+    parts = []
+    for r in rows:
+        parts.append(f"{r['id']}:{r['status']}:{r['completed_at']}")
+    raw = "|".join(parts)
+    return hashlib.sha256(raw.encode()).hexdigest()
+
+
 # ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------
@@ -208,6 +235,16 @@ def resolve_block_kind(
 # spirit (default 2) but counts a different signal: manual unblock recurrences,
 # not dispatcher spawn/crash/timeout failures.
 BLOCK_RECURRENCE_LIMIT = 2
+
+# Backstop for the dependency-wait hot loop (DISP-1, 2026-07-27). Even with
+# the sticky fingerprint gate, a task whose parent status flickers (or whose
+# external dependency provider returns inconsistent results) could still
+# cycle. This cap limits consecutive dependency_wait re-dispatches per task
+# before emitting an observable ``dependency_wait_backstop`` event and
+# leaving the card parked in ``todo`` — degrading the loop from unbounded
+# spend into a visible stalled card. Independent of ``consecutive_failures``
+# because a dependency_wait is not a failure.
+DEP_WAIT_REDISPATCH_CAP = 3
 VALID_WORKSPACE_KINDS = {"scratch", "worktree", "dir"}
 KNOWN_TOOLSET_NAMES = frozenset(name.casefold() for name in get_toolset_names())
 _IS_WINDOWS = sys.platform == "win32"
@@ -1197,6 +1234,13 @@ class Task:
     block_deadline: Optional[int] = None
     block_retry_after: Optional[int] = None
     block_error_type: Optional[str] = None
+    # Sticky dependency-wait fingerprint (DISP-1). Set when a worker blocks
+    # with kind=dependency; cleared when the blocking condition materially
+    # changes. See ``_dependency_fingerprint`` / ``recompute_ready``.
+    dep_wait_fingerprint: Optional[str] = None
+    # Consecutive dependency_wait re-dispatches under the same fingerprint.
+    # Used by the DEP_WAIT_REDISPATCH_CAP backstop.
+    dep_wait_count: int = 0
 
     @classmethod
     def from_row(cls, row: sqlite3.Row) -> "Task":
@@ -1306,6 +1350,16 @@ class Task:
             ),
             block_error_type=(
                 row["block_error_type"] if "block_error_type" in keys else None
+            ),
+            dep_wait_fingerprint=(
+                row["dep_wait_fingerprint"]
+                if "dep_wait_fingerprint" in keys
+                else None
+            ),
+            dep_wait_count=(
+                int(row["dep_wait_count"])
+                if "dep_wait_count" in keys and row["dep_wait_count"] is not None
+                else 0
             ),
         )
 
@@ -1498,7 +1552,20 @@ CREATE TABLE IF NOT EXISTS tasks (
     block_fingerprint    TEXT,
     block_deadline       INTEGER,
     block_retry_after    INTEGER,
-    block_error_type     TEXT
+    block_error_type     TEXT,
+    -- Sticky dependency-wait fingerprint. When a worker blocks with
+    -- kind=dependency, we capture a fingerprint of the blocking condition
+    -- (parent ids + their status/completed_at). recompute_ready refuses to
+    -- re-promote the task until this fingerprint materially changes,
+    -- preventing the dependency_wait → promote → spawn → dependency_wait
+    -- hot loop (DISP-1, 2026-07-27 incident: 122 wasted runs). NULL on
+    -- fresh tasks and after the dependency genuinely clears.
+    dep_wait_fingerprint TEXT,
+    -- Number of times this task has been re-dispatched while the
+    -- dependency fingerprint was unchanged. Used by the backstop
+    -- (DEP_WAIT_REDISPATCH_CAP) to degrade a silent loop into an
+    -- observable stalled card instead of unbounded spend.
+    dep_wait_count       INTEGER NOT NULL DEFAULT 0
 );
 
 CREATE TABLE IF NOT EXISTS task_links (
@@ -2845,6 +2912,19 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
     ):
         if column_name not in cols:
             _add_column_if_missing(conn, "tasks", column_name, column_sql)
+
+    # Sticky dependency-wait tracking (DISP-1). dep_wait_fingerprint is
+    # NULL on existing rows (no prior dependency block), which is correct:
+    # the sticky gate only activates after the first kind=dependency block.
+    if "dep_wait_fingerprint" not in cols:
+        _add_column_if_missing(
+            conn, "tasks", "dep_wait_fingerprint", "dep_wait_fingerprint TEXT"
+        )
+    if "dep_wait_count" not in cols:
+        _add_column_if_missing(
+            conn, "tasks", "dep_wait_count",
+            "dep_wait_count INTEGER NOT NULL DEFAULT 0",
+        )
 
     # Indexes over additive ``tasks`` columns must be created after the
     # columns exist. Keeping them in SCHEMA_SQL breaks legacy boards: SQLite
@@ -4441,10 +4521,65 @@ def _has_sticky_block(conn: sqlite3.Connection, task_id: str) -> bool:
     return bool(row) and row["kind"] == "blocked"
 
 
+def _maybe_emit_dep_wait_backstop(
+    conn: sqlite3.Connection,
+    task_id: str,
+    dep_wait_count: int,
+    fingerprint: str,
+) -> None:
+    """Emit a ``dependency_wait_backstop`` event if one hasn't been emitted
+    for this fingerprint/count boundary already.
+
+    Deduplication: we check whether the most recent ``dependency_wait_backstop``
+    event for this task carries the same fingerprint and count. If so, we
+    suppress the duplicate — the operator has already been notified that this
+    task is stalled, and re-emitting on every tick would itself be a noise
+    loop. A new event fires only when the count increases past a prior
+    emission (meaning the worker somehow got re-dispatched and blocked again
+    despite the gate — which shouldn't happen under the sticky gate, but the
+    backstop exists precisely as defense-in-depth for that case).
+    """
+    prev = conn.execute(
+        "SELECT payload FROM task_events "
+        "WHERE task_id = ? AND kind = 'dependency_wait_backstop' "
+        "ORDER BY id DESC LIMIT 1",
+        (task_id,),
+    ).fetchone()
+    if prev is not None and prev["payload"]:
+        try:
+            payload = json.loads(prev["payload"])
+        except (ValueError, TypeError):
+            payload = {}
+        if (
+            payload.get("dep_wait_fingerprint") == fingerprint
+            and payload.get("dep_wait_count", 0) >= dep_wait_count
+        ):
+            return
+    _append_event(
+        conn,
+        task_id,
+        "dependency_wait_backstop",
+        {
+            "dep_wait_count": dep_wait_count,
+            "dep_wait_fingerprint": fingerprint,
+            "cap": DEP_WAIT_REDISPATCH_CAP,
+            "reason": (
+                "Task has blocked on dependency_wait "
+                f"{dep_wait_count} times against an unchanged "
+                "blocking condition. It is parked in 'todo' to "
+                "prevent unbounded re-dispatch. An operator may "
+                "need to investigate the blocking dependency or "
+                "explicitly unblock the task."
+            ),
+        },
+    )
+
+
 def recompute_ready(
     conn: sqlite3.Connection,
     failure_limit: int = None,
     board: Optional[str] = None,
+    dependency_wait_stalled: Optional[list[str]] = None,
 ) -> int:
     """Promote ``todo`` tasks to ``ready`` when all parents are ``done`` or ``archived``.
 
@@ -4480,7 +4615,8 @@ def recompute_ready(
     promoted = 0
     with write_txn(conn):
         todo_rows = conn.execute(
-            "SELECT id, status, consecutive_failures, max_retries "
+            "SELECT id, status, consecutive_failures, max_retries, "
+            "dep_wait_fingerprint, dep_wait_count "
             "FROM tasks WHERE status IN ('todo', 'blocked')"
         ).fetchall()
         for row in todo_rows:
@@ -4492,6 +4628,38 @@ def recompute_ready(
                 # legitimate exit (it emits ``"unblocked"`` which flips
                 # this predicate back).
                 continue
+            # Sticky dependency-wait gate (DISP-1). A task that blocked
+            # with kind=dependency must NOT be re-promoted until the
+            # blocking condition materially changes. We compare the stored
+            # fingerprint against a fresh computation: if they match, the
+            # dependency hasn't moved since the worker said "I'm waiting,"
+            # so we park the task in todo and move on.
+            stored_dep_fp = row["dep_wait_fingerprint"]
+            if stored_dep_fp is not None:
+                current_dep_fp = _dependency_fingerprint(conn, task_id)
+                if current_dep_fp == stored_dep_fp:
+                    # Same blocking condition — do not re-promote.
+                    if dependency_wait_stalled is not None:
+                        dependency_wait_stalled.append(task_id)
+                    dep_count = int(row["dep_wait_count"] or 0)
+                    if dep_count >= DEP_WAIT_REDISPATCH_CAP:
+                        # Backstop tripped: emit a deduplicated
+                        # ``dependency_wait_backstop`` event so the loop
+                        # degrades into an observable stalled card
+                        # instead of silently sitting in todo. We emit
+                        # only once per cap crossing: when dep_count
+                        # equals the cap exactly, not on every subsequent
+                        # tick. The worker will re-block on the next
+                        # dispatch (if it ever happens) and increment
+                        # dep_count further, but we only log the event at
+                        # the boundary.
+                        _maybe_emit_dep_wait_backstop(
+                            conn, task_id, dep_count, stored_dep_fp
+                        )
+                    continue
+                    # NOTE: if the fingerprint changed, we fall through
+                    # to the normal parent-gate check below, and clear
+                    # the stale dep_wait fields on promotion.
             parents = conn.execute(
                 "SELECT t.status, t.completed_at FROM tasks t "
                 "JOIN task_links l ON l.parent_id = t.id "
@@ -4523,13 +4691,16 @@ def recompute_ready(
                     if failures >= effective_limit:
                         continue
                     conn.execute(
-                        "UPDATE tasks SET status = 'ready' "
+                        "UPDATE tasks SET status = 'ready', "
+                        "dep_wait_fingerprint = NULL, dep_wait_count = 0 "
                         "WHERE id = ? AND status = 'blocked'",
                         (task_id,),
                     )
                 else:
                     conn.execute(
-                        "UPDATE tasks SET status = 'ready' WHERE id = ? AND status = 'todo'",
+                        "UPDATE tasks SET status = 'ready', "
+                        "dep_wait_fingerprint = NULL, dep_wait_count = 0 "
+                        "WHERE id = ? AND status = 'todo'",
                         (task_id,),
                     )
                 _append_event(conn, task_id, "promoted", None)
@@ -5510,7 +5681,9 @@ def complete_task(
                        block_fingerprint = NULL,
                        block_deadline = NULL,
                        block_retry_after = NULL,
-                       block_error_type = NULL
+                       block_error_type = NULL,
+                       dep_wait_fingerprint = NULL,
+                       dep_wait_count = 0
                  WHERE id = ?
                    AND status IN ('running', 'ready', 'blocked')
                 """,
@@ -5531,7 +5704,9 @@ def complete_task(
                        block_fingerprint = NULL,
                        block_deadline = NULL,
                        block_retry_after = NULL,
-                       block_error_type = NULL
+                       block_error_type = NULL,
+                       dep_wait_fingerprint = NULL,
+                       dep_wait_count = 0
                  WHERE id = ?
                    AND status IN ('running', 'ready', 'blocked')
                    AND current_run_id = ?
@@ -5608,7 +5783,9 @@ def complete_task(
                        block_fingerprint = NULL,
                        block_deadline = NULL,
                        block_retry_after = NULL,
-                       block_error_type = NULL
+                       block_error_type = NULL,
+                       dep_wait_fingerprint = NULL,
+                       dep_wait_count = 0
                  WHERE id = ?
                    AND status IN ('ready', 'blocked')
                    AND current_run_id IS NULL
@@ -6468,6 +6645,36 @@ def block_task(
         # here (rather than ``blocked``) is what keeps a cron from ever seeing
         # a dependency-wait as something to "unblock".
         if kind == "dependency":
+            # Compute the dependency fingerprint BEFORE the UPDATE so
+            # recompute_ready can detect "same blocking condition" and
+            # refuse to re-promote (DISP-1: 2026-07-27 incident, 122 wasted
+            # runs in a dependency_wait → promote → spawn → dependency_wait
+            # loop). The worker already told us it can't proceed; we must
+            # not re-dispatch until the dependency materially changes.
+            dep_fp = _dependency_fingerprint(conn, task_id)
+            # Read the current dep_wait_count so we can increment it. On
+            # the first dependency block for this task it's 0 → 1.
+            dep_count_row = conn.execute(
+                "SELECT dep_wait_count, dep_wait_fingerprint FROM tasks WHERE id = ?",
+                (task_id,),
+            ).fetchone()
+            prev_dep_count = (
+                int(dep_count_row["dep_wait_count"])
+                if dep_count_row
+                and dep_count_row["dep_wait_count"] is not None
+                else 0
+            )
+            prev_dep_fp = (
+                dep_count_row["dep_wait_fingerprint"] if dep_count_row else None
+            )
+            # If the fingerprint is the same as the last dependency_wait,
+            # this is a re-dispatch against an unchanged condition —
+            # increment the counter for the backstop. If it's different or
+            # new, reset to 1 (fresh wait against a new condition).
+            if prev_dep_fp is not None and prev_dep_fp == dep_fp:
+                new_dep_count = prev_dep_count + 1
+            else:
+                new_dep_count = 1
             cur = conn.execute(
                 """
                 UPDATE tasks
@@ -6479,12 +6686,18 @@ def block_task(
                        block_fingerprint = ?,
                        block_deadline = ?,
                        block_retry_after = ?,
-                       block_error_type = ?
+                       block_error_type = ?,
+                       dep_wait_fingerprint = ?,
+                       dep_wait_count = ?
                  WHERE id = ?
                    AND status IN ('running', 'ready')
                 """ + ("" if expected_run_id is None else " AND current_run_id = ?"),
-                (kind, *block_values, task_id) if expected_run_id is None
-                else (kind, *block_values, task_id, int(expected_run_id)),
+                (kind, *block_values, dep_fp, new_dep_count, task_id)
+                if expected_run_id is None
+                else (
+                    kind, *block_values, dep_fp, new_dep_count, task_id,
+                    int(expected_run_id),
+                ),
             )
             if cur.rowcount != 1:
                 return False
@@ -6499,9 +6712,19 @@ def block_task(
                 )
             _append_event(
                 conn, task_id, "dependency_wait",
-                {"reason": reason, "kind": kind, "contract": contract_payload},
+                {
+                    "reason": reason,
+                    "kind": kind,
+                    "contract": contract_payload,
+                    "dep_wait_fingerprint": dep_fp,
+                    "dep_wait_count": new_dep_count,
+                },
                 run_id=run_id,
             )
+            if new_dep_count >= DEP_WAIT_REDISPATCH_CAP:
+                _maybe_emit_dep_wait_backstop(
+                    conn, task_id, new_dep_count, dep_fp
+                )
             _blocked_task = get_task(conn, task_id)
             _fire_kanban_lifecycle_hook(
                 "kanban_task_blocked",
@@ -7113,7 +7336,13 @@ def sweep_block_propagation_and_deadlines(
 
 
 def unblock_task(conn: sqlite3.Connection, task_id: str) -> bool:
-    """Transition ``blocked``/``scheduled`` -> ready or todo.
+    """Explicitly release a blocked, scheduled, or sticky dependency wait.
+
+    Ordinary ``todo`` tasks are not unblockable. A ``todo`` task carrying a
+    dependency-wait fingerprint is the exception: clearing that fingerprint
+    is the operator override required to release the sticky gate. Parent links
+    still re-gate the resulting status, so the override cannot bypass an open
+    board dependency.
 
     Defensively closes any stale ``current_run_id`` pointer before flipping
     status. In the common path (``block_task`` closed the run already) this
@@ -7125,7 +7354,9 @@ def unblock_task(conn: sqlite3.Connection, task_id: str) -> bool:
     now = int(time.time())
     with write_txn(conn):
         stale = conn.execute(
-            "SELECT current_run_id FROM tasks WHERE id = ? AND status IN ('blocked', 'scheduled')",
+            "SELECT current_run_id FROM tasks WHERE id = ? AND "
+            "(status IN ('blocked', 'scheduled') OR "
+            " (status = 'todo' AND dep_wait_fingerprint IS NOT NULL))",
             (task_id,),
         ).fetchone()
         if stale and stale["current_run_id"]:
@@ -7165,8 +7396,10 @@ def unblock_task(conn: sqlite3.Connection, task_id: str) -> bool:
         # start for the dispatcher's retry budget.
         cur = conn.execute(
             "UPDATE tasks SET status = ?, current_run_id = NULL, "
-            "consecutive_failures = 0, last_failure_error = NULL "
-            "WHERE id = ? AND status IN ('blocked', 'scheduled')",
+            "consecutive_failures = 0, last_failure_error = NULL, "
+            "dep_wait_fingerprint = NULL, dep_wait_count = 0 "
+            "WHERE id = ? AND (status IN ('blocked', 'scheduled') OR "
+            " (status = 'todo' AND dep_wait_fingerprint IS NOT NULL))",
             (new_status, task_id),
         )
         if cur.rowcount != 1:
@@ -8322,6 +8555,13 @@ class DispatchResult:
     """Tasks deferred because unsatisfied external (cross-board) blockers exist.
     Each entry is ``(task_id, blocker_dicts)``.  Separate bucket so dry-run
     and telemetry can show scheduler-aware blocking."""
+    dependency_wait_stalled: list[str] = field(default_factory=list)
+    """Tasks held in ``todo`` by the sticky dependency-wait gate (DISP-1).
+    Their blocking condition hasn't materially changed since the last
+    ``dependency_wait`` block, so recompute_ready correctly refused to
+    re-promote them. NOT an operator-actionable failure by itself — but if
+    a task appears here persistently across many ticks, the blocking
+    dependency may be stuck and warrants investigation."""
     skipped_locked: bool = False
     """True when this tick was skipped because another process already held
     the board's dispatch lock (issue #35240). A losing dispatcher does no
@@ -10135,6 +10375,7 @@ def _dispatch_once_locked(
         conn,
         failure_limit=failure_limit,
         board=board,
+        dependency_wait_stalled=result.dependency_wait_stalled,
     )
 
     # Count tasks already running so max_spawn enforces concurrency rather
