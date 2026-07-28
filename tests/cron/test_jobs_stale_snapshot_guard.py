@@ -128,6 +128,57 @@ def test_fresh_list_without_provenance_is_still_writable(tmp_path):
     assert after == {"x", "y"}
 
 
+def test_remove_job_does_not_strip_the_generation_tag(tmp_path, monkeypatch):
+    """``remove_job`` must not rebuild the list and lose its provenance.
+
+    Found in independent review of the original guard. ``remove_job`` did::
+
+        jobs = load_jobs()
+        jobs = [j for j in jobs if j["id"] != canonical_id]   # plain list!
+        save_jobs(jobs)
+
+    The comprehension rebinds ``jobs`` to an ordinary ``list``, so the tag is
+    gone and that ``save_jobs`` is written with no freshness check at all. The
+    flock bounds the practical risk today, but the deletion path is exactly the
+    one where an unguarded overwrite is most destructive, and "it is additive
+    across many call sites" is no argument for a single identifiable site.
+
+    This is a white-box test on purpose. The invariant — *the list reaching
+    ``save_jobs`` still carries its generation* — is not observable from
+    behaviour alone, because ``remove_job`` loads and saves inside one lock and
+    so is never itself stale. Asserting on the value passed to the writer is the
+    only way to pin it.
+    """
+    seen: dict = {}
+    real_save = jobs._save_jobs_unlocked
+
+    def _spy(job_list):
+        seen["type"] = type(job_list).__name__
+        seen["generation"] = getattr(job_list, "hermes_generation", None)
+        return real_save(job_list)
+
+    with jobs.use_cron_store(tmp_path):
+        jobs.save_jobs([_job("a"), _job("b")])
+        on_disk_generation = jobs.load_jobs().hermes_generation
+
+        monkeypatch.setattr(jobs, "_save_jobs_unlocked", _spy)
+        removed = jobs.remove_job("b")
+        monkeypatch.undo()
+
+        after = _ids(jobs.load_jobs())
+
+    assert removed is True
+    assert after == {"a"}, "removal must still work"
+    assert seen.get("generation") is not None, (
+        "remove_job saved a list with no generation tag — that write is "
+        f"unguarded against a stale-snapshot clobber (saw type={seen.get('type')!r})"
+    )
+    assert seen["generation"] == on_disk_generation, (
+        "remove_job's saved list carried a generation that does not match the "
+        "store it was loaded from"
+    )
+
+
 def test_reload_after_rejected_write_sees_current_state(tmp_path):
     """After a stale write is refused, the caller can recover by reloading."""
     with jobs.use_cron_store(tmp_path):

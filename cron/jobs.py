@@ -1767,7 +1767,11 @@ def remove_job(job_id: str) -> bool:
     with _jobs_lock():
         jobs = load_jobs()
         original_len = len(jobs)
-        jobs = [j for j in jobs if j["id"] != canonical_id]
+        # Filter IN PLACE. Rebinding via a list comprehension would replace the
+        # tagged _JobList with a plain list and strip its generation, leaving
+        # the save below with no freshness check at all - on the deletion path,
+        # where an unguarded overwrite is most destructive.
+        jobs[:] = [j for j in jobs if j["id"] != canonical_id]
         if len(jobs) < original_len:
             # Resolve the output dir BEFORE saving so a legacy unsafe ID (e.g.
             # left over from before the create-time guard) fails closed without
