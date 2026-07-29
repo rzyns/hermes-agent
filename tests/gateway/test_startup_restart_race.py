@@ -17,7 +17,7 @@ from gateway.restart import (
 # several seconds even though the state machine is making progress; keep the
 # bound generous enough to detect a deadlock without turning import speed into
 # a flaky assertion.
-_STARTUP_RESTART_TIMEOUT = 10
+_STARTUP_RESTART_TIMEOUT = 30
 
 
 class StartupRaceAdapter(BasePlatformAdapter):
