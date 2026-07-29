@@ -2075,6 +2075,77 @@ class TestListenForSpeech:
         heard, _ = self._run(mock_sd, levels)
         assert heard is False
 
+    def test_quiet_then_loud_playback_does_not_trip(self, mock_sd):
+        """TTS that starts quiet and gets louder must NOT trip barge-in.
+
+        This is the core regression: a one-shot calibration freezes the
+        floor from the quiet opening, then louder TTS exceeds the stale
+        floor and false-triggers.  The rolling window keeps the floor
+        current so the louder passage is absorbed into the floor.
+        """
+        levels = [100] * self.CALIB_BLOCKS + [200] * 30 + [500] * 30 + [1000] * 30
+        heard, _ = self._run(mock_sd, levels)
+        assert heard is False
+
+    def test_8x_multiplier_absorbs_tts_volume_spikes(self, mock_sd):
+        """TTS volume spikes that would exceed a 5x floor must NOT trip.
+
+        At 5x multiplier, a quiet TTS passage (RMS 200) sets a floor of
+        ~180 and a trigger of 900. A subsequent louder passage at RMS
+        1000 exceeds the trigger, is excluded from the floor window, and
+        after sustained_ms of consecutive above-trigger blocks the VAD
+        false-trips and cuts playback mid-sentence. The 8x multiplier
+        raises the trigger to 1440 so the 1000-RMS passage stays below
+        it and gets absorbed into the rolling floor.
+        """
+        # Calib at 200 RMS → floor ~180 → 8x trigger = 1440
+        # Then 1000 RMS TTS: below 3200 (400*8), absorbed into floor, no trip.
+        # With old 5x: trigger=2000 (400*5), 1000 < 2000, would NOT trip either.
+        # To actually test the 8x multiplier, use levels where 5x would trip
+        # but 8x would not: calib at 200 → floor=180 → 5x trigger=900,
+        # 8x trigger=1440. Feed 1200 RMS: above 900 (5x trips) but below
+        # 1440 (8x absorbs). With min_floor=400 the trigger is max(400,180*8)=1440,
+        # so 1200 < 1440 → no trip at 8x, but 1200 > 900 → would trip at 5x.
+        levels = [200] * self.CALIB_BLOCKS + [1200] * 50
+        heard, _ = self._run(mock_sd, levels)
+        assert heard is False
+
+    def test_trigger_ceiling_lets_genuine_speech_trip(self, mock_sd):
+        """Even with a loud TTS floor, genuine speech must still trip.
+
+        Loud TTS at 3000 RMS → floor ~2700 → 8x trigger = 21600, but
+        the ceiling caps it at 4000. Speech at 5000 RMS exceeds the
+        capped trigger and trips after sustained_ms blocks.
+        """
+        levels = [3000] * self.CALIB_BLOCKS + [5000] * 50
+        heard, _ = self._run(mock_sd, levels)
+        assert heard is True
+
+    def test_silence_calibration_does_not_false_trip_on_tts(self, mock_sd):
+        """Calibration during an inter-sentence gap must NOT false-trip.
+
+        If the grace period ends during a pause between TTS sentences, the
+        calibration window samples near-silence.  Without the min_floor clamp,
+        min_floor locks near zero, the trigger drops to 400 RMS (SILENCE_RMS_THRESHOLD
+        * 2), and the next TTS sentence at 800 RMS exceeds it — those blocks are
+        excluded from the rolling window (rms >= trigger), the floor freezes, and
+        after sustained_ms the VAD false-triggers and cuts playback mid-sentence.
+
+        With the clamp, min_floor stays at SILENCE_RMS_THRESHOLD * 2 = 400, the
+        trigger is max(400, 400 * 8.0) = 3200, and 800-RMS TTS stays below it and
+        feeds the rolling floor.  No false trip.
+        """
+        # calibration_ms=800 → CALIB_BLOCKS = 800/30 ≈ 26 blocks of silence
+        # Then TTS resumes at 800 RMS — must NOT trip (below 3200 trigger).
+        calib = 800 // 30
+        levels = [0] * calib + [800] * 100
+        heard, _ = self._run(
+            mock_sd, levels,
+            sustained_ms=1000,
+            calibration_ms=800,
+        )
+        assert heard is False
+
 
 class TestListenForSpeechCapture:
     """capture=True: the barge monitor records the interruption with pre-roll,
@@ -2129,6 +2200,172 @@ class TestListenForSpeechCapture:
         monkeypatch.setattr("tools.voice_mode._import_audio", MagicMock(side_effect=OSError("no audio")))
         from tools.voice_mode import listen_for_speech
         assert listen_for_speech(lambda: False, capture=True) is None
+
+
+class TestFullDuplexListen:
+    """full_duplex_listen: one agent-turn listener spanning generation and
+    playback — pre-playback calibration, phase-aware trigger, grace window."""
+
+    CALIB = 15       # 450ms / 30ms — pre-playback quiet calibration
+    TRIP = 10        # 300ms / 30ms window; trip needs >=8 above
+    GRACE = 16       # 500ms / 30ms
+    BLOCK = 480      # 30ms at 16 kHz
+
+    def _run(self, mock_sd, monkeypatch, levels, playing_from=None,
+             playing_until=None, should_stop=None, on_trigger=None, **kwargs):
+        np = pytest.importorskip("numpy")
+        stream = _FakeInputStream(np, levels)
+        mock_sd.InputStream.return_value = stream
+        written = {}
+        monkeypatch.setattr(
+            "tools.voice_mode.AudioRecorder._write_wav",
+            staticmethod(lambda audio: written.update(audio=audio) or "/tmp/fd.wav"),
+        )
+        from tools.voice_mode import full_duplex_listen
+
+        def is_playing():
+            if playing_from is None:
+                return False
+            if stream.reads < playing_from:
+                return False
+            if playing_until is not None and stream.reads >= playing_until:
+                return False
+            return True
+
+        stops = iter([False] * len(levels) + [True] * 10_000)
+        path = full_duplex_listen(
+            should_stop or (lambda: next(stops)),
+            is_playing=is_playing,
+            on_trigger=on_trigger,
+            **kwargs,
+        )
+        return path, written.get("audio"), stream
+
+    def test_generation_phase_speech_trips_and_captures(self, mock_sd, monkeypatch):
+        """Speech while the LLM generates (no playback) trips with
+        phase='generation' and the utterance is captured with pre-roll."""
+        phases = []
+        levels = [100] * self.CALIB + [5000] * 30 + [0] * 500
+        path, audio, _ = self._run(
+            mock_sd, monkeypatch, levels,
+            on_trigger=lambda phase: phases.append(phase),
+        )
+        assert path == "/tmp/fd.wav"
+        assert phases == ["generation"]
+        assert int((audio == 5000).sum()) > 0  # speech onset in the capture
+
+    def test_playback_bleed_alone_does_not_trip(self, mock_sd, monkeypatch):
+        """Speaker bleed (~1000 RMS) during playback stays below the playback
+        trigger clamp — the old monitor's self-calibration deafness class."""
+        phases = []
+        levels = [100] * self.CALIB + [1000] * 300
+        path, _, _ = self._run(
+            mock_sd, monkeypatch, levels,
+            playing_from=self.CALIB,
+            on_trigger=lambda phase: phases.append(phase),
+        )
+        assert path is None
+        assert phases == []
+
+    def test_speech_over_bleed_trips_in_playback_phase(self, mock_sd, monkeypatch):
+        """Real speech (5000 RMS) over playback trips with phase='playback'
+        even though playback bleed was present — the trigger comes from the
+        PRE-playback quiet floor, never from bleed self-calibration."""
+        phases = []
+        # quiet calib → playback bleed (past grace) → user speaks over it
+        levels = (
+            [100] * self.CALIB
+            + [1000] * (self.GRACE + 20)
+            + [5000] * 30
+            + [1000] * 200
+        )
+        path, _, _ = self._run(
+            mock_sd, monkeypatch, levels,
+            playing_from=self.CALIB,
+            on_trigger=lambda phase: phases.append(phase),
+        )
+        assert path == "/tmp/fd.wav"
+        assert phases == ["playback"]
+
+    def test_quiet_floor_held_through_playback(self, mock_sd, monkeypatch):
+        """Loud playback bleed must NOT be absorbed into the floor: speech at
+        3000 RMS still trips after minutes-equivalent of 1400-RMS bleed."""
+        phases = []
+        levels = (
+            [100] * self.CALIB
+            + [1400] * (self.GRACE + 100)  # sustained loud-ish bleed
+            + [3000] * 30
+            + [0] * 200
+        )
+        path, _, _ = self._run(
+            mock_sd, monkeypatch, levels,
+            playing_from=self.CALIB,
+            on_trigger=lambda phase: phases.append(phase),
+        )
+        assert path == "/tmp/fd.wav"
+        assert phases == ["playback"]
+
+    def test_grace_window_suppresses_playback_onset(self, mock_sd, monkeypatch):
+        """Loud blocks inside the 0.5s grace right after playback starts are
+        suppressed (onset transient), but speech after grace still trips."""
+        phases = []
+        # loud transient fully inside grace, then quiet bleed, then speech
+        levels = (
+            [100] * self.CALIB
+            + [5000] * 8            # onset transient (inside 16-block grace)
+            + [800] * 40
+            + [5000] * 30
+            + [0] * 200
+        )
+
+        def trig(phase):
+            phases.append(phase)
+
+        path, _, stream = self._run(
+            mock_sd, monkeypatch, levels,
+            playing_from=self.CALIB,
+            on_trigger=trig,
+        )
+        assert path == "/tmp/fd.wav"
+        assert phases == ["playback"]
+        # Trip must come from the post-grace speech, not the onset transient:
+        # by the time capture starts, we're past calib+transient+bleed blocks.
+        assert stream.reads > self.CALIB + 8 + 40
+
+    def test_generation_trigger_uses_multiplier_over_quiet_floor(self, mock_sd, monkeypatch):
+        """Threshold math: floor≈300, multiplier 3 → trigger 900. 1200-RMS
+        speech trips; with multiplier 8 the trigger is 2400 and it doesn't."""
+        levels = [300] * self.CALIB + [1200] * 40 + [0] * 400
+        path3, _, _ = self._run(mock_sd, monkeypatch, levels, multiplier=3.0)
+        assert path3 == "/tmp/fd.wav"
+        path8, _, _ = self._run(mock_sd, monkeypatch, levels, multiplier=8.0)
+        assert path8 is None
+
+    def test_windowed_majority_tolerates_intra_word_dips(self, mock_sd, monkeypatch):
+        """A brief energy dip inside a word must not reset detection — the
+        old strictly-consecutive counter failed exactly this way."""
+        speech = ([5000] * 4 + [300]) * 8  # 80% above trigger, dips inside
+        levels = [100] * self.CALIB + speech + [0] * 400
+        path, _, _ = self._run(mock_sd, monkeypatch, levels)
+        assert path == "/tmp/fd.wav"
+
+    def test_brief_spike_does_not_trip(self, mock_sd, monkeypatch):
+        levels = [100] * self.CALIB + [5000] * 3 + [100] * 500
+        path, _, _ = self._run(mock_sd, monkeypatch, levels)
+        assert path is None
+
+    def test_should_stop_ends_without_trip(self, mock_sd, monkeypatch):
+        path, audio, _ = self._run(mock_sd, monkeypatch, [100] * 60)
+        assert path is None
+        assert audio is None
+
+    def test_returns_none_when_audio_unavailable(self, monkeypatch):
+        monkeypatch.setattr(
+            "tools.voice_mode._import_audio",
+            MagicMock(side_effect=OSError("no audio")),
+        )
+        from tools.voice_mode import full_duplex_listen
+        assert full_duplex_listen(lambda: False) is None
 
 
 class TestGetBeepVolume:

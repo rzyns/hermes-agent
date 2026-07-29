@@ -759,7 +759,7 @@ HERMES_DASHBOARD_TRUSTED_PLUGIN_API_ROOTS=/absolute/path/to/my-plugin \
 For live-dev symlinks under `~/.hermes/plugins`, trust the real source plugin directory or the symlink path; Hermes resolves both before matching. Only add directories containing local plugin code you control.
 :::
 
-Plugin API routes use the dashboard session-token fetch helper from the UI (`SDK.fetchJSON`). Treat backend code as local trusted code; do not expose the dashboard on a public interface with `--host 0.0.0.0` if you run plugins you do not control.
+Plugin API routes sit behind the dashboard's normal auth gate: unauthenticated requests get a `401` before the plugin route runs, and requests to a disabled plugin's routes are rejected at request time. The UI uses the dashboard session-token fetch helper (`SDK.fetchJSON`). Treat backend code as local trusted code; do not expose the dashboard on a public interface with `--host 0.0.0.0` if you run plugins you do not control.
 
 #### Accessing Hermes internals
 

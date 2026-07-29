@@ -12,7 +12,7 @@ from agent.kanban_stop import (
 
 
 @pytest.fixture
-def clear_kanban_env(monkeypatch):
+def clear_kanban_env(monkeypatch, tmp_path):
     for var in (
         "HERMES_KANBAN_TASK",
         "HERMES_KANBAN_STOP_NUDGE",
@@ -20,6 +20,12 @@ def clear_kanban_env(monkeypatch):
         "HERMES_HOME",
     ):
         monkeypatch.delenv(var, raising=False)
+    # Keep config-backed feature flags hermetic. Deleting HERMES_HOME alone
+    # falls back to the developer's real default profile, so an enabled local
+    # checkpoint flag can make the default-off byte-contract test flaky.
+    hermes_home = tmp_path / ".hermes"
+    hermes_home.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(hermes_home))
     return monkeypatch
 
 

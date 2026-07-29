@@ -23,8 +23,6 @@ import sqlite3
 from pathlib import Path
 from typing import Any, Iterable, Literal, Optional
 
-import yaml
-
 from hermes_cli import kanban_db as kb
 
 BLACKBOARD_PREFIX = "[swarm:blackboard] "
@@ -118,7 +116,17 @@ def _external_skill_dirs(hermes_home: str) -> list[Path]:
     if not cfg_path.is_file():
         return []
     try:
-        cfg = yaml.safe_load(cfg_path.read_text(encoding="utf-8")) or {}
+        from hermes_cli.config import load_config_readonly
+        from hermes_constants import (
+            reset_hermes_home_override,
+            set_hermes_home_override,
+        )
+
+        token = set_hermes_home_override(hermes_home)
+        try:
+            cfg = load_config_readonly()
+        finally:
+            reset_hermes_home_override(token)
         skill_cfg = cfg.get("skills") or {}
         dirs = skill_cfg.get("external_dirs") or skill_cfg.get("external_skill_dirs") or []
         if isinstance(dirs, str):

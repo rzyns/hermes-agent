@@ -1707,11 +1707,13 @@ def _bridge_max_turns_from_config(home: "Path") -> None:
     if not config_path.exists():
         return
     try:
-        import yaml as _yaml
-        with open(config_path, encoding="utf-8") as f:
-            cfg = _yaml.safe_load(f) or {}
-        from hermes_cli.config import _expand_env_vars
+        from hermes_cli.config import _expand_env_vars, read_user_config_raw
+        # Presence-sensitive env bridge: raw read is deliberate (only keys the
+        # user actually wrote get bridged); overlay + expansion applied below.
+        cfg = read_user_config_raw(config_path)
         cfg = _expand_env_vars(cfg)
+        if not isinstance(cfg, dict):
+            cfg = {}
         # Managed scope: keep administrator-pinned values authoritative on every
         # turn too. This per-turn reload re-bridges config→env, so without the
         # overlay a managed agent.max_turns / timezone / redact_secrets would be
@@ -1873,12 +1875,15 @@ _DOCKER_MEDIA_OUTPUT_CONTAINER_PATHS = {"/output", "/outputs"}
 _config_path = _hermes_home / 'config.yaml'
 if _config_path.exists():
     try:
-        import yaml as _yaml
-        with open(_config_path, encoding="utf-8") as _f:
-            _cfg = _yaml.safe_load(_f) or {}
+        # Presence-sensitive env bridge: raw read is deliberate — only keys the
+        # user actually wrote may be bridged (a defaults merge would export the
+        # whole DEFAULT_CONFIG into the env). Overlay + expansion applied below.
+        from hermes_cli.config import _expand_env_vars, read_user_config_raw
+        _cfg = read_user_config_raw(_config_path)
         # Expand ${ENV_VAR} references before bridging to env vars.
-        from hermes_cli.config import _expand_env_vars
         _cfg = _expand_env_vars(_cfg)
+        if not isinstance(_cfg, dict):
+            _cfg = {}
         # Managed scope: overlay administrator-pinned values BEFORE bridging to
         # env vars, so a managed timezone / redact_secrets / max_turns / terminal
         # setting wins over the user's value at the env layer too. This bridge
@@ -2437,12 +2442,10 @@ def _try_resolve_fallback_provider() -> dict | None:
     """Attempt to resolve credentials from the fallback_model/fallback_providers config."""
     from hermes_cli.runtime_provider import resolve_runtime_provider
     try:
-        import yaml as _y
-        cfg_path = _hermes_home / "config.yaml"
-        if not cfg_path.exists():
-            return None
-        with open(cfg_path, encoding="utf-8") as _f:
-            cfg = _y.safe_load(_f) or {}
+        # Canonical gateway loader: managed overlay + ${VAR} expansion +
+        # root-model normalization now reach the fallback chain too (a raw
+        # read here used to miss administrator-pinned fallback_providers).
+        cfg = _load_gateway_runtime_config()
         fb_list = get_fallback_chain(cfg)
         if not fb_list:
             return None
@@ -5854,12 +5857,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
     def _load_provider_routing() -> dict:
         """Load OpenRouter provider routing preferences from config.yaml."""
         try:
-            import yaml as _y
-            cfg_path = _hermes_home / "config.yaml"
-            if cfg_path.exists():
-                with open(cfg_path, encoding="utf-8") as _f:
-                    cfg = _y.safe_load(_f) or {}
-                return cfg.get("provider_routing", {}) or {}
+            # Canonical gateway loader (fail-open): managed overlay + ${VAR}
+            # expansion now apply to provider_routing too.
+            cfg = _load_gateway_runtime_config()
+            return cfg.get("provider_routing", {}) or {}
         except Exception:
             pass
         return {}
@@ -5873,14 +5874,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         when both keys are present.
         """
         try:
-            import yaml as _y
-            cfg_path = _hermes_home / "config.yaml"
-            if cfg_path.exists():
-                with open(cfg_path, encoding="utf-8") as _f:
-                    cfg = _y.safe_load(_f) or {}
-                fb = get_fallback_chain(cfg)
-                if fb:
-                    return fb
+            # Canonical gateway loader (fail-open): managed overlay + ${VAR}
+            # expansion now apply to the fallback chain too.
+            cfg = _load_gateway_runtime_config()
+            fb = get_fallback_chain(cfg)
+            if fb:
+                return fb
         except Exception:
             pass
         return None
@@ -5900,13 +5899,28 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         that genuinely lacks the key clears the chain.
         """
         try:
-            import yaml as _y
+            from hermes_cli.config import read_user_config_raw
             cfg_path = _hermes_home / "config.yaml"
             if not cfg_path.exists():
                 self._fallback_model = None
                 return self._fallback_model
-            with open(cfg_path, encoding="utf-8") as _f:
-                cfg = _y.safe_load(_f) or {}
+            # Raw primitive (raises on parse failure) is required here: the
+            # canonical fail-open loader would return {} on a torn mid-edit
+            # write and WIPE the last known-good chain. The overlay/expansion
+            # below fixes the managed-scope/${VAR} drift without losing that.
+            cfg = read_user_config_raw(cfg_path)
+            try:
+                from hermes_cli import managed_scope
+                cfg = managed_scope.apply_managed_overlay(cfg)
+            except Exception:
+                pass
+            try:
+                from hermes_cli.config import _expand_env_vars
+                expanded = _expand_env_vars(cfg)
+                if isinstance(expanded, dict):
+                    cfg = expanded
+            except Exception:
+                pass
         except Exception:
             # Transient failure — keep last known-good chain.
             logger.debug(
@@ -7323,7 +7337,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 )
                 """
             ).strip()
-            watcher_env = os.environ.copy()
+            from tools.environments.local import build_subprocess_env
+            watcher_env = build_subprocess_env(scrub_secrets=False, inherit_profile_home=True)
             # This watcher is intentionally outside the running gateway. If it
             # inherits the gateway marker, `hermes gateway restart` refuses to
             # run as a self-restart loop guard and the gateway stays stopped.
@@ -7412,7 +7427,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # _HERMES_GATEWAY=1 from us, and the CLI's self-restart loop guard
         # refuses to run when that marker is set — silently (DEVNULL), so the
         # gateway stops and never comes back.
-        watcher_env = os.environ.copy()
+        from tools.environments.local import build_subprocess_env
+        watcher_env = build_subprocess_env(scrub_secrets=False, inherit_profile_home=True)
         watcher_env.pop("_HERMES_GATEWAY", None)
         setsid_bin = shutil.which("setsid")
         if setsid_bin:
@@ -8046,7 +8062,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         except (RuntimeError, ValueError, OSError):
             try:
                 _fh_log_dir = getattr(self.config, "log_dir", None) or os.path.join(
-                    os.environ.get("HERMES_HOME", str(Path.home() / ".hermes")),
+                    str(get_hermes_home()),
                     "logs",
                 )
                 os.makedirs(_fh_log_dir, exist_ok=True)
@@ -8065,7 +8081,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         if _sigusr2 is not None and hasattr(faulthandler, "register"):
             try:
                 _log_dir = getattr(self.config, "log_dir", None) or os.path.join(
-                    os.environ.get("HERMES_HOME", str(Path.home() / ".hermes")),
+                    str(get_hermes_home()),
                     "logs",
                 )
                 _faulthandler_path = os.path.join(_log_dir, "gateway_faulthandler.log")
@@ -8156,6 +8172,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             write_runtime_status(gateway_state="starting", exit_reason=None)
         except Exception:
             pass
+        try:
+            from hermes_cli.config import load_config
+            from agent.monitoring.gateway_health_export import start_gateway_health_export
+            self._gateway_health_export_runtime = start_gateway_health_export(load_config())
+            if getattr(self._gateway_health_export_runtime, "enabled", False):
+                logger.info("Gateway health OTLP export: enabled")
+        except Exception:
+            logger.debug("gateway health OTLP export startup failed", exc_info=True)
 
         # Log any active supply-chain security advisories. Operators see this
         # in gateway.log and `hermes status` surfaces it; we do NOT block
@@ -10243,6 +10267,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 self._update_runtime_status("running", self._exit_reason)
             else:
                 self._update_runtime_status("stopped", self._exit_reason)
+            _shutdown_gateway_health_export(self)
             logger.info("Gateway stopped (total teardown %.2fs)", _phase_elapsed())
 
         self._stop_task = asyncio.create_task(_stop_impl())
@@ -11130,6 +11155,252 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         )
         return switched
 
+    # ------------------------------------------------------------------
+    # Mid-run (busy-session) slash command dispatch — "Guard 2".
+    #
+    # Replaces the historical hand-written per-command if-chain: each
+    # command's mid-run behavior is declared on its CommandDef
+    # (busy_policy / busy_handler in hermes_cli/commands.py) and resolved
+    # here through a single handler table. Reply strings are byte-identical
+    # to the old chain.
+    # ------------------------------------------------------------------
+
+    # Command-specific mid-run reject texts (busy_policy == "reject" with a
+    # busy_handler naming an entry here). All other rejected commands get
+    # the generic catch-all text in _dispatch_busy_slash_command.
+    _BUSY_REJECT_TEXT: Dict[str, str] = {
+        "model": "Agent is running — wait or /stop first, then switch models.",
+        "codex-runtime": ("Agent is running — wait or /stop first, then "
+                          "change runtime."),
+        "moa": "Agent is running — wait or /stop first, then run /moa.",
+    }
+
+    async def _dispatch_busy_slash_command(
+        self, event: MessageEvent, cmd_def, quick_key: str, source,
+    ):
+        """Dispatch a recognized slash command while an agent is running.
+
+        Resolution order:
+          1. ``busy_handler`` — special mid-run variant (e.g. /goal's
+             control-verb whitelist, /queue's FIFO enqueue, /model's
+             custom reject text).
+          2. ``busy_policy == "dispatch"`` — the command's normal handler.
+          3. Catch-all busy-reject text. Rejecting is required rather than
+             falling through to interrupt + discard: commands like /model,
+             /reasoning, /voice, /insights, /title, /resume, /retry,
+             /undo, /compress, /usage, /reload-mcp, /sethome, /reset (all
+             registered as Discord slash commands) would interrupt the
+             agent AND get silently discarded by the slash-command safety
+             net, producing a zero-char response. See #5057, #6252, #10370.
+        """
+        name = cmd_def.name
+        policy = getattr(cmd_def, "busy_policy", "reject")
+        handler_key = getattr(cmd_def, "busy_handler", None)
+
+        if handler_key:
+            special = {
+                "start": self._busy_start_command,
+                "stop": self._busy_stop_command,
+                "new": self._busy_new_command,
+                "queue": self._busy_queue_command,
+                "steer": self._busy_steer_command,
+                "egress": self._busy_egress_command,
+                "goal": self._busy_goal_command,
+            }.get(handler_key)
+            if special is not None:
+                return await special(event, quick_key, source)
+            reject_text = self._BUSY_REJECT_TEXT.get(handler_key)
+            if reject_text is not None:
+                return reject_text
+
+        if policy in ("dispatch", "interrupt_then_dispatch"):
+            plain = {
+                "status": self._handle_status_command,
+                "context": self._handle_context_command,
+                "restart": self._handle_restart_command,
+                "approve": self._handle_approve_command,
+                "deny": self._handle_deny_command,
+                "agents": self._handle_agents_command,
+                "background": self._handle_background_command,
+                "kanban": self._handle_kanban_command,
+                "subgoal": self._handle_subgoal_command,
+                "yolo": self._handle_yolo_command,
+                "verbose": self._handle_verbose_command,
+                "footer": self._handle_footer_command,
+                "help": self._handle_help_command,
+                "commands": self._handle_commands_command,
+                "profile": self._handle_profile_command,
+                "update": self._handle_update_command,
+                "version": self._handle_version_command,
+            }.get(name)
+            if plain is not None:
+                return await plain(event)
+            logger.warning(
+                "busy_policy=%s for /%s has no mid-run handler — "
+                "falling back to busy-reject", policy, name,
+            )
+
+        # Catch-all: any other recognized slash command reached the
+        # running-agent guard. Reject gracefully rather than falling
+        # through to interrupt + discard.
+        return (
+            f"⏳ Agent is running — `/{name}` can't run "
+            f"mid-turn. Wait for the current response or `/stop` first."
+        )
+
+    async def _busy_start_command(self, event: MessageEvent, quick_key: str, source):
+        # Telegram sends /start for bot launches/deep-links. Treat it as a
+        # platform ping, not a user command: no help dump, no agent
+        # interrupt, no queued text.
+        logger.info("Ignoring /start platform ping for active session %s", quick_key)
+        return ""
+
+    async def _busy_egress_command(self, event: MessageEvent, quick_key: str, source):
+        from hermes_cli.proxy_cli import format_status_text
+
+        return format_status_text()
+
+    async def _busy_stop_command(self, event: MessageEvent, quick_key: str, source):
+        # /stop must hard-kill the session when an agent is running.
+        # A soft interrupt (agent.interrupt()) doesn't help when the agent
+        # is truly hung — the executor thread is blocked and never checks
+        # _interrupt_requested.  Force-clean _running_agents so the session
+        # is unlocked and subsequent messages are processed normally.
+        await self._interrupt_and_clear_session(
+            quick_key,
+            source,
+            interrupt_reason=_INTERRUPT_REASON_STOP,
+            invalidation_reason="stop_command",
+        )
+        logger.info("STOP for session %s — agent interrupted, session lock released", quick_key)
+        return EphemeralReply(t("gateway.stop.stopped"))
+
+    async def _busy_new_command(self, event: MessageEvent, quick_key: str, source):
+        # /reset and /new must bypass the running-agent guard so they
+        # actually dispatch as commands instead of being queued as user
+        # text (which would be fed back to the agent with the same
+        # broken history — #2170).  Interrupt the agent first, then
+        # clear the adapter's pending queue so the stale "/reset" text
+        # doesn't get re-processed as a user message after the
+        # interrupt completes.
+        # Clear any pending messages so the old text doesn't replay
+        await self._interrupt_and_clear_session(
+            quick_key,
+            source,
+            interrupt_reason=_INTERRUPT_REASON_RESET,
+            invalidation_reason="new_command",
+        )
+        # Clean up the running agent entry so the reset handler
+        # doesn't think an agent is still active.
+        return await self._handle_reset_command(event)
+
+    async def _busy_queue_command(self, event: MessageEvent, quick_key: str, source):
+        # /queue <prompt> — queue without interrupting.
+        # Semantics: each /queue invocation produces its own full agent
+        # turn, processed in FIFO order after the current run (and any
+        # earlier /queue items) finishes.  Messages are NOT merged.
+        queued_text = event.get_command_args().strip()
+        # Preserve media/reply payloads: a /queue carrying a photo,
+        # document, or reply context is valid even with no prompt text
+        # (e.g. "/queue" as the caption of an image). Dropping these
+        # fields silently lost the attachment when the queued turn ran.
+        has_media = bool(getattr(event, "media_urls", None))
+        if not queued_text and not has_media:
+            return "Usage: /queue <prompt>"
+        adapter = self._adapter_for_source(source)
+        if adapter:
+            queued_event = MessageEvent(
+                text=queued_text,
+                message_type=event.message_type if has_media else MessageType.TEXT,
+                source=event.source,
+                raw_message=event.raw_message,
+                message_id=event.message_id,
+                media_urls=list(getattr(event, "media_urls", []) or []),
+                media_types=list(getattr(event, "media_types", []) or []),
+                reply_to_message_id=event.reply_to_message_id,
+                reply_to_text=event.reply_to_text,
+                reply_to_author_id=event.reply_to_author_id,
+                reply_to_author_name=event.reply_to_author_name,
+                reply_to_is_own_message=event.reply_to_is_own_message,
+                auto_skill=event.auto_skill,
+                channel_prompt=event.channel_prompt,
+                channel_context=event.channel_context,
+                internal=event.internal,
+                timestamp=event.timestamp,
+            )
+            self._enqueue_fifo(quick_key, queued_event, adapter)
+        depth = self._queue_depth(quick_key, adapter=self._adapter_for_source(source))
+        if depth <= 1:
+            return "Queued for the next turn."
+        return f"Queued for the next turn. ({depth} queued)"
+
+    async def _busy_steer_command(self, event: MessageEvent, quick_key: str, source):
+        # /steer <prompt> — inject mid-run after the next tool call.
+        # Unlike /queue (turn boundary), /steer lands BETWEEN tool-call
+        # iterations inside the same agent run, by appending to the
+        # last tool result's content. No interrupt, no new user turn,
+        # no role-alternation violation.
+        steer_text = event.get_command_args().strip()
+        if not steer_text:
+            return "Usage: /steer <prompt>"
+        running_agent = self._running_agents.get(quick_key)
+        if running_agent is _AGENT_PENDING_SENTINEL:
+            # Agent hasn't started yet — queue as turn-boundary fallback.
+            adapter = self._adapter_for_source(source)
+            if adapter:
+                queued_event = MessageEvent(
+                    text=steer_text,
+                    message_type=MessageType.TEXT,
+                    source=event.source,
+                    message_id=event.message_id,
+                    channel_prompt=event.channel_prompt,
+                    channel_context=event.channel_context,
+                )
+                adapter._pending_messages[quick_key] = queued_event
+            return "Agent still starting — /steer queued for the next turn."
+        if running_agent and hasattr(running_agent, "steer"):
+            try:
+                accepted = running_agent.steer(steer_text)
+            except Exception as exc:
+                logger.warning("Steer failed for session %s: %s", quick_key, exc)
+                return f"⚠️ Steer failed: {exc}"
+            if accepted:
+                preview = steer_text[:60] + ("..." if len(steer_text) > 60 else "")
+                return f"⏩ Steer queued — arrives after the next tool call: '{preview}'"
+            return "Steer rejected (empty payload)."
+        # Running agent is missing or lacks steer() — fall back to queue.
+        adapter = self._adapter_for_source(source)
+        if adapter:
+            queued_event = MessageEvent(
+                text=steer_text,
+                message_type=MessageType.TEXT,
+                source=event.source,
+                message_id=event.message_id,
+                channel_prompt=event.channel_prompt,
+                channel_context=event.channel_context,
+            )
+            adapter._pending_messages[quick_key] = queued_event
+        return "No active agent — /steer queued for the next turn."
+
+    async def _busy_goal_command(self, event: MessageEvent, quick_key: str, source):
+        # /goal is safe mid-run for status/pause/clear/wait (inspection
+        # and control-plane only — doesn't interrupt the running turn).
+        # Setting a new goal text mid-run is rejected with the same
+        # "wait or /stop" message as /model so we don't race a second
+        # continuation prompt against the current turn.
+        _goal_arg = (event.get_command_args() or "").strip().lower()
+        _goal_verb = _goal_arg.split(None, 1)[0] if _goal_arg else ""
+        # Exact-match control verbs (unchanged semantics), plus the
+        # wait/unwait barrier verbs which take a pid argument.
+        _is_control = (
+            not _goal_arg
+            or _goal_arg in {"status", "pause", "resume", "clear", "stop", "done", "unwait"}
+            or _goal_verb == "wait"
+        )
+        if _is_control:
+            return await self._handle_goal_command(event)
+        return "Agent is running — use /goal status / pause / clear / wait mid-run, or /stop before setting a new goal."
+
     async def _handle_message(self, event: MessageEvent) -> Optional[str]:
         """
         Handle an incoming message from any platform.
@@ -11543,19 +11814,21 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 self._release_running_agent_state(_quick_key)
 
         if _quick_key in self._running_agents:
-            if event.get_command() == "status":
-                return await self._handle_status_command(event)
-
-            if event.get_command() in {"context", "ctx"}:
-                return await self._handle_context_command(event)
-
-            # Resolve the command once for all early-intercept checks below.
-            from hermes_cli.commands import (
-                ACTIVE_SESSION_BYPASS_COMMANDS as _DEDICATED_HANDLERS,
-                resolve_command as _resolve_cmd_inner,
-            )
+            # Resolve the command once; every command's mid-run behavior is
+            # declared on its CommandDef (busy_policy / busy_handler in
+            # hermes_cli/commands.py) and dispatched through the single
+            # resolver _dispatch_busy_slash_command below — no per-command
+            # if-chain here.
+            from hermes_cli.commands import resolve_command as _resolve_cmd_inner
             _evt_cmd = event.get_command()
             _cmd_def_inner = _resolve_cmd_inner(_evt_cmd) if _evt_cmd else None
+
+            # /status and /context are intentionally pre-gate so users
+            # always see session state.
+            if _cmd_def_inner and _cmd_def_inner.name == "status":
+                return await self._handle_status_command(event)
+            if _cmd_def_inner and _cmd_def_inner.name == "context":
+                return await self._handle_context_command(event)
 
             # Slash command access control on the running-agent fast-path.
             # Mirrors the cold-path gate further below so non-admin users
@@ -11568,252 +11841,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 if _denied is not None:
                     return _denied
 
-            # Telegram sends /start for bot launches/deep-links. Treat it as a
-            # platform ping, not a user command: no help dump, no agent
-            # interrupt, no queued text.
-            if _cmd_def_inner and _cmd_def_inner.name == "start":
-                logger.info("Ignoring /start platform ping for active session %s", _quick_key)
-                return ""
-
-            if _cmd_def_inner and _cmd_def_inner.name == "restart":
-                return await self._handle_restart_command(event)
-
-            if _cmd_def_inner and _cmd_def_inner.name == "egress":
-                from hermes_cli.proxy_cli import format_status_text
-
-                return format_status_text()
-
-            # /stop must hard-kill the session when an agent is running.
-            # A soft interrupt (agent.interrupt()) doesn't help when the agent
-            # is truly hung — the executor thread is blocked and never checks
-            # _interrupt_requested.  Force-clean _running_agents so the session
-            # is unlocked and subsequent messages are processed normally.
-            if _cmd_def_inner and _cmd_def_inner.name == "stop":
-                await self._interrupt_and_clear_session(
-                    _quick_key,
-                    source,
-                    interrupt_reason=_INTERRUPT_REASON_STOP,
-                    invalidation_reason="stop_command",
-                )
-                logger.info("STOP for session %s — agent interrupted, session lock released", _quick_key)
-                return EphemeralReply(t("gateway.stop.stopped"))
-
-            # /reset and /new must bypass the running-agent guard so they
-            # actually dispatch as commands instead of being queued as user
-            # text (which would be fed back to the agent with the same
-            # broken history — #2170).  Interrupt the agent first, then
-            # clear the adapter's pending queue so the stale "/reset" text
-            # doesn't get re-processed as a user message after the
-            # interrupt completes.
-            if _cmd_def_inner and _cmd_def_inner.name == "new":
-                # Clear any pending messages so the old text doesn't replay
-                await self._interrupt_and_clear_session(
-                    _quick_key,
-                    source,
-                    interrupt_reason=_INTERRUPT_REASON_RESET,
-                    invalidation_reason="new_command",
-                )
-                # Clean up the running agent entry so the reset handler
-                # doesn't think an agent is still active.
-                return await self._handle_reset_command(event)
-
-            # /queue <prompt> — queue without interrupting.
-            # Semantics: each /queue invocation produces its own full agent
-            # turn, processed in FIFO order after the current run (and any
-            # earlier /queue items) finishes.  Messages are NOT merged.
-            if event.get_command() in {"queue", "q"}:
-                queued_text = event.get_command_args().strip()
-                # Preserve media/reply payloads: a /queue carrying a photo,
-                # document, or reply context is valid even with no prompt text
-                # (e.g. "/queue" as the caption of an image). Dropping these
-                # fields silently lost the attachment when the queued turn ran.
-                has_media = bool(getattr(event, "media_urls", None))
-                if not queued_text and not has_media:
-                    return "Usage: /queue <prompt>"
-                adapter = self._adapter_for_source(source)
-                if adapter:
-                    queued_event = MessageEvent(
-                        text=queued_text,
-                        message_type=event.message_type if has_media else MessageType.TEXT,
-                        source=event.source,
-                        raw_message=event.raw_message,
-                        message_id=event.message_id,
-                        media_urls=list(getattr(event, "media_urls", []) or []),
-                        media_types=list(getattr(event, "media_types", []) or []),
-                        reply_to_message_id=event.reply_to_message_id,
-                        reply_to_text=event.reply_to_text,
-                        reply_to_author_id=event.reply_to_author_id,
-                        reply_to_author_name=event.reply_to_author_name,
-                        reply_to_is_own_message=event.reply_to_is_own_message,
-                        auto_skill=event.auto_skill,
-                        channel_prompt=event.channel_prompt,
-                        channel_context=event.channel_context,
-                        internal=event.internal,
-                        timestamp=event.timestamp,
-                    )
-                    self._enqueue_fifo(_quick_key, queued_event, adapter)
-                depth = self._queue_depth(_quick_key, adapter=self._adapter_for_source(source))
-                if depth <= 1:
-                    return "Queued for the next turn."
-                return f"Queued for the next turn. ({depth} queued)"
-
-            # /steer <prompt> — inject mid-run after the next tool call.
-            # Unlike /queue (turn boundary), /steer lands BETWEEN tool-call
-            # iterations inside the same agent run, by appending to the
-            # last tool result's content. No interrupt, no new user turn,
-            # no role-alternation violation.
-            if _cmd_def_inner and _cmd_def_inner.name == "steer":
-                steer_text = event.get_command_args().strip()
-                if not steer_text:
-                    return "Usage: /steer <prompt>"
-                running_agent = self._running_agents.get(_quick_key)
-                if running_agent is _AGENT_PENDING_SENTINEL:
-                    # Agent hasn't started yet — queue as turn-boundary fallback.
-                    adapter = self._adapter_for_source(source)
-                    if adapter:
-                        queued_event = MessageEvent(
-                            text=steer_text,
-                            message_type=MessageType.TEXT,
-                            source=event.source,
-                            message_id=event.message_id,
-                            channel_prompt=event.channel_prompt,
-                            channel_context=event.channel_context,
-                        )
-                        adapter._pending_messages[_quick_key] = queued_event
-                    return "Agent still starting — /steer queued for the next turn."
-                if running_agent and hasattr(running_agent, "steer"):
-                    try:
-                        accepted = running_agent.steer(steer_text)
-                    except Exception as exc:
-                        logger.warning("Steer failed for session %s: %s", _quick_key, exc)
-                        return f"⚠️ Steer failed: {exc}"
-                    if accepted:
-                        preview = steer_text[:60] + ("..." if len(steer_text) > 60 else "")
-                        return f"⏩ Steer queued — arrives after the next tool call: '{preview}'"
-                    return "Steer rejected (empty payload)."
-                # Running agent is missing or lacks steer() — fall back to queue.
-                adapter = self._adapter_for_source(source)
-                if adapter:
-                    queued_event = MessageEvent(
-                        text=steer_text,
-                        message_type=MessageType.TEXT,
-                        source=event.source,
-                        message_id=event.message_id,
-                        channel_prompt=event.channel_prompt,
-                        channel_context=event.channel_context,
-                    )
-                    adapter._pending_messages[_quick_key] = queued_event
-                return "No active agent — /steer queued for the next turn."
-
-            # /model must not be used while the agent is running.
-            if _cmd_def_inner and _cmd_def_inner.name == "model":
-                return "Agent is running — wait or /stop first, then switch models."
-
-            # /codex-runtime must not be used while the agent is running.
-            # Switching mid-turn would split a turn across two transports.
-            if _cmd_def_inner and _cmd_def_inner.name == "codex-runtime":
-                return ("Agent is running — wait or /stop first, then "
-                        "change runtime.")
-
-            # /approve and /deny must bypass the running-agent interrupt path.
-            # The agent thread is blocked on a threading.Event inside
-            # tools/approval.py — sending an interrupt won't unblock it.
-            # Route directly to the approval handler so the event is signalled.
-            if _cmd_def_inner and _cmd_def_inner.name in {"approve", "deny"}:
-                if _cmd_def_inner.name == "approve":
-                    return await self._handle_approve_command(event)
-                return await self._handle_deny_command(event)
-
-            # /agents (/tasks alias) should be query-only and never interrupt.
-            if _cmd_def_inner and _cmd_def_inner.name == "agents":
-                return await self._handle_agents_command(event)
-
-            # /background must bypass the running-agent guard — it starts a
-            # parallel task and must never interrupt the active conversation.
-            # /btw is an alias of /background and resolves to the same canonical
-            # name, so this branch handles both commands.
-            if _cmd_def_inner and _cmd_def_inner.name == "background":
-                return await self._handle_background_command(event)
-
-            # /kanban must bypass the guard. It writes to a profile-agnostic
-            # DB (kanban.db), not to the running agent's state. In fact
-            # /kanban unblock is often the only way to free a worker that
-            # has blocked waiting for a peer — letting that be dispatched
-            # mid-run is the whole point of the board.
-            if _cmd_def_inner and _cmd_def_inner.name == "kanban":
-                return await self._handle_kanban_command(event)
-
-            # /goal is safe mid-run for status/pause/clear/wait (inspection
-            # and control-plane only — doesn't interrupt the running turn).
-            # Setting a new goal text mid-run is rejected with the same
-            # "wait or /stop" message as /model so we don't race a second
-            # continuation prompt against the current turn.
-            if _cmd_def_inner and _cmd_def_inner.name == "goal":
-                _goal_arg = (event.get_command_args() or "").strip().lower()
-                _goal_verb = _goal_arg.split(None, 1)[0] if _goal_arg else ""
-                # Exact-match control verbs (unchanged semantics), plus the
-                # wait/unwait barrier verbs which take a pid argument.
-                _is_control = (
-                    not _goal_arg
-                    or _goal_arg in {"status", "pause", "resume", "clear", "stop", "done", "unwait"}
-                    or _goal_verb == "wait"
-                )
-                if _is_control:
-                    return await self._handle_goal_command(event)
-                return "Agent is running — use /goal status / pause / clear / wait mid-run, or /stop before setting a new goal."
-
-            if _cmd_def_inner and _cmd_def_inner.name == "moa":
-                return "Agent is running — wait or /stop first, then run /moa."
-
-            # /subgoal is safe mid-run — it only modifies the goal's
-            # subgoals list, which the judge reads at the next turn
-            # boundary. No race with the running turn.
-            if _cmd_def_inner and _cmd_def_inner.name == "subgoal":
-                return await self._handle_subgoal_command(event)
-
-            # Session-level toggles that are safe to run mid-agent —
-            # /yolo can unblock a pending approval prompt, /verbose cycles
-            # the tool-progress display mode for the ongoing stream.
-            # Both modify session state without needing agent interaction
-            # and must not be queued (the safety net would discard them).
-            # /fast and /reasoning are config-only and take effect next
-            # message, so they fall through to the catch-all busy response
-            # below — users should wait and set them between turns.
-            if _cmd_def_inner and _cmd_def_inner.name in {"yolo", "verbose", "footer"}:
-                if _cmd_def_inner.name == "yolo":
-                    return await self._handle_yolo_command(event)
-                if _cmd_def_inner.name == "verbose":
-                    return await self._handle_verbose_command(event)
-                if _cmd_def_inner.name == "footer":
-                    return await self._handle_footer_command(event)
-
-            # Gateway-handled info/control commands with dedicated
-            # running-agent handlers.
-            if _cmd_def_inner and _cmd_def_inner.name in _DEDICATED_HANDLERS:
-                if _cmd_def_inner.name == "help":
-                    return await self._handle_help_command(event)
-                if _cmd_def_inner.name == "commands":
-                    return await self._handle_commands_command(event)
-                if _cmd_def_inner.name == "profile":
-                    return await self._handle_profile_command(event)
-                if _cmd_def_inner.name == "update":
-                    return await self._handle_update_command(event)
-                if _cmd_def_inner.name == "version":
-                    return await self._handle_version_command(event)
-
-            # Catch-all: any other recognized slash command reached the
-            # running-agent guard. Reject gracefully rather than falling
-            # through to interrupt + discard. Without this, commands
-            # like /model, /reasoning, /voice, /insights, /title,
-            # /resume, /retry, /undo, /compress, /usage,
-            # /reload-mcp, /sethome, /reset (all registered as Discord
-            # slash commands) would interrupt the agent AND get
-            # silently discarded by the slash-command safety net,
-            # producing a zero-char response. See #5057, #6252, #10370.
+            # Any recognized slash command: dispatch according to its
+            # declared busy_policy (dispatch / interrupt_then_dispatch /
+            # reject). Unrecognized commands and plain text fall through
+            # to the interrupt/queue logic below.
             if _cmd_def_inner:
-                return (
-                    f"⏳ Agent is running — `/{_cmd_def_inner.name}` can't run "
-                    f"mid-turn. Wait for the current response or `/stop` first."
+                return await self._dispatch_busy_slash_command(
+                    event, _cmd_def_inner, _quick_key, source,
                 )
 
             if event.message_type == MessageType.PHOTO:
@@ -12446,8 +12480,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                             # Sanitize env to prevent credential leakage —
                             # quick commands run in the gateway process which
                             # has all API keys in os.environ.
-                            from tools.environments.local import _sanitize_subprocess_env
-                            sanitized_env = _sanitize_subprocess_env(os.environ.copy())
+                            from tools.environments.local import build_subprocess_env
+                            sanitized_env = build_subprocess_env()
                             proc = await asyncio.create_subprocess_shell(
                                 exec_cmd,
                                 stdout=asyncio.subprocess.PIPE,
@@ -17519,7 +17553,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             return
 
         def _strip_ansi(text: str) -> str:
-            return re.sub(r'\x1b\[[0-9;]*[A-Za-z]', '', text)
+            from tools.ansi_strip import strip_ansi
+            return strip_ansi(text)
 
         bytes_sent = 0
         last_stream_time = loop.time()
@@ -17761,7 +17796,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     adapter=adapter,
                 )
                 # Strip ANSI escape codes for clean display
-                output = re.sub(r'\x1b\[[0-9;]*m', '', output).strip()
+                from tools.ansi_strip import strip_ansi
+                output = strip_ansi(output).strip()
                 if output:
                     if len(output) > 3500:
                         output = "…" + output[-3500:]
@@ -20317,6 +20353,75 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             return url.rstrip("/")
         return None
 
+    def _build_stream_consumer_config(
+        self,
+        source: "SessionSource",
+        scfg: Any,
+        adapter: Any,
+        *,
+        on_missing_cursor: str,
+    ) -> "tuple[Any, Optional[Callable[[], None]]]":
+        """Build the shared ``StreamConsumerConfig`` and the optional
+        Telegram pause-typing closure used by both agent-run paths.
+
+        ``on_missing_cursor`` controls how platforms whose adapter sets
+        ``SUPPORTS_MESSAGE_EDITING = False`` are handled — both semantics
+        are preserved verbatim from the pre-refactor call sites:
+
+        - ``"fallback"`` (proxy path): stream anyway with an empty cursor.
+        - ``"raise"`` (in-process agent path): raise ``RuntimeError`` so
+          the caller's ``except`` skips streaming entirely.
+
+        Returns ``(consumer_cfg, pause_typing_before_finalize)``.
+        """
+        from gateway.stream_consumer import StreamConsumerConfig
+
+        _pause_typing_before_finalize = None
+        if source.platform == Platform.TELEGRAM and hasattr(adapter, "pause_typing_for_chat"):
+            def _pause_typing_before_finalize(
+                _adapter=adapter,
+                _chat_id=source.chat_id,
+            ) -> None:
+                _adapter.pause_typing_for_chat(_chat_id)
+        # Platforms that don't support editing sent messages
+        # (e.g. QQ, WeChat) should skip streaming entirely —
+        # without edit support, the consumer sends a partial
+        # first message that can never be updated, resulting in
+        # duplicate messages (partial + final).
+        # (The proxy path instead opts into a cursorless fallback
+        # via on_missing_cursor="fallback".)
+        _adapter_supports_edit = getattr(adapter, "SUPPORTS_MESSAGE_EDITING", True)
+        if not _adapter_supports_edit and on_missing_cursor == "raise":
+            raise RuntimeError("skip streaming for non-editable platform")
+        _effective_cursor = scfg.cursor if _adapter_supports_edit else ""
+        # Some Matrix clients render the streaming cursor
+        # as a visible tofu/white-box artifact.  Keep
+        # streaming text on Matrix, but suppress the cursor.
+        _buffer_only = False
+        if source.platform == Platform.MATRIX:
+            _effective_cursor = ""
+            _buffer_only = True
+        # Fresh-final applies to Telegram only — other
+        # platforms either edit in place cheaply (Discord,
+        # Slack) or don't have the timestamp-on-edit /
+        # edit-timestamp-stays-stale problem.
+        # (Ported from openclaw/openclaw#72038.)
+        _fresh_final_secs = (
+            float(getattr(scfg, "fresh_final_after_seconds", 0.0) or 0.0)
+            if source.platform == Platform.TELEGRAM
+            else 0.0
+        )
+        _consumer_cfg = StreamConsumerConfig(
+            edit_interval=scfg.edit_interval,
+            buffer_threshold=scfg.buffer_threshold,
+            cursor=_effective_cursor,
+            buffer_only=_buffer_only,
+            fresh_final_after_seconds=_fresh_final_secs,
+            transport=scfg.transport or "edit",
+            chat_type=getattr(source, "chat_type", "") or "",
+        )
+        return _consumer_cfg, _pause_typing_before_finalize
+
     async def _run_agent_via_proxy(
         self,
         message: str,
@@ -20426,39 +20531,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
         if _streaming_enabled:
             try:
-                from gateway.stream_consumer import GatewayStreamConsumer, StreamConsumerConfig
+                from gateway.stream_consumer import GatewayStreamConsumer
                 _adapter = self._adapter_for_source(source)
                 if _adapter:
-                    _pause_typing_before_finalize = None
-                    if source.platform == Platform.TELEGRAM and hasattr(_adapter, "pause_typing_for_chat"):
-                        def _pause_typing_before_finalize(
-                            _adapter=_adapter,
-                            _chat_id=source.chat_id,
-                        ) -> None:
-                            _adapter.pause_typing_for_chat(_chat_id)
-                    _adapter_supports_edit = getattr(_adapter, "SUPPORTS_MESSAGE_EDITING", True)
-                    _effective_cursor = _scfg.cursor if _adapter_supports_edit else ""
-                    _buffer_only = False
-                    if source.platform == Platform.MATRIX:
-                        _effective_cursor = ""
-                        _buffer_only = True
-                    # Fresh-final applies to Telegram only — other
-                    # platforms either edit in place cheaply (Discord,
-                    # Slack) or don't have the timestamp-on-edit
-                    # problem.  (Ported from openclaw/openclaw#72038.)
-                    _fresh_final_secs = (
-                        float(getattr(_scfg, "fresh_final_after_seconds", 0.0) or 0.0)
-                        if source.platform == Platform.TELEGRAM
-                        else 0.0
-                    )
-                    _consumer_cfg = StreamConsumerConfig(
-                        edit_interval=_scfg.edit_interval,
-                        buffer_threshold=_scfg.buffer_threshold,
-                        cursor=_effective_cursor,
-                        buffer_only=_buffer_only,
-                        fresh_final_after_seconds=_fresh_final_secs,
-                        transport=_scfg.transport or "edit",
-                        chat_type=getattr(source, "chat_type", "") or "",
+                    _consumer_cfg, _pause_typing_before_finalize = (
+                        self._build_stream_consumer_config(
+                            source, _scfg, _adapter,
+                            on_missing_cursor="fallback",
+                        )
                     )
                     _stream_consumer = GatewayStreamConsumer(
                         adapter=_adapter,
@@ -22008,49 +22088,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             _want_interim_consumer = _want_interim_messages
             if _want_stream_deltas or _want_interim_consumer:
                 try:
-                    from gateway.stream_consumer import GatewayStreamConsumer, StreamConsumerConfig
+                    from gateway.stream_consumer import GatewayStreamConsumer
                     _adapter = self._adapter_for_source(source)
                     if _adapter:
-                        _pause_typing_before_finalize = None
-                        if source.platform == Platform.TELEGRAM and hasattr(_adapter, "pause_typing_for_chat"):
-                            def _pause_typing_before_finalize(
-                                _adapter=_adapter,
-                                _chat_id=source.chat_id,
-                            ) -> None:
-                                _adapter.pause_typing_for_chat(_chat_id)
-                        # Platforms that don't support editing sent messages
-                        # (e.g. QQ, WeChat) should skip streaming entirely —
-                        # without edit support, the consumer sends a partial
-                        # first message that can never be updated, resulting in
-                        # duplicate messages (partial + final).
-                        _adapter_supports_edit = getattr(_adapter, "SUPPORTS_MESSAGE_EDITING", True)
-                        if not _adapter_supports_edit:
-                            raise RuntimeError("skip streaming for non-editable platform")
-                        _effective_cursor = _scfg.cursor
-                        # Some Matrix clients render the streaming cursor
-                        # as a visible tofu/white-box artifact.  Keep
-                        # streaming text on Matrix, but suppress the cursor.
-                        _buffer_only = False
-                        if source.platform == Platform.MATRIX:
-                            _effective_cursor = ""
-                            _buffer_only = True
-                        # Fresh-final applies to Telegram only — other
-                        # platforms either edit in place cheaply or don't
-                        # have the edit-timestamp-stays-stale problem.
-                        # (Ported from openclaw/openclaw#72038.)
-                        _fresh_final_secs = (
-                            float(getattr(_scfg, "fresh_final_after_seconds", 0.0) or 0.0)
-                            if source.platform == Platform.TELEGRAM
-                            else 0.0
-                        )
-                        _consumer_cfg = StreamConsumerConfig(
-                            edit_interval=_scfg.edit_interval,
-                            buffer_threshold=_scfg.buffer_threshold,
-                            cursor=_effective_cursor,
-                            buffer_only=_buffer_only,
-                            fresh_final_after_seconds=_fresh_final_secs,
-                            transport=_scfg.transport or "edit",
-                            chat_type=getattr(source, "chat_type", "") or "",
+                        _consumer_cfg, _pause_typing_before_finalize = (
+                            self._build_stream_consumer_config(
+                                source, _scfg, _adapter,
+                                on_missing_cursor="raise",
+                            )
                         )
                         _stream_consumer = GatewayStreamConsumer(
                             adapter=_adapter,
@@ -24563,6 +24608,18 @@ async def _await_thread_exit(
     return not thread.is_alive()
 
 
+def _shutdown_gateway_health_export(runner: Any) -> None:
+    """Idempotently drain and detach Gateway Health OTLP export."""
+    runtime = getattr(runner, "_gateway_health_export_runtime", None)
+    if runtime is None:
+        return
+    runner._gateway_health_export_runtime = None
+    try:
+        runtime.shutdown()
+    except Exception:
+        logger.debug("gateway health OTLP export shutdown failed", exc_info=True)
+
+
 async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = False, verbosity: Optional[int] = 0) -> bool:
     """
     Start the gateway and run until interrupted.
@@ -25021,8 +25078,13 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
         logger.debug("MCP tool discovery failed: %s", e)
 
     # Start the gateway
-    success = await runner.start()
+    try:
+        success = await runner.start()
+    except BaseException:
+        _shutdown_gateway_health_export(runner)
+        raise
     if not success:
+        _shutdown_gateway_health_export(runner)
         return False
     # Recover any pending messages flushed during a previous shutdown (#72680).
     try:
@@ -25035,6 +25097,7 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
     except Exception:
         pass
     if runner.should_exit_cleanly:
+        _shutdown_gateway_health_export(runner)
         if runner.exit_reason:
             logger.error("Gateway exiting cleanly: %s", runner.exit_reason)
         # A clean exit that carries an explicit exit code (e.g. a fatal
@@ -25050,19 +25113,22 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
     if not runner._running:
         # Startup was intentionally aborted by restart/shutdown before entering
         # running mode; preserve that lifecycle path without starting cron.
-        await runner.wait_for_shutdown()
-        if runner.should_exit_with_failure:
-            if runner.exit_reason:
-                logger.error("Gateway exiting with failure: %s", runner.exit_reason)
-            return False
         try:
-            from tools.mcp_tool import shutdown_mcp_servers
-            shutdown_mcp_servers()
-        except Exception:
-            pass
-        if runner.exit_code is not None:
-            raise SystemExit(runner.exit_code)
-        return True
+            await runner.wait_for_shutdown()
+            if runner.should_exit_with_failure:
+                if runner.exit_reason:
+                    logger.error("Gateway exiting with failure: %s", runner.exit_reason)
+                return False
+            try:
+                from tools.mcp_tool import shutdown_mcp_servers
+                shutdown_mcp_servers()
+            except Exception:
+                pass
+            if runner.exit_code is not None:
+                raise SystemExit(runner.exit_code)
+            return True
+        finally:
+            _shutdown_gateway_health_export(runner)
 
     # Start the background cron scheduler via the resolved provider so
     # scheduled jobs fire automatically. The built-in provider is the

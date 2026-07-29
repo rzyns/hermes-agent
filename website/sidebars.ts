@@ -234,9 +234,9 @@ const sidebars: SidebarsConfig = {
                   key: 'skills-bundled-mlops',
                   collapsed: true,
                   items: [
+                    'user-guide/skills/bundled/mlops/mlops-evaluation-evaluating-llms-harness',
                     'user-guide/skills/bundled/mlops/mlops-huggingface-hub',
                     'user-guide/skills/bundled/mlops/mlops-inference-llama-cpp',
-                    'user-guide/skills/bundled/mlops/mlops-evaluation-evaluating-llms-harness',
                     'user-guide/skills/bundled/mlops/mlops-inference-serving-llms-vllm',
                     'user-guide/skills/bundled/mlops/mlops-evaluation-weights-and-biases',
                   ],
@@ -308,6 +308,7 @@ const sidebars: SidebarsConfig = {
                   items: [
                     'user-guide/skills/bundled/software-development/software-development-dogfood',
                     'user-guide/skills/bundled/software-development/software-development-hermes-agent-skill-authoring',
+                    'user-guide/skills/bundled/software-development/software-development-inspecting-hermes-desktop-dom',
                     'user-guide/skills/bundled/software-development/software-development-node-inspect-debugger',
                     'user-guide/skills/bundled/software-development/software-development-plan',
                     'user-guide/skills/bundled/software-development/software-development-python-debugpy',
@@ -668,6 +669,7 @@ const sidebars: SidebarsConfig = {
             'user-guide/messaging/ntfy',
             'user-guide/messaging/irc',
             'user-guide/messaging/open-webui',
+            'user-guide/messaging/relay',
             'user-guide/messaging/webhooks',
           ],
         },
