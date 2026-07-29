@@ -57,10 +57,10 @@ _MAX_CONTEXT_CHARS = 4000
 def _title_language() -> str:
     """Return configured title language, or empty string to match the user."""
     try:
-        from hermes_cli.config import load_config
+        from hermes_cli.config import load_config_readonly
 
         return str(
-            ((load_config() or {}).get("auxiliary") or {})
+            ((load_config_readonly() or {}).get("auxiliary") or {})
             .get("title_generation", {})
             .get("language", "")
         ).strip()
