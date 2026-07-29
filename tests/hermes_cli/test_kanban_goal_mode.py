@@ -324,6 +324,32 @@ def test_loop_blocks_on_budget_exhaustion(monkeypatch):
     assert "turn budget" in blocked["reason"].lower()
 
 
+def test_progress_turns_consume_goal_budget_without_reset(monkeypatch):
+    """Checkpoint-only responses are ordinary goal turns, not free retries."""
+    _patch_judge(monkeypatch, ["continue"] * 10)
+    progress_turns = []
+    blocked = {}
+
+    def _run_progress_turn(prompt):
+        progress_turns.append(prompt)
+        return "called kanban_progress; task remains running"
+
+    res = goals.run_kanban_goal_loop(
+        task_id="t_progress_budget",
+        goal_text="finish all slices",
+        run_turn=_run_progress_turn,
+        task_status_fn=lambda: "running",
+        block_fn=lambda reason: blocked.update(reason=reason),
+        max_turns=3,
+        first_response="called kanban_progress after the first slice",
+    )
+
+    assert res["outcome"] == "blocked_budget"
+    assert res["turns_used"] == 3
+    assert len(progress_turns) == 2
+    assert "3/3" in blocked["reason"]
+
+
 def test_loop_finalize_nudge_when_judge_done_but_open(monkeypatch):
     # Judge says done, but worker never terminated → one finalize nudge,
     # then worker completes.

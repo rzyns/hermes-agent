@@ -6110,6 +6110,53 @@ class TestRunConversation:
         assert call.kwargs.get("end_run") is True
         assert "Iteration budget exhausted" in call.kwargs.get("error", "")
 
+    def test_kanban_progress_consumes_worker_iteration_budget(self, agent, monkeypatch):
+        """Progress tool calls do not reset or extend per-worker max turns."""
+        self._setup_agent(agent)
+        agent.max_iterations = 2
+        agent.valid_tool_names.add("kanban_progress")
+        monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
+        monkeypatch.setenv("HERMES_KANBAN_PROGRESS", "1")
+
+        progress_call = _mock_tool_call(
+            name="kanban_progress",
+            arguments='{"summary":"checkpoint"}',
+            call_id="progress-call",
+        )
+        progress_response = _mock_response(
+            content="",
+            finish_reason="tool_calls",
+            tool_calls=[progress_call],
+        )
+        summary_response = _mock_response(
+            content="Worker budget exhausted after progress.",
+            finish_reason="stop",
+        )
+        agent.client.chat.completions.create.side_effect = [
+            progress_response,
+            progress_response,
+            summary_response,
+        ]
+
+        with (
+            patch("run_agent.handle_function_call", return_value='{"ok":true}') as handle,
+            patch.object(agent, "_persist_session"),
+            patch.object(agent, "_save_trajectory"),
+            patch.object(agent, "_cleanup_task_resources"),
+        ):
+            result = agent.run_conversation("continue the kanban task")
+
+        assert result["api_calls"] == 2
+        assert result["turn_exit_reason"] == "max_iterations_reached(2/2)"
+        assert result["completed"] is False
+        assert handle.call_count == 2
+        assert all(
+            call.args[:2] == ("kanban_progress", {"summary": "checkpoint"})
+            for call in handle.call_args_list
+        )
+        # Two budgeted calls plus the existing toolless summary fallback.
+        assert agent.client.chat.completions.create.call_count == 3
+
     def test_no_kanban_block_when_not_in_kanban_mode(self, agent, monkeypatch):
         """The exhaustion bridge must NOT fire when HERMES_KANBAN_TASK
         is unset (non-kanban runs are unaffected by #29747 gap 2)."""

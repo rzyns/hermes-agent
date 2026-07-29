@@ -5841,3 +5841,45 @@ def test_progress_checkpoint_fails_closed_for_stale_run(kanban_home):
             expected_run_id=task.current_run_id + 1,
         )
         assert not [e for e in kb.list_events(conn, tid) if e.kind == "progress"]
+
+
+def test_progress_then_clean_exit_still_records_protocol_violation(
+    kanban_home, monkeypatch
+):
+    """A non-terminal progress event cannot turn rc=0 into run completion."""
+    monkeypatch.setenv("HERMES_KANBAN_CRASH_GRACE_SECONDS", "0")
+    fake_pid = 998741
+
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="checkpoint then exit", assignee="worker")
+        host = kb._claimer_id().split(":", 1)[0]
+        kb.claim_task(conn, tid, claimer=f"{host}:progress-test")
+        task = kb.get_task(conn, tid)
+        assert task is not None
+        run_id = task.current_run_id
+        assert run_id is not None
+        assert kb.record_progress_checkpoint(
+            conn,
+            tid,
+            summary="ordinary turn checkpoint",
+            expected_run_id=run_id,
+        )
+        kb._set_worker_pid(conn, tid, fake_pid)
+        kb._record_worker_exit(fake_pid, 0)
+        monkeypatch.setattr(kb, "_pid_alive", lambda _pid: False)
+
+        assert tid in kb.detect_crashed_workers(conn)
+
+        task = kb.get_task(conn, tid)
+        run = kb.latest_run(conn, tid)
+        assert task is not None
+        assert run is not None
+        kinds = [event.kind for event in kb.list_events(conn, tid)]
+        assert task.status == "ready"
+        assert task.current_run_id is None
+        assert run.id == run_id
+        assert run.status == "crashed"
+        assert run.outcome == "crashed"
+        assert kinds.count("progress") == 1
+        assert kinds.count("protocol_violation") == 1
+        assert "completed" not in kinds

@@ -65,6 +65,29 @@ def test_nudge_when_no_terminal_tool(clear_kanban_env):
     assert "protocol violation" in nudge.lower() or "protocol" in nudge.lower()
 
 
+def test_progress_flag_off_preserves_pre_feature_nudge_bytes(clear_kanban_env):
+    """Default-OFF must preserve the exact pre-kanban_progress wire text."""
+    clear_kanban_env.setenv("HERMES_KANBAN_TASK", "t_46be8aa5")
+    expected = (
+        "[System: You are a Hermes kanban worker. A plain-text reply is NOT a "
+        "terminal state for the board.\n\n"
+        "Task `t_46be8aa5` is still `running`. Ending now without a board tool "
+        "causes a protocol violation (clean exit with no "
+        "`kanban_complete` / `kanban_block`).\n\n"
+        "Do this immediately in your next response — do not narrate intent:\n"
+        "1. Finish any remaining deliverable (write the required file(s) now).\n"
+        "2. Call `kanban_complete(summary=..., artifacts=[...])` if the work "
+        "is done, OR `kanban_block(reason=...)` if you are blocked.\n\n"
+        "Never end a turn with only a promise of future action. Repeated "
+        "protocol violations will block this task and require manual intervention.]"
+    )
+
+    actual = build_kanban_stop_nudge(messages=[], attempts=0)
+
+    assert actual is not None
+    assert actual.encode("utf-8") == expected.encode("utf-8")
+
+
 def test_no_nudge_after_kanban_complete(clear_kanban_env):
     clear_kanban_env.setenv("HERMES_KANBAN_TASK", "t_abc")
     messages = [

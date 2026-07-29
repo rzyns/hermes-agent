@@ -145,18 +145,22 @@ def build_kanban_stop_nudge(
         return None
 
     tid = (task_id or os.environ.get("HERMES_KANBAN_TASK") or "").strip() or "this task"
+    progress_enabled = kanban_progress_enabled()
     progress_option = (
         ", OR `kanban_progress(summary=..., metadata=...)` if real work was "
         "done but the task is continuing"
-        if kanban_progress_enabled()
+        if progress_enabled
         else ""
     )
+    terminal_tools = "`kanban_complete` / `kanban_block`"
+    if progress_enabled:
+        terminal_tools += " / enabled checkpoint"
     return (
         "[System: You are a Hermes kanban worker. A plain-text reply is NOT a "
         "terminal state for the board.\n\n"
         f"Task `{tid}` is still `running`. Ending now without a board tool "
         "causes a protocol violation (clean exit with no "
-        "`kanban_complete` / `kanban_block` / enabled checkpoint).\n\n"
+        f"{terminal_tools}).\n\n"
         "Do this immediately in your next response — do not narrate intent:\n"
         "1. Finish any remaining deliverable (write the required file(s) now).\n"
         "2. Call `kanban_complete(summary=..., artifacts=[...])` if the work "
