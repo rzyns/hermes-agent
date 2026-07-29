@@ -1689,6 +1689,16 @@ class TestKanbanGuidanceV2:
         assert "‹CHANGED›" not in KANBAN_GUIDANCE_V2
         assert "‹PENDING-SURFACE" not in KANBAN_GUIDANCE_V2
 
+    def test_progress_guidance_is_config_gated(self):
+        from agent.prompt_builder import KANBAN_PROGRESS_GUIDANCE
+        from hermes_cli.config import DEFAULT_CONFIG
+
+        assert DEFAULT_CONFIG["agent"]["kanban_progress_enabled"] is False
+        assert KANBAN_PROGRESS_GUIDANCE not in self._make_agent({})._build_system_prompt()
+        prompt = self._make_agent({"kanban_progress_enabled": True})._build_system_prompt()
+        assert KANBAN_PROGRESS_GUIDANCE in prompt
+        assert "does not reset budgets or breakers" in prompt
+
 
 class TestTaskCompletionGuidance:
     """Tests for the universal task-completion / no-fabrication guidance

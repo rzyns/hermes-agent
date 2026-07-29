@@ -8620,6 +8620,69 @@ def heartbeat_worker(
     return True
 
 
+def record_progress_checkpoint(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    summary: str,
+    metadata: Optional[dict] = None,
+    contract: Optional[dict[str, Any]] = None,
+    expected_run_id: Optional[int] = None,
+) -> bool:
+    """Record a semantic checkpoint without transitioning or extending a lease.
+
+    Progress refreshes watchdog liveness timestamps and records what changed,
+    but deliberately leaves claim expiry, run timing, budgets, and breaker state
+    untouched. ``expected_run_id`` closes the stale-worker write race.
+    """
+    normalized_contract = None
+    if contract is not None:
+        _, normalized_contract, _ = _normalize_block_contract(
+            reason=None,
+            kind=None,
+            contract=contract,
+        )
+    now = int(time.time())
+    with write_txn(conn):
+        if expected_run_id is None:
+            cur = conn.execute(
+                "UPDATE tasks SET last_heartbeat_at = ? "
+                "WHERE id = ? AND status = 'running'",
+                (now, task_id),
+            )
+        else:
+            cur = conn.execute(
+                "UPDATE tasks SET last_heartbeat_at = ? "
+                "WHERE id = ? AND status = 'running' AND current_run_id = ?",
+                (now, task_id, int(expected_run_id)),
+            )
+        if cur.rowcount != 1:
+            return False
+        run_id = (
+            int(expected_run_id)
+            if expected_run_id is not None
+            else _current_run_id(conn, task_id)
+        )
+        if run_id is not None:
+            conn.execute(
+                "UPDATE task_runs SET last_heartbeat_at = ? WHERE id = ?",
+                (now, run_id),
+            )
+        _append_event(
+            conn,
+            task_id,
+            "progress",
+            {
+                "summary": summary[:400],
+                "summary_len": len(summary),
+                "metadata": metadata,
+                "contract": normalized_contract,
+            },
+            run_id=run_id,
+        )
+    return True
+
+
 def enforce_max_runtime(
     conn: sqlite3.Connection,
     *,

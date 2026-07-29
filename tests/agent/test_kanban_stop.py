@@ -13,7 +13,12 @@ from agent.kanban_stop import (
 
 @pytest.fixture
 def clear_kanban_env(monkeypatch):
-    for var in ("HERMES_KANBAN_TASK", "HERMES_KANBAN_STOP_NUDGE"):
+    for var in (
+        "HERMES_KANBAN_TASK",
+        "HERMES_KANBAN_STOP_NUDGE",
+        "HERMES_KANBAN_PROGRESS",
+        "HERMES_HOME",
+    ):
         monkeypatch.delenv(var, raising=False)
     return monkeypatch
 
@@ -131,3 +136,54 @@ def test_nudge_and_dispatcher_budgets_are_independent(clear_kanban_env):
     # Dispatcher-side streak is tracked in the DB, not in the nudge module —
     # the nudge module has no knowledge of the streak counter.
     assert not hasattr(build_kanban_stop_nudge, "_streak")
+
+
+def test_progress_suppresses_nudge_only_when_config_enabled(
+    clear_kanban_env, tmp_path
+):
+    clear_kanban_env.setenv("HERMES_KANBAN_TASK", "t_abc")
+    clear_kanban_env.setenv("HERMES_HOME", str(tmp_path))
+    messages = [{"role": "tool", "name": "kanban_progress", "content": "ok"}]
+
+    assert build_kanban_stop_nudge(messages=messages) is not None
+
+    (tmp_path / "config.yaml").write_text(
+        "agent:\n  kanban_progress_enabled: true\n", encoding="utf-8"
+    )
+    assert build_kanban_stop_nudge(messages=messages) is None
+
+
+def test_progress_env_override_enables_checkpoint(clear_kanban_env):
+    clear_kanban_env.setenv("HERMES_KANBAN_TASK", "t_abc")
+    clear_kanban_env.setenv("HERMES_KANBAN_PROGRESS", "1")
+    messages = [{"role": "tool", "name": "kanban_progress", "content": "ok"}]
+
+    assert build_kanban_stop_nudge(messages=messages) is None
+
+
+def test_progress_only_satisfies_the_current_user_turn(clear_kanban_env):
+    clear_kanban_env.setenv("HERMES_KANBAN_TASK", "t_abc")
+    clear_kanban_env.setenv("HERMES_KANBAN_PROGRESS", "1")
+    messages = [
+        {"role": "user", "content": "first turn"},
+        {"role": "tool", "name": "kanban_progress", "content": "ok"},
+        {"role": "user", "content": "continue the goal"},
+        {"role": "assistant", "content": "I will continue later"},
+    ]
+
+    assert build_kanban_stop_nudge(messages=messages) is not None
+
+
+def test_progress_enabled_nudge_names_checkpoint_without_changing_budget(
+    clear_kanban_env, tmp_path
+):
+    clear_kanban_env.setenv("HERMES_KANBAN_TASK", "t_abc")
+    clear_kanban_env.setenv("HERMES_HOME", str(tmp_path))
+    (tmp_path / "config.yaml").write_text(
+        "agent:\n  kanban_progress_enabled: true\n", encoding="utf-8"
+    )
+
+    nudge = build_kanban_stop_nudge(messages=[], attempts=1)
+    assert nudge is not None
+    assert "kanban_progress" in nudge
+    assert build_kanban_stop_nudge(messages=[], attempts=2) is None

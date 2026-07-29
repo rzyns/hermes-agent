@@ -5740,3 +5740,104 @@ def test_second_identical_failure_fingerprint_short_circuits_retries(kanban_home
         payload = json.loads(event["payload"])
         assert payload["fingerprint_short_circuit"] is True
         assert payload["contract"]["fingerprint"] == row["block_fingerprint"]
+
+
+def test_progress_checkpoint_records_payload_without_extending_lease_or_breaker(
+    kanban_home,
+):
+    with kb.connect() as conn:
+        tid = kb.create_task(
+            conn, title="checkpoint", assignee="worker", max_runtime_seconds=900
+        )
+        kb.claim_task(conn, tid, claimer="host:progress", ttl_seconds=60)
+        task = kb.get_task(conn, tid)
+        run_id = task.current_run_id
+        conn.execute(
+            "UPDATE tasks SET consecutive_failures=2, claim_expires=1234 WHERE id=?",
+            (tid,),
+        )
+        conn.execute(
+            "UPDATE task_runs SET claim_expires=1234 WHERE id=?",
+            (run_id,),
+        )
+        conn.commit()
+        before_run = conn.execute(
+            "SELECT started_at, claim_expires FROM task_runs WHERE id=?", (run_id,)
+        ).fetchone()
+
+        assert kb.record_progress_checkpoint(
+            conn,
+            tid,
+            summary="made a decision",
+            metadata={"decisions": ["use CAS"], "recovered_from": "stale run"},
+            contract={
+                "error_type": "rate_limit",
+                "fingerprint": "provider throttled",
+                "retryable": True,
+                "retry_after": 30,
+                "needs_authority": False,
+                "detail": "Retry the provider call next turn",
+            },
+            expected_run_id=run_id,
+        )
+
+        after = conn.execute(
+            "SELECT status, current_run_id, consecutive_failures, claim_expires, "
+            "max_runtime_seconds, last_heartbeat_at FROM tasks WHERE id=?",
+            (tid,),
+        ).fetchone()
+        after_run = conn.execute(
+            "SELECT status, started_at, ended_at, outcome, claim_expires, "
+            "last_heartbeat_at FROM task_runs WHERE id=?",
+            (run_id,),
+        ).fetchone()
+        event = conn.execute(
+            "SELECT run_id, payload FROM task_events "
+            "WHERE task_id=? AND kind='progress' ORDER BY id DESC LIMIT 1",
+            (tid,),
+        ).fetchone()
+
+        assert after["status"] == "running"
+        assert after["current_run_id"] == run_id
+        assert after["consecutive_failures"] == 2
+        assert after["claim_expires"] == 1234
+        assert after["max_runtime_seconds"] == 900
+        assert after["last_heartbeat_at"] is not None
+        assert after_run["status"] == "running"
+        assert after_run["started_at"] == before_run["started_at"]
+        assert after_run["ended_at"] is None
+        assert after_run["outcome"] is None
+        assert after_run["claim_expires"] == before_run["claim_expires"] == 1234
+        assert after_run["last_heartbeat_at"] == after["last_heartbeat_at"]
+        assert event["run_id"] == run_id
+        assert json.loads(event["payload"]) == {
+            "summary": "made a decision",
+            "summary_len": 15,
+            "metadata": {
+                "decisions": ["use CAS"],
+                "recovered_from": "stale run",
+            },
+            "contract": {
+                "error_type": "rate_limit",
+                "fingerprint": "provider throttled",
+                "retryable": True,
+                "retry_after": 30,
+                "needs_authority": False,
+                "detail": "Retry the provider call next turn",
+            },
+        }
+
+
+def test_progress_checkpoint_fails_closed_for_stale_run(kanban_home):
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="checkpoint", assignee="worker")
+        kb.claim_task(conn, tid)
+        task = kb.get_task(conn, tid)
+
+        assert not kb.record_progress_checkpoint(
+            conn,
+            tid,
+            summary="stale",
+            expected_run_id=task.current_run_id + 1,
+        )
+        assert not [e for e in kb.list_events(conn, tid) if e.kind == "progress"]
