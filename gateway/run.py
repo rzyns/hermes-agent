@@ -6939,7 +6939,28 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                             _strip(_session_messages)
                         except Exception:
                             pass
-                    _flush(_session_messages)
+                    try:
+                        _flush(_session_messages)
+                    except Exception as _flush_err:
+                        # The in-memory transcript could not be persisted
+                        # (e.g. FTS/SQLite index corruption — #72680). A plain
+                        # debug log loses the conversation permanently when the
+                        # process exits. Dump the live agent history to an
+                        # external JSON recovery snapshot so an operator can
+                        # salvage it after repairing state.db. The flush is
+                        # non-fatal; shutdown must never block on a best-effort
+                        # backup.
+                        logger.warning(
+                            "Shutdown transcript flush failed (%s); preserving "
+                            "%d in-memory message(s) to recovery snapshot",
+                            _flush_err,
+                            len(_session_messages),
+                        )
+                        from gateway.shutdown_flush import flush_agent_history_to_file
+                        flush_agent_history_to_file(
+                            getattr(agent, "session_id", None),
+                            _session_messages,
+                        )
             except Exception as _e:
                 logger.debug("Shutdown transcript flush failed: %s", _e)
             try:
@@ -7073,6 +7094,24 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             return
         try:
             if hasattr(agent, "shutdown_memory_provider"):
+                # Drain queued memory writes BEFORE tearing the provider down.
+                # The memory manager persists per-turn sync and end-of-session
+                # extraction on a single serialized background worker.
+                # shutdown_memory_provider() -> shutdown_all() only gives that
+                # worker a ~5s bounded drain and abandons (cancels) anything
+                # still queued past it, so a /reset — or any gateway session
+                # rotation that reaches this cleanup path — could silently drop
+                # writes the session had already handed off. The next session
+                # then loads stale memory (#73297). Give pending work a bounded
+                # head start through the manager's own barrier first, mirroring
+                # the CLI exit path (cli.py). Best-effort: a flush failure must
+                # never block teardown.
+                _mm = getattr(agent, "_memory_manager", None)
+                if _mm is not None and hasattr(_mm, "flush_pending"):
+                    try:
+                        _mm.flush_pending(timeout=10)
+                    except Exception:
+                        pass
                 # Pass the agent's own conversation transcript so memory
                 # providers' ``on_session_end`` hooks see the real messages
                 # instead of the empty default (#15165). ``_session_messages``
@@ -13108,9 +13147,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     _msg_config_ctx = None
                 if _msg_config_ctx is not None and isinstance(_msg_model_cfg, dict):
                     try:
-                        from hermes_cli.route_identity import should_clear_context_pin
+                        from hermes_cli.route_identity import should_clear_context_pin_async
 
-                        if should_clear_context_pin(
+                        if await should_clear_context_pin_async(
                             None,  # model match already checked above
                             None,
                             _msg_model_cfg.get("base_url"),
@@ -13703,9 +13742,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
                 if _hyg_config_context_length is not None:
                     try:
-                        from hermes_cli.route_identity import should_clear_context_pin
+                        from hermes_cli.route_identity import should_clear_context_pin_async
 
-                        if should_clear_context_pin(
+                        if await should_clear_context_pin_async(
                             _hyg_configured_model,
                             _hyg_model,
                             _hyg_configured_base_url,
