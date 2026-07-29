@@ -6447,7 +6447,6 @@ def block_task(
         contract_payload["retry_after"],
         contract_payload["error_type"],
     )
-    routed_to = "blocked"
     recurrences = 0
     with write_txn(conn):
         cur_row = conn.execute(
@@ -6503,7 +6502,6 @@ def block_task(
                 {"reason": reason, "kind": kind, "contract": contract_payload},
                 run_id=run_id,
             )
-            routed_to = "todo"
             _blocked_task = get_task(conn, task_id)
             _fire_kanban_lifecycle_hook(
                 "kanban_task_blocked",
@@ -6599,7 +6597,6 @@ def block_task(
                 },
                 run_id=run_id,
             )
-            routed_to = "triage"
         else:
             if expected_run_id is None:
                 cur = conn.execute(
@@ -8897,7 +8894,6 @@ def detect_stale_running(
 
 
     now = int(time.time())
-    host_prefix = f"{_claimer_id().split(':', 1)[0]}:"
     reclaimed: list[str] = []
 
     rows = conn.execute(
@@ -9557,7 +9553,6 @@ def _record_task_failure(
         if row is None:
             return False
         failures = int(row["consecutive_failures"]) + 1
-        cur_status = row["status"]
         previous_error = row["last_failure_error"]
         fingerprint_short_circuit = bool(
             failures >= 2

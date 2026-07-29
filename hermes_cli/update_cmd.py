@@ -3567,7 +3567,11 @@ def _run_update_maintenance(
             # driver) keeps the installed version — `hermes update`
             # must stay fast; `hermes computer-use install --upgrade`
             # remains the force path.
-            install_cua_driver(upgrade=True, require_confirmed_update=True)
+            install_cua_driver(
+                upgrade=True,
+                require_confirmed_update=True,
+                show_installer_progress=False,
+            )
     except Exception as e:
         logger.debug("cua-driver refresh failed: %s", e)
     if gateway_mode:
