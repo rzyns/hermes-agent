@@ -64,6 +64,30 @@ def test_kanban_tools_visible_with_env_var(monkeypatch, tmp_path):
     assert kanban == expected, f"expected {expected}, got {kanban}"
 
 
+def test_kanban_progress_visible_only_when_config_enabled(monkeypatch, tmp_path):
+    monkeypatch.setenv("HERMES_KANBAN_TASK", "t_fake")
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(home))
+
+    import tools.kanban_tools  # ensure registered
+    from tools.registry import invalidate_check_fn_cache, registry
+    from toolsets import resolve_toolset
+
+    def names():
+        invalidate_check_fn_cache()
+        schema = registry.get_definitions(
+            set(resolve_toolset("hermes-cli")), quiet=True
+        )
+        return {s["function"].get("name") for s in schema if "function" in s}
+
+    assert "kanban_progress" not in names()
+    (home / "config.yaml").write_text(
+        "agent:\n  kanban_progress_enabled: true\n", encoding="utf-8"
+    )
+    assert "kanban_progress" in names()
+
+
 def test_kanban_worker_env_overrides_profile_toolset_filter(monkeypatch, tmp_path):
     """Dispatcher-spawned workers must get lifecycle tools even when the
     assignee profile restricts enabled toolsets and does not list kanban.
@@ -159,6 +183,7 @@ def worker_env(monkeypatch, tmp_path):
     monkeypatch.setenv("HERMES_HOME", str(home))
     monkeypatch.setenv("HERMES_PROFILE", "test-worker")
     monkeypatch.delenv("HERMES_SESSION_ID", raising=False)
+    monkeypatch.delenv("HERMES_KANBAN_PROGRESS", raising=False)
     from pathlib import Path as _Path
     monkeypatch.setattr(_Path, "home", lambda: tmp_path)
 
@@ -971,6 +996,124 @@ def test_heartbeat_without_note(worker_env):
     out = kt._handle_heartbeat({})
     d = json.loads(out)
     assert d["ok"] is True
+
+
+def test_progress_records_checkpoint_without_extending_claim(worker_env, monkeypatch):
+    from hermes_cli import kanban_db as kb
+    from tools import kanban_tools as kt
+
+    monkeypatch.setenv("HERMES_KANBAN_PROGRESS", "1")
+
+    conn = kb.connect()
+    try:
+        conn.execute("UPDATE tasks SET claim_expires=1234 WHERE id=?", (worker_env,))
+        conn.commit()
+    finally:
+        conn.close()
+
+    out = kt._handle_progress({
+        "summary": "implemented the kernel slice",
+        "metadata": {"decisions": ["checkpoint is not a lease"]},
+        "next_steps": ["wire the stop guard"],
+        "error_type": "rate_limit",
+        "fingerprint": "provider throttled",
+        "retryable": True,
+        "retry_after": 30,
+        "needs_authority": False,
+        "detail": "Retry the provider call next turn",
+    })
+    result = json.loads(out)
+    assert result["ok"] is True
+    assert result["task_id"] == worker_env
+    assert result["run_id"] is not None
+
+    conn = kb.connect()
+    try:
+        task = kb.get_task(conn, worker_env)
+        event = [e for e in kb.list_events(conn, worker_env) if e.kind == "progress"][-1]
+        assert task.status == "running"
+        assert task.claim_expires == 1234
+        assert event.payload == {
+            "summary": "implemented the kernel slice",
+            "summary_len": 28,
+            "metadata": {
+                "decisions": ["checkpoint is not a lease"],
+                "next_steps": ["wire the stop guard"],
+            },
+            "contract": {
+                "error_type": "rate_limit",
+                "fingerprint": "provider throttled",
+                "retryable": True,
+                "retry_after": 30,
+                "needs_authority": False,
+                "detail": "Retry the provider call next turn",
+            },
+        }
+    finally:
+        conn.close()
+
+
+def test_progress_rejects_empty_summary(worker_env, monkeypatch):
+    from tools import kanban_tools as kt
+
+    monkeypatch.setenv("HERMES_KANBAN_PROGRESS", "1")
+
+    assert json.loads(kt._handle_progress({"summary": "  "})).get("error")
+
+
+def test_progress_schema_exposes_structured_contract_fields():
+    from tools import kanban_tools as kt
+
+    properties = kt.KANBAN_PROGRESS_SCHEMA["parameters"]["properties"]
+    assert {
+        "error_type",
+        "fingerprint",
+        "retryable",
+        "retry_after",
+        "needs_authority",
+        "detail",
+    } <= properties.keys()
+
+
+def test_progress_rejects_foreign_task(worker_env, monkeypatch):
+    from hermes_cli import kanban_db as kb
+    from tools import kanban_tools as kt
+
+    monkeypatch.setenv("HERMES_KANBAN_PROGRESS", "1")
+
+    with kb.connect() as conn:
+        other = kb.create_task(conn, title="foreign", assignee="other")
+    out = json.loads(kt._handle_progress({"task_id": other, "summary": "nope"}))
+    assert out.get("error")
+    assert "scoped" in out["error"]
+
+
+def test_progress_flag_off_is_strict_no_op(worker_env):
+    from hermes_cli import kanban_db as kb
+    from tools import kanban_tools as kt
+
+    out = json.loads(kt._handle_progress({"summary": "must not persist"}))
+
+    assert "error" in out
+    with kb.connect() as conn:
+        assert not [e for e in kb.list_events(conn, worker_env) if e.kind == "progress"]
+
+
+def test_progress_redacts_metadata(worker_env, monkeypatch):
+    from hermes_cli import kanban_db as kb
+    from tools import kanban_tools as kt
+
+    monkeypatch.setenv("HERMES_KANBAN_PROGRESS", "1")
+    secret = "ghp_ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghij"
+    out = json.loads(kt._handle_progress({
+        "summary": "checkpoint",
+        "metadata": {"recovered_from": secret},
+    }))
+
+    assert out["ok"] is True
+    with kb.connect() as conn:
+        event = [e for e in kb.list_events(conn, worker_env) if e.kind == "progress"][-1]
+    assert secret not in json.dumps(event.payload)
 
 
 def test_heartbeat_extends_claim_expires(worker_env):

@@ -999,6 +999,10 @@ DEFAULT_CONFIG = {
         "task_completion_guidance": True,
         # Opt-in Kanban worker guidance revision. False preserves the v1 prompt.
         "kanban_guidance_v2": False,
+        # Opt-in semantic Kanban checkpoint. A progress call ends a worker turn
+        # legitimately without completing/blocking the task or extending leases,
+        # runtime/turn budgets, or breaker state.
+        "kanban_progress_enabled": False,
         # Universal parallel-tool-call guidance — short prompt block applied to
         # all models that tells the model to batch independent tool calls
         # (reads, searches, web fetches, read-only commands) into one turn

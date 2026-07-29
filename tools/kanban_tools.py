@@ -109,6 +109,15 @@ def _check_kanban_mode() -> bool:
     return _profile_has_kanban_toolset()
 
 
+def _check_kanban_progress_mode() -> bool:
+    """Expose kanban_progress only in Kanban mode with its opt-in flag on."""
+    if not _check_kanban_mode():
+        return False
+    from agent.kanban_stop import kanban_progress_enabled
+
+    return kanban_progress_enabled()
+
+
 def _check_kanban_orchestrator_mode() -> bool:
     """Board-routing tools (kanban_list, kanban_unblock) are intentionally
     hidden from task workers.
@@ -973,6 +982,86 @@ def _handle_heartbeat(args: dict, **kw) -> str:
     except Exception as e:
         logger.exception("kanban_heartbeat failed")
         return tool_error(f"kanban_heartbeat: {e}")
+
+
+def _handle_progress(args: dict, **kw) -> str:
+    """Record a semantic, non-terminal checkpoint without extending the lease."""
+    if not _check_kanban_progress_mode():
+        return tool_error(
+            "kanban_progress is disabled; enable agent.kanban_progress_enabled "
+            "in config.yaml"
+        )
+    delegated_err = _reject_delegated_child_mutation("kanban_progress")
+    if delegated_err:
+        return delegated_err
+    tid = _default_task_id(args.get("task_id"))
+    if not tid:
+        return tool_error(
+            "task_id is required (or set HERMES_KANBAN_TASK in the env)"
+        )
+    ownership_err = _enforce_worker_task_ownership(tid)
+    if ownership_err:
+        return ownership_err
+    summary = args.get("summary")
+    if not summary or not str(summary).strip():
+        return tool_error("summary is required")
+    summary = redact_sensitive_text(str(summary).strip(), force=True)
+    metadata = args.get("metadata")
+    if metadata is not None and not isinstance(metadata, dict):
+        return tool_error("metadata must be an object")
+    metadata = dict(metadata or {})
+    next_steps = args.get("next_steps")
+    if next_steps is not None:
+        if not isinstance(next_steps, list) or not all(
+            isinstance(step, str) for step in next_steps
+        ):
+            return tool_error("next_steps must be an array of strings")
+        metadata["next_steps"] = next_steps
+    metadata_json = redact_sensitive_text(json.dumps(metadata), force=True)
+    try:
+        metadata = json.loads(metadata_json)
+    except json.JSONDecodeError:
+        return tool_error("metadata could not be safely serialized")
+    metadata = _stamp_worker_session_metadata(tid, metadata) or {}
+    contract_fields = (
+        "error_type",
+        "fingerprint",
+        "retryable",
+        "retry_after",
+        "needs_authority",
+        "detail",
+    )
+    contract = {key: args[key] for key in contract_fields if key in args}
+    for text_field in ("fingerprint", "detail"):
+        text_value = contract.get(text_field)
+        if isinstance(text_value, str):
+            contract[text_field] = redact_sensitive_text(text_value, force=True)
+    board = args.get("board")
+    try:
+        kb, conn = _connect(board=board)
+        try:
+            ok = kb.record_progress_checkpoint(
+                conn,
+                tid,
+                summary=summary,
+                metadata=metadata,
+                contract=contract or None,
+                expected_run_id=_worker_run_id(tid),
+            )
+            if not ok:
+                return tool_error(
+                    f"could not record progress for {tid} "
+                    "(unknown id, not running, or stale run)"
+                )
+            run = kb.latest_run(conn, tid)
+            return _ok(task_id=tid, run_id=run.id if run else None)
+        finally:
+            conn.close()
+    except ValueError as e:
+        return tool_error(f"kanban_progress: {e}")
+    except Exception as e:
+        logger.exception("kanban_progress failed")
+        return tool_error(f"kanban_progress: {e}")
 
 
 def _handle_comment(args: dict, **kw) -> str:
@@ -1953,6 +2042,81 @@ KANBAN_HEARTBEAT_SCHEMA = {
     },
 }
 
+KANBAN_PROGRESS_SCHEMA = {
+    "name": "kanban_progress",
+    "description": (
+        "Record a semantic checkpoint after real work when the task is still "
+        "continuing. This ends the turn legitimately but does not complete or "
+        "block the task, extend its lease or budgets, or reset breakers."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "task_id": {
+                "type": "string",
+                "description": _DESC_TASK_ID_DEFAULT,
+            },
+            "summary": {
+                "type": "string",
+                "description": (
+                    "1-3 sentence checkpoint summary of what was attempted "
+                    "and what remains."
+                ),
+            },
+            "metadata": {
+                "type": "object",
+                "description": (
+                    "Structured facts such as decisions, recovered_from, "
+                    "changed_files, and next steps."
+                ),
+            },
+            "next_steps": {
+                "type": "array",
+                "items": {"type": "string"},
+                "description": "Concrete next steps for the next turn.",
+            },
+            "error_type": {
+                "type": "string",
+                "enum": [
+                    "provider_quota",
+                    "provider_auth",
+                    "model_missing",
+                    "rate_limit",
+                    "crash",
+                    "timeout",
+                    "budget_exhausted",
+                    "judgment",
+                    "unknown",
+                ],
+                "description": "Optional machine-readable cause encountered this turn.",
+            },
+            "fingerprint": {
+                "type": "string",
+                "description": "Optional stable fingerprint for the encountered failure.",
+            },
+            "retryable": {
+                "type": "boolean",
+                "description": "Whether the underlying failure may be retried.",
+            },
+            "retry_after": {
+                "type": "integer",
+                "minimum": 0,
+                "description": "Optional seconds before retrying the failed operation.",
+            },
+            "needs_authority": {
+                "type": "boolean",
+                "description": "Whether recovery requires human authority.",
+            },
+            "detail": {
+                "type": "string",
+                "description": "Optional structured detail about the encountered failure.",
+            },
+            "board": _board_schema_prop(),
+        },
+        "required": ["summary"],
+    },
+}
+
 KANBAN_COMMENT_SCHEMA = {
     "name": "kanban_comment",
     "description": (
@@ -2407,6 +2571,15 @@ registry.register(
     handler=_handle_heartbeat,
     check_fn=_check_kanban_mode,
     emoji="💓",
+)
+
+registry.register(
+    name="kanban_progress",
+    toolset="kanban",
+    schema=KANBAN_PROGRESS_SCHEMA,
+    handler=_handle_progress,
+    check_fn=_check_kanban_progress_mode,
+    emoji="⏩",
 )
 
 registry.register(

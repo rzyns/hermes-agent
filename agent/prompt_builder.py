@@ -303,6 +303,16 @@ KANBAN_GUIDANCE = (
     "cross-agent handoffs that outlive one API loop."
 )
 
+KANBAN_PROGRESS_GUIDANCE = (
+    "## Non-terminal progress checkpoint\n"
+    "If you have done real work this turn but the task is not complete and you "
+    "are not blocked, call `kanban_progress(summary=..., metadata=..., "
+    "next_steps=[...])` to end the turn legitimately. This is a semantic "
+    "checkpoint, not a lease: it counts as a turn and does not reset budgets or "
+    "breakers, extend runtime, or complete/block the task. Use "
+    "`kanban_heartbeat` separately for pure liveness during a long operation."
+)
+
 KANBAN_GUIDANCE_V2 = """# Kanban task execution protocol
 You have been assigned ONE task from the shared board at `~/.hermes/kanban.db`.
 Your task id is in `$HERMES_KANBAN_TASK`; your workspace is

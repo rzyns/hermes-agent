@@ -1560,12 +1560,14 @@ def init_agent(
     # existing v1 block when the flag is absent/false so live defaults do not
     # change. Normal chat sessions retain the empty block resolved above.
     if agent._kanban_worker_guidance:
-        from agent.prompt_builder import KANBAN_GUIDANCE_V2
+        from agent.prompt_builder import KANBAN_GUIDANCE_V2, KANBAN_PROGRESS_GUIDANCE
         _kanban_agent_section = _agent_cfg.get("agent", {})
         if not isinstance(_kanban_agent_section, dict):
             _kanban_agent_section = {}
         if bool(_kanban_agent_section.get("kanban_guidance_v2", False)):
             agent._kanban_worker_guidance = KANBAN_GUIDANCE_V2
+        if bool(_kanban_agent_section.get("kanban_progress_enabled", False)):
+            agent._kanban_worker_guidance += "\n\n" + KANBAN_PROGRESS_GUIDANCE
 
     # Codex commentary visibility (display.show_commentary, default true).
     # When true, completed Codex phase=commentary messages are delivered as
