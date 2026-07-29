@@ -8,7 +8,7 @@ from tools.environments import docker as docker_env
 
 
 def _mock_subprocess_run(monkeypatch):
-    """Mock subprocess.run to intercept docker run -d and docker version calls.
+    """Mock Docker subprocess calls used while constructing an environment.
 
     Returns a list of captured (cmd, kwargs) tuples for inspection.
 
@@ -30,6 +30,10 @@ def _mock_subprocess_run(monkeypatch):
         return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
 
     monkeypatch.setattr(docker_env.subprocess, "run", _run)
+    # DockerEnvironment starts its command shell through Popen after the mocked
+    # ``docker run`` returns ``fake-container-id``. Leaving that path live makes
+    # hosts with a real Docker client block on ``docker exec fake-container-id``.
+    monkeypatch.setattr(docker_env.subprocess, "Popen", _FakePopen)
     return calls
 
 
