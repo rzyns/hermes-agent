@@ -27,9 +27,15 @@ export interface RenderRecord {
   /** ...of those, how many had changed hook state (useState/useMemo/store). */
   stateChanged: number
   /**
-   * ...of those, how many had NEITHER changed props nor changed state. These
-   * re-rendered purely because a parent did — the wasted work a `memo()` or a
-   * narrower store subscription would eliminate.
+   * ...of those, how many consumed a context whose value changed. `memo()`
+   * cannot block these — the fix is to narrow or split the provider, not to
+   * add a memo boundary.
+   */
+  contextChanged: number
+  /**
+   * ...of those, how many had NEITHER changed props, changed state, nor a
+   * changed context. These re-rendered purely because a parent did — the
+   * wasted work a `memo()` or a narrower store subscription would eliminate.
    */
   wasted: number
   /** Sum of `actualDuration` across counted renders, in ms. */
@@ -40,7 +46,14 @@ const counts = new Map<string, RenderRecord>()
 let commits = 0
 let recording = false
 
+// explain() state: while set, every wasted render of this component walks up
+// the fiber tree to find the ancestor whose props/state/context actually
+// changed — the origin of the cascade.
+let explainTarget: null | string = null
+const explainCauses = new Map<string, number>()
+
 const blank = (): RenderRecord => ({
+  contextChanged: 0,
   propsChanged: 0,
   renders: 0,
   stateChanged: 0,
@@ -69,16 +82,67 @@ function propsChanged(fiber: Fiber): boolean {
 /** Did any hook's memoizedState change? Covers useState, useSyncExternalStore
  *  (so nanostores `useStore`), useMemo, and useReducer alike. */
 function stateChanged(fiber: Fiber): boolean {
+  return changedHookIndices(fiber).length > 0
+}
+
+/** Indices (source order) of the hooks whose memoizedState changed. The index
+ *  maps straight onto the component's hook call order, so "hook #3 changed"
+ *  identifies the exact useStore/useState line without guessing. */
+function changedHookIndices(fiber: Fiber): number[] {
   let next: Fiber['memoizedState'] | null | undefined = fiber.memoizedState
   let prev: Fiber['memoizedState'] | null | undefined = fiber.alternate?.memoizedState
+  const changed: number[] = []
+  let index = 0
 
   while (next && prev) {
     if (!Object.is(next.memoizedState, prev.memoizedState)) {
-      return true
+      changed.push(index)
     }
 
     next = next.next
     prev = prev.next
+    index += 1
+  }
+
+  return changed
+}
+
+/** Names of the props whose identity changed — the cascade origin's smoking
+ *  gun. Used by explain() so the answer is "Streamdown (props: children)" and
+ *  not just "Streamdown (props)". */
+function changedPropKeys(fiber: Fiber): string[] {
+  const prev = fiber.alternate?.memoizedProps as Record<string, unknown> | null | undefined
+  const next = fiber.memoizedProps as Record<string, unknown> | null | undefined
+
+  if (!prev || !next) {
+    return []
+  }
+
+  const keys: string[] = []
+
+  for (const key of Object.keys(next)) {
+    if (!Object.is(prev[key], next[key])) {
+      keys.push(key)
+    }
+  }
+
+  return keys
+}
+
+/** Did any consumed context value change? A `memo()` cannot block a re-render
+ *  caused by context, so distinguishing this from a parent-driven render is
+ *  the difference between "add a memo" and "split the provider". */
+function contextChanged(fiber: Fiber): boolean {
+  let dep = fiber.dependencies?.firstContext
+
+  while (dep) {
+    const context = dep.context as { _currentValue?: unknown } | undefined
+
+    if (context && 'memoizedValue' in dep && !Object.is(dep.memoizedValue, context._currentValue)) {
+      return true
+    }
+
+    dep = dep.next
   }
 
   return false
@@ -94,6 +158,7 @@ function record(fiber: Fiber) {
   const entry = counts.get(name) ?? blank()
   const props = propsChanged(fiber)
   const state = stateChanged(fiber)
+  const context = contextChanged(fiber)
 
   entry.renders += 1
   entry.totalMs += fiber.actualDuration ?? 0
@@ -106,8 +171,52 @@ function record(fiber: Fiber) {
     entry.stateChanged += 1
   }
 
-  if (!props && !state) {
+  if (context) {
+    entry.contextChanged += 1
+  }
+
+  if (!props && !state && !context) {
     entry.wasted += 1
+
+    // explain() support: walk UP from a wasted render to the TOP of the
+    // cascade — the highest ancestor that also rendered this commit. That
+    // fiber is the origin; its own changed props/state is the reason.
+    // Stopping at the first ancestor with changed props is wrong: JSX rebuilt
+    // by a parent makes every intermediate node report "children changed",
+    // which is the symptom cascading down, not the cause.
+    if (explainTarget && name === explainTarget) {
+      let origin: Fiber = fiber
+      let cursor = fiber.return
+      let hops = 0
+
+      while (cursor && hops < 80) {
+        if (isCompositeFiber(cursor) && didFiberRender(cursor)) {
+          origin = cursor
+        }
+
+        cursor = cursor.return
+        hops += 1
+      }
+
+      const originName = getDisplayName(origin) ?? '?'
+      const changed = changedPropKeys(origin).filter(k => k !== 'children')
+
+      const why =
+        origin === fiber
+          ? 'self'
+          : stateChanged(origin)
+            ? `state (hooks #${changedHookIndices(origin).slice(0, 5).join(',#')})`
+            : changed.length
+              ? `props: ${changed.slice(0, 4).join(',')}`
+              : contextChanged(origin)
+                ? 'context'
+                : changedPropKeys(origin).length
+                  ? 'children only'
+                  : 'no visible change (external store?)'
+
+      const key = `${originName} (${why})`
+      explainCauses.set(key, (explainCauses.get(key) ?? 0) + 1)
+    }
   }
 
   counts.set(name, entry)
@@ -137,6 +246,12 @@ declare global {
       report: (limit?: number) => Array<RenderRecord & { name: string }>
       /** Attribution for one component by display name. */
       get: (name: string) => RenderRecord | undefined
+      /**
+       * Name a component (its displayName, e.g. 'Block'), interact, then call
+       * with no argument to get the tally of which CHANGED ancestor each of
+       * its wasted renders cascaded from. The origin, walked — not guessed.
+       */
+      explain: (name?: null | string) => Record<string, number> | string
     }
   }
 }
@@ -164,6 +279,20 @@ if (typeof window !== 'undefined' && !window.__RENDER_COUNTS__) {
     },
     commits: () => commits,
     counts,
+    explain: name => {
+      if (name !== undefined) {
+        explainTarget = name
+        explainCauses.clear()
+
+        if (name && !recording) {
+          recording = true
+        }
+
+        return name ? `explaining ${name} — interact, then call explain() to read` : 'explain off'
+      }
+
+      return Object.fromEntries([...explainCauses.entries()].sort((x, y) => y[1] - x[1]))
+    },
     get: name => counts.get(name),
     recording: () => recording,
     report,

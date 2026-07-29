@@ -180,12 +180,11 @@ def test_board_health_report_corrupt_db_page(multi_board_home):
     kh.inject_corruption(db_path, offset=4096, length=512)
     report = kh.board_health_report("testboard")
     assert report["slug"] == "testboard"
-    assert report["integrity_check"] in (
-        "ok",
-        "malformed",
-        "database disk image is malformed",
-    )
+    assert isinstance(report["integrity_check"], str)
+    assert report["integrity_check"]
     assert isinstance(report["healthy"], bool)
+    if report["integrity_check"] != "ok":
+        assert report["healthy"] is False
 
 
 # ---------------------------------------------------------------------------
@@ -503,9 +502,12 @@ def test_sidecar_info_no_wal(multi_board_home):
 
 
 def test_pragma_str_ok(multi_board_home):
+    from hermes_state import is_sqlite_wal_reset_vulnerable
+
     conn = kb.connect(board="default")
     val = kh._pragma_str(conn, "PRAGMA journal_mode")
-    assert val.lower() == "wal"
+    expected = "delete" if is_sqlite_wal_reset_vulnerable() else "wal"
+    assert val.lower() == expected
     conn.close()
 
 

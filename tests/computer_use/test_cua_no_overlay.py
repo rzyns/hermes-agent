@@ -27,9 +27,11 @@ class TestNoOverlayFlag:
 
     def test_default_linux_desktop_enables(self):
         """Auto-detect: Linux with DISPLAY => overlay enabled."""
+        fake_version = "Linux version 6.8.0-generic"
         with patch("hermes_cli.config.load_config", return_value={}), \
              patch.object(sys, "platform", "linux"), \
-             patch.dict(os.environ, {"DISPLAY": ":0"}):
+             patch.dict(os.environ, {"DISPLAY": ":0"}), \
+             patch("builtins.open", mock_open(read_data=fake_version)):
             assert cua_backend._cua_no_overlay() is False
 
     def test_default_linux_wsl2_disables(self):
@@ -81,10 +83,12 @@ class TestNoOverlayFlag:
             assert cua_backend._cua_no_overlay() is False
 
     def test_missing_section_falls_through_to_auto_detect(self):
+        fake_version = "Linux version 6.8.0-generic"
         with patch("hermes_cli.config.load_config",
                    return_value={"other": {}}), \
              patch.object(sys, "platform", "linux"), \
-             patch.dict(os.environ, {"DISPLAY": ":0"}):
+             patch.dict(os.environ, {"DISPLAY": ":0"}), \
+             patch("builtins.open", mock_open(read_data=fake_version)):
             assert cua_backend._cua_no_overlay() is False
 
 

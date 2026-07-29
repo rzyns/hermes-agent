@@ -49,9 +49,11 @@ def notify_session_end_once(
     effective_task_id,
     turn_id,
     completed=False,
+    failed=False,
     interrupted=False,
+    turn_exit_reason=None,
 ):
-    """Emit the plugin ``on_session_end`` hook at most once per turn.
+    """Emit the lifecycle ``on_session_end`` hook at most once per turn.
 
     ``run_conversation`` has several terminal early-return paths that bypass the
     normal ``finalize_turn`` tail. Observability plugins such as Langfuse open
@@ -80,14 +82,16 @@ def notify_session_end_once(
     seen.add(key)
 
     try:
-        from hermes_cli.plugins import invoke_hook as _invoke_hook
+        from hermes_cli.lifecycle import invoke_hook as _invoke_hook
         _invoke_hook(
             "on_session_end",
             session_id=session_id,
             task_id=task_id,
             turn_id=turn,
             completed=completed,
+            failed=failed,
             interrupted=interrupted,
+            turn_exit_reason=turn_exit_reason,
             model=getattr(agent, "model", None),
             platform=getattr(agent, "platform", None) or "",
         )
@@ -549,7 +553,7 @@ def finalize_turn(
     # First hook to return a string wins; None/empty return leaves text unchanged.
     if final_response and not interrupted:
         try:
-            from hermes_cli.plugins import invoke_hook as _invoke_hook
+            from hermes_cli.lifecycle import invoke_hook as _invoke_hook
             _transform_results = _invoke_hook(
                 "transform_llm_output",
                 response_text=final_response,
@@ -571,7 +575,7 @@ def finalize_turn(
     # to an external memory system).
     if final_response and not interrupted:
         try:
-            from hermes_cli.plugins import invoke_hook as _invoke_hook
+            from hermes_cli.lifecycle import invoke_hook as _invoke_hook
             _invoke_hook(
                 "post_llm_call",
                 session_id=agent.session_id,
@@ -735,7 +739,9 @@ def finalize_turn(
         effective_task_id=effective_task_id,
         turn_id=turn_id,
         completed=completed,
+        failed=failed,
         interrupted=interrupted,
+        turn_exit_reason=_turn_exit_reason,
     )
 
     agent._turn_preflight_display_snapshot = None

@@ -389,6 +389,15 @@ class TestFailureAttribution:
         (hermes_home / "auth.json").write_text(
             json.dumps({"version": 1, "credential_pool": {"anthropic": entries}})
         )
+        # Keep these routing tests independent of credentials installed by the
+        # developer's Claude Code client.  The pool intentionally discovers
+        # those from ~/.claude even when HERMES_HOME points at a temp profile.
+        monkeypatch.setattr(
+            "agent.anthropic_adapter.read_claude_code_credentials", lambda: None
+        )
+        monkeypatch.setattr(
+            "agent.anthropic_adapter.read_hermes_oauth_credentials", lambda: None
+        )
         from agent.credential_pool import load_pool
 
         return load_pool("anthropic")

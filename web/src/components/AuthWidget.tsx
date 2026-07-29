@@ -42,17 +42,17 @@ function truncateUserId(id: string): string {
 }
 
 export function AuthWidget({ className }: AuthWidgetProps) {
-  const authRequired =
-    typeof window !== "undefined" && window.__HERMES_AUTH_REQUIRED__ === true;
+  const gated =
+    typeof window !== "undefined" && !!window.__HERMES_AUTH_REQUIRED__;
   const [me, setMe] = useState<AuthMeResponse | null>(null);
-  const [hidden, setHidden] = useState(!authRequired);
+  const [hidden, setHidden] = useState(!gated);
   const [error, setError] = useState<string | null>(null);
 
+  // Loopback / --insecure mode: the auth gate is off, so /api/auth/me is a
+  // guaranteed 401. Don't fire the request at all — it only produces console
+  // noise ("Failed to load resource: 401") on every dashboard load.
   useEffect(() => {
-    if (!authRequired) {
-      return;
-    }
-
+    if (!gated) return;
     let cancelled = false;
     api
       .getAuthMe()
@@ -75,7 +75,10 @@ export function AuthWidget({ className }: AuthWidgetProps) {
     return () => {
       cancelled = true;
     };
-  }, [authRequired]);
+  }, [gated]);
+
+  // Nothing to show in ungated mode — there is no logged-in identity.
+  if (!gated) return null;
 
   if (hidden) return null;
 

@@ -1571,7 +1571,7 @@ class TestLazyMcpInstall:
         from tools import lazy_deps
         assert lazy_deps.feature_specs("tool.computer_use") == (
             "mcp==1.26.0",
-            "starlette==1.0.1",
+            "starlette==1.3.1",
         )
 
     def test_start_lazy_installs_mcp(self):
@@ -1822,6 +1822,7 @@ class TestCuaDriverSessionReconnect:
         session._shutdown_event = None
         session._lifecycle_future = None
         session._setup_error = None
+        session._declared_session_id = None
         session._call_tool_async = lambda name, args: ("call", name, args)
         # Record what reconnect does — stop then start, in that order.
         session._reconnect_log = []
@@ -1855,6 +1856,152 @@ class TestCuaDriverSessionReconnect:
         assert session._reconnect_log == ["stop", "start"]
         assert bridge.calls[1][0] == ("call", "list_apps", {})
         assert len(bridge.calls) == 2
+
+    def test_reconnect_retry_can_revive_ended_session(self):
+        """A reconnect result may still require reviving the declared session."""
+        from anyio import ClosedResourceError
+
+        ended = {
+            "data": "session 'hermes-test' has ended; call start_session to revive it",
+            "images": [],
+            "structuredContent": None,
+            "isError": True,
+        }
+        revived = {"data": "revived", "isError": False}
+        windows = {
+            "data": "",
+            "structuredContent": {"windows": []},
+            "isError": False,
+        }
+
+        class FakeBridge:
+            def __init__(self):
+                self.calls = []
+                self.effects = [
+                    ClosedResourceError(),
+                    ended,
+                    revived,
+                    windows,
+                ]
+
+            def run(self, value, timeout=None):
+                self.calls.append((value, timeout))
+                effect = self.effects.pop(0)
+                if isinstance(effect, Exception):
+                    raise effect
+                return effect
+
+        bridge = FakeBridge()
+        session = self._make_session(bridge)
+        session._declared_session_id = "hermes-test"
+
+        result = session.call_tool(
+            "list_windows", {"session": "hermes-test"}
+        )
+
+        assert result is windows
+        assert session._reconnect_log == ["stop", "start"]
+        assert [call[0] for call in bridge.calls] == [
+            ("call", "list_windows", {"session": "hermes-test"}),
+            ("call", "list_windows", {"session": "hermes-test"}),
+            ("call", "start_session", {"session": "hermes-test"}),
+            ("call", "list_windows", {"session": "hermes-test"}),
+        ]
+
+    def test_call_tool_revives_ended_session_then_retries_once(self):
+        """Logical ended-session errors revive the same id before one replay."""
+        ended = {
+            "data": (
+                "session 'hermes-test' has ended; tool call 'list_windows' "
+                "was rejected. Call start_session with this id to revive it."
+            ),
+            "images": [],
+            "structuredContent": None,
+            "isError": True,
+        }
+        ok = {"data": "revived", "images": [], "structuredContent": None, "isError": False}
+        windows = {
+            "data": "",
+            "images": [],
+            "structuredContent": {"windows": [{"pid": 1, "window_id": 2}]},
+            "isError": False,
+        }
+
+        class FakeBridge:
+            def __init__(self):
+                self.calls = []
+                self.effects = [ended, ok, windows]
+
+            def run(self, value, timeout=None):
+                self.calls.append((value, timeout))
+                return self.effects.pop(0)
+
+        bridge = FakeBridge()
+        session = self._make_session(bridge)
+        session._declared_session_id = "hermes-test"
+
+        result = session.call_tool(
+            "list_windows", {"on_screen_only": True, "session": "hermes-test"}
+        )
+
+        assert result is windows
+        assert [call[0] for call in bridge.calls] == [
+            ("call", "list_windows", {"on_screen_only": True, "session": "hermes-test"}),
+            ("call", "start_session", {"session": "hermes-test"}),
+            ("call", "list_windows", {"on_screen_only": True, "session": "hermes-test"}),
+        ]
+
+    def test_call_tool_does_not_loop_when_retry_is_still_ended(self):
+        """A repeated ended-session result is surfaced after one revival."""
+        ended = {
+            "data": "session 'hermes-test' has ended; call start_session to revive it",
+            "images": [],
+            "structuredContent": None,
+            "isError": True,
+        }
+
+        class FakeBridge:
+            def __init__(self):
+                self.calls = []
+                self.effects = [ended, {"isError": False}, ended]
+
+            def run(self, value, timeout=None):
+                self.calls.append((value, timeout))
+                return self.effects.pop(0)
+
+        bridge = FakeBridge()
+        session = self._make_session(bridge)
+        session._declared_session_id = "hermes-test"
+
+        result = session.call_tool("list_windows", {"session": "hermes-test"})
+
+        assert result is ended
+        assert len(bridge.calls) == 3
+
+    def test_lifecycle_call_does_not_try_to_revive_itself(self):
+        """start_session failures stay single-shot and cannot recurse."""
+        ended = {
+            "data": "session 'hermes-test' has ended; call start_session to revive it",
+            "images": [],
+            "structuredContent": None,
+            "isError": True,
+        }
+
+        class FakeBridge:
+            def __init__(self):
+                self.calls = []
+
+            def run(self, value, timeout=None):
+                self.calls.append((value, timeout))
+                return ended
+
+        bridge = FakeBridge()
+        session = self._make_session(bridge)
+
+        result = session.call_tool("start_session", {"session": "hermes-test"})
+
+        assert result is ended
+        assert len(bridge.calls) == 1
 
     def test_call_tool_does_not_retry_on_unrelated_error(self):
         """Non-transport errors must propagate without a reconnect attempt."""
@@ -2616,7 +2763,10 @@ class TestFocusAppFilterNoMatch:
 
         assert backend._active_pid == 300
         assert backend._active_window_id == 3
-        assert cap.app == ""
+        # The merged window normalizer may enrich a raw nameless row with its
+        # process name; target identity, not the display label, proves the
+        # constrained title fallback selected the nameless source row.
+        assert cap.app != "計算機"
 
     def test_title_fallback_survives_list_apps_failure(self):
         windows = [
@@ -2639,7 +2789,6 @@ class TestFocusAppFilterNoMatch:
 
         cap = backend.capture(mode="ax", app="Mousepad")
 
-        assert cap.app == ""
         assert backend._active_pid == 300
         assert backend._active_window_id == 3
 

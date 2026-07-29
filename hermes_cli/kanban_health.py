@@ -181,8 +181,17 @@ def board_health_report(
         # WAL/SHM sidecars
         sidecars = _sidecar_info(db_path)
 
-        # Task counts
-        counts = kb.board_stats(conn)
+        # Task counts. A corrupt page can become visible only after the broad
+        # integrity probes have returned (or only to this specific query),
+        # especially when the WAL-reset safety guard selects DELETE mode.
+        # Health reporting must degrade rather than raise on that late read.
+        try:
+            counts = kb.board_stats(conn)
+        except sqlite3.DatabaseError as exc:
+            counts = {"by_status": {}}
+            healthy = False
+            if integrity_ok:
+                integrity_msg = str(exc)
         by_status = counts.get("by_status", {})
         total = sum(by_status.values())
         running = by_status.get("running", 0)

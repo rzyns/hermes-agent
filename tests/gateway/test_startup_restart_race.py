@@ -12,6 +12,14 @@ from gateway.restart import (
 )
 
 
+# Restart exercises real shutdown cleanup, including lazy imports for every
+# installed optional subsystem. Full-extra developer/CI environments can take
+# several seconds even though the state machine is making progress; keep the
+# bound generous enough to detect a deadlock without turning import speed into
+# a flaky assertion.
+_STARTUP_RESTART_TIMEOUT = 10
+
+
 class StartupRaceAdapter(BasePlatformAdapter):
     def __init__(
         self,
@@ -136,7 +144,9 @@ async def test_startup_aborts_when_restart_requested_before_start(tmp_path, monk
     runner.request_restart(detached=False, via_service=True)
     runner._create_adapter = MagicMock()
 
-    result = await asyncio.wait_for(runner.start(), timeout=2)
+    result = await asyncio.wait_for(
+        runner.start(), timeout=_STARTUP_RESTART_TIMEOUT
+    )
 
     assert result is True
     runner._create_adapter.assert_not_called()
@@ -167,7 +177,9 @@ async def test_startup_aborts_when_restart_begins_during_platform_connect(tmp_pa
     telegram.disconnect = disconnect_and_release
     runner._create_adapter = MagicMock(side_effect=[telegram, slack])
 
-    result = await asyncio.wait_for(runner.start(), timeout=2)
+    result = await asyncio.wait_for(
+        runner.start(), timeout=_STARTUP_RESTART_TIMEOUT
+    )
 
     assert result is True
     assert telegram.disconnected is True
@@ -202,7 +214,7 @@ async def test_startup_abort_waits_for_existing_stop_task(tmp_path):
 
     result = await asyncio.wait_for(
         runner._abort_startup_if_shutdown_requested(adapter, Platform.TELEGRAM),
-        timeout=2,
+        timeout=_STARTUP_RESTART_TIMEOUT,
     )
 
     assert result is True
@@ -227,7 +239,9 @@ async def test_startup_aborts_after_registered_adapter_restart(tmp_path, monkeyp
 
     runner._update_platform_runtime_status = MagicMock(side_effect=update_platform_runtime_status)
 
-    result = await asyncio.wait_for(runner.start(), timeout=2)
+    result = await asyncio.wait_for(
+        runner.start(), timeout=_STARTUP_RESTART_TIMEOUT
+    )
 
     assert result is True
     assert telegram.connected is True
