@@ -308,10 +308,14 @@ def test_fence_cancelled_compression_leaves_lock_reacquirable(tmp_path: Path) ->
 
     worker = threading.Thread(target=_run_compression, name="fenced-hygiene")
     worker.start()
-    assert summary_started.wait(timeout=2)
-    assert fence.cancel_before_commit() is True
-    release_summary.set()
-    worker.join(timeout=5)
+    try:
+        assert summary_started.wait(timeout=10)
+        assert fence.cancel_before_commit() is True
+    finally:
+        # Never strand the compression thread when a synchronization
+        # assertion fails under a heavily loaded test runner.
+        release_summary.set()
+        worker.join(timeout=10)
     assert not worker.is_alive()
 
     # Cancelled attempt: no mutation, and — the invariant under test — the
