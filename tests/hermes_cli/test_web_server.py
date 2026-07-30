@@ -2554,6 +2554,12 @@ class TestWebServerEndpoints:
             "acp-session",
         }
 
+        singular = self.client.get(
+            "/api/sessions?source=cron&sources=tool&limit=10"
+        ).json()
+        assert singular["total"] == 1
+        assert [s["id"] for s in singular["sessions"]] == ["cron-session"]
+
     def test_get_sessions_order_recent_surfaces_compression_tip(self):
         """A long-running conversation that auto-compresses must stay on the
         first page by recency, listed under its live continuation id."""
