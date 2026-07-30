@@ -20,6 +20,8 @@ from hermes_constants import get_hermes_home
 
 logger = logging.getLogger(__name__)
 
+_PROCESS_START_TIME_SOURCE = "gateway-stable-v1"
+
 
 def coerce_max_concurrent_sessions(value: Any, key: str = "max_concurrent_sessions") -> Optional[int]:
     """Return a positive integer cap, or None when disabled/invalid."""
@@ -202,13 +204,12 @@ def _write_entries(path: Path, entries: list[dict[str, Any]]) -> None:
     os.replace(tmp, path)
 
 
-def _process_start_time(pid: int) -> Optional[float]:
-    # Pair pid with process create_time when psutil can read it, so a recycled
-    # pid does not keep a stale lease alive indefinitely.
+def _process_start_time(pid: int) -> Optional[int]:
+    """Return the shared, platform-stable PID-reuse fingerprint."""
     try:
-        import psutil  # type: ignore
+        from gateway.status import get_process_start_time
 
-        return float(psutil.Process(pid).create_time())
+        return get_process_start_time(pid)
     except Exception:
         return None
 
@@ -222,7 +223,20 @@ def _optional_float(value: Any) -> Optional[float]:
         return None
 
 
-def _pid_alive(pid: Any, process_start_time: Any = None) -> bool:
+def _optional_int(value: Any) -> Optional[int]:
+    if value is None or value == "":
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _pid_alive(
+    pid: Any,
+    stable_process_start_time: Any = None,
+    process_start_time_source: Any = None,
+) -> bool:
     try:
         pid_int = int(pid)
     except (TypeError, ValueError):
@@ -237,20 +251,30 @@ def _pid_alive(pid: Any, process_start_time: Any = None) -> bool:
         return False
     if not exists:
         return False
-    expected_start = _optional_float(process_start_time)
+    # Pre-v1 entries have no stable fingerprint source. Their legacy
+    # process_start_time was psutil's epoch-derived create_time, which can drift
+    # on WSL while a process is alive. Retain those live entries until their PID
+    # exits rather than risking false eviction and session over-admission.
+    if process_start_time_source != _PROCESS_START_TIME_SOURCE:
+        return True
+    expected_start = _optional_int(stable_process_start_time)
     if expected_start is None:
         return True
     current_start = _process_start_time(pid_int)
     if current_start is None:
         return True
-    return abs(current_start - expected_start) < 0.001
+    return current_start == expected_start
 
 
 def _prune_dead(entries: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return [
         entry
         for entry in entries
-        if _pid_alive(entry.get("pid"), entry.get("process_start_time"))
+        if _pid_alive(
+            entry.get("pid"),
+            entry.get("stable_process_start_time"),
+            entry.get("process_start_time_source"),
+        )
     ]
 
 
@@ -296,7 +320,13 @@ def try_acquire_active_session(
         "session_id": str(session_id),
         "surface": str(surface),
         "pid": os.getpid(),
-        "process_start_time": _process_start_time(os.getpid()),
+        # Older Hermes readers only compare this legacy field when non-null.
+        # Keep it null so a mixed-version peer uses PID-only liveness instead
+        # of comparing the stable fingerprint as epoch seconds and pruning a
+        # live lease during a rolling upgrade.
+        "process_start_time": None,
+        "stable_process_start_time": _process_start_time(os.getpid()),
+        "process_start_time_source": _PROCESS_START_TIME_SOURCE,
         "started_at": now,
         "updated_at": now,
     }
