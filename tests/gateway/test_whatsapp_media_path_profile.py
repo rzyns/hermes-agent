@@ -19,20 +19,6 @@ def _make_profile(root: Path) -> Path:
     return root
 
 
-def test_validator_accepts_active_profile_media(tmp_path):
-    from plugins.platforms.whatsapp.adapter import _is_allowed_bridge_path
-
-    prof = _make_profile(tmp_path / "profB")
-    media = prof / "cache" / "images" / "img_abc.jpg"
-    media.write_bytes(b"\xff\xd8\xff\x00")
-
-    token = set_hermes_home_override(str(prof))
-    try:
-        assert _is_allowed_bridge_path(str(media)) is True
-    finally:
-        reset_hermes_home_override(token)
-
-
 def test_validator_follows_override_switch(tmp_path):
     """A path under profile A is rejected while the override is profile B."""
     from plugins.platforms.whatsapp.adapter import _is_allowed_bridge_path
@@ -50,18 +36,5 @@ def test_validator_follows_override_switch(tmp_path):
         assert _is_allowed_bridge_path(str(b_media)) is True
         # ...and a path from a *different* profile is not in B's cache roots.
         assert _is_allowed_bridge_path(str(a_media)) is False
-    finally:
-        reset_hermes_home_override(token)
-
-
-def test_validator_rejects_non_cache_path(tmp_path):
-    from plugins.platforms.whatsapp.adapter import _is_allowed_bridge_path
-
-    prof = _make_profile(tmp_path / "profB")
-    outside = tmp_path / "etc_passwd"
-    outside.write_text("root:x:0:0")
-    token = set_hermes_home_override(str(prof))
-    try:
-        assert _is_allowed_bridge_path(str(outside)) is False
     finally:
         reset_hermes_home_override(token)

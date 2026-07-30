@@ -123,12 +123,11 @@ class TestCodeGeneration:
             code = store.generate_code("telegram", "user1", "Alice")
             pending = store.list_pending("telegram")
         assert len(pending) == 1
-        # list_pending no longer returns the original code — it returns a
-        # truncated hash prefix.  Verify the metadata is correct instead.
         assert pending[0]["user_id"] == "user1"
         assert pending[0]["user_name"] == "Alice"
-        # The code field is now a hash prefix, not the original plaintext code
-        assert pending[0]["code"] != code
+        assert pending[0]["request_id"]
+        assert pending[0]["request_id"] != code
+        assert "code" not in pending[0]
 
 
 # ---------------------------------------------------------------------------
@@ -264,7 +263,8 @@ class TestLegacyPendingFileCompat:
             pending = store.list_pending("telegram")
         assert len(pending) == 1
         assert pending[0]["user_id"] == "legacy-user"
-        assert pending[0]["code"] == "legacy"  # placeholder
+        assert pending[0]["request_id"] == ""
+        assert "code" not in pending[0]
 
     def test_cleanup_expired_removes_legacy_at_ttl(self, tmp_path):
         """Legacy entries past CODE_TTL must still get pruned."""
@@ -456,6 +456,64 @@ class TestApprovalFlow:
         assert result["user_id"] == "user1"
         assert result["user_name"] == "Alice"
 
+    def test_approve_request_id_from_pending_list(self, tmp_path):
+        with patch("gateway.pairing.PAIRING_DIR", tmp_path):
+            store = PairingStore()
+            bot_code = store.generate_code("telegram", "user1", "Alice")
+            pending = store.list_pending("telegram")
+            request_id = pending[0]["request_id"]
+
+            assert request_id
+            assert request_id != bot_code
+
+            result = store.approve_request("telegram", request_id.upper())
+            remaining = store.list_pending("telegram")
+
+        assert isinstance(result, dict)
+        assert result["user_id"] == "user1"
+        assert result["user_name"] == "Alice"
+        assert remaining == []
+
+    def test_approve_request_never_reveals_or_accepts_the_code_digest(self, tmp_path):
+        """Pending rows expose an approvable id, never a code-derived value."""
+        with patch("gateway.pairing.PAIRING_DIR", tmp_path):
+            store = PairingStore()
+            bot_code = store.generate_code("telegram", "user1", "Alice")
+            entry = store.list_pending("telegram")[0]
+
+            digest = json.loads(
+                (tmp_path / "telegram-pending.json").read_text()
+            )[entry["request_id"]]["hash"]
+
+            assert set(entry) == {
+                "platform",
+                "request_id",
+                "user_id",
+                "user_name",
+                "age_minutes",
+            }
+            assert bot_code not in entry.values()
+            assert entry["request_id"] not in (digest, digest[:8])
+            assert store.approve_code("telegram", digest[:8]) is None
+            assert store.approve_request("telegram", digest[:8]) is None
+
+    def test_stale_request_id_never_locks_out_the_code_path(self, tmp_path):
+        """An expired GUI row is not a brute-force code attempt."""
+        with patch("gateway.pairing.PAIRING_DIR", tmp_path):
+            store = PairingStore()
+            code = store.generate_code("telegram", "user1", "Alice")
+            stale_id = store.list_pending("telegram")[0]["request_id"]
+            assert store.approve_request("telegram", stale_id) is not None
+
+            for _ in range(MAX_FAILED_ATTEMPTS + 3):
+                assert store.approve_request("telegram", stale_id) is None
+
+            assert store._is_locked_out("telegram") is False
+            next_code = store.generate_code("telegram", "user2", "Bee")
+            assert next_code is not None
+            assert store.approve_code("telegram", next_code) is not None
+            assert code != next_code
+
     def test_invalid_code_returns_none(self, tmp_path):
         with patch("gateway.pairing.PAIRING_DIR", tmp_path):
             store = PairingStore()
@@ -588,6 +646,23 @@ class TestLockout:
             limits[lockout_key] = time.time() - 1  # expired
             store._save_json(store._rate_limit_path(), limits)
 
+            assert store._is_locked_out("telegram") is False
+
+    def test_successful_approval_resets_failure_counter(self, tmp_path):
+        with patch("gateway.pairing.PAIRING_DIR", tmp_path):
+            store = PairingStore()
+
+            for _ in range(MAX_FAILED_ATTEMPTS - 1):
+                assert store.approve_code("telegram", "WRONGCODE") is None
+            assert store._is_locked_out("telegram") is False
+
+            code = store.generate_code("telegram", "user1", "Alice")
+            assert code is not None
+            assert store.approve_code("telegram", code) is not None
+            limits = store._load_json(store._rate_limit_path())
+            assert limits.get("_failures:telegram", 0) == 0
+
+            assert store.approve_code("telegram", "WRONGCODE") is None
             assert store._is_locked_out("telegram") is False
 
 

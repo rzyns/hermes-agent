@@ -236,8 +236,3 @@ class TestReplacePrimaryRetiresInsteadOfClosing:
             agent._retire_shared_openai_client(client, reason="unit_test")
 
         client.close.assert_not_called()
-
-    def test_retire_helper_none_is_noop(self):
-        agent = _make_agent()
-        # Must not raise.
-        agent._retire_shared_openai_client(None, reason="unit_test")

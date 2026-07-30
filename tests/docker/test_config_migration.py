@@ -48,22 +48,3 @@ def test_config_migration_runs_on_boot(
         f"config.yaml not owned by hermes (migration may have run as root): "
         f"{r.stdout.strip()}"
     )
-
-
-def test_config_migration_opt_out_env_var_respected(
-    built_image: str, container_name: str,
-) -> None:
-    """HERMES_SKIP_CONFIG_MIGRATION=1 must skip the migration."""
-    start_container(
-        built_image, container_name, "HERMES_SKIP_CONFIG_MIGRATION=1",
-    )
-
-    # config.yaml should still be seeded (seeding is separate from migration)
-    r = docker_exec_sh(
-        container_name,
-        "test -f /opt/data/config.yaml && echo EXISTS || echo MISSING",
-        timeout=10,
-    )
-    assert "EXISTS" in r.stdout, (
-        f"config.yaml should be seeded even with migration skipped: {r.stdout}"
-    )

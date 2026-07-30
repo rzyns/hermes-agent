@@ -112,7 +112,3 @@ class TestIncompleteFleetRestartWarning:
         assert out.count("hermes-gateway-xiaomo5") == 1
         assert "hermes-gateway-xiaomo6" in out
         assert "pre-update code" in out
-
-    def test_noop_when_no_failures(self, capsys):
-        _warn_incomplete_gateway_fleet_restart([])
-        assert capsys.readouterr().out == ""

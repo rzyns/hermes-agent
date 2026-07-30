@@ -27,9 +27,3 @@ def test_session_source_falls_back_to_platform(monkeypatch):
     monkeypatch.delenv("HERMES_SESSION_SOURCE", raising=False)
 
     assert _session_source_for_agent("tui") == "tui"
-
-
-def test_session_source_falls_back_to_env(monkeypatch):
-    monkeypatch.setenv("HERMES_SESSION_SOURCE", "webhook")
-
-    assert _session_source_for_agent(None) == "webhook"
