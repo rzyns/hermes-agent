@@ -792,6 +792,11 @@ def detect_project_facts(root: Path) -> ProjectFacts:
     verify: list[str] = []
     if (root / "scripts" / "run_tests.sh").is_file():
         verify.append("scripts/run_tests.sh")
+    if (root / "run_tests.sh").is_file():
+        # Repo-root runner (common in small repos/fixtures): credit it as
+        # canonical verification so the turn-end guard doesn't demand ad-hoc
+        # verifier scripts after the documented runner already passed.
+        verify.append("./run_tests.sh")
     if (root / "package.json").is_file():
         try:
             scripts = json.loads(_read_small(root / "package.json") or "{}").get("scripts") or {}
