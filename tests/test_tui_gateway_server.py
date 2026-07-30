@@ -662,7 +662,11 @@ def test_profile_scoped_agent_build_starts_mcp_discovery_in_profile_home(
     server._sessions[sid] = session
     try:
         server._start_agent_build(sid, session)
-        assert built.wait(timeout=2)
+        # _make_agent is only the midpoint of the daemon build thread. Wait
+        # for its terminal event so the thread cannot outlive this test and
+        # observe monkeypatches installed by the next test.
+        assert ready.wait(timeout=10)
+        assert built.is_set()
     finally:
         server._sessions.pop(sid, None)
 
@@ -717,7 +721,11 @@ def test_profile_scoped_agent_build_installs_secret_scope(monkeypatch, tmp_path)
     server._sessions[sid] = session
     try:
         server._start_agent_build(sid, session)
-        assert built.wait(timeout=2)
+        # Keep the profile secret-scope assertion isolated from later tests:
+        # _make_agent returns before callbacks, event emission, and context
+        # cleanup finish on the daemon build thread.
+        assert ready.wait(timeout=10)
+        assert built.is_set()
     finally:
         server._sessions.pop(sid, None)
 
