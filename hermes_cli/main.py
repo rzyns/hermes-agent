@@ -794,6 +794,7 @@ from hermes_cli.model_setup_flows import (
     _model_flow_api_key_provider,
     _model_flow_anthropic,
     _model_flow_moa,
+    _model_flow_ai_gateway,
 )
 logger = logging.getLogger(__name__)
 
@@ -3404,6 +3405,8 @@ def select_provider_and_model(args=None):
         _model_flow_openrouter(config, current_model)
     elif selected_provider == "moa":
         _model_flow_moa(config, current_model)
+    elif selected_provider == "ai-gateway":
+        _model_flow_ai_gateway(config, current_model)
     elif selected_provider == "nous":
         _model_flow_nous(config, current_model, args=args)
     elif selected_provider == "openai-codex":
@@ -7574,6 +7577,22 @@ def _lazy_refresh_marker_path() -> Path:
     return PROJECT_ROOT / ".lazy-refresh-incomplete"
 
 
+def _pytest_owns_live_checkout(root: Path) -> bool:
+    """True when running under pytest AND ``root`` is this checkout itself.
+
+    Tests that drive update/recovery without sandboxing ``PROJECT_ROOT``
+    must neither litter the live repo root with recovery breadcrumbs
+    (a leftover ``.lazy-refresh-incomplete`` / ``.update-incomplete``
+    false-arms recovery on the developer's next real launch) nor run a real
+    reinstall against the executing venv. Sandboxed tests point at a
+    tmp_path and are unaffected (same posture as
+    ``managed_scope._under_pytest``)."""
+    return (
+        "PYTEST_CURRENT_TEST" in os.environ
+        and root == Path(__file__).resolve().parent.parent
+    )
+
+
 def _clear_marker_file(path: Path, *, label: str) -> None:
     """Remove an update-recovery breadcrumb. Never raises."""
     try:
@@ -7620,6 +7639,8 @@ def _recover_from_interrupted_install() -> None:
     protocol stream (``hermes acp`` speaks JSON-RPC on stdout) must never get
     install noise on stdout.
     """
+    if _pytest_owns_live_checkout(PROJECT_ROOT):
+        return
     core_marker = _update_marker_path().exists()
     lazy_marker = _lazy_refresh_marker_path().exists()
     if not core_marker and not lazy_marker:

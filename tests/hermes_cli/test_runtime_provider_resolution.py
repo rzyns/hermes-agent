@@ -481,6 +481,20 @@ def test_qwen_oauth_auto_fallthrough_on_auth_failure(monkeypatch):
     assert resolved["provider"] != "qwen-oauth"
 
 
+def test_resolve_runtime_provider_ai_gateway(monkeypatch):
+    monkeypatch.setattr(rp, "resolve_provider", lambda *a, **k: "ai-gateway")
+    monkeypatch.setattr(rp, "_get_model_config", lambda: {})
+    monkeypatch.setenv("AI_GATEWAY_API_KEY", "test-ai-gw-key")
+
+    resolved = rp.resolve_runtime_provider(requested="ai-gateway")
+
+    assert resolved["provider"] == "ai-gateway"
+    assert resolved["api_mode"] == "chat_completions"
+    assert resolved["base_url"] == "https://ai-gateway.vercel.sh/v1"
+    assert resolved["api_key"] == "test-ai-gw-key"
+    assert resolved["requested_provider"] == "ai-gateway"
+
+
 def test_resolve_runtime_provider_lmstudio_uses_token_when_present(monkeypatch):
     monkeypatch.setattr(rp, "resolve_provider", lambda *a, **k: "lmstudio")
     monkeypatch.setattr(
@@ -616,6 +630,36 @@ def test_resolve_runtime_provider_lmstudio_normalizes_native_api_saved_base_url(
     assert resolved["provider"] == "lmstudio"
     assert resolved["api_mode"] == "chat_completions"
     assert resolved["base_url"] == "http://192.168.1.10:1234/v1"
+
+
+def test_resolve_runtime_provider_ai_gateway_explicit_override_skips_pool(monkeypatch):
+    def _unexpected_pool(provider):
+        raise AssertionError(f"load_pool should not be called for {provider}")
+
+    def _unexpected_provider_resolution(provider):
+        raise AssertionError(f"resolve_api_key_provider_credentials should not be called for {provider}")
+
+    monkeypatch.setattr(rp, "resolve_provider", lambda *a, **k: "ai-gateway")
+    monkeypatch.setattr(rp, "_get_model_config", lambda: {})
+    monkeypatch.setattr(rp, "load_pool", _unexpected_pool)
+    monkeypatch.setattr(
+        rp,
+        "resolve_api_key_provider_credentials",
+        _unexpected_provider_resolution,
+    )
+
+    resolved = rp.resolve_runtime_provider(
+        requested="ai-gateway",
+        explicit_api_key="ai-gateway-explicit-token",
+        explicit_base_url="https://proxy.example.com/v1/",
+    )
+
+    assert resolved["provider"] == "ai-gateway"
+    assert resolved["api_mode"] == "chat_completions"
+    assert resolved["api_key"] == "ai-gateway-explicit-token"
+    assert resolved["base_url"] == "https://proxy.example.com/v1"
+    assert resolved["source"] == "explicit"
+    assert resolved.get("credential_pool") is None
 
 
 def test_resolve_runtime_provider_openrouter_explicit(monkeypatch):
