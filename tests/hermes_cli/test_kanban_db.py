@@ -1817,6 +1817,129 @@ def test_heartbeat_uses_env_default_ttl(kanban_home, monkeypatch):
         assert new > int(time.time()) + 3000
 
 
+# ---------------------------------------------------------------------------
+# ENV-3c: heartbeat_claim run-id + claim-lock CAS
+# ---------------------------------------------------------------------------
+
+def test_heartbeat_claim_rejects_stale_run_with_same_lock(kanban_home):
+    """A stale old run with the same claim_lock must not extend the
+    successor run's lease — the current_run_id predicate must reject it.
+
+    Reproduction of the ENV-3 principal-review probe (t_539ff469 finding):
+    run A (run_id=1) claims task; dispatcher re-claims for run B (run_id=2)
+    with the same host:pid lock; run A calls heartbeat_claim — it must fail.
+    """
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="x", assignee="a")
+        lock = "host:12345"
+
+        # Simulate run 1 claiming the task (sets current_run_id=1).
+        kb.claim_task(conn, t, claimer=lock, ttl_seconds=60)
+        task = kb.get_task(conn, t)
+        assert task.status == "running"
+        run1_id = task.current_run_id
+        assert run1_id is not None
+
+        # Simulate the dispatcher re-claiming for a successor run (run 2)
+        # on the same lock (same host:pid — e.g. dispatcher restart).
+        # We bypass the re-claim guard by directly updating the task row
+        # to simulate the dispatcher having already moved the task to run 2.
+        conn.execute(
+            "UPDATE tasks SET claim_lock = ?, status = 'running' "
+            "WHERE id = ? AND status = 'running'",
+            (lock, t),
+        )
+        # Insert run 2 as the new current run.
+        now = int(time.time())
+        cursor = conn.execute(
+            "INSERT INTO task_runs (task_id, profile, status, claim_lock, "
+            "claim_expires, started_at) VALUES (?, 'test', 'running', ?, ?, ?)",
+            (t, lock, now + 120, now),
+        )
+        run2_id = int(cursor.lastrowid)
+        assert run2_id is not None
+        conn.execute(
+            "UPDATE tasks SET current_run_id = ?, claim_expires = ? "
+            "WHERE id = ?",
+            (run2_id, now + 120, t),
+        )
+
+        # Verify the task now points to run 2.
+        task = kb.get_task(conn, t)
+        assert task is not None
+        assert task.current_run_id == run2_id
+
+        # Run 1 (stale) attempts heartbeat_claim with the same lock but
+        # run_id=1 — must be rejected by the current_run_id predicate.
+        ok_stale = kb.heartbeat_claim(
+            conn, t, claimer=lock, expected_run_id=run1_id, ttl_seconds=3600,
+        )
+        assert ok_stale is False, (
+            "Stale run must not extend successor's lease"
+        )
+
+        # Verify the claim_expires was NOT extended by run 1.
+        task = kb.get_task(conn, t)
+        assert task.claim_expires == now + 120, (
+            "Stale run must not mutate claim_expires"
+        )
+
+
+def test_heartbeat_claim_accepts_current_run_with_same_lock(kanban_home):
+    """The current run (run_id=2) using the same lock must succeed."""
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="x", assignee="a")
+        lock = "host:12345"
+
+        # Set up: run 1 claims and is then superseded by run 2 on same lock.
+        kb.claim_task(conn, t, claimer=lock, ttl_seconds=60)
+        task = kb.get_task(conn, t)
+        run1_id = task.current_run_id
+
+        now = int(time.time())
+        cursor = conn.execute(
+            "INSERT INTO task_runs (task_id, profile, status, claim_lock, "
+            "claim_expires, started_at) VALUES (?, 'test', 'running', ?, ?, ?)",
+            (t, lock, now + 120, now),
+        )
+        run2_id = int(cursor.lastrowid)
+        assert run2_id is not None
+        conn.execute(
+            "UPDATE tasks SET current_run_id = ?, claim_expires = ? "
+            "WHERE id = ?",
+            (run2_id, now + 120, t),
+        )
+
+        # Run 2 (current) calls heartbeat_claim with its own run_id.
+        # Must succeed and extend the lease.
+        ok_current = kb.heartbeat_claim(
+            conn, t, claimer=lock, expected_run_id=run2_id, ttl_seconds=3600,
+        )
+        assert ok_current is True, "Current run must be able to heartbeat"
+
+        task = kb.get_task(conn, t)
+        assert task is not None
+        assert task.claim_expires > now + 120, (
+            "Current run must extend claim_expires"
+        )
+
+
+def test_heartbeat_claim_without_run_id_still_works(kanban_home):
+    """Passing expected_run_id=None keeps the legacy lock-only behaviour
+    (safe for callers that never set HERMES_KANBAN_RUN_ID, e.g. tests
+    or local tools that never went through the dispatcher).
+    """
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="x", assignee="a")
+        lock = "host:hb"
+        kb.claim_task(conn, t, claimer=lock, ttl_seconds=60)
+        conn.execute("UPDATE tasks SET claim_expires = 0 WHERE id = ?", (t,))
+        ok = kb.heartbeat_claim(conn, t, claimer=lock, ttl_seconds=3600)
+        assert ok
+        task = kb.get_task(conn, t)
+        assert task.claim_expires > int(time.time()) + 3000
+
+
 def test_concurrent_claims_only_one_wins(kanban_home):
     """Fire N threads claiming the same task; exactly one must win."""
     with kb.connect() as conn:

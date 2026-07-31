@@ -5037,20 +5037,35 @@ def heartbeat_claim(
     *,
     ttl_seconds: Optional[int] = None,
     claimer: Optional[str] = None,
+    expected_run_id: Optional[int] = None,
 ) -> bool:
     """Extend a running claim.  Returns True if we still own it.
 
     Workers that know they'll exceed 15 minutes should call this every
     few minutes to keep ownership.
+
+    Authorization requires BOTH ``claim_lock`` (the caller's host:pid or
+    explicit lock) AND the caller's ``expected_run_id`` to match the row's
+    ``current_run_id``.  This prevents a stale old run from extending a
+    successor run's lease when the same lock is reused (e.g. same host:pid
+    after a dispatcher restart or same-machine reclaim).
     """
     expires = int(time.time()) + _resolve_claim_ttl_seconds(ttl_seconds)
     lock = claimer or _claimer_id()
     with write_txn(conn):
-        cur = conn.execute(
-            "UPDATE tasks SET claim_expires = ? "
-            "WHERE id = ? AND status = 'running' AND claim_lock = ?",
-            (expires, task_id, lock),
-        )
+        if expected_run_id is None:
+            cur = conn.execute(
+                "UPDATE tasks SET claim_expires = ? "
+                "WHERE id = ? AND status = 'running' AND claim_lock = ?",
+                (expires, task_id, lock),
+            )
+        else:
+            cur = conn.execute(
+                "UPDATE tasks SET claim_expires = ? "
+                "WHERE id = ? AND status = 'running' "
+                "AND claim_lock = ? AND current_run_id = ?",
+                (expires, task_id, lock, int(expected_run_id)),
+            )
         if cur.rowcount == 1:
             run_id = _current_run_id(conn, task_id)
             if run_id is not None:

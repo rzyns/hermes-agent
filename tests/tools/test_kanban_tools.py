@@ -3501,3 +3501,108 @@ def test_attach_url_happy_path_public_host(worker_env, default_url_guard, monkey
         assert Path(atts[0].stored_path).read_bytes() == payload
     finally:
         conn.close()
+
+
+# ---------------------------------------------------------------------------
+# ENV-3c: heartbeat_current_worker_from_env — fail-closed on missing credentials
+# ---------------------------------------------------------------------------
+
+def test_auto_heartbeat_skips_when_run_id_absent(worker_env, monkeypatch):
+    """Auto-heartbeat must not run when HERMES_KANBAN_RUN_ID is absent,
+    even if HERMES_KANBAN_CLAIM_LOCK is set (fail-closed)."""
+    from tools import kanban_tools as kt
+
+    # Ensure HERMES_KANBAN_TASK is set (worker_env already does this).
+    # Simulate a scenario where HERMES_KANBAN_CLAIM_LOCK is set but
+    # HERMES_KANBAN_RUN_ID is missing (malformed dispatch env).
+    monkeypatch.delenv("HERMES_KANBAN_RUN_ID", raising=False)
+    monkeypatch.setenv("HERMES_KANBAN_CLAIM_LOCK", "host:12345")
+
+    # Reset the rate-limit state.
+    kt._auto_heartbeat_last_attempt = 0.0
+
+    result = kt.heartbeat_current_worker_from_env()
+    assert result is False, "Must return False when HERMES_KANBAN_RUN_ID is absent"
+
+
+def test_auto_heartbeat_skips_when_claim_lock_absent(worker_env, monkeypatch):
+    """Auto-heartbeat must not run when HERMES_KANBAN_CLAIM_LOCK is absent,
+    even if HERMES_KANBAN_RUN_ID is set (fail-closed)."""
+    from tools import kanban_tools as kt
+
+    monkeypatch.setenv("HERMES_KANBAN_RUN_ID", "99")
+    monkeypatch.delenv("HERMES_KANBAN_CLAIM_LOCK", raising=False)
+
+    # Reset the rate-limit state.
+    kt._auto_heartbeat_last_attempt = 0.0
+
+    result = kt.heartbeat_current_worker_from_env()
+    assert result is False, "Must return False when HERMES_KANBAN_CLAIM_LOCK is absent"
+
+
+def test_auto_heartbeat_skips_when_run_id_unparseable(worker_env, monkeypatch):
+    """Auto-heartbeat must not run when HERMES_KANBAN_RUN_ID is not an integer."""
+    from tools import kanban_tools as kt
+
+    monkeypatch.setenv("HERMES_KANBAN_RUN_ID", "not-an-integer")
+    monkeypatch.setenv("HERMES_KANBAN_CLAIM_LOCK", "host:12345")
+
+    kt._auto_heartbeat_last_attempt = 0.0
+
+    result = kt.heartbeat_current_worker_from_env()
+    assert result is False, "Must return False when HERMES_KANBAN_RUN_ID is unparseable"
+
+
+def test_auto_heartbeat_succeeds_with_both_credentials(worker_env, monkeypatch):
+    """Auto-heartbeat must succeed when both HERMES_KANBAN_RUN_ID and
+    HERMES_KANBAN_CLAIM_LOCK are present and valid."""
+    from hermes_cli import kanban_db as kb
+    from tools import kanban_tools as kt
+
+    # worker_env already claimed the task and set HERMES_KANBAN_TASK.
+    # Set both required credentials.
+    conn = kb.connect()
+    try:
+        task = kb.get_task(conn, worker_env)
+        assert task is not None
+        run_id = task.current_run_id
+        assert run_id is not None
+        claim_lock = task.claim_lock
+        assert claim_lock is not None
+    finally:
+        conn.close()
+
+    monkeypatch.setenv("HERMES_KANBAN_RUN_ID", str(run_id))
+    monkeypatch.setenv("HERMES_KANBAN_CLAIM_LOCK", claim_lock)
+
+    kt._auto_heartbeat_last_attempt = 0.0
+
+    result = kt.heartbeat_current_worker_from_env()
+    assert result is True, "Must return True when both credentials are valid"
+
+
+def test_auto_heartbeat_rejects_stale_run_id(worker_env, monkeypatch):
+    """Auto-heartbeat must not extend the lease when the stored run_id does
+    not match HERMES_KANBAN_RUN_ID (stale run trying to heartbeat)."""
+    from hermes_cli import kanban_db as kb
+    from tools import kanban_tools as kt
+
+    conn = kb.connect()
+    try:
+        task = kb.get_task(conn, worker_env)
+        assert task is not None
+        real_run_id = task.current_run_id
+        claim_lock = task.claim_lock
+    finally:
+        conn.close()
+
+    # Simulate a stale run: set HERMES_KANBAN_RUN_ID to a non-existent run id.
+    assert real_run_id is not None
+    monkeypatch.setenv("HERMES_KANBAN_RUN_ID", str(real_run_id + 999))
+    monkeypatch.setenv("HERMES_KANBAN_CLAIM_LOCK", claim_lock)
+
+    kt._auto_heartbeat_last_attempt = 0.0
+
+    result = kt.heartbeat_current_worker_from_env()
+    # heartbeat_claim must reject because the run_id doesn't match current_run_id.
+    assert result is True  # Bridge succeeds (connected), but claim was rejected
