@@ -239,11 +239,13 @@ BLOCK_RECURRENCE_LIMIT = 2
 # Backstop for the dependency-wait hot loop (DISP-1, 2026-07-27). Even with
 # the sticky fingerprint gate, a task whose parent status flickers (or whose
 # external dependency provider returns inconsistent results) could still
-# cycle. This cap limits consecutive dependency_wait re-dispatches per task
-# before emitting an observable ``dependency_wait_backstop`` event and
-# leaving the card parked in ``todo`` — degrading the loop from unbounded
-# spend into a visible stalled card. Independent of ``consecutive_failures``
-# because a dependency_wait is not a failure.
+# cycle. This cap limits dependency_wait dispatches in an operator-reset
+# window, regardless of fingerprint changes, before emitting one observable
+# ``dependency_wait_backstop`` event and leaving the card parked in ``todo``.
+# The window resets only on explicit unblock or terminal completion. This
+# degrades the loop from unbounded spend into a visible stalled card and is
+# independent of ``consecutive_failures`` because a dependency_wait is not a
+# failure.
 DEP_WAIT_REDISPATCH_CAP = 3
 VALID_WORKSPACE_KINDS = {"scratch", "worktree", "dir"}
 KNOWN_TOOLSET_NAMES = frozenset(name.casefold() for name in get_toolset_names())
@@ -1238,9 +1240,12 @@ class Task:
     # with kind=dependency; cleared when the blocking condition materially
     # changes. See ``_dependency_fingerprint`` / ``recompute_ready``.
     dep_wait_fingerprint: Optional[str] = None
-    # Consecutive dependency_wait re-dispatches under the same fingerprint.
-    # Used by the DEP_WAIT_REDISPATCH_CAP backstop.
+    # Dependency-wait attempts in the current operator-reset window. Unlike
+    # the sticky fingerprint, this survives dependency-state changes.
     dep_wait_count: int = 0
+    # Durable dedup latch for the independent dependency-wait backstop.
+    # Reset only by explicit operator unblock or terminal completion.
+    dep_wait_backstop_tripped: bool = False
 
     @classmethod
     def from_row(cls, row: sqlite3.Row) -> "Task":
@@ -1360,6 +1365,11 @@ class Task:
                 int(row["dep_wait_count"])
                 if "dep_wait_count" in keys and row["dep_wait_count"] is not None
                 else 0
+            ),
+            dep_wait_backstop_tripped=(
+                bool(row["dep_wait_backstop_tripped"])
+                if "dep_wait_backstop_tripped" in keys
+                else False
             ),
         )
 
@@ -1561,11 +1571,13 @@ CREATE TABLE IF NOT EXISTS tasks (
     -- hot loop (DISP-1, 2026-07-27 incident: 122 wasted runs). NULL on
     -- fresh tasks and after the dependency genuinely clears.
     dep_wait_fingerprint TEXT,
-    -- Number of times this task has been re-dispatched while the
-    -- dependency fingerprint was unchanged. Used by the backstop
-    -- (DEP_WAIT_REDISPATCH_CAP) to degrade a silent loop into an
-    -- observable stalled card instead of unbounded spend.
-    dep_wait_count       INTEGER NOT NULL DEFAULT 0
+    -- Number of dependency waits in the current operator-reset window.
+    -- This intentionally survives fingerprint changes and promotion so the
+    -- backstop remains independent of the primary sticky gate.
+    dep_wait_count       INTEGER NOT NULL DEFAULT 0,
+    -- Durable event/guard latch for that window. Reset only by explicit
+    -- operator unblock or terminal completion.
+    dep_wait_backstop_tripped INTEGER NOT NULL DEFAULT 0
 );
 
 CREATE TABLE IF NOT EXISTS task_links (
@@ -2924,6 +2936,11 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
         _add_column_if_missing(
             conn, "tasks", "dep_wait_count",
             "dep_wait_count INTEGER NOT NULL DEFAULT 0",
+        )
+    if "dep_wait_backstop_tripped" not in cols:
+        _add_column_if_missing(
+            conn, "tasks", "dep_wait_backstop_tripped",
+            "dep_wait_backstop_tripped INTEGER NOT NULL DEFAULT 0",
         )
 
     # Indexes over additive ``tasks`` columns must be created after the
@@ -4525,36 +4542,24 @@ def _maybe_emit_dep_wait_backstop(
     conn: sqlite3.Connection,
     task_id: str,
     dep_wait_count: int,
-    fingerprint: str,
+    fingerprint: Optional[str],
 ) -> None:
-    """Emit a ``dependency_wait_backstop`` event if one hasn't been emitted
-    for this fingerprint/count boundary already.
+    """Trip the independent wait cap and emit its event exactly once.
 
-    Deduplication: we check whether the most recent ``dependency_wait_backstop``
-    event for this task carries the same fingerprint and count. If so, we
-    suppress the duplicate — the operator has already been notified that this
-    task is stalled, and re-emitting on every tick would itself be a noise
-    loop. A new event fires only when the count increases past a prior
-    emission (meaning the worker somehow got re-dispatched and blocked again
-    despite the gate — which shouldn't happen under the sticky gate, but the
-    backstop exists precisely as defense-in-depth for that case).
+    ``dep_wait_backstop_tripped`` is a durable per-window latch. The guarded
+    UPDATE is both the enforcement state and the event deduplication CAS, so
+    counts above the cap cannot create duplicate events. The window resets
+    only on explicit operator unblock (or terminal completion), never merely
+    because the sticky dependency fingerprint changed.
     """
-    prev = conn.execute(
-        "SELECT payload FROM task_events "
-        "WHERE task_id = ? AND kind = 'dependency_wait_backstop' "
-        "ORDER BY id DESC LIMIT 1",
-        (task_id,),
-    ).fetchone()
-    if prev is not None and prev["payload"]:
-        try:
-            payload = json.loads(prev["payload"])
-        except (ValueError, TypeError):
-            payload = {}
-        if (
-            payload.get("dep_wait_fingerprint") == fingerprint
-            and payload.get("dep_wait_count", 0) >= dep_wait_count
-        ):
-            return
+    tripped = conn.execute(
+        "UPDATE tasks SET dep_wait_backstop_tripped = 1 "
+        "WHERE id = ? AND dep_wait_backstop_tripped = 0 "
+        "AND dep_wait_count >= ?",
+        (task_id, DEP_WAIT_REDISPATCH_CAP),
+    )
+    if tripped.rowcount != 1:
+        return
     _append_event(
         conn,
         task_id,
@@ -4563,10 +4568,11 @@ def _maybe_emit_dep_wait_backstop(
             "dep_wait_count": dep_wait_count,
             "dep_wait_fingerprint": fingerprint,
             "cap": DEP_WAIT_REDISPATCH_CAP,
+            "window_reset": "explicit_unblock_or_terminal_completion",
             "reason": (
                 "Task has blocked on dependency_wait "
-                f"{dep_wait_count} times against an unchanged "
-                "blocking condition. It is parked in 'todo' to "
+                f"{dep_wait_count} times in the current wait window. "
+                "It is parked in 'todo' to "
                 "prevent unbounded re-dispatch. An operator may "
                 "need to investigate the blocking dependency or "
                 "explicitly unblock the task."
@@ -4616,7 +4622,8 @@ def recompute_ready(
     with write_txn(conn):
         todo_rows = conn.execute(
             "SELECT id, status, consecutive_failures, max_retries, "
-            "dep_wait_fingerprint, dep_wait_count "
+            "dep_wait_fingerprint, dep_wait_count, "
+            "dep_wait_backstop_tripped "
             "FROM tasks WHERE status IN ('todo', 'blocked')"
         ).fetchall()
         for row in todo_rows:
@@ -4627,6 +4634,17 @@ def recompute_ready(
                 # silently auto-recover.  ``unblock_task`` is the only
                 # legitimate exit (it emits ``"unblocked"`` which flips
                 # this predicate back).
+                continue
+            dep_count = int(row["dep_wait_count"] or 0)
+            if dep_count >= DEP_WAIT_REDISPATCH_CAP:
+                # Independent hard stop: unlike the sticky fingerprint gate,
+                # this survives dependency changes and therefore bounds a
+                # flickering or bypassed dependency-wait loop.
+                if dependency_wait_stalled is not None:
+                    dependency_wait_stalled.append(task_id)
+                _maybe_emit_dep_wait_backstop(
+                    conn, task_id, dep_count, row["dep_wait_fingerprint"]
+                )
                 continue
             # Sticky dependency-wait gate (DISP-1). A task that blocked
             # with kind=dependency must NOT be re-promoted until the
@@ -4641,21 +4659,6 @@ def recompute_ready(
                     # Same blocking condition — do not re-promote.
                     if dependency_wait_stalled is not None:
                         dependency_wait_stalled.append(task_id)
-                    dep_count = int(row["dep_wait_count"] or 0)
-                    if dep_count >= DEP_WAIT_REDISPATCH_CAP:
-                        # Backstop tripped: emit a deduplicated
-                        # ``dependency_wait_backstop`` event so the loop
-                        # degrades into an observable stalled card
-                        # instead of silently sitting in todo. We emit
-                        # only once per cap crossing: when dep_count
-                        # equals the cap exactly, not on every subsequent
-                        # tick. The worker will re-block on the next
-                        # dispatch (if it ever happens) and increment
-                        # dep_count further, but we only log the event at
-                        # the boundary.
-                        _maybe_emit_dep_wait_backstop(
-                            conn, task_id, dep_count, stored_dep_fp
-                        )
                     continue
                     # NOTE: if the fingerprint changed, we fall through
                     # to the normal parent-gate check below, and clear
@@ -4692,14 +4695,14 @@ def recompute_ready(
                         continue
                     conn.execute(
                         "UPDATE tasks SET status = 'ready', "
-                        "dep_wait_fingerprint = NULL, dep_wait_count = 0 "
+                        "dep_wait_fingerprint = NULL "
                         "WHERE id = ? AND status = 'blocked'",
                         (task_id,),
                     )
                 else:
                     conn.execute(
                         "UPDATE tasks SET status = 'ready', "
-                        "dep_wait_fingerprint = NULL, dep_wait_count = 0 "
+                        "dep_wait_fingerprint = NULL "
                         "WHERE id = ? AND status = 'todo'",
                         (task_id,),
                     )
@@ -4729,6 +4732,40 @@ def claim_task(
     lock = claimer or _claimer_id()
     expires = now + _resolve_claim_ttl_seconds(ttl_seconds)
     with write_txn(conn):
+        # Defense in depth: reject even a directly-forced ``ready`` row once
+        # its dependency-wait window hit the independent cap. This keeps the
+        # guard effective if recompute_ready or the sticky fingerprint gate
+        # regresses or is bypassed by another writer.
+        wait_state = conn.execute(
+            "SELECT status, dep_wait_count, dep_wait_fingerprint FROM tasks "
+            "WHERE id = ?",
+            (task_id,),
+        ).fetchone()
+        if (
+            wait_state is not None
+            and wait_state["status"] == "ready"
+            and int(wait_state["dep_wait_count"] or 0)
+            >= DEP_WAIT_REDISPATCH_CAP
+        ):
+            dep_count = int(wait_state["dep_wait_count"] or 0)
+            conn.execute(
+                "UPDATE tasks SET status = 'todo' "
+                "WHERE id = ? AND status = 'ready'",
+                (task_id,),
+            )
+            _maybe_emit_dep_wait_backstop(
+                conn,
+                task_id,
+                dep_count,
+                wait_state["dep_wait_fingerprint"],
+            )
+            _append_event(
+                conn,
+                task_id,
+                "claim_rejected",
+                {"reason": "dependency_wait_backstop", "cap": DEP_WAIT_REDISPATCH_CAP},
+            )
+            return None
         # Structural invariant: never transition ready -> running while any
         # parent is not yet 'done'. This is the single enforcement point
         # regardless of which writer (create_task, link_tasks, unblock_task,
@@ -5683,7 +5720,8 @@ def complete_task(
                        block_retry_after = NULL,
                        block_error_type = NULL,
                        dep_wait_fingerprint = NULL,
-                       dep_wait_count = 0
+                       dep_wait_count = 0,
+                       dep_wait_backstop_tripped = 0
                  WHERE id = ?
                    AND status IN ('running', 'ready', 'blocked')
                 """,
@@ -5706,7 +5744,8 @@ def complete_task(
                        block_retry_after = NULL,
                        block_error_type = NULL,
                        dep_wait_fingerprint = NULL,
-                       dep_wait_count = 0
+                       dep_wait_count = 0,
+                       dep_wait_backstop_tripped = 0
                  WHERE id = ?
                    AND status IN ('running', 'ready', 'blocked')
                    AND current_run_id = ?
@@ -5785,7 +5824,8 @@ def complete_task(
                        block_retry_after = NULL,
                        block_error_type = NULL,
                        dep_wait_fingerprint = NULL,
-                       dep_wait_count = 0
+                       dep_wait_count = 0,
+                       dep_wait_backstop_tripped = 0
                  WHERE id = ?
                    AND status IN ('ready', 'blocked')
                    AND current_run_id IS NULL
@@ -6655,7 +6695,7 @@ def block_task(
             # Read the current dep_wait_count so we can increment it. On
             # the first dependency block for this task it's 0 → 1.
             dep_count_row = conn.execute(
-                "SELECT dep_wait_count, dep_wait_fingerprint FROM tasks WHERE id = ?",
+                "SELECT dep_wait_count FROM tasks WHERE id = ?",
                 (task_id,),
             ).fetchone()
             prev_dep_count = (
@@ -6664,17 +6704,11 @@ def block_task(
                 and dep_count_row["dep_wait_count"] is not None
                 else 0
             )
-            prev_dep_fp = (
-                dep_count_row["dep_wait_fingerprint"] if dep_count_row else None
-            )
-            # If the fingerprint is the same as the last dependency_wait,
-            # this is a re-dispatch against an unchanged condition —
-            # increment the counter for the backstop. If it's different or
-            # new, reset to 1 (fresh wait against a new condition).
-            if prev_dep_fp is not None and prev_dep_fp == dep_fp:
-                new_dep_count = prev_dep_count + 1
-            else:
-                new_dep_count = 1
+            # Independent wait-window counter: unlike the sticky fingerprint,
+            # this deliberately survives dependency changes and promotion.
+            # Only explicit operator unblock (or completion) starts a new
+            # window, so a flickering dependency cannot evade the cap.
+            new_dep_count = prev_dep_count + 1
             cur = conn.execute(
                 """
                 UPDATE tasks
@@ -7397,7 +7431,8 @@ def unblock_task(conn: sqlite3.Connection, task_id: str) -> bool:
         cur = conn.execute(
             "UPDATE tasks SET status = ?, current_run_id = NULL, "
             "consecutive_failures = 0, last_failure_error = NULL, "
-            "dep_wait_fingerprint = NULL, dep_wait_count = 0 "
+            "dep_wait_fingerprint = NULL, dep_wait_count = 0, "
+            "dep_wait_backstop_tripped = 0 "
             "WHERE id = ? AND (status IN ('blocked', 'scheduled') OR "
             " (status = 'todo' AND dep_wait_fingerprint IS NOT NULL))",
             (new_status, task_id),
@@ -10174,7 +10209,8 @@ def has_spawnable_ready(conn: sqlite3.Connection) -> bool:
     rows = conn.execute(
         "SELECT DISTINCT assignee FROM tasks "
         "WHERE status = 'ready' AND assignee IS NOT NULL "
-        "    AND claim_lock IS NULL"
+        "    AND claim_lock IS NULL AND dep_wait_count < ?",
+        (DEP_WAIT_REDISPATCH_CAP,),
     ).fetchall()
     if not rows:
         return False
@@ -10396,7 +10432,9 @@ def _dispatch_once_locked(
     ready_rows = conn.execute(
         "SELECT id, assignee FROM tasks "
         "WHERE status = 'ready' AND claim_lock IS NULL "
-        "ORDER BY priority DESC, created_at ASC"
+        "AND dep_wait_count < ? "
+        "ORDER BY priority DESC, created_at ASC",
+        (DEP_WAIT_REDISPATCH_CAP,),
     ).fetchall()
     # Honour kanban.max_in_progress: if the board already has enough running
     # tasks, skip spawning this tick so slow workers (local LLMs,

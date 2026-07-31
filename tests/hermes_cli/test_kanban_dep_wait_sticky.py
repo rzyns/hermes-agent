@@ -15,9 +15,10 @@ computation and refuses to re-promote when they match. The task stays
 parked in ``todo`` until the dependency materially changes (parent
 completes, link removed, etc.).
 
-Backstop: ``DEP_WAIT_REDISPATCH_CAP`` limits consecutive dependency_wait
-re-dispatches per task before emitting a deduplicated
-``dependency_wait_backstop`` event.
+Backstop: ``DEP_WAIT_REDISPATCH_CAP`` limits dependency-wait dispatches
+within an operator-reset window, independently of fingerprint changes. It
+emits exactly one ``dependency_wait_backstop`` event per window and prevents
+further promotion, claim, and spawn until an explicit unblock resets it.
 """
 
 from __future__ import annotations
@@ -126,10 +127,11 @@ def test_promoted_once_parent_genuinely_completes(kanban_home: Path) -> None:
         kb.complete_task(conn, parent, result="done")
         kb.recompute_ready(conn)
         assert kb.get_task(conn, child).status == "ready"
-        # dep_wait fields should be cleared on promotion.
+        # Promotion releases only the sticky fingerprint. The independent
+        # backstop window count must survive dependency-state changes.
         child_t = kb.get_task(conn, child)
         assert child_t.dep_wait_fingerprint is None
-        assert child_t.dep_wait_count == 0
+        assert child_t.dep_wait_count == 1
 
 
 def test_repeated_dependency_blocks_increment_count(kanban_home: Path) -> None:
@@ -185,6 +187,13 @@ def test_backstop_event_fires_and_deduplicated(kanban_home: Path) -> None:
         assert payload.get("cap") == kb.DEP_WAIT_REDISPATCH_CAP
         # Tick again — no duplicate event for the same count.
         kb.recompute_ready(conn)
+        # Even if a broken caller bypasses the cap and re-blocks at count 4,
+        # the already-tripped window must not emit another event.
+        _force_running_for_reblock(conn, child)
+        kb.block_task(conn, child, reason="still waiting", kind="dependency")
+        assert kb.get_task(conn, child).dep_wait_count == (
+            kb.DEP_WAIT_REDISPATCH_CAP + 1
+        )
         events = [
             e for e in kb.list_events(conn, child)
             if e.kind == "dependency_wait_backstop"
@@ -193,6 +202,70 @@ def test_backstop_event_fires_and_deduplicated(kanban_home: Path) -> None:
             "backstop event was duplicated on a second tick for the "
             "same fingerprint/count — dedup failed"
         )
+
+
+def test_backstop_caps_public_dispatch_lifecycle_across_fingerprint_changes(
+    kanban_home: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The independent cap holds even when each wait fingerprint changes.
+
+    Every loop before the trip uses public create/claim/complete/link,
+    dispatch_once, and block_task APIs. No status or counter is forced with
+    SQL. A fresh completed parent changes the dependency fingerprint while
+    leaving all board parents satisfied, reproducing a flickering dependency
+    state that bypasses the primary sticky-fingerprint gate.
+    """
+    monkeypatch.setattr("hermes_cli.profiles.profile_exists", lambda _: True)
+
+    with kb.connect_closing() as conn:
+        child = _running_task(conn, title="child")
+        assert kb.block_task(
+            conn, child, reason="initial wait", kind="dependency"
+        )
+        spawn_count = 0
+
+        def spawn_and_block(task, _workspace):
+            nonlocal spawn_count
+            spawn_count += 1
+            assert kb.block_task(
+                conn,
+                task.id,
+                reason=f"wait {spawn_count + 1}",
+                kind="dependency",
+                expected_run_id=task.current_run_id,
+            )
+            return None
+
+        # Each completed parent changes the fingerprint, so the sticky gate
+        # legitimately releases. The independent window count must continue.
+        for index in range(1, kb.DEP_WAIT_REDISPATCH_CAP):
+            parent = _running_task(conn, title=f"done-parent-{index}")
+            assert kb.complete_task(conn, parent, result="done")
+            kb.link_tasks(conn, parent_id=parent, child_id=child)
+            result = kb.dispatch_once(conn, spawn_fn=spawn_and_block)
+            assert [task_id for task_id, *_ in result.spawned] == [child]
+
+        task = kb.get_task(conn, child)
+        assert task.dep_wait_count == kb.DEP_WAIT_REDISPATCH_CAP
+        assert task.status == "todo"
+        assert spawn_count == kb.DEP_WAIT_REDISPATCH_CAP - 1
+
+        # Another material fingerprint change cannot reopen a tripped window.
+        parent = _running_task(conn, title="post-cap-parent")
+        assert kb.complete_task(conn, parent, result="done")
+        kb.link_tasks(conn, parent_id=parent, child_id=child)
+        result = kb.dispatch_once(conn, spawn_fn=spawn_and_block)
+        assert result.spawned == []
+        assert kb.get_task(conn, child).status == "todo"
+        assert spawn_count == kb.DEP_WAIT_REDISPATCH_CAP - 1
+
+        events = [
+            event
+            for event in kb.list_events(conn, child)
+            if event.kind == "dependency_wait_backstop"
+        ]
+        assert len(events) == 1
 
 
 def test_dispatch_result_surfaces_stalled_dependency_wait(
@@ -208,6 +281,68 @@ def test_dispatch_result_surfaces_stalled_dependency_wait(
         result = kb.dispatch_once(conn, spawn_fn=lambda *_: None)
         assert child in result.dependency_wait_stalled
         assert kb.get_task(conn, child).status == "todo"
+
+
+def test_explicit_unblock_starts_new_backstop_event_window(
+    kanban_home: Path,
+) -> None:
+    """An explicit operator unblock is the documented event-window reset."""
+    with kb.connect_closing() as conn:
+        child = _running_task(conn, title="child")
+        for _ in range(kb.DEP_WAIT_REDISPATCH_CAP):
+            _force_running_for_reblock(conn, child)
+            assert kb.block_task(
+                conn, child, reason="waiting", kind="dependency"
+            )
+
+        task = kb.get_task(conn, child)
+        assert task.dep_wait_backstop_tripped is True
+        assert kb.unblock_task(conn, child)
+        task = kb.get_task(conn, child)
+        assert task.dep_wait_count == 0
+        assert task.dep_wait_backstop_tripped is False
+
+        for _ in range(kb.DEP_WAIT_REDISPATCH_CAP):
+            _force_running_for_reblock(conn, child)
+            assert kb.block_task(
+                conn, child, reason="waiting again", kind="dependency"
+            )
+
+        events = [
+            event
+            for event in kb.list_events(conn, child)
+            if event.kind == "dependency_wait_backstop"
+        ]
+        assert len(events) == 2
+
+
+def test_claim_rejects_ready_task_after_backstop_trip(
+    kanban_home: Path,
+) -> None:
+    """The claim boundary enforces the cap even if promotion is bypassed."""
+    with kb.connect_closing() as conn:
+        child = _running_task(conn, title="child")
+        for _ in range(kb.DEP_WAIT_REDISPATCH_CAP):
+            _force_running_for_reblock(conn, child)
+            assert kb.block_task(
+                conn, child, reason="waiting", kind="dependency"
+            )
+
+        # Simulate an unknown writer bypassing recompute_ready. The public
+        # claim API must still demote and reject before a run can be created.
+        with kb.write_txn(conn):
+            conn.execute(
+                "UPDATE tasks SET status='ready', claim_lock=NULL WHERE id=?",
+                (child,),
+            )
+        assert kb.claim_task(conn, child, claimer="test") is None
+        assert kb.get_task(conn, child).status == "todo"
+        events = [
+            event
+            for event in kb.list_events(conn, child)
+            if event.kind == "dependency_wait_backstop"
+        ]
+        assert len(events) == 1
 
 
 def test_archived_not_completed_parent_stays_gated(kanban_home: Path) -> None:
