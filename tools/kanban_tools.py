@@ -408,22 +408,47 @@ def heartbeat_current_worker_from_env() -> bool:
     try:
         kb, conn = _connect()
         try:
-            ok = kb.heartbeat_claim(
+            ok, reason = kb.heartbeat_claim_with_event(
                 conn, tid,
                 claimer=claim_lock,
                 expected_run_id=run_id,
             )
             if not ok:
-                logger.debug(
-                    "auto-heartbeat: heartbeat_claim rejected "
-                    "(not current run owner or not claimed)"
-                )
-            try:
-                kb.heartbeat_worker(
-                    conn, tid, note=None, expected_run_id=run_id,
-                )
-            except Exception:
-                logger.debug("auto-heartbeat: heartbeat_worker failed", exc_info=True)
+                # Log at WARNING so operators can see this in agent.log.
+                # Distinguish the two failure flavours:
+                # - "rotated_lock" → another valid worker holds the claim; normal.
+                # - "stale_run_id" → this run is stale; a newer run took over.
+                # Both mean "do not heartbeat" — we do NOT proceed silently.
+                if reason == "rotated_lock":
+                    logger.warning(
+                        "auto-heartbeat: heartbeat_claim rejected — "
+                        "claim_lock %r does not match current holder; "
+                        "task %s is claimed by a different worker",
+                        claim_lock, tid,
+                    )
+                elif reason == "stale_run_id":
+                    logger.warning(
+                        "auto-heartbeat: heartbeat_claim rejected — "
+                        "run_id mismatch (expected %s); task %s was reclaimed "
+                        "by a newer run; this stale heartbeat is discarded",
+                        run_id, tid,
+                    )
+                elif reason == "not_running":
+                    logger.warning(
+                        "auto-heartbeat: heartbeat_claim rejected — "
+                        "task %s is no longer running", tid,
+                    )
+                elif reason == "not_claimed":
+                    logger.warning(
+                        "auto-heartbeat: heartbeat_claim rejected — "
+                        "task %s has no active claim", tid,
+                    )
+                else:
+                    logger.warning(
+                        "auto-heartbeat: heartbeat_claim rejected for task %s "
+                        "(reason=%r)", tid, reason,
+                    )
+                return True  # Did attempt; rejected is still "did attempt".
         finally:
             try:
                 conn.close()
@@ -954,12 +979,11 @@ def _handle_block(args: dict, **kw) -> str:
 def _handle_heartbeat(args: dict, **kw) -> str:
     """Signal that the worker is still alive during a long operation.
 
-    Extends the claim TTL via ``heartbeat_claim`` AND records a heartbeat
-    event via ``heartbeat_worker``. Without the ``heartbeat_claim`` half,
-    a diligent worker that loops this tool while a single tool call
-    blocks the agent for >DEFAULT_CLAIM_TTL_SECONDS still gets reclaimed
-    by ``release_stale_claims`` — which is exactly the trap that
-    ``heartbeat_claim``'s docstring warns against.
+    Extends the claim TTL via ``heartbeat_claim_with_event`` and records a
+    heartbeat event — both in a single atomic transaction. If the CAS
+    rejects (rotated lock, stale run, or unclaimed), no heartbeat state is
+    written and the function returns an error. This is the fail-closed
+    invariant required for run-id+claim-lock identity.
     """
     delegated_err = _reject_delegated_child_mutation("kanban_heartbeat")
     if delegated_err:
@@ -974,34 +998,26 @@ def _handle_heartbeat(args: dict, **kw) -> str:
         return ownership_err
     note = args.get("note")
     board = args.get("board")
+    run_id = _worker_run_id(tid)
+    claim_lock = os.environ.get("HERMES_KANBAN_CLAIM_LOCK")
     try:
         kb, conn = _connect(board=board)
         try:
-            # Extend the claim TTL atomically scoped to the current run id.
-            # Both heartbeat_claim and heartbeat_worker must use the same run id
-            # so the TTL extension is inseparable from the heartbeat event
-            # (prevents a stale old run from extending the successor's lease).
-            run_id = _worker_run_id(tid)
-            claim_lock = os.environ.get("HERMES_KANBAN_CLAIM_LOCK")
-            ok = kb.heartbeat_claim(
+            # Single atomic call: claim TTL + heartbeat event in one txn.
+            # No heartbeat state is written if the CAS is rejected.
+            ok, reason = kb.heartbeat_claim_with_event(
                 conn, tid,
                 claimer=claim_lock,
                 expected_run_id=run_id,
             )
             if not ok:
-                return tool_error(
-                    f"could not heartbeat {tid} (not the current run owner)"
+                logger.warning(
+                    "kanban_heartbeat: heartbeat rejected for task %s "
+                    "(run_id=%s, reason=%r)",
+                    tid, run_id, reason,
                 )
-
-            ok = kb.heartbeat_worker(
-                conn,
-                tid,
-                note=note,
-                expected_run_id=run_id,
-            )
-            if not ok:
                 return tool_error(
-                    f"could not heartbeat {tid} (unknown id or not running)"
+                    f"could not heartbeat {tid} (run_id={run_id}, reason={reason})"
                 )
             return _ok(task_id=tid)
         finally:
