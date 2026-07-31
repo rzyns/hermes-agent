@@ -984,19 +984,137 @@ def test_block_non_goal_mode_task_unaffected_by_new_gate(worker_env):
     assert json.loads(out).get("ok") is True
 
 
-def test_heartbeat_happy_path(worker_env):
+def test_heartbeat_happy_path(worker_env, monkeypatch):
+    from hermes_cli import kanban_db as kb
     from tools import kanban_tools as kt
+
+    conn = kb.connect()
+    try:
+        task = kb.get_task(conn, worker_env)
+        assert task is not None
+        run_id = task.current_run_id
+        claim_lock = task.claim_lock
+    finally:
+        conn.close()
+
+    monkeypatch.setenv("HERMES_KANBAN_RUN_ID", str(run_id))
+    monkeypatch.setenv("HERMES_KANBAN_CLAIM_LOCK", claim_lock)
+
     out = kt._handle_heartbeat({"note": "progress"})
     d = json.loads(out)
     assert d["ok"] is True
 
 
-def test_heartbeat_without_note(worker_env):
-    """note is optional."""
+def test_heartbeat_without_note(worker_env, monkeypatch):
+    """note is optional; credentials are required."""
+    from hermes_cli import kanban_db as kb
     from tools import kanban_tools as kt
+
+    conn = kb.connect()
+    try:
+        task = kb.get_task(conn, worker_env)
+        assert task is not None
+        run_id = task.current_run_id
+        claim_lock = task.claim_lock
+    finally:
+        conn.close()
+
+    monkeypatch.setenv("HERMES_KANBAN_RUN_ID", str(run_id))
+    monkeypatch.setenv("HERMES_KANBAN_CLAIM_LOCK", claim_lock)
+
     out = kt._handle_heartbeat({})
     d = json.loads(out)
     assert d["ok"] is True
+
+
+def test_heartbeat_rejects_missing_credentials(worker_env, monkeypatch):
+    """Explicit kanban_heartbeat must fail closed when run-id/claim-lock
+    credentials are missing, like the auto-heartbeat bridge."""
+    from tools import kanban_tools as kt
+
+    monkeypatch.delenv("HERMES_KANBAN_RUN_ID", raising=False)
+    monkeypatch.delenv("HERMES_KANBAN_CLAIM_LOCK", raising=False)
+
+    out = kt._handle_heartbeat({"note": "progress"})
+    d = json.loads(out)
+    assert d.get("ok") is not True
+    assert "missing" in d.get("error", "").lower() or "credentials" in d.get("error", "").lower()
+
+
+def test_heartbeat_rejects_malformed_run_id(worker_env, monkeypatch):
+    """A non-integer HERMES_KANBAN_RUN_ID must be treated as absent and fail closed."""
+    from tools import kanban_tools as kt
+
+    monkeypatch.setenv("HERMES_KANBAN_RUN_ID", "not-an-integer")
+    monkeypatch.setenv("HERMES_KANBAN_CLAIM_LOCK", "host:12345")
+
+    out = kt._handle_heartbeat({"note": "progress"})
+    d = json.loads(out)
+    assert d.get("ok") is not True
+    assert "missing" in d.get("error", "").lower() or "credentials" in d.get("error", "").lower()
+
+
+def test_heartbeat_rejects_stale_run_id(worker_env, monkeypatch, caplog):
+    """Explicit kanban_heartbeat must not write heartbeat state when the
+    run-id is stale (a newer run reclaimed the task)."""
+    import logging
+    from hermes_cli import kanban_db as kb
+    from tools import kanban_tools as kt
+
+    conn = kb.connect()
+    try:
+        task = kb.get_task(conn, worker_env)
+        assert task is not None
+        run_id = task.current_run_id
+        original_lock = task.claim_lock
+        hb_before = task.last_heartbeat_at
+    finally:
+        conn.close()
+
+    # Simulate successor run with same lock, new run id.
+    conn2 = kb.connect()
+    try:
+        conn2.execute(
+            "UPDATE tasks SET claim_lock = ?, status = 'running' "
+            "WHERE id = ? AND status = 'running'",
+            (original_lock, worker_env),
+        )
+        now = int(time.time())
+        cursor = conn2.execute(
+            "INSERT INTO task_runs (task_id, profile, status, claim_lock, "
+            "claim_expires, started_at) VALUES (?, 'test', 'running', ?, ?, ?)",
+            (worker_env, original_lock, now + 120, now),
+        )
+        run2_id = int(cursor.lastrowid or 0)
+        assert run2_id > 0
+        conn2.execute(
+            "UPDATE tasks SET current_run_id = ?, claim_expires = ? "
+            "WHERE id = ?",
+            (run2_id, now + 120, worker_env),
+        )
+        conn2.commit()
+    finally:
+        conn2.close()
+
+    monkeypatch.setenv("HERMES_KANBAN_RUN_ID", str(run_id))
+    monkeypatch.setenv("HERMES_KANBAN_CLAIM_LOCK", original_lock)
+
+    with caplog.at_level(logging.WARNING):
+        out = kt._handle_heartbeat({"note": "stale"})
+
+    d = json.loads(out)
+    assert d.get("ok") is not True
+
+    conn3 = kb.connect()
+    try:
+        task3 = kb.get_task(conn3, worker_env)
+        assert task3 is not None
+        assert task3.last_heartbeat_at == hb_before
+        assert task3.current_run_id == run2_id
+        events = kb.list_events(conn3, worker_env)
+        assert not [e for e in events if e.kind == "heartbeat"]
+    finally:
+        conn3.close()
 
 
 def test_progress_records_checkpoint_without_extending_claim(worker_env, monkeypatch):
@@ -1031,6 +1149,7 @@ def test_progress_records_checkpoint_without_extending_claim(worker_env, monkeyp
     conn = kb.connect()
     try:
         task = kb.get_task(conn, worker_env)
+        assert task is not None
         event = [e for e in kb.list_events(conn, worker_env) if e.kind == "progress"][-1]
         assert task.status == "running"
         assert task.claim_expires == 1234
@@ -1117,7 +1236,7 @@ def test_progress_redacts_metadata(worker_env, monkeypatch):
     assert secret not in json.dumps(event.payload)
 
 
-def test_heartbeat_extends_claim_expires(worker_env):
+def test_heartbeat_extends_claim_expires(worker_env, monkeypatch):
     """The kanban_heartbeat tool MUST extend claim_expires, not just
     update last_heartbeat_at — otherwise long-running workers loop the
     heartbeat tool diligently and still get reclaimed by
@@ -1131,10 +1250,14 @@ def test_heartbeat_extends_claim_expires(worker_env):
     from hermes_cli import kanban_db as kb
     from tools import kanban_tools as kt
 
-    # Rewind claim_expires into the past so any forward movement is
-    # unambiguous (avoids time.sleep flakiness).
     conn = kb.connect()
     try:
+        task = kb.get_task(conn, worker_env)
+        assert task is not None
+        run_id = task.current_run_id
+        claim_lock = task.claim_lock
+        # Rewind claim_expires into the past so any forward movement is
+        # unambiguous (avoids time.sleep flakiness).
         conn.execute(
             "UPDATE tasks SET claim_expires = ? WHERE id = ?",
             (1, worker_env),
@@ -1146,6 +1269,9 @@ def test_heartbeat_extends_claim_expires(worker_env):
     finally:
         conn.close()
     assert before == 1
+
+    monkeypatch.setenv("HERMES_KANBAN_RUN_ID", str(run_id))
+    monkeypatch.setenv("HERMES_KANBAN_CLAIM_LOCK", claim_lock)
 
     out = kt._handle_heartbeat({"note": "still alive"})
     assert json.loads(out).get("ok") is True
@@ -1914,11 +2040,24 @@ def test_unblock_rejects_non_blocked_task(monkeypatch, worker_env):
     assert json.loads(out).get("error")
 
 
-def test_worker_lifecycle_through_tools(worker_env):
+def test_worker_lifecycle_through_tools(worker_env, monkeypatch):
     """Drive the full claim -> heartbeat -> comment -> complete lifecycle
     exclusively through the tools, then verify the DB state matches what
     the dispatcher/notifier expect."""
+    from hermes_cli import kanban_db as kb
     from tools import kanban_tools as kt
+
+    # Pin run credentials so heartbeat is permitted (ENV-3e fail-closed identity).
+    conn = kb.connect()
+    try:
+        task = kb.get_task(conn, worker_env)
+        assert task is not None
+        run_id = task.current_run_id
+        claim_lock = task.claim_lock
+    finally:
+        conn.close()
+    monkeypatch.setenv("HERMES_KANBAN_RUN_ID", str(run_id))
+    monkeypatch.setenv("HERMES_KANBAN_CLAIM_LOCK", claim_lock)
 
     # 1. show — worker orientation
     show = json.loads(kt._handle_show({}))
@@ -2751,8 +2890,13 @@ def test_board_param_routes_heartbeat_to_alt_board(monkeypatch, tmp_path):
     # Seed the alt board with a claimed task.
     with kb.connect(board="alt") as conn:
         tid = kb.create_task(conn, title="alt hb", assignee="alt-worker")
-        kb.claim_task(conn, tid)
+        task = kb.claim_task(conn, tid)
+        assert task is not None
+        run_id = task.current_run_id
+        claim_lock = task.claim_lock
     monkeypatch.setenv("HERMES_KANBAN_TASK", tid)
+    monkeypatch.setenv("HERMES_KANBAN_RUN_ID", str(run_id))
+    monkeypatch.setenv("HERMES_KANBAN_CLAIM_LOCK", claim_lock)
 
     from tools import kanban_tools as kt
     out = kt._handle_heartbeat({"note": "alive on alt", "board": "alt"})
@@ -3623,24 +3767,22 @@ def test_auto_heartbeat_rejects_stale_run_id_no_event_written(
     assert len(warning_messages) >= 1, (
         "A WARNING must be logged when heartbeat_claim_with_event rejects"
     )
-    assert any("stale" in msg or "run_id" in msg for msg in warning_messages)
+    assert any("stale_run_id" in msg for msg in warning_messages), (
+        "The stale_run_id flavour WARNING branch must run"
+    )
 
     # No heartbeat event was written (state write is fail-closed).
     conn2 = kb.connect()
     try:
         task2 = kb.get_task(conn2, worker_env)
+        assert task2 is not None
         assert task2.last_heartbeat_at == hb_before, (
             "last_heartbeat_at must not change when CAS is rejected"
         )
         events = kb.list_events(conn2, worker_env)
         heartbeat_events = [e for e in events if e.kind == "heartbeat"]
-        # Count heartbeat events after the single stale heartbeat attempt.
-        # We don't make a second call because the rate limiter would cause
-        # heartbeat_current_worker_from_env to return False (not a CAS reject).
-        events_after = kb.list_events(conn2, worker_env)
-        heartbeat_count_after = len([e for e in events_after if e.kind == "heartbeat"])
-        assert heartbeat_count_after == len(heartbeat_events), (
-            "No new heartbeat event may be written on CAS reject"
+        assert not heartbeat_events, (
+            "No heartbeat event may be written on CAS reject"
         )
     finally:
         conn2.close()
@@ -3712,12 +3854,18 @@ def test_auto_heartbeat_rejects_rotated_lock_warning_logged(
     assert len(warning_messages) >= 1, (
         "WARNING must be logged when rotated lock rejects heartbeat"
     )
+    assert any("rotated_lock" in msg for msg in warning_messages), (
+        "The rotated_lock flavour WARNING branch must run"
+    )
 
     # No heartbeat state written after rotated-lock rejection.
     conn3 = kb.connect()
     try:
         task3 = kb.get_task(conn3, worker_env)
+        assert task3 is not None
         assert task3.last_heartbeat_at == hb_before
+        events = kb.list_events(conn3, worker_env)
+        assert not [e for e in events if e.kind == "heartbeat"]
     finally:
         conn3.close()
 

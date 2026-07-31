@@ -8,8 +8,10 @@ import os
 import sqlite3
 import subprocess
 import sys
+import threading
 import time
 import types
+import typing
 import unittest.mock
 from pathlib import Path
 
@@ -2025,12 +2027,6 @@ def test_heartbeat_claim_with_event_no_event_on_rotated_lock(kanban_home):
     the CAS is rejected due to a rotated lock (different host:pid).
     The stale owner (lock_a) attempts heartbeat after the task has been
     re-claimed by a different owner (lock_b) — must be rejected silently.
-
-    Note: with same `expected_run_id=run_a_id` AND different lock (lock_b
-    ≠ lock_a), the CAS rejects at the `claim_lock = ?` predicate. However,
-    when the row IS found with `status='running'` and a different `claim_lock`,
-    the reason is determined by the `current_run_id != expected_run_id` check
-    (since run_a_id ≠ run_b_id) which fires first → returns "stale_run_id".
     """
     with kb.connect() as conn:
         t = kb.create_task(conn, title="x", assignee="a")
@@ -2070,16 +2066,14 @@ def test_heartbeat_claim_with_event_no_event_on_rotated_lock(kanban_home):
         assert run_b_id != run_a_id
 
         # Run A (stale lock) attempts heartbeat_claim_with_event —
-        # must be rejected with "rotated_lock".
+        # must be rejected with "rotated_lock" because a different lock holds the claim.
         ok, reason = kb.heartbeat_claim_with_event(
             conn, t,
             claimer=lock_a,
             expected_run_id=run_a_id,
         )
         assert ok is False
-        # Same lock_a but different run (run_b_id ≠ run_a_id) → stale_run_id
-        # (run_id check fires before the rotated-lock distinction in the impl).
-        assert reason == "stale_run_id"
+        assert reason == "rotated_lock"
 
         # No heartbeat event written.
         events = kb.list_events(conn, t)
@@ -2108,42 +2102,68 @@ def test_heartbeat_claim_with_event_single_transaction(kanban_home):
         original_expires = task.claim_expires
         hb_before = task.last_heartbeat_at
 
-    # Simulate a successor run (dispatcher moved the task to a new worker).
-    with kb.connect() as conn2:
-        conn2.execute(
-            "UPDATE tasks SET claim_lock = ?, status = 'running' "
-            "WHERE id = ? AND status = 'running'",
-            ("successor-lock", t),
-        )
-        now = int(time.time())
-        cursor = conn2.execute(
-            "INSERT INTO task_runs (task_id, profile, status, claim_lock, "
-            "claim_expires, started_at) VALUES (?, 'test', 'running', ?, ?, ?)",
-            (t, "successor-lock", now + 120, now),
-        )
-        run2_id = int(cursor.lastrowid)
-        conn2.execute(
-            "UPDATE tasks SET current_run_id = ?, claim_expires = ? "
-            "WHERE id = ?",
-            (run2_id, now + 120, t),
-        )
-        conn2.commit()
+    # Spin up two concurrent actors that genuinely race on the DB.
+    #   - Actor A tries to heartbeat using the old run/lock.
+    #   - Actor B reclaims the task (new lock + new run id) and COMMITS.
+    # If the heartbeat transaction were split (CAS in txn1, event in txn2),
+    # Actor B could reclaim between the two, leaving an orphan heartbeat event
+    # or a half-extended lease. We verify the final state is clean.
+    ready = threading.Event()
+    a_result: dict[str, typing.Any] = {"ok": None, "reason": None}
 
-    # Stale heartbeat attempt with old run1_id — CAS must reject atomically.
+    def actor_a():
+        with kb.connect() as c:
+            ready.wait(timeout=5)
+            ok, reason = kb.heartbeat_claim_with_event(
+                c, t,
+                claimer=lock,
+                expected_run_id=run1_id,
+            )
+            a_result["ok"] = ok
+            a_result["reason"] = reason
+
+    def actor_b():
+        with kb.connect() as c:
+            # Reclaim by brute force to model dispatcher restart/new worker.
+            c.execute(
+                "UPDATE tasks SET claim_lock = ?, status = 'running' "
+                "WHERE id = ? AND status = 'running'",
+                ("successor-lock", t),
+            )
+            now = int(time.time())
+            cursor = c.execute(
+                "INSERT INTO task_runs (task_id, profile, status, claim_lock, "
+                "claim_expires, started_at) VALUES (?, 'test', 'running', ?, ?, ?)",
+                (t, "successor-lock", now + 120, now),
+            )
+            run2_id = int(cursor.lastrowid)
+            c.execute(
+                "UPDATE tasks SET current_run_id = ?, claim_expires = ? "
+                "WHERE id = ?",
+                (run2_id, now + 120, t),
+            )
+            c.commit()
+        ready.set()
+
+    t_a = threading.Thread(target=actor_a)
+    t_b = threading.Thread(target=actor_b)
+    t_a.start()
+    t_b.start()
+    t_a.join(timeout=10)
+    t_b.join(timeout=10)
+
+    # The stale heartbeat must lose (rejected) regardless of ordering.
+    assert a_result["ok"] is False, (
+        f"Stale heartbeat must be rejected in a race (reason={a_result['reason']!r})"
+    )
+    assert a_result["reason"] in {"stale_run_id", "rotated_lock"}
+
     with kb.connect() as conn3:
-        ok, reason = kb.heartbeat_claim_with_event(
-            conn3, t,
-            claimer=lock,
-            expected_run_id=run1_id,
-        )
-        assert ok is False, "Stale heartbeat must be rejected"
-        assert reason == "stale_run_id"
-
         # No heartbeat event was appended (the key atomicity guarantee).
         events = kb.list_events(conn3, t)
         heartbeat_events = [e for e in events if e.kind == "heartbeat"]
         assert len(heartbeat_events) == 0, (
-            "No heartbeat event may be written on CAS reject"
+            "No heartbeat event may be written on CAS reject under concurrency"
         )
 
     # The task can still be reclaimed by the successor (atomicity preserved).

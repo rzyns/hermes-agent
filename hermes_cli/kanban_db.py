@@ -5325,11 +5325,11 @@ def heartbeat_claim_with_event(
             return (False, "not_running")
         if row["claim_lock"] is None:
             return (False, "not_claimed")
-        if row["current_run_id"] != expected_run_id:
-            # Same lock but run_id mismatch → stale old run trying to extend.
-            return (False, "stale_run_id")
-        # Lock mismatch: different worker holds the claim.
-        return (False, "rotated_lock")
+        if row["claim_lock"] != lock:
+            # A different lock holds the claim — rotated lock / different worker.
+            return (False, "rotated_lock")
+        # Same lock but run_id mismatch → stale old run trying to extend.
+        return (False, "stale_run_id")
 
 
 def _heartbeat_event(

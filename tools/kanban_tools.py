@@ -421,32 +421,32 @@ def heartbeat_current_worker_from_env() -> bool:
                 # Both mean "do not heartbeat" — we do NOT proceed silently.
                 if reason == "rotated_lock":
                     logger.warning(
-                        "auto-heartbeat: heartbeat_claim rejected — "
+                        "auto-heartbeat: heartbeat_claim rejected — rotated_lock: "
                         "claim_lock %r does not match current holder; "
                         "task %s is claimed by a different worker",
                         claim_lock, tid,
                     )
                 elif reason == "stale_run_id":
                     logger.warning(
-                        "auto-heartbeat: heartbeat_claim rejected — "
+                        "auto-heartbeat: heartbeat_claim rejected — stale_run_id: "
                         "run_id mismatch (expected %s); task %s was reclaimed "
                         "by a newer run; this stale heartbeat is discarded",
                         run_id, tid,
                     )
                 elif reason == "not_running":
                     logger.warning(
-                        "auto-heartbeat: heartbeat_claim rejected — "
+                        "auto-heartbeat: heartbeat_claim rejected — not_running: "
                         "task %s is no longer running", tid,
                     )
                 elif reason == "not_claimed":
                     logger.warning(
-                        "auto-heartbeat: heartbeat_claim rejected — "
+                        "auto-heartbeat: heartbeat_claim rejected — not_claimed: "
                         "task %s has no active claim", tid,
                     )
                 else:
                     logger.warning(
-                        "auto-heartbeat: heartbeat_claim rejected for task %s "
-                        "(reason=%r)", tid, reason,
+                        "auto-heartbeat: heartbeat_claim rejected — %s for task %s",
+                        reason, tid,
                     )
                 return True  # Did attempt; rejected is still "did attempt".
         finally:
@@ -998,8 +998,24 @@ def _handle_heartbeat(args: dict, **kw) -> str:
         return ownership_err
     note = args.get("note")
     board = args.get("board")
+
+    # Fail-closed: explicit kanban_heartbeat from a dispatcher-spawned worker
+    # MUST present both run-id and claim-lock credentials, just like the
+    # auto-heartbeat bridge. Missing either means this process is not the
+    # current run owner and must not extend any lease or emit heartbeat state.
     run_id = _worker_run_id(tid)
     claim_lock = os.environ.get("HERMES_KANBAN_CLAIM_LOCK")
+    if run_id is None or not claim_lock:
+        logger.warning(
+            "kanban_heartbeat: missing run-id/claim-lock credentials for task %s "
+            "(run_id=%s, claim_lock=%r); refusing heartbeat",
+            tid, run_id, claim_lock,
+        )
+        return tool_error(
+            "could not heartbeat: missing run-id or claim-lock credentials; "
+            "refusing to heartbeat without run-scoped identity"
+        )
+
     try:
         kb, conn = _connect(board=board)
         try:
