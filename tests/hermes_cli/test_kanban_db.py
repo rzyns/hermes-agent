@@ -115,10 +115,20 @@ def test_connect_migrates_existing_db_missing_session_id(tmp_path):
         cols = {row["name"] for row in conn.execute("PRAGMA table_info(tasks)")}
         indexes = {row["name"] for row in conn.execute("PRAGMA index_list(tasks)")}
         title = conn.execute("SELECT title FROM tasks WHERE id='t_legacy'").fetchone()["title"]
+        dep_wait_defaults = conn.execute(
+            "SELECT dep_wait_fingerprint, dep_wait_count, "
+            "dep_wait_backstop_tripped FROM tasks WHERE id='t_legacy'"
+        ).fetchone()
 
     assert "session_id" in cols
+    assert {
+        "dep_wait_fingerprint",
+        "dep_wait_count",
+        "dep_wait_backstop_tripped",
+    } <= cols
     assert "idx_tasks_session_id" in indexes
     assert title == "preserve me"
+    assert tuple(dep_wait_defaults) == (None, 0, 0)
 
 
 def test_init_creates_expected_tables(kanban_home):
