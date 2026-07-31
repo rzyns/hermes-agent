@@ -12,6 +12,7 @@ import os
 import re
 import time
 
+from agent.delegation_context import child_env_lookup
 from agent.redact import redact_sensitive_text
 from agent.secret_scope import get_secret
 
@@ -1990,7 +1991,7 @@ def _check_send_message():
     reply with more than the ~200-char first-line truncation the kanban
     notifier applies.
     """
-    if os.environ.get("HERMES_KANBAN_TASK"):
+    if child_env_lookup("HERMES_KANBAN_TASK"):
         return True
     from gateway.session_context import get_session_env
     platform = get_session_env("HERMES_SESSION_PLATFORM", "")

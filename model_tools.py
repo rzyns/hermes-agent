@@ -48,6 +48,16 @@ def _is_delegated_child_context() -> bool:
         return False
 
 
+def child_env_lookup(key: str, default: str | None = None) -> str | None:
+    """Resolve an env var, honoring any thread-local child overlay."""
+    try:
+        from agent.delegation_context import child_env_lookup as _child_env_lookup
+
+        return _child_env_lookup(key, default)
+    except Exception:
+        return os.environ.get(key, default)
+
+
 # =============================================================================
 # Async Bridging  (single source of truth -- used by registry.dispatch too)
 # =============================================================================
@@ -330,7 +340,7 @@ def get_tool_definitions(
             frozenset(disabled_toolsets) if disabled_toolsets else None,
             registry._generation,
             cfg_fp,
-            bool(os.environ.get("HERMES_KANBAN_TASK")),
+            bool(child_env_lookup("HERMES_KANBAN_TASK")),
             bool(skip_tool_search_assembly),
             _is_delegated_child_context(),
         )
@@ -377,7 +387,7 @@ def _compute_tool_definitions(
     if enabled_toolsets is not None:
         effective_enabled_toolsets = list(enabled_toolsets)
         if (
-            os.environ.get("HERMES_KANBAN_TASK")
+            child_env_lookup("HERMES_KANBAN_TASK")
             and not _is_delegated_child_context()
             and "kanban" not in effective_enabled_toolsets
         ):

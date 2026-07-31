@@ -25,6 +25,7 @@ from __future__ import annotations
 import os
 from typing import Any
 
+from agent.delegation_context import child_env_lookup, is_delegated_child_context
 from agent.codex_responses_adapter import _summarize_user_message_for_log
 from agent.message_content import flatten_message_text
 
@@ -207,16 +208,22 @@ def finalize_turn(
         # came from the summary call or an explicitly pending continuation;
         # both exhausted the task budget and must advance the failure circuit.
         #
+        # Delegated children are never Kanban workers: even if they inherit
+        # HERMES_KANBAN_* via os.environ, the DB mutation layer rejects them,
+        # but we also fail fast here so the failure message is silent and
+        # we do not try to record a budget-exhausted failure against the
+        # parent's task/run.
+        #
         # We route through ``_record_task_failure(outcome="timed_out")``
         # rather than ``kanban_block`` so this counts toward the dispatcher's
         # consecutive-failure circuit breaker (#29747 gap 2).
-        _kanban_task = os.environ.get("HERMES_KANBAN_TASK")
-        if _kanban_task:
+        _kanban_task = child_env_lookup("HERMES_KANBAN_TASK")
+        if _kanban_task and not is_delegated_child_context():
             try:
                 from hermes_cli import kanban_db as _kb
                 _kanban_run_id = None
                 try:
-                    _kanban_run_id = int(os.environ.get("HERMES_KANBAN_RUN_ID", ""))
+                    _kanban_run_id = int(child_env_lookup("HERMES_KANBAN_RUN_ID") or "")
                 except (TypeError, ValueError):
                     pass
                 _conn = _kb.connect()
@@ -239,6 +246,7 @@ def finalize_turn(
                             "budget_max": agent.max_iterations,
                         },
                     )
+
                     logger.info(
                         "recorded budget-exhausted failure for task %s (%d/%d)",
                         _kanban_task, api_call_count, agent.max_iterations,
@@ -698,9 +706,15 @@ def finalize_turn(
 
     # Check skill trigger NOW — based on how many tool iterations THIS turn used.
     _should_review_skills = False
-    if (agent._skill_nudge_interval > 0
-            and agent._iters_since_skill >= agent._skill_nudge_interval
-            and "skill_manage" in agent.valid_tool_names):
+    _skill_nudge_interval = getattr(agent, "_skill_nudge_interval", 0)
+    _iters_since_skill = getattr(agent, "_iters_since_skill", 0)
+    if (
+        isinstance(_skill_nudge_interval, int)
+        and not isinstance(_skill_nudge_interval, bool)
+        and _skill_nudge_interval > 0
+        and _iters_since_skill >= _skill_nudge_interval
+        and "skill_manage" in getattr(agent, "valid_tool_names", {})
+    ):
         _should_review_skills = True
         agent._iters_since_skill = 0
 

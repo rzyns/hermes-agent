@@ -140,6 +140,7 @@ from model_tools import (
     handle_function_call,  # noqa: F401  # re-exported for tests that mock.patch("run_agent.handle_function_call")
     check_toolset_requirements,  # noqa: F401  # re-exported for tests that mock.patch("run_agent.check_toolset_requirements")
 )
+from agent.delegation_context import child_env_lookup, is_delegated_child_context
 from tools.terminal_tool import cleanup_vm, get_active_env
 from tools.interrupt import set_interrupt as _set_interrupt
 from tools.browser_tool import cleanup_browser
@@ -3538,7 +3539,15 @@ class AIAgent:
         """
         self._last_activity_ts = time.time()
         self._last_activity_desc = desc
-        if os.environ.get("HERMES_KANBAN_TASK"):
+
+        # When this is a delegated child context, HERMES_KANBAN_TASK must not be
+        # used as proof of dispatcher ownership; it is only inherited via the
+        # thread-local env overlay / os.environ.  The child is not a Kanban
+        # worker and should not heartbeat or otherwise act as one.
+        if is_delegated_child_context():
+            return
+
+        if child_env_lookup("HERMES_KANBAN_TASK"):
             try:
                 from tools.kanban_tools import heartbeat_current_worker_from_env
                 heartbeat_current_worker_from_env()

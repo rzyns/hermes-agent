@@ -8,6 +8,8 @@ import re
 from urllib.parse import urlparse
 from typing import Any, Dict, Optional
 
+from agent.delegation_context import child_env_lookup
+
 logger = logging.getLogger(__name__)
 
 from hermes_cli import auth as auth_mod
@@ -567,7 +569,7 @@ def resolve_requested_provider(requested: Optional[str] = None) -> str:
 
     # Prefer the persisted config selection over any stale shell/.env
     # provider override so chat uses the endpoint the user last saved.
-    env_provider = _getenv("HERMES_INFERENCE_PROVIDER", "").strip().lower()
+    env_provider = child_env_lookup("HERMES_INFERENCE_PROVIDER", "").strip().lower()
     if env_provider:
         return env_provider
 
@@ -990,7 +992,7 @@ def canonical_custom_identity(
         except Exception:
             candidate = ""
     if not candidate:
-        candidate = os.environ.get("HERMES_INFERENCE_PROVIDER", "").strip()
+        candidate = child_env_lookup("HERMES_INFERENCE_PROVIDER", "").strip()
 
     candidate_norm = _normalize_custom_provider_name(candidate)
     # A bare/non-routable candidate cannot heal a bare custom override.

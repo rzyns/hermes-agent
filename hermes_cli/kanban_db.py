@@ -74,6 +74,8 @@ import contextlib
 import hashlib
 import json
 import os
+
+from agent.delegation_context import child_env_lookup
 import re
 import random
 import secrets
@@ -631,7 +633,7 @@ def get_current_board() -> str:
         except ValueError:
             pass
 
-    env = os.environ.get("HERMES_KANBAN_BOARD", "").strip()
+    env = child_env_lookup("HERMES_KANBAN_BOARD", "").strip()
     if env:
         try:
             normed = _normalize_board_slug(env)

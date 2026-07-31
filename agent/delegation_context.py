@@ -27,17 +27,60 @@ KANBAN_ENV_KEYS: tuple[str, ...] = (
     "HERMES_KANBAN_CLAIM_LOCK",
     "HERMES_KANBAN_BOARD",
     "HERMES_KANBAN_DB",
+    "HERMES_KANBAN_BRANCH",
+)
+
+# Run-scoped HERMES_* variables that identify the current worker's own task
+# and launch-time inference settings. They must NOT propagate into delegated
+# sub-agents: a child should have its own identity and resolve its own model
+# rather than inheriting the parent's Kanban task or a forced inference seed.
+_RUN_SCOPED_ENV_VARS: frozenset[str] = frozenset(
+    {
+        "HERMES_KANBAN_TASK",
+        "HERMES_KANBAN_RUN_ID",
+        "HERMES_KANBAN_WORKSPACE",
+        "HERMES_KANBAN_WORKSPACES_ROOT",
+        "HERMES_KANBAN_CLAIM_LOCK",
+        "HERMES_KANBAN_BOARD",
+        "HERMES_KANBAN_DB",
+        "HERMES_KANBAN_BRANCH",
+        "HERMES_INFERENCE_MODEL",
+        "HERMES_INFERENCE_PROVIDER",
+    }
+)
+
+
+# Context-local overlay: per-call environment map that shadows os.environ for
+# in-process resolution without mutating the process-global mapping. Using a
+# ContextVar means the overlay travels with the delegated-child context when it
+# is copied to a worker thread (e.g. by DaemonThreadPoolExecutor).
+# A value of ``None`` means the key is explicitly removed (returning ``default``
+# rather than falling back to the parent's process env).
+_CHILD_ENV_OVERLAY: ContextVar[dict[str, str | None] | None] = ContextVar(
+    "hermes_child_env_overlay",
+    default=None,
 )
 
 
 @contextmanager
-def delegated_child_context() -> Iterator[None]:
-    """Mark the current execution context as a delegate_task child."""
+def delegated_child_context(
+    overlay: Mapping[str, str | None] | None = None,
+) -> Iterator[None]:
+    """Mark the current execution context as a delegate_task child.
+
+    ``overlay`` is a per-child environment map that can shadow process env
+    without mutating ``os.environ``.  When provided, code that resolves
+    run-scoped HERMES_* variables through :func:`child_env_lookup` will see
+    the overlay values (or ``default`` for explicitly removed keys) for this
+    thread only.
+    """
     token = _DELEGATED_CHILD_CONTEXT.set(True)
+    overlay_token = _CHILD_ENV_OVERLAY.set(dict(overlay) if overlay is not None else None)
     try:
         yield
     finally:
         _DELEGATED_CHILD_CONTEXT.reset(token)
+        _CHILD_ENV_OVERLAY.reset(overlay_token)
 
 
 def is_delegated_child_context() -> bool:
@@ -54,6 +97,36 @@ def is_delegated_child_process_context() -> bool:
     )
 
 
+def child_env_overlay() -> dict[str, str | None] | None:
+    """Return the current context's child env overlay, if any."""
+    return _CHILD_ENV_OVERLAY.get()
+
+
+def child_env_lookup(key: str, default: str | None = None) -> str | None:
+    """Resolve a single env var respecting the child env overlay.
+
+    In a delegate_task child context with an active overlay, the overlay is
+    authoritative for the keys it contains:
+
+    - A string value is returned directly.
+    - ``None`` means the key was explicitly removed; ``default`` is returned
+      (this prevents a scrubbed run-scoped var from falling back to the
+      parent's process env).
+
+    Outside child contexts the process environment is used directly.
+    """
+    overlay = child_env_overlay()
+    if overlay is not None and is_delegated_child_context():
+        if key in overlay:
+            value = overlay[key]
+            if value is None:
+                return default
+            return value
+    import os
+
+    return os.environ.get(key, default)
+
+
 def scrub_kanban_env(env: Mapping[str, str] | MutableMapping[str, str]) -> dict[str, str]:
     """Return *env* with dispatcher-only Kanban variables removed."""
     cleaned = dict(env)
@@ -63,8 +136,20 @@ def scrub_kanban_env(env: Mapping[str, str] | MutableMapping[str, str]) -> dict[
     return cleaned
 
 
+def scrub_run_scoped_env(
+    env: Mapping[str, str],
+) -> dict[str, str]:
+    """Return *env* with run-scoped HERMES_* vars removed.
+
+    This is the same scrub set used at the in-process delegation boundary so
+    that subprocess consumers (terminal, execute_code, ACP, etc.) inherit a
+    consistent child identity.
+    """
+    return {k: v for k, v in env.items() if k not in _RUN_SCOPED_ENV_VARS}
+
+
 def delegated_child_subprocess_env(
-    env: Mapping[str, str] | MutableMapping[str, str] | None = None,
+    env: Mapping[str, str] | None = None,
 ) -> dict[str, str] | None:
     """Return an env override only when delegated-child lineage must cross fork.
 
@@ -82,4 +167,19 @@ def delegated_child_subprocess_env(
         import os
 
         env = os.environ
-    return scrub_kanban_env(env)
+    base = dict(env)
+    # Apply the in-process overlay first, if present, so subprocess consumers
+    # inherit the same shadowed values this thread sees.  Drop overlay entries
+    # whose value is ``None`` (explicit removal) instead of materialising them.
+    overlay = child_env_overlay()
+    if overlay is not None:
+        for k, v in overlay.items():
+            if v is None:
+                base.pop(k, None)
+            else:
+                base[k] = v
+    # Then strip run-scoped identity and mark the child lineage.
+    base = {k: v for k, v in base.items() if v is not None}
+    base = scrub_run_scoped_env(base)
+    base[DELEGATED_CHILD_ENV_MARKER] = "1"
+    return base

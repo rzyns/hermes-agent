@@ -39,6 +39,8 @@ needs to replace the import + call site:
 from contextvars import ContextVar
 from typing import Any
 
+from agent.delegation_context import child_env_lookup
+
 # Sentinel to distinguish "never set in this context" from "explicitly set to empty".
 # When a contextvar holds _UNSET, we fall back to os.environ (CLI/cron compat).
 # When it holds "" (after clear_session_vars resets it), we return "" — no fallback.
@@ -430,7 +432,7 @@ def async_delivery_supported() -> bool:
     # disappear after the quiet turn returns, so a completion queued later has
     # no durable consumer even though an ordinary CLI session can drain that
     # queue. Force tools onto their existing synchronous/polling fallbacks.
-    if os.environ.get("HERMES_KANBAN_TASK"):
+    if child_env_lookup("HERMES_KANBAN_TASK"):
         return False
 
     value = _SESSION_ASYNC_DELIVERY.get()
