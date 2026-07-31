@@ -108,25 +108,32 @@ def _kanban_dependencies():
 
 
 def _parent_dependency_satisfied(parent: sqlite3.Row) -> bool:
-    """Return True when a parent row satisfies child dependency gating.
+    """Return True when a parent row proves the dependency is complete.
 
-    A dependency is satisfied when the parent is genuinely terminal:
+    A dependency is satisfied only when the parent is genuinely terminal:
     * status == "done", or
-    * status == "archived" AND completed_at IS NOT NULL.
+    * status == "archived" AND completed_at IS NOT NULL AND completed_at != 0.
 
-    An archived parent that never actually completed (completed_at IS NULL
-    and result IS NULL) does NOT satisfy the dependency. This prevents
-    tasks that were archived as stale / abandoned / never-started from
-    silently unblocking their children.
+    ``completed_at`` is an INTEGER unix timestamp. ``0`` is reserved as a
+    sentinel meaning "defaulted / never actually set" (even though 0 is a
+    legitimate epoch value, the codebase never records real completions at
+    the epoch). Archived parents lacking real completion evidence must NOT
+    unblock their children; otherwise abandoned work masquerades as success.
     """
     status = parent["status"]
     if status == "done":
         return True
     if status == "archived":
         completed_at = parent["completed_at"]
-        # completed_at is stored as INTEGER (unix timestamp) or NULL.
         return completed_at is not None and completed_at != 0
     return False
+
+
+# SQL fragment expressing the same predicate as ``_parent_dependency_satisfied``
+# for a tasks row named ``t`` or ``p``. Keep it in sync with the Python helper
+# above; this single source of truth lets SQL callers and Python callers agree.
+_PARENT_SATISFIED_SQL = "(t.status = 'done' OR (t.status = 'archived' AND t.completed_at IS NOT NULL AND t.completed_at != 0))"
+_PARENT_SATISFIED_SQL_P = "(p.status = 'done' OR (p.status = 'archived' AND p.completed_at IS NOT NULL AND p.completed_at != 0))"
 
 
 # ---------------------------------------------------------------------------
@@ -3953,17 +3960,21 @@ def child_ids(conn: sqlite3.Connection, task_id: str) -> list[str]:
 
 
 def parent_results(conn: sqlite3.Connection, task_id: str) -> list[tuple[str, Optional[str]]]:
-    """Return ``(parent_id, result)`` for every done parent of ``task_id``."""
-    rows = conn.execute(
-        """
+    """Return ``(parent_id, result)`` for every satisfied parent of ``task_id``.
+
+    A parent satisfies dependency gating when it is ``done`` or when it is
+    ``archived`` with real completion evidence (completed_at IS NOT NULL and
+    completed_at != 0). This intentionally mirrors ``_parent_dependency_satisfied``
+    so handoffs and promotion checks agree.
+    """
+    sql = f"""
         SELECT t.id AS id, t.result AS result
         FROM tasks t
         JOIN task_links l ON l.parent_id = t.id
-        WHERE l.child_id = ? AND t.status = 'done'
+        WHERE l.child_id = ? AND {_PARENT_SATISFIED_SQL.replace('t.', 't.')}
         ORDER BY t.completed_at ASC
-        """,
-        (task_id,),
-    ).fetchall()
+        """
+    rows = conn.execute(sql, (task_id,)).fetchall()
     return [(r["id"], r["result"]) for r in rows]
 
 
@@ -4446,7 +4457,7 @@ def recompute_ready(
     failure_limit: int = None,
     board: Optional[str] = None,
 ) -> int:
-    """Promote ``todo`` tasks to ``ready`` when all parents are ``done`` or ``archived``.
+    """Promote tasks whose internal parents are satisfied.
 
     Returns the number of tasks promoted.  Safe to call inside or outside
     an existing transaction; it opens its own IMMEDIATE txn.
@@ -4486,16 +4497,10 @@ def recompute_ready(
         for row in todo_rows:
             task_id = row["id"]
             cur_status = row["status"]
-            if cur_status == "blocked" and _has_sticky_block(conn, task_id):
-                # Worker / operator asked for human review — do not
-                # silently auto-recover.  ``unblock_task`` is the only
-                # legitimate exit (it emits ``"unblocked"`` which flips
-                # this predicate back).
-                continue
             parents = conn.execute(
-                "SELECT t.status, t.completed_at FROM tasks t "
+                "SELECT t.id, t.status, t.completed_at FROM tasks t "
                 "JOIN task_links l ON l.parent_id = t.id "
-                "WHERE l.child_id = ?",
+                "WHERE l.child_id = ? ORDER BY t.id",
                 (task_id,),
             ).fetchall()
             if all(_parent_dependency_satisfied(p) for p in parents):
@@ -4506,6 +4511,44 @@ def recompute_ready(
                 if external_blockers:
                     continue
                 if cur_status == "blocked":
+                    # Emit one observable telemetry event when a blocked task
+                    # has satisfied internal parents but is still blocked
+                    # before sticky-block / external-blocker / failure-cap
+                    # checks. This is the broad "blocked at sweep with internal
+                    # deps satisfied" signal, distinct from the sticky-only
+                    # narrow path.
+                    if parents:
+                        latest = conn.execute(
+                            "SELECT kind FROM task_events "
+                            "WHERE task_id = ? AND kind IN ("
+                            "'stranded_dependency_child', 'blocked', 'unblocked', 'promoted'"
+                            ") ORDER BY id DESC LIMIT 1",
+                            (task_id,),
+                        ).fetchone()
+                        if not latest or latest["kind"] != "stranded_dependency_child":
+                            _append_event(
+                                conn,
+                                task_id,
+                                "stranded_dependency_child",
+                                {
+                                    "parents": [
+                                        {
+                                            "id": p["id"],
+                                            "status": p["status"],
+                                            "completed_at": p["completed_at"],
+                                        }
+                                        for p in parents
+                                    ]
+                                },
+                            )
+                    if _has_sticky_block(conn, task_id):
+                        # Worker / operator asked for human review — do not
+                        # silently auto-recover.  ``unblock_task`` is the only
+                        # legitimate exit (it emits ``"unblocked"`` which flips
+                        # this predicate back). The stranded_dependency_child
+                        # event above makes this otherwise-silent satisfied
+                        # dependency state visible.
+                        continue
                     # Don't auto-recover tasks that have hit the
                     # circuit-breaker failure limit.  Without this
                     # guard, a task that repeatedly exhausts its
@@ -6899,7 +6942,7 @@ def requeue_due_transients(
             undone_parents = conn.execute(
                 "SELECT 1 FROM task_links l "
                 "JOIN tasks p ON p.id = l.parent_id "
-                "WHERE l.child_id = ? AND p.status != 'done' LIMIT 1",
+                f"WHERE l.child_id = ? AND NOT {_PARENT_SATISFIED_SQL_P} LIMIT 1",
                 (task_id,),
             ).fetchone()
             new_status = "todo" if undone_parents else "ready"
@@ -7149,7 +7192,7 @@ def unblock_task(conn: sqlite3.Connection, task_id: str) -> bool:
         undone_parents = conn.execute(
             "SELECT 1 FROM task_links l "
             "JOIN tasks p ON p.id = l.parent_id "
-            "WHERE l.child_id = ? AND p.status != 'done' LIMIT 1",
+            f"WHERE l.child_id = ? AND NOT {_PARENT_SATISFIED_SQL_P} LIMIT 1",
             (task_id,),
         ).fetchone()
         new_status = "todo" if undone_parents else "ready"
@@ -11306,7 +11349,9 @@ def build_worker_context(conn: sqlite3.Connection, task_id: str) -> str:
         wrote_header = False
         for pid in parent_ids:
             pt = get_task(conn, pid)
-            if not pt or pt.status != "done":
+            if not pt or not _parent_dependency_satisfied(
+                {"status": pt.status, "completed_at": pt.completed_at}  # type: ignore[arg-type]
+            ):
                 continue
             runs = [r for r in list_runs(conn, pid) if r.outcome == "completed"]
             runs.sort(key=lambda r: r.started_at, reverse=True)

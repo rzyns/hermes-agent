@@ -735,6 +735,92 @@ def test_recompute_ready_fan_in_waits_for_all_parents(kanban_home):
         assert kb.get_task(conn, c).status == "ready"
 
 
+def test_recompute_ready_emits_stranded_dependency_child_for_sticky_block(kanban_home):
+    """A blocked child with satisfied dependencies but a sticky operator block
+    must not auto-promote, and should emit a 'stranded_dependency_child' event
+    so the failure mode is observable rather than silent.
+    """
+    with kb.connect() as conn:
+        parent = kb.create_task(conn, title="parent", assignee="a")
+        child = kb.create_task(
+            conn, title="child", assignee="a", parents=[parent],
+        )
+        kb.claim_task(conn, parent)
+        kb.complete_task(conn, parent, result="done")
+
+        # Operator explicitly blocks the child with a needs_input block (sticky).
+        assert kb.block_task(
+            conn, child,
+            kind="needs_input",
+            reason="waiting for human decision",
+        )
+        assert kb.get_task(conn, child).status == "blocked"
+
+        kb.recompute_ready(conn)
+
+        task = kb.get_task(conn, child)
+        assert task is not None
+        assert task.status == "blocked"
+        events = kb.list_events(conn, child)
+        stranded = [e for e in events if e.kind == "stranded_dependency_child"]
+        assert len(stranded) == 1
+        payload = stranded[0].payload
+        assert payload["parents"][0]["id"] == parent
+        assert payload["parents"][0]["status"] == "done"
+
+
+def test_recompute_ready_emits_stranded_dependency_child_for_direct_sql_blocked(
+    kanban_home,
+):
+    """A task set to 'blocked' by direct SQL with completed parents should still
+    emit a stranded_dependency_child event and then promote, because there is no
+    sticky block event holding it back. This restores the broad promotable-path
+    coverage that 4f1e087 had and 8ac44353a7 narrowed.
+    """
+    with kb.connect() as conn:
+        parent = kb.create_task(conn, title="parent")
+        child = kb.create_task(conn, title="child", parents=[parent])
+        kb.claim_task(conn, parent)
+        kb.complete_task(conn, parent, result="done")
+        conn.execute(
+            "UPDATE tasks SET status='blocked', consecutive_failures=0, "
+            "last_failure_error=NULL WHERE id=?",
+            (child,),
+        )
+        conn.commit()
+
+        promoted = kb.recompute_ready(conn)
+        assert promoted == 1
+        assert kb.get_task(conn, child).status == "ready"
+        events = kb.list_events(conn, child)
+        assert any(e.kind == "stranded_dependency_child" for e in events)
+
+
+def test_recompute_ready_deduplicates_stranded_dependency_child_for_sticky_block(
+    kanban_home,
+):
+    """Periodic sweeps must expose a stall without spamming every tick."""
+    with kb.connect() as conn:
+        parent = kb.create_task(conn, title="parent")
+        child = kb.create_task(conn, title="child", parents=[parent])
+        kb.claim_task(conn, parent)
+        kb.complete_task(conn, parent, result="done")
+        assert kb.block_task(
+            conn, child,
+            kind="needs_input",
+            reason="operator hold",
+        )
+
+        kb.recompute_ready(conn)
+        kb.recompute_ready(conn)
+        count = conn.execute(
+            "SELECT COUNT(*) FROM task_events "
+            "WHERE task_id=? AND kind='stranded_dependency_child'",
+            (child,),
+        ).fetchone()[0]
+        assert count == 1
+
+
 # ---------------------------------------------------------------------------
 # Atomic claim (CAS)
 # ---------------------------------------------------------------------------
@@ -2088,9 +2174,88 @@ def test_worker_context_includes_parent_results_and_comments(kanban_home):
     assert "child" in ctx
 
 
-# ---------------------------------------------------------------------------
-# Dispatcher
-# ---------------------------------------------------------------------------
+def test_worker_context_includes_archived_parent_result(kanban_home):
+    """A parent archived AFTER real completion still contributes its result
+    to the child's worker context. Regression: parent_results only looked at
+    status='done', so completed-then-archived parents silently dropped their
+    handoff content.
+    """
+    with kb.connect() as conn:
+        parent = kb.create_task(conn, title="parent")
+        kb.claim_task(conn, parent)
+        kb.complete_task(conn, parent, result="ARCHIVED_PARENT_HANDOFF")
+        kb.archive_task(conn, parent)
+        child = kb.create_task(conn, title="child", parents=[parent])
+        ctx = kb.build_worker_context(conn, child)
+    assert "ARCHIVED_PARENT_HANDOFF" in ctx
+    assert parent in ctx
+
+
+def test_worker_context_excludes_archived_parent_without_completion(kanban_home):
+    """An archived-without-completion parent must not appear as a satisfied
+    handoff in the child's worker context.
+    """
+    with kb.connect() as conn:
+        parent = kb.create_task(conn, title="parent")
+        child = kb.create_task(conn, title="child", parents=[parent])
+        conn.execute(
+            "UPDATE tasks SET status='archived', completed_at=NULL, result=NULL WHERE id=?",
+            (parent,),
+        )
+        conn.commit()
+        ctx = kb.build_worker_context(conn, child)
+    assert "## Parent task results" not in ctx
+    assert parent not in ctx.split("## Cross-task role history")[0]
+
+
+def test_parent_completion_predicate_invariant_across_null_zero_real_ts(kanban_home):
+    """The same predicate must govern dependency gating, parent_results(), and
+    build_worker_context(). Edge values: NULL, 0, real unix timestamp.
+    """
+    with kb.connect() as conn:
+        for scenario, completed_at, expected_satisfied in [
+            ("NULL", None, False),
+            ("zero", 0, False),
+            ("real_ts", 1234567890, True),
+        ]:
+            parent = kb.create_task(conn, title=f"parent_{scenario}")
+            child = kb.create_task(conn, title=f"child_{scenario}", parents=[parent])
+            conn.execute(
+                "UPDATE tasks SET status='archived', completed_at=?, result='r' WHERE id=?",
+                (completed_at, parent),
+            )
+            conn.commit()
+
+            # 1. Dependency gating (recompute_ready / promote_task / claim_task path)
+            assert kb._parent_dependency_satisfied(
+                {"status": "archived", "completed_at": completed_at}
+            ) is expected_satisfied
+
+            # 2. parent_results() SQL path
+            results = kb.parent_results(conn, child)
+            assert (parent in [r[0] for r in results]) is expected_satisfied, scenario
+
+            # 3. build_worker_context() rendering path
+            ctx = kb.build_worker_context(conn, child)
+            in_parent_section = (
+                "## Parent task results" in ctx
+                and parent in ctx.split("## Parent task results")[1].split("## Cross-task role history")[0]
+            )
+            assert in_parent_section is expected_satisfied, scenario
+
+            # 4. SQL fragment matches Python helper
+            row = conn.execute(
+                "SELECT status, completed_at FROM tasks WHERE id=?", (parent,)
+            ).fetchone()
+            sql_satisfied = bool(
+                conn.execute(
+                    f"SELECT 1 FROM tasks t WHERE t.id=? AND {kb._PARENT_SATISFIED_SQL}",
+                    (parent,),
+                ).fetchone()
+            )
+            assert sql_satisfied is expected_satisfied, scenario
+            assert sql_satisfied is kb._parent_dependency_satisfied(row), scenario
+
 
 def test_dispatch_dry_run_does_not_claim(kanban_home, all_assignees_spawnable):
     with kb.connect() as conn:
