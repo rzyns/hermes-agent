@@ -89,12 +89,18 @@ import time
 from contextvars import ContextVar, Token
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Iterable, Mapping, Optional
+from typing import Any, Callable, Iterable, Mapping, Optional
 
 from hermes_cli.sqlite_util import add_column_if_missing as _add_column_if_missing
 from toolsets import get_toolset_names
 
 _log = logging.getLogger(__name__)
+
+
+# Test-only hook for deterministic interleave verification.  Called inside
+# the heartbeat_claim_with_event write_txn, between the CAS UPDATE and the
+# heartbeat event write, while the SQLite writer lock is still held.
+_test_interleave_hook: Optional[Callable[[sqlite3.Connection, str], None]] = None
 
 
 # ---------------------------------------------------------------------------
@@ -5310,6 +5316,12 @@ def heartbeat_claim_with_event(
                     (expires, run_id),
                 )
             # Heartbeat event + last_heartbeat_at bump — same txn, same run_id.
+            # Test-only deterministic pause point: while this write_txn still
+            # holds the SQLite writer lock, a test hook can drive a competing
+            # reclaim on another connection and observe the serialization.
+            hook = _test_interleave_hook
+            if hook is not None:
+                hook(conn, task_id)
             _heartbeat_event(conn, task_id, note=note, run_id=run_id)
             return (True, "")
         # CAS rejected — determine the reason from current row state so the

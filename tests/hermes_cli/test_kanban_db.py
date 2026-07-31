@@ -2087,12 +2087,21 @@ def test_heartbeat_claim_with_event_no_event_on_rotated_lock(kanban_home):
         assert task.last_heartbeat_at == hb_before
 
 
-def test_heartbeat_claim_with_event_single_transaction(kanban_home):
-    """heartbeat_claim_with_event must update both claim_expires and
-    last_heartbeat_at in a single transaction. If the CAS rejects, neither
-    may be written — verifiable by observing the task state is unchanged
-    after a stale-run heartbeat and the task remains reclaimable.
+def test_heartbeat_claim_with_event_atomic_reclaim_race(kanban_home, monkeypatch):
+    """Deterministic interleave: reclaim attempt between CAS and event write
+    is blocked by the single transaction; heartbeat event precedes reclaim.
+
+    A test-only hook pauses actor A inside the heartbeat_claim_with_event
+    write_txn, between the successful CAS UPDATE and the heartbeat event
+    insert, while the SQLite writer lock is still held. Actor B then tries
+    to reclaim the task on a separate connection. SQLite serializes writers,
+    so B must block until A commits. After A commits, B's reclaim succeeds;
+    the heartbeat event (already written with the original run_id) has a
+    lower event id than the later reclaim/claim, proving it was not an
+    orphan written after the reclaim.
     """
+    import hermes_cli.kanban_db as _kb
+
     with kb.connect() as conn:
         t = kb.create_task(conn, title="x", assignee="a")
         lock = "host:hb"
@@ -2100,84 +2109,207 @@ def test_heartbeat_claim_with_event_single_transaction(kanban_home):
         task = kb.get_task(conn, t)
         run1_id = task.current_run_id
         original_expires = task.claim_expires
-        hb_before = task.last_heartbeat_at
 
-    # Spin up two concurrent actors that genuinely race on the DB.
-    #   - Actor A tries to heartbeat using the old run/lock.
-    #   - Actor B reclaims the task (new lock + new run id) and COMMITS.
-    # If the heartbeat transaction were split (CAS in txn1, event in txn2),
-    # Actor B could reclaim between the two, leaving an orphan heartbeat event
-    # or a half-extended lease. We verify the final state is clean.
-    ready = threading.Event()
-    a_result: dict[str, typing.Any] = {"ok": None, "reason": None}
+    cas_done = threading.Event()
+    actor_b_progress = threading.Event()
+    b_status = {"value": None}
+    reclaim_done = threading.Event()
 
-    def actor_a():
-        with kb.connect() as c:
-            ready.wait(timeout=5)
+    def hook(conn, task_id):
+        cas_done.set()
+        actor_b_progress.wait(timeout=5)
+
+    def actor_b():
+        cas_done.wait(timeout=5)
+        busy_observed = False
+        try:
+            with kb.connect() as c:
+                # Short busy timeout so the first BEGIN IMMEDIATE either wins
+                # immediately or fails fast with BUSY, letting us record that
+                # actor A still holds the writer lock inside the single txn.
+                c.execute("PRAGMA busy_timeout = 1")
+                for _ in range(200):
+                    try:
+                        c.execute("BEGIN IMMEDIATE")
+                        cur = c.execute(
+                            "UPDATE tasks SET status='ready', claim_lock=NULL, "
+                            "claim_expires=NULL, worker_pid=NULL, "
+                            "current_run_id=NULL "
+                            "WHERE id = ? AND status = 'running' "
+                            "AND claim_lock = ?",
+                            (t, lock),
+                        )
+                        c.commit()
+                        if cur.rowcount == 1:
+                            # Now re-claim as the successor to emit a
+                            # `claimed` event we can order against.
+                            kb.claim_task(
+                                c, t, claimer="successor-lock", ttl_seconds=60,
+                            )
+                        break
+                    except sqlite3.OperationalError as exc:
+                        if "database is locked" in str(exc).lower() or \
+                           "database is busy" in str(exc).lower():
+                            if not busy_observed:
+                                busy_observed = True
+                                b_status["value"] = "busy"
+                                actor_b_progress.set()
+                            c.rollback()
+                            time.sleep(0.01)
+                            continue
+                        c.rollback()
+                        raise
+        finally:
+            if not busy_observed:
+                b_status["value"] = "reclaimed_without_busy"
+                actor_b_progress.set()
+            reclaim_done.set()
+
+    monkeypatch.setattr(_kb, "_test_interleave_hook", hook)
+    thread_b = threading.Thread(target=actor_b)
+    thread_b.start()
+
+    try:
+        with kb.connect() as conn_a:
             ok, reason = kb.heartbeat_claim_with_event(
-                c, t,
+                conn_a, t,
                 claimer=lock,
                 expected_run_id=run1_id,
             )
-            a_result["ok"] = ok
-            a_result["reason"] = reason
+    finally:
+        thread_b.join(timeout=10)
+        monkeypatch.setattr(_kb, "_test_interleave_hook", None)
+
+    assert thread_b.is_alive() is False, "actor B did not finish"
+    assert ok is True, f"heartbeat should succeed atomically; got reason={reason!r}"
+    assert b_status["value"] == "busy", (
+        "actor B must observe SQLite lock contention while actor A holds "
+        f"the write_txn; got {b_status['value']!r}"
+    )
+
+    with kb.connect() as conn:
+        task = kb.get_task(conn, t)
+        assert task is not None
+        assert task.status == "running"
+        assert task.claim_lock == "successor-lock"
+        assert task.current_run_id != run1_id
+        assert task.claim_expires is not None
+        assert task.claim_expires >= original_expires
+
+        events = kb.list_events(conn, t)
+        heartbeat_events = [e for e in events if e.kind == "heartbeat"]
+        claimed_events = [e for e in events if e.kind == "claimed"]
+        assert len(heartbeat_events) == 1, (
+            "exactly one heartbeat event must be written, bound to the "
+            f"original run; found {len(heartbeat_events)}"
+        )
+        assert len(claimed_events) >= 1, "successor claim must emit a claimed event"
+        # The heartbeat happened inside the atomic txn, before the reclaim
+        # that followed the commit.
+        assert heartbeat_events[0].id < claimed_events[-1].id
+        assert heartbeat_events[0].run_id == run1_id
+
+
+@pytest.mark.xfail(reason="deliberate split-transaction mutant; fails-on-faulty")
+def test_heartbeat_claim_with_event_split_mutant_orphan_xfail(
+    kanban_home, monkeypatch,
+):
+    """Deliberate split-transaction mutant: CAS in one txn, event in a second.
+
+    This recreates the pre-ENV-3d shape inside the test and shows the same
+    interleave probe leaves an orphan heartbeat event written to a task that
+    has already been reclaimed. Marked xfail because the mutant violates the
+    invariant the real implementation satisfies.
+    """
+    import hermes_cli.kanban_db as _kb
+
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="x", assignee="a")
+        lock = "host:hb"
+        kb.claim_task(conn, t, claimer=lock, ttl_seconds=60)
+        task = kb.get_task(conn, t)
+        run1_id = task.current_run_id
+
+    cas_done = threading.Event()
+    reclaim_done = threading.Event()
+
+    def _split_heartbeat_claim_with_event(
+        conn, task_id, *, claimer=None, expected_run_id=None, note=None,
+    ):
+        # First transaction: CAS only, mimicking the old heartbeat_claim.
+        ok = kb.heartbeat_claim(
+            conn, task_id,
+            claimer=claimer,
+            expected_run_id=expected_run_id,
+            ttl_seconds=60,
+        )
+        if not ok:
+            return (False, "cas_rejected")
+        # Hook between the two transactions: the writer lock is NOT held here.
+        hook = _kb._test_interleave_hook
+        if hook is not None:
+            hook(conn, task_id)
+        # Second transaction: heartbeat event only, mimicking the old
+        # heartbeat_worker. This is the split point: a reclaim can land here.
+        kb.heartbeat_worker(
+            conn, task_id,
+            note=note,
+            expected_run_id=expected_run_id,
+        )
+        return (True, "")
+
+    monkeypatch.setattr(
+        _kb, "heartbeat_claim_with_event", _split_heartbeat_claim_with_event,
+    )
+
+    def hook(conn, task_id):
+        cas_done.set()
+        reclaim_done.wait(timeout=5)
 
     def actor_b():
+        cas_done.wait(timeout=5)
         with kb.connect() as c:
-            # Reclaim by brute force to model dispatcher restart/new worker.
-            c.execute(
-                "UPDATE tasks SET claim_lock = ?, status = 'running' "
-                "WHERE id = ? AND status = 'running'",
-                ("successor-lock", t),
-            )
-            now = int(time.time())
-            cursor = c.execute(
-                "INSERT INTO task_runs (task_id, profile, status, claim_lock, "
-                "claim_expires, started_at) VALUES (?, 'test', 'running', ?, ?, ?)",
-                (t, "successor-lock", now + 120, now),
-            )
-            run2_id = int(cursor.lastrowid)
-            c.execute(
-                "UPDATE tasks SET current_run_id = ?, claim_expires = ? "
-                "WHERE id = ?",
-                (run2_id, now + 120, t),
-            )
-            c.commit()
-        ready.set()
+            kb.reclaim_task(c, t, reason="interleave probe")
+            kb.claim_task(c, t, claimer="successor-lock", ttl_seconds=60)
+        reclaim_done.set()
 
-    t_a = threading.Thread(target=actor_a)
-    t_b = threading.Thread(target=actor_b)
-    t_a.start()
-    t_b.start()
-    t_a.join(timeout=10)
-    t_b.join(timeout=10)
+    monkeypatch.setattr(_kb, "_test_interleave_hook", hook)
+    thread_b = threading.Thread(target=actor_b)
+    thread_b.start()
 
-    # The stale heartbeat must lose (rejected) regardless of ordering.
-    assert a_result["ok"] is False, (
-        f"Stale heartbeat must be rejected in a race (reason={a_result['reason']!r})"
-    )
-    assert a_result["reason"] in {"stale_run_id", "rotated_lock"}
+    try:
+        with kb.connect() as conn_a:
+            ok, reason = kb.heartbeat_claim_with_event(
+                conn_a, t,
+                claimer=lock,
+                expected_run_id=run1_id,
+            )
+    finally:
+        thread_b.join(timeout=10)
+        monkeypatch.setattr(_kb, "_test_interleave_hook", None)
 
-    with kb.connect() as conn3:
-        # No heartbeat event was appended (the key atomicity guarantee).
-        events = kb.list_events(conn3, t)
+    assert thread_b.is_alive() is False
+    assert ok is True, f"split mutant heartbeat should succeed; got reason={reason!r}"
+
+    with kb.connect() as conn:
+        task = kb.get_task(conn, t)
+        assert task is not None
+        # In the split mutant, the reclaim wins before the heartbeat event
+        # is written, so the task is no longer running/claimed by run1.
+        assert task.status == "ready", (
+            "split mutant must allow reclaim between CAS and event write"
+        )
+        assert task.claim_lock != lock
+
+        events = kb.list_events(conn, t)
         heartbeat_events = [e for e in events if e.kind == "heartbeat"]
+        claimed_events = [e for e in events if e.kind == "claimed"]
+        # The desired invariant: no orphan heartbeat event after reclaim.
+        # The split mutant violates this, so this assertion FAILS — that is
+        # the discriminating evidence.
         assert len(heartbeat_events) == 0, (
-            "No heartbeat event may be written on CAS reject under concurrency"
-        )
-
-    # The task can still be reclaimed by the successor (atomicity preserved).
-    # Reset status='ready' + clear claim so claim_task succeeds.
-    with kb.connect() as conn4:
-        conn4.execute(
-            "UPDATE tasks SET status = 'ready', claim_expires = 0, "
-            "claim_lock = NULL, current_run_id = NULL WHERE id = ?",
-            (t,),
-        )
-        conn4.commit()
-        reclaimed = kb.claim_task(conn4, t, claimer="reclaimer:1", ttl_seconds=60)
-        assert reclaimed is not None, (
-            "Task must be reclaimable after stale heartbeat was rejected atomically"
+            "split mutant wrote an orphan heartbeat event after reclaim; "
+            f"found {len(heartbeat_events)}"
         )
 
 
