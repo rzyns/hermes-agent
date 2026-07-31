@@ -13,8 +13,9 @@ loop continues instead of exiting.
 
 from __future__ import annotations
 
-import os
 from typing import Any, Iterable, Optional
+
+from agent.delegation_context import child_env_lookup, is_delegated_child_context
 
 
 _TERMINAL_KANBAN_TOOLS = frozenset({"kanban_complete", "kanban_block"})
@@ -25,7 +26,7 @@ _DEFAULT_MAX_ATTEMPTS = 2
 
 def kanban_progress_enabled() -> bool:
     """Return whether semantic Kanban checkpoints are enabled (default off)."""
-    env = os.environ.get("HERMES_KANBAN_PROGRESS")
+    env = child_env_lookup("HERMES_KANBAN_PROGRESS")
     if env is not None:
         normalized = env.strip().lower()
         if normalized in {"1", "true", "yes", "on"}:
@@ -46,12 +47,15 @@ def kanban_stop_nudge_enabled() -> bool:
     """Return whether the kanban stop-guard is active for this process.
 
     On when ``HERMES_KANBAN_TASK`` is set (dispatcher-spawned worker), unless
-    ``HERMES_KANBAN_STOP_NUDGE`` explicitly disables it.
+    ``HERMES_KANBAN_STOP_NUDGE`` explicitly disables it. Delegated children are
+    never Kanban workers, so the guard is always off inside child contexts.
     """
-    env = os.environ.get("HERMES_KANBAN_STOP_NUDGE")
+    if is_delegated_child_context():
+        return False
+    env = child_env_lookup("HERMES_KANBAN_STOP_NUDGE")
     if env is not None and env.strip().lower() in {"0", "false", "no", "off"}:
         return False
-    task = (os.environ.get("HERMES_KANBAN_TASK") or "").strip()
+    task = (child_env_lookup("HERMES_KANBAN_TASK") or "").strip()
     return bool(task)
 
 
@@ -144,7 +148,7 @@ def build_kanban_stop_nudge(
     if session_ended_kanban_turn_legitimately(messages):
         return None
 
-    tid = (task_id or os.environ.get("HERMES_KANBAN_TASK") or "").strip() or "this task"
+    tid = (task_id or child_env_lookup("HERMES_KANBAN_TASK") or "").strip() or "this task"
     progress_enabled = kanban_progress_enabled()
     progress_option = (
         ", OR `kanban_progress(summary=..., metadata=...)` if real work was "

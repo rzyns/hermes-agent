@@ -18,6 +18,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, NamedTuple, Optional
 
+from agent.delegation_context import child_env_lookup
 from agent.secret_scope import (
     build_profile_secret_scope,
     reset_secret_scope,
@@ -3202,9 +3203,10 @@ def _ensure_skin_watcher() -> None:
 
 
 def _resolve_model() -> str:
+    from agent.delegation_context import child_env_lookup
     env = (
-        os.environ.get("HERMES_MODEL", "")
-        or os.environ.get("HERMES_INFERENCE_MODEL", "")
+        child_env_lookup("HERMES_MODEL", "")
+        or child_env_lookup("HERMES_INFERENCE_MODEL", "")
     ).strip()
     if env:
         return env
@@ -3306,8 +3308,8 @@ def _resolve_startup_runtime() -> tuple[str, str | None]:
         return model, explicit_provider
 
     explicit_model = (
-        os.environ.get("HERMES_MODEL", "")
-        or os.environ.get("HERMES_INFERENCE_MODEL", "")
+        child_env_lookup("HERMES_MODEL", "")
+        or child_env_lookup("HERMES_INFERENCE_MODEL", "")
     ).strip()
     if not explicit_model:
         return model, None
@@ -3322,7 +3324,7 @@ def _resolve_startup_runtime() -> tuple[str, str | None]:
                 if isinstance(cfg, dict)
                 else ""
             )
-            or os.environ.get("HERMES_INFERENCE_PROVIDER", "").strip().lower()
+            or child_env_lookup("HERMES_INFERENCE_PROVIDER", "").strip().lower()
             or "auto"
         )
         detected = detect_static_provider_for_model(explicit_model, current_provider)

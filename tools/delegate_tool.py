@@ -40,6 +40,7 @@ from toolsets import TOOLSETS
 _RUNTIME_PROVIDER_CUSTOM = "custom"
 from tools import file_state
 from tools.terminal_tool import set_approval_callback as _set_subagent_approval_cb
+from agent.delegation_context import DELEGATED_CHILD_ENV_MARKER
 from utils import base_url_hostname, is_truthy_value
 
 
@@ -2148,6 +2149,25 @@ def _run_single_child(
         # below; a stdlib non-daemon worker would then block interpreter
         # exit at atexit-join time if the child never unwinds.
         from tools.daemon_pool import DaemonThreadPoolExecutor
+
+        # Build a thread-local env overlay for this child: run-scoped HERMES_*
+        # variables are removed for the worker thread WITHOUT mutating the parent
+        # process's os.environ.  The overlay is restored to its prior state after
+        # the child finishes so executor reuse stays safe.
+        from agent.delegation_context import (
+            _RUN_SCOPED_ENV_VARS,
+            delegated_child_context,
+            scrub_run_scoped_env,
+        )
+
+        _overlay: Dict[str, Optional[str]] = scrub_run_scoped_env(dict(os.environ))
+        # Explicitly mark run-scoped vars as removed so child_env_lookup returns
+        # default instead of falling back to the parent's process env.
+        for _key in _RUN_SCOPED_ENV_VARS:
+            if _key in os.environ:
+                _overlay[_key] = None
+        _overlay[DELEGATED_CHILD_ENV_MARKER] = "1"
+
         _timeout_executor = DaemonThreadPoolExecutor(
             max_workers=1,
             # Install a non-interactive approval callback in the worker thread
@@ -2174,9 +2194,8 @@ def _run_single_child(
 
         def _run_with_thread_capture():
             _worker_thread_holder["t"] = threading.current_thread()
-            from agent.delegation_context import delegated_child_context
 
-            with delegated_child_context():
+            with delegated_child_context(overlay=_overlay):
                 return child.run_conversation(
                     user_message=goal,
                     task_id=child_task_id,

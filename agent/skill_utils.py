@@ -303,7 +303,15 @@ def _detect_environment(env: str) -> bool:
         # kanban toolset. Mirror the same signals the kanban tools themselves
         # gate on (``tools/kanban_tools.py``) so the offer filter agrees with
         # tool availability.
-        if os.getenv("HERMES_KANBAN_TASK") or os.getenv("HERMES_KANBAN_BOARD"):
+        #
+        # A delegated child is NOT the dispatcher worker, even if the parent
+        # os.environ still carries HERMES_KANBAN_*. Treating the child as a
+        # worker would offer kanban/skills that the child must not use.
+        from agent.delegation_context import child_env_lookup, is_delegated_child_context
+
+        if is_delegated_child_context():
+            result = False
+        elif child_env_lookup("HERMES_KANBAN_TASK") or child_env_lookup("HERMES_KANBAN_BOARD"):
             result = True
         else:
             try:

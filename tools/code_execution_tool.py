@@ -268,17 +268,19 @@ def _scrub_child_env(source_env, is_passthrough=None, is_windows=None):
 
     # delegate_task children are marked with a ContextVar, not os.environ, while
     # the execute_code sandbox crosses a process boundary. Bridge that context
-    # into the child env and strip dispatcher-owned Kanban variables after the
-    # normal secret/passthrough scrub so an explicit passthrough cannot re-grant
-    # a delegated child the parent's board mutation capability.
+    # into the child env and strip run-scoped HERMES_* vars after the normal
+    # secret/passthrough scrub so an explicit passthrough cannot re-grant a
+    # delegated child the parent's board mutation capability or inference seed.
     try:
         from agent.delegation_context import (
+            DELEGATED_CHILD_ENV_MARKER,
             is_delegated_child_process_context,
-            scrub_kanban_env,
+            scrub_run_scoped_env,
         )
 
         if is_delegated_child_process_context():
-            scrubbed = scrub_kanban_env(scrubbed)
+            scrubbed = scrub_run_scoped_env(scrubbed)
+            scrubbed[DELEGATED_CHILD_ENV_MARKER] = "1"
     except Exception:
         pass
     return scrubbed

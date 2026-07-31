@@ -24,6 +24,7 @@ import time
 from pathlib import Path
 from typing import Any, Optional
 
+from agent.delegation_context import child_env_lookup
 from hermes_cli import kanban_db as kb
 from hermes_cli import kanban_intake_link as kil
 from hermes_cli import kanban_intake_link_health as kih
@@ -2663,9 +2664,9 @@ def _cmd_attach_rm(args: argparse.Namespace) -> int:
 
 
 def _worker_run_id_for(task_id: str) -> Optional[int]:
-    if os.environ.get("HERMES_KANBAN_TASK") != task_id:
+    if child_env_lookup("HERMES_KANBAN_TASK") != task_id:
         return None
-    raw = os.environ.get("HERMES_KANBAN_RUN_ID")
+    raw = child_env_lookup("HERMES_KANBAN_RUN_ID")
     if not raw:
         return None
     try:
