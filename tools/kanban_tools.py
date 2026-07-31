@@ -364,13 +364,11 @@ def heartbeat_current_worker_from_env() -> bool:
     swallowed exception). The boolean is informational — callers should
     not branch on it.
 
-    Identity comes from:
-      * ``HERMES_KANBAN_TASK`` — task id (required; absence means no-op)
-      * ``HERMES_KANBAN_RUN_ID`` — pins the run row so we don't heartbeat
-        a stale run that may have already been reclaimed
-      * ``HERMES_KANBAN_CLAIM_LOCK`` — claim lock for ``heartbeat_claim``;
-        falls back to the default ``_claimer_id()`` for locally-driven
-        workers that never went through the dispatcher path
+    **Fail-closed contract:** this function requires BOTH
+    ``HERMES_KANBAN_RUN_ID`` (the current run's id, not any stale run) AND
+    ``HERMES_KANBAN_CLAIM_LOCK`` (the run-scoped lock pinned at dispatch).
+    Either being absent or unparseable means this worker does not hold a
+    run-scoped lease and must NOT extend any claim or emit heartbeat state.
 
     Rate-limited via the module-level ``_auto_heartbeat_last_attempt``
     timestamp (monotonic clock); not thread-safe in the strict sense, but
@@ -385,22 +383,45 @@ def heartbeat_current_worker_from_env() -> bool:
     if (now - _auto_heartbeat_last_attempt) < _AUTO_HEARTBEAT_MIN_INTERVAL_SECONDS:
         return False
     _auto_heartbeat_last_attempt = now
+
+    # Fail-closed: both credentials are required for run-scoped auto-heartbeat.
+    # HERMES_KANBAN_RUN_ID pins the current run so stale runs cannot heartbeat.
+    # HERMES_KANBAN_CLAIM_LOCK is the run-scoped lock (not the fallback
+    # _claimer_id() default) so same-host:pid reuse does not extend the lease.
+    run_id_raw = os.environ.get("HERMES_KANBAN_RUN_ID")
+    claim_lock = os.environ.get("HERMES_KANBAN_CLAIM_LOCK")
+    if not run_id_raw or not claim_lock:
+        # Missing credentials means this worker does not hold a run-scoped
+        # lease; do nothing rather than risk extending a stale lease.
+        logger.debug(
+            "auto-heartbeat: skipped — HERMES_KANBAN_RUN_ID or "
+            "HERMES_KANBAN_CLAIM_LOCK is unset; not the current run owner"
+        )
+        return False
+    run_id: Optional[int]
+    try:
+        run_id = int(run_id_raw)
+    except (TypeError, ValueError):
+        logger.debug("auto-heartbeat: HERMES_KANBAN_RUN_ID is not an integer")
+        return False
+
     try:
         kb, conn = _connect()
         try:
-            claim_lock = os.environ.get("HERMES_KANBAN_CLAIM_LOCK")
+            ok = kb.heartbeat_claim(
+                conn, tid,
+                claimer=claim_lock,
+                expected_run_id=run_id,
+            )
+            if not ok:
+                logger.debug(
+                    "auto-heartbeat: heartbeat_claim rejected "
+                    "(not current run owner or not claimed)"
+                )
             try:
-                kb.heartbeat_claim(conn, tid, claimer=claim_lock)
-            except Exception:
-                logger.debug("auto-heartbeat: heartbeat_claim failed", exc_info=True)
-            run_id_raw = os.environ.get("HERMES_KANBAN_RUN_ID")
-            run_id: Optional[int]
-            try:
-                run_id = int(run_id_raw) if run_id_raw else None
-            except (TypeError, ValueError):
-                run_id = None
-            try:
-                kb.heartbeat_worker(conn, tid, note=None, expected_run_id=run_id)
+                kb.heartbeat_worker(
+                    conn, tid, note=None, expected_run_id=run_id,
+                )
             except Exception:
                 logger.debug("auto-heartbeat: heartbeat_worker failed", exc_info=True)
         finally:
@@ -956,19 +977,27 @@ def _handle_heartbeat(args: dict, **kw) -> str:
     try:
         kb, conn = _connect(board=board)
         try:
-            # Extend the claim TTL first. The dispatcher pins
-            # HERMES_KANBAN_CLAIM_LOCK in the worker env at spawn time
-            # (see _default_spawn in kanban_db.py); falling back to the
-            # default _claimer_id() covers locally-driven workers that
-            # never went through the dispatcher path.
+            # Extend the claim TTL atomically scoped to the current run id.
+            # Both heartbeat_claim and heartbeat_worker must use the same run id
+            # so the TTL extension is inseparable from the heartbeat event
+            # (prevents a stale old run from extending the successor's lease).
+            run_id = _worker_run_id(tid)
             claim_lock = os.environ.get("HERMES_KANBAN_CLAIM_LOCK")
-            kb.heartbeat_claim(conn, tid, claimer=claim_lock)
+            ok = kb.heartbeat_claim(
+                conn, tid,
+                claimer=claim_lock,
+                expected_run_id=run_id,
+            )
+            if not ok:
+                return tool_error(
+                    f"could not heartbeat {tid} (not the current run owner)"
+                )
 
             ok = kb.heartbeat_worker(
                 conn,
                 tid,
                 note=note,
-                expected_run_id=_worker_run_id(tid),
+                expected_run_id=run_id,
             )
             if not ok:
                 return tool_error(
