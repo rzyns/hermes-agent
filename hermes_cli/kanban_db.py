@@ -97,6 +97,150 @@ from toolsets import get_toolset_names
 _log = logging.getLogger(__name__)
 
 
+# ---------------------------------------------------------------------------
+# Fail-closed temp-DB isolation for mutation-capable verification paths.
+#
+# Verification/repair tooling that intentionally creates a throwaway board
+# must not be able to write to a live board just because HERMES_KANBAN_DB
+# (or HERMES_KANBAN_HOME / HERMES_KANBAN_BOARD / HERMES_KANBAN_WORKSPACES_ROOT)
+# survived into a temp-HERMES_HOME process.  The incident: a review run using
+# an "independent temporary-DB API matrix" created fixture cards on the live
+# `hermes` board because kanban_db_path() honors HERMES_KANBAN_DB with the
+# highest precedence, even when HERMES_HOME points at a temp dir.
+#
+# Strategy:
+# - A context-local ``kanban_mutation_isolation`` mode forces every
+#   mutation-capable public entry point to verify that the resolved DB path
+#   is under the caller-declared temp root.  If the resolved path lands
+#   outside that root, the operation fails closed.
+# - The context manager is opt-in, intended for verification matrices and
+#   repair scripts that create a temp root and explicitly want fail-closed
+#   behavior.  Normal dispatcher/worker code is unaffected.
+# - We reuse a ContextVar (not os.environ) so multiple async contexts in one
+#   process can each have their own isolation envelope without leaking.
+# ---------------------------------------------------------------------------
+_KANBAN_MUTATION_ISOLATION_ROOT: ContextVar[Optional[Path]] = ContextVar(
+    "hermes_kanban_mutation_isolation_root",
+    default=None,
+)
+
+
+@contextlib.contextmanager
+def kanban_mutation_isolation(root: str | Path):
+    """Temporarily require that all Kanban mutations target *root*.
+
+    Inside this context, any public Kanban mutator that resolves a DB path
+    (``connect``, ``init_db``, ``create_task``, ``claim_task``,
+    ``complete_task``, etc.) refuses to act if the resolved DB path falls
+    outside ``root``.  This prevents a temp-DB verification matrix from
+    accidentally writing to a live board via a stale ``HERMES_KANBAN_DB``
+    env var or other cross-root env leakage.
+
+    *root* is expected to be a temp directory that the caller created and
+    will discard.  Reads (``list_tasks``, ``get_task``, etc.) are not gated.
+    Only operations that create or mutate durable state are gated.
+
+    Example::
+
+        with tempfile.TemporaryDirectory() as tmp:
+            with kanban_mutation_isolation(tmp):
+                # Any mutation that resolves outside tmp raises PermissionError.
+                create_task(connect(), title="fixture", assignee="reviewer")
+    """
+    root_path = Path(root).expanduser().resolve()
+    token: Token[Optional[Path]] = _KANBAN_MUTATION_ISOLATION_ROOT.set(root_path)
+    try:
+        yield
+    finally:
+        _KANBAN_MUTATION_ISOLATION_ROOT.reset(token)
+
+
+def _get_mutation_isolation_root() -> Optional[Path]:
+    """Return the active isolation root, if any."""
+    return _KANBAN_MUTATION_ISOLATION_ROOT.get()
+
+
+def _resolve_db_identity(conn: sqlite3.Connection) -> Optional[Path]:
+    """Return the canonical main DB file path for an open connection.
+
+    Uses ``PRAGMA database_list`` to ask SQLite which file the ``main``
+    database is backed by.  This is the *actual* identity of the connection,
+    independent of how the caller resolved ``kanban_db_path()`` or what env
+    vars are currently set.  Returns ``None`` when the main DB is ``:memory:``
+    or the identity cannot be determined (fail-closed callers should reject
+    ``None`` as ambiguous).
+    """
+    try:
+        rows = conn.execute("PRAGMA database_list").fetchall()
+    except sqlite3.Error:
+        return None
+    main_rows = [r for r in rows if r and str(r[1]).lower() == "main"]
+    if len(main_rows) != 1:
+        return None
+    file_path = main_rows[0][2]
+    if not file_path:
+        return None
+    return Path(file_path)
+
+
+def _is_under_isolation_root(path: Path, root: Path) -> bool:
+    """True when *path* resolves to a location under *root*.
+
+    ``path`` may be a relative path, may contain symlinks, and may not exist
+    yet.  Resolve it the same way the production connection path does, then
+    check ``relative_to``.  If ``path`` is ``None`` or empty, treat it as the
+    default board path (``kanban_db_path()``) and resolve that.
+    """
+    if path is None:
+        path = kanban_db_path()
+    try:
+        resolved = path.expanduser().resolve()
+        resolved.relative_to(root)
+        return True
+    except (ValueError, OSError):
+        return False
+
+
+def _assert_mutation_isolation_permits(
+    path: Optional[Path],
+    *,
+    conn: Optional[sqlite3.Connection] = None,
+) -> None:
+    """Fail closed if an active isolation context forbids writing *path*.
+
+    Call at the start of every public Kanban mutator that opens or writes
+    a DB file.  When no isolation context is active, this is a no-op.
+
+    If ``conn`` is provided, the check uses the actual main DB identity from
+    ``PRAGMA database_list`` rather than the caller-resolved path.  This
+    closes the gap where a pre-opened connection is later handed to a
+    mutator while the env pin has switched away from the isolation root.
+    """
+    root = _get_mutation_isolation_root()
+    if root is None:
+        return
+    if conn is not None:
+        identity = _resolve_db_identity(conn)
+        if identity is None:
+            raise PermissionError(
+                "kanban_mutation_isolation: could not determine the actual DB "
+                "identity of the supplied connection. Refusing to mutate an "
+                "ambiguous database. See t_dae1e07e."
+            )
+        resolved = identity.expanduser().resolve()
+    else:
+        resolved = kanban_db_path() if path is None else path
+        resolved = resolved.expanduser().resolve()
+    try:
+        resolved.relative_to(root)
+    except (ValueError, OSError):
+        raise PermissionError(
+            f"kanban_mutation_isolation: resolved DB path {resolved} is outside "
+            f"the declared temp root {root}. Refusing to mutate a potentially "
+            f"live board. See t_0645f051."
+        )
+
+
 def _kanban_dependencies():
     """Return the current dependency-provider module.
 
@@ -666,6 +810,7 @@ def set_current_board(slug: str) -> Path:
     instead of silently pointing at nothing.
     """
     _assert_not_delegated_child_mutation()
+    _assert_mutation_isolation_permits(current_board_path())
     normed = _normalize_board_slug(slug)
     if not normed:
         raise ValueError("board slug is required")
@@ -678,6 +823,7 @@ def set_current_board(slug: str) -> Path:
 def clear_current_board() -> None:
     """Remove ``<root>/kanban/current`` so the active board reverts to ``default``."""
     _assert_not_delegated_child_mutation()
+    _assert_mutation_isolation_permits(current_board_path())
     try:
         current_board_path().unlink()
     except FileNotFoundError:
@@ -918,6 +1064,7 @@ def write_board_metadata(
     """
     _assert_not_delegated_child_mutation()
     slug = _normalize_board_slug(board) or DEFAULT_BOARD
+    _assert_mutation_isolation_permits(board_metadata_path(slug))
     meta = read_board_metadata(slug)
     # Preserve existing DB-derived fields — they get re-computed each
     # read but shouldn't be written into board.json.
@@ -984,6 +1131,8 @@ def set_board_maintenance(board: Optional[str], enabled: bool, *, reason: str = 
 
 def clear_board_maintenance(board: Optional[str]) -> dict:
     """Explicitly clear maintenance fields from board metadata."""
+    _assert_not_delegated_child_mutation()
+    _assert_mutation_isolation_permits(board_metadata_path(_normalize_board_slug(board) or DEFAULT_BOARD))
     slug = _normalize_board_slug(board) or DEFAULT_BOARD
     meta = read_board_metadata(slug)
     meta.pop("maintenance", None)
@@ -1036,6 +1185,7 @@ def create_board(
     normed = _normalize_board_slug(slug)
     if not normed:
         raise ValueError("board slug is required")
+    _assert_mutation_isolation_permits(board_dir(normed))
     meta = write_board_metadata(
         normed,
         name=name,
@@ -1110,6 +1260,7 @@ def remove_board(slug: str, *, archive: bool = True) -> dict:
     "new_path"}``).
     """
     _assert_not_delegated_child_mutation()
+    _assert_mutation_isolation_permits(board_dir(slug))
     normed = _normalize_board_slug(slug)
     if not normed:
         raise ValueError("board slug is required")
@@ -2609,6 +2760,7 @@ def connect(
         path = db_path
     else:
         path = kanban_db_path(board=board)
+    _assert_mutation_isolation_permits(path)
     path.parent.mkdir(parents=True, exist_ok=True)
 
     # Fast path: once THIS process has initialized this path, the expensive
@@ -2762,6 +2914,7 @@ def init_db(
         path = db_path
     else:
         path = kanban_db_path(board=board)
+    _assert_mutation_isolation_permits(path)
     path.parent.mkdir(parents=True, exist_ok=True)
     resolved = str(path.resolve())
     # Clear the cache entry so the underlying connect() re-runs the
@@ -3295,6 +3448,7 @@ def write_txn(conn: sqlite3.Connection):
     a SQLite auto-rollback (which leaves no active transaction) does not
     shadow the original exception with a spurious rollback error.
     """
+    _assert_mutation_isolation_permits(None, conn=conn)
     _assert_not_delegated_child_mutation()
     _execute_boundary_with_retry(conn, "BEGIN IMMEDIATE")
     try:
@@ -4220,6 +4374,7 @@ def store_attachment_bytes(
         )
     safe_name = _safe_attachment_name(filename)
     dest_dir = task_attachments_dir(task_id, board=board)
+    _assert_mutation_isolation_permits(dest_dir)
     dest_dir.mkdir(parents=True, exist_ok=True)
     dest_path = _collision_free_path(dest_dir, safe_name)
     dest_path.write_bytes(data)
@@ -4336,11 +4491,27 @@ def delete_attachment(conn: sqlite3.Connection, attachment_id: int) -> Optional[
     Returns ``None`` when no row matched. The blob is removed best-effort
     (a missing file is not an error); the metadata row is the source of
     truth for whether an attachment "exists".
+
+    When ``kanban_mutation_isolation`` is active, the stored path is verified
+    to be under the declared temp root before the row is removed or the blob
+    unlinked.  If the stored path is outside the root, the entire operation
+    is refused and the DB/file state remains consistent.
     """
     with write_txn(conn):
         att = get_attachment(conn, attachment_id)
         if att is None:
             return None
+        root = _get_mutation_isolation_root()
+        if root is not None:
+            try:
+                resolved = Path(att.stored_path).expanduser().resolve()
+                resolved.relative_to(root)
+            except (ValueError, OSError):
+                raise PermissionError(
+                    f"kanban_mutation_isolation: attachment stored path "
+                    f"{att.stored_path} resolves outside the declared temp root "
+                    f"{root}. Refusing to delete an outside file. See t_dae1e07e."
+                )
         conn.execute("DELETE FROM task_attachments WHERE id = ?", (attachment_id,))
         _append_event(
             conn, att.task_id, "attachment_removed", {"filename": att.filename}
@@ -8061,6 +8232,26 @@ def _ensure_git_worktree(repo_root: Path, target: Path, branch_name: str) -> Non
         )
 
 
+def _assert_workspace_under_isolation_root(path: Path) -> None:
+    """Fail closed if ``path`` is outside an active mutation isolation root.
+
+    Called before a workspace directory is materialized or a git worktree is
+    added.  When no isolation context is active, this is a no-op.
+    """
+    root = _get_mutation_isolation_root()
+    if root is None:
+        return
+    try:
+        resolved = path.expanduser().resolve()
+        resolved.relative_to(root)
+    except (ValueError, OSError):
+        raise PermissionError(
+            f"kanban_mutation_isolation: workspace path {path} resolves outside "
+            f"the declared temp root {root}. Refusing to materialize an "
+            f"outside workspace. See t_dae1e07e."
+        )
+
+
 def _resolve_worktree_workspace(
     task: Task, *, board: Optional[str] = None
 ) -> tuple[Path, str]:
@@ -8101,6 +8292,7 @@ def _resolve_worktree_workspace(
                 f"{board_slug!r} default_workdir {board_default!r} is not inside a git repo"
             )
         target = repo_root / ".worktrees" / task.id
+        _assert_workspace_under_isolation_root(target)
         _ensure_git_worktree(repo_root, target, branch_name)
         return target, branch_name
 
@@ -8111,6 +8303,7 @@ def _resolve_worktree_workspace(
             f"{task.workspace_path!r}; use an absolute path"
         )
     requested_resolved = requested.resolve(strict=False)
+    _assert_workspace_under_isolation_root(requested_resolved)
 
     if requested.exists() and _is_linked_worktree_checkout(requested):
         actual_branch = _git_current_branch(requested)
@@ -8126,6 +8319,7 @@ def _resolve_worktree_workspace(
         fallback_root = _repo_root_for_worktree_target(requested.parent)
         if fallback_root is not None:
             fallback = fallback_root / ".worktrees" / task.id
+            _assert_workspace_under_isolation_root(fallback)
             if fallback.resolve(strict=False) != requested_resolved:
                 _ensure_git_worktree(fallback_root, fallback, branch_name)
                 return fallback.resolve(strict=False), branch_name
@@ -8137,6 +8331,7 @@ def _resolve_worktree_workspace(
     repo_root = _git_toplevel(requested)
     if repo_root is not None and requested_resolved == repo_root:
         target = repo_root / ".worktrees" / task.id
+        _assert_workspace_under_isolation_root(target)
         _ensure_git_worktree(repo_root, target, branch_name)
         return target, branch_name
 
@@ -8146,6 +8341,7 @@ def _resolve_worktree_workspace(
             f"task {task.id} worktree path {task.workspace_path!r} is not inside a git repo "
             "and does not point at a git repo root"
         )
+    _assert_workspace_under_isolation_root(requested_resolved)
     _ensure_git_worktree(repo_root, requested, branch_name)
     return requested, branch_name
 
@@ -8190,6 +8386,7 @@ def resolve_workspace(task: Task, *, board: Optional[str] = None) -> Path:
                 )
         else:
             p = workspaces_root(board=board) / task.id
+        _assert_mutation_isolation_permits(p)
         p.mkdir(parents=True, exist_ok=True)
         return p
     if kind == "dir":
@@ -8204,6 +8401,7 @@ def resolve_workspace(task: Task, *, board: Optional[str] = None) -> Path:
                 f"{task.workspace_path!r}; use an absolute path "
                 f"(relative paths are ambiguous against the dispatcher's CWD)"
             )
+        _assert_mutation_isolation_permits(p)
         p.mkdir(parents=True, exist_ok=True)
         return p
     if kind == "worktree":
