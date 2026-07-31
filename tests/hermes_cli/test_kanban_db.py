@@ -2220,6 +2220,14 @@ def test_heartbeat_claim_with_event_split_mutant_orphan_xfail(
     interleave probe leaves an orphan heartbeat event written to a task that
     has already been reclaimed. Marked xfail because the mutant violates the
     invariant the real implementation satisfies.
+
+    The mutant intentionally uses the old run-unaware ``heartbeat_worker`` for
+    its second transaction. After actor B reclaims and re-claims the task, the
+    current_run_id is the successor's, so ``heartbeat_worker`` (without
+    ``expected_run_id``) happily writes a heartbeat event bound to the new run
+    even though the old run's heartbeat is semantically dead. The invariant
+    under test is that no heartbeat event may be written after the task has
+    been reclaimed from the heartbeating run; the mutant breaks that.
     """
     import hermes_cli.kanban_db as _kb
 
@@ -2249,14 +2257,18 @@ def test_heartbeat_claim_with_event_split_mutant_orphan_xfail(
         hook = _kb._test_interleave_hook
         if hook is not None:
             hook(conn, task_id)
-        # Second transaction: heartbeat event only, mimicking the old
-        # heartbeat_worker. This is the split point: a reclaim can land here.
-        kb.heartbeat_worker(
+        # Second transaction: heartbeat event only, using the old run-unaware
+        # heartbeat_worker. Because the CAS already committed, this phase is
+        # not scoped to the original run id; a reclaim+claim in between will
+        # cause it to emit a heartbeat event bound to the *successor* run.
+        event_ok = kb.heartbeat_worker(
             conn, task_id,
             note=note,
-            expected_run_id=expected_run_id,
+            expected_run_id=None,
         )
-        return (True, "")
+        # The split mutant must not silently report success when it failed to
+        # write the heartbeat event; we return that failure as a real result.
+        return (event_ok, "event_rejected" if not event_ok else "")
 
     monkeypatch.setattr(
         _kb, "heartbeat_claim_with_event", _split_heartbeat_claim_with_event,
@@ -2289,26 +2301,26 @@ def test_heartbeat_claim_with_event_split_mutant_orphan_xfail(
         monkeypatch.setattr(_kb, "_test_interleave_hook", None)
 
     assert thread_b.is_alive() is False
-    assert ok is True, f"split mutant heartbeat should succeed; got reason={reason!r}"
+    # The CAS phase succeeds; the event phase is what the mutant gets wrong.
+    assert ok is True, f"split mutant CAS phase should succeed; got reason={reason!r}"
 
     with kb.connect() as conn:
         task = kb.get_task(conn, t)
         assert task is not None
-        # In the split mutant, the reclaim wins before the heartbeat event
-        # is written, so the task is no longer running/claimed by run1.
-        assert task.status == "ready", (
-            "split mutant must allow reclaim between CAS and event write"
-        )
-        assert task.claim_lock != lock
+        # After reclaim+claim the task is running under the successor, not run1.
+        assert task.status == "running"
+        assert task.claim_lock == "successor-lock"
+        assert task.current_run_id != run1_id
 
         events = kb.list_events(conn, t)
         heartbeat_events = [e for e in events if e.kind == "heartbeat"]
         claimed_events = [e for e in events if e.kind == "claimed"]
-        # The desired invariant: no orphan heartbeat event after reclaim.
-        # The split mutant violates this, so this assertion FAILS — that is
-        # the discriminating evidence.
+        # The desired invariant: the old run's heartbeat must not leave an
+        # event after the task has been reclaimed. The split mutant violates
+        # this by writing a heartbeat event bound to the successor run, so
+        # this assertion FAILS — that is the discriminating evidence.
         assert len(heartbeat_events) == 0, (
-            "split mutant wrote an orphan heartbeat event after reclaim; "
+            "split mutant wrote a heartbeat event after reclaim; "
             f"found {len(heartbeat_events)}"
         )
 
