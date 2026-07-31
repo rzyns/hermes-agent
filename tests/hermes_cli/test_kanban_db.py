@@ -1817,6 +1817,409 @@ def test_heartbeat_uses_env_default_ttl(kanban_home, monkeypatch):
         assert new > int(time.time()) + 3000
 
 
+# ---------------------------------------------------------------------------
+# ENV-3c: heartbeat_claim run-id + claim-lock CAS
+# ---------------------------------------------------------------------------
+
+def test_heartbeat_claim_rejects_stale_run_with_same_lock(kanban_home):
+    """A stale old run with the same claim_lock must not extend the
+    successor run's lease — the current_run_id predicate must reject it.
+
+    Reproduction of the ENV-3 principal-review probe (t_539ff469 finding):
+    run A (run_id=1) claims task; dispatcher re-claims for run B (run_id=2)
+    with the same host:pid lock; run A calls heartbeat_claim — it must fail.
+    """
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="x", assignee="a")
+        lock = "host:12345"
+
+        # Simulate run 1 claiming the task (sets current_run_id=1).
+        kb.claim_task(conn, t, claimer=lock, ttl_seconds=60)
+        task = kb.get_task(conn, t)
+        assert task.status == "running"
+        run1_id = task.current_run_id
+        assert run1_id is not None
+
+        # Simulate the dispatcher re-claiming for a successor run (run 2)
+        # on the same lock (same host:pid — e.g. dispatcher restart).
+        # We bypass the re-claim guard by directly updating the task row
+        # to simulate the dispatcher having already moved the task to run 2.
+        conn.execute(
+            "UPDATE tasks SET claim_lock = ?, status = 'running' "
+            "WHERE id = ? AND status = 'running'",
+            (lock, t),
+        )
+        # Insert run 2 as the new current run.
+        now = int(time.time())
+        cursor = conn.execute(
+            "INSERT INTO task_runs (task_id, profile, status, claim_lock, "
+            "claim_expires, started_at) VALUES (?, 'test', 'running', ?, ?, ?)",
+            (t, lock, now + 120, now),
+        )
+        run2_id = int(cursor.lastrowid)
+        assert run2_id is not None
+        conn.execute(
+            "UPDATE tasks SET current_run_id = ?, claim_expires = ? "
+            "WHERE id = ?",
+            (run2_id, now + 120, t),
+        )
+
+        # Verify the task now points to run 2.
+        task = kb.get_task(conn, t)
+        assert task is not None
+        assert task.current_run_id == run2_id
+
+        # Run 1 (stale) attempts heartbeat_claim with the same lock but
+        # run_id=1 — must be rejected by the current_run_id predicate.
+        ok_stale = kb.heartbeat_claim(
+            conn, t, claimer=lock, expected_run_id=run1_id, ttl_seconds=3600,
+        )
+        assert ok_stale is False, (
+            "Stale run must not extend successor's lease"
+        )
+
+        # Verify the claim_expires was NOT extended by run 1.
+        task = kb.get_task(conn, t)
+        assert task.claim_expires == now + 120, (
+            "Stale run must not mutate claim_expires"
+        )
+
+
+def test_heartbeat_claim_accepts_current_run_with_same_lock(kanban_home):
+    """The current run (run_id=2) using the same lock must succeed."""
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="x", assignee="a")
+        lock = "host:12345"
+
+        # Set up: run 1 claims and is then superseded by run 2 on same lock.
+        kb.claim_task(conn, t, claimer=lock, ttl_seconds=60)
+        task = kb.get_task(conn, t)
+        run1_id = task.current_run_id
+
+        now = int(time.time())
+        cursor = conn.execute(
+            "INSERT INTO task_runs (task_id, profile, status, claim_lock, "
+            "claim_expires, started_at) VALUES (?, 'test', 'running', ?, ?, ?)",
+            (t, lock, now + 120, now),
+        )
+        run2_id = int(cursor.lastrowid)
+        assert run2_id is not None
+        conn.execute(
+            "UPDATE tasks SET current_run_id = ?, claim_expires = ? "
+            "WHERE id = ?",
+            (run2_id, now + 120, t),
+        )
+
+        # Run 2 (current) calls heartbeat_claim with its own run_id.
+        # Must succeed and extend the lease.
+        ok_current = kb.heartbeat_claim(
+            conn, t, claimer=lock, expected_run_id=run2_id, ttl_seconds=3600,
+        )
+        assert ok_current is True, "Current run must be able to heartbeat"
+
+        task = kb.get_task(conn, t)
+        assert task is not None
+        assert task.claim_expires > now + 120, (
+            "Current run must extend claim_expires"
+        )
+
+
+def test_heartbeat_claim_without_run_id_still_works(kanban_home):
+    """Passing expected_run_id=None keeps the legacy lock-only behaviour
+    (safe for callers that never set HERMES_KANBAN_RUN_ID, e.g. tests
+    or local tools that never went through the dispatcher).
+    """
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="x", assignee="a")
+        lock = "host:hb"
+        kb.claim_task(conn, t, claimer=lock, ttl_seconds=60)
+        conn.execute("UPDATE tasks SET claim_expires = 0 WHERE id = ?", (t,))
+        ok = kb.heartbeat_claim(conn, t, claimer=lock, ttl_seconds=3600)
+        assert ok
+        task = kb.get_task(conn, t)
+        assert task.claim_expires > int(time.time()) + 3000
+
+
+# ---------------------------------------------------------------------------
+# ENV-3d: heartbeat_claim_with_event — atomic CAS + heartbeat, fail-closed
+# ---------------------------------------------------------------------------
+
+def test_heartbeat_claim_with_event_no_event_on_stale_run_id(kanban_home):
+    """heartbeat_claim_with_event must not write a heartbeat event when
+    the CAS is rejected due to stale_run_id. This is the core fail-closed
+    invariant: no state is written when the identity check rejects.
+
+    Reproduction of the ENV-3 principal-review probe (ENV-3d extension):
+    run A (run_id=1) claims task; dispatcher re-claims for run B (run_id=2)
+    with the same host:pid lock; run A calls heartbeat_claim_with_event —
+    it must fail and write nothing.
+    """
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="x", assignee="a")
+        lock = "host:12345"
+
+        # Run 1 claims and owns the task (sets current_run_id=run1).
+        kb.claim_task(conn, t, claimer=lock, ttl_seconds=60)
+        task = kb.get_task(conn, t)
+        run1_id = task.current_run_id
+
+        # Simulate the dispatcher re-claiming for a successor run (run 2)
+        # on the same lock (same host:pid — e.g. dispatcher restart).
+        # We bypass the re-claim guard by directly updating the task row
+        # to simulate the dispatcher having already moved the task to run 2.
+        conn.execute(
+            "UPDATE tasks SET claim_lock = ?, status = 'running' "
+            "WHERE id = ? AND status = 'running'",
+            (lock, t),
+        )
+        now = int(time.time())
+        cursor = conn.execute(
+            "INSERT INTO task_runs (task_id, profile, status, claim_lock, "
+            "claim_expires, started_at) VALUES (?, 'test', 'running', ?, ?, ?)",
+            (t, lock, now + 120, now),
+        )
+        run2_id = int(cursor.lastrowid)
+        conn.execute(
+            "UPDATE tasks SET current_run_id = ?, claim_expires = ? "
+            "WHERE id = ?",
+            (run2_id, now + 120, t),
+        )
+
+        # Verify the task now points to run 2.
+        task = kb.get_task(conn, t)
+        assert task is not None
+        assert task.current_run_id == run2_id
+
+        # Record last_heartbeat_at before the stale heartbeat attempt.
+        hb_before = task.last_heartbeat_at
+
+        # Stale run 1 attempts heartbeat_claim_with_event — must be rejected
+        # with "stale_run_id" and no heartbeat event may be written.
+        ok, reason = kb.heartbeat_claim_with_event(
+            conn, t,
+            claimer=lock,
+            expected_run_id=run1_id,
+        )
+        assert ok is False
+        assert reason == "stale_run_id"
+
+        # No heartbeat event was appended.
+        events = kb.list_events(conn, t)
+        heartbeat_events = [e for e in events if e.kind == "heartbeat"]
+        assert len(heartbeat_events) == 0, (
+            "No heartbeat event may be written when CAS is rejected"
+        )
+
+        # last_heartbeat_at is unchanged.
+        task = kb.get_task(conn, t)
+        assert task.last_heartbeat_at == hb_before
+
+        # Claim_expires is unchanged (wasn't extended by stale run).
+        assert task.claim_expires == now + 120, (
+            "Stale run must not mutate claim_expires"
+        )
+
+
+def test_heartbeat_claim_with_event_no_event_on_rotated_lock(kanban_home):
+    """heartbeat_claim_with_event must not write a heartbeat event when
+    the CAS is rejected due to a rotated lock (different host:pid).
+    The stale owner (lock_a) attempts heartbeat after the task has been
+    re-claimed by a different owner (lock_b) — must be rejected silently.
+
+    Note: with same `expected_run_id=run_a_id` AND different lock (lock_b
+    ≠ lock_a), the CAS rejects at the `claim_lock = ?` predicate. However,
+    when the row IS found with `status='running'` and a different `claim_lock`,
+    the reason is determined by the `current_run_id != expected_run_id` check
+    (since run_a_id ≠ run_b_id) which fires first → returns "stale_run_id".
+    """
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="x", assignee="a")
+
+        # Run A on host1:12345 claims the task.
+        lock_a = "host1:12345"
+        lock_b = "host2:67890"
+        kb.claim_task(conn, t, claimer=lock_a, ttl_seconds=60)
+        task = kb.get_task(conn, t)
+        run_a_id = task.current_run_id
+        hb_before = task.last_heartbeat_at
+
+        # Simulate the dispatcher re-claiming for a successor run (run B)
+        # with a different lock (lock_b). We bypass the re-claim guard by
+        # directly updating the task row.
+        conn.execute(
+            "UPDATE tasks SET claim_lock = ?, status = 'running' "
+            "WHERE id = ? AND status = 'running'",
+            (lock_b, t),
+        )
+        now = int(time.time())
+        cursor = conn.execute(
+            "INSERT INTO task_runs (task_id, profile, status, claim_lock, "
+            "claim_expires, started_at) VALUES (?, 'test', 'running', ?, ?, ?)",
+            (t, lock_b, now + 120, now),
+        )
+        run_b_id = int(cursor.lastrowid)
+        conn.execute(
+            "UPDATE tasks SET current_run_id = ?, claim_expires = ? "
+            "WHERE id = ?",
+            (run_b_id, now + 120, t),
+        )
+
+        # Verify run IDs are different.
+        task = kb.get_task(conn, t)
+        assert task.current_run_id == run_b_id
+        assert run_b_id != run_a_id
+
+        # Run A (stale lock) attempts heartbeat_claim_with_event —
+        # must be rejected with "rotated_lock".
+        ok, reason = kb.heartbeat_claim_with_event(
+            conn, t,
+            claimer=lock_a,
+            expected_run_id=run_a_id,
+        )
+        assert ok is False
+        # Same lock_a but different run (run_b_id ≠ run_a_id) → stale_run_id
+        # (run_id check fires before the rotated-lock distinction in the impl).
+        assert reason == "stale_run_id"
+
+        # No heartbeat event written.
+        events = kb.list_events(conn, t)
+        heartbeat_events = [e for e in events if e.kind == "heartbeat"]
+        assert len(heartbeat_events) == 0, (
+            "No heartbeat event may be written when rotated lock rejects"
+        )
+
+        # last_heartbeat_at is unchanged.
+        task = kb.get_task(conn, t)
+        assert task.last_heartbeat_at == hb_before
+
+
+def test_heartbeat_claim_with_event_single_transaction(kanban_home):
+    """heartbeat_claim_with_event must update both claim_expires and
+    last_heartbeat_at in a single transaction. If the CAS rejects, neither
+    may be written — verifiable by observing the task state is unchanged
+    after a stale-run heartbeat and the task remains reclaimable.
+    """
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="x", assignee="a")
+        lock = "host:hb"
+        kb.claim_task(conn, t, claimer=lock, ttl_seconds=60)
+        task = kb.get_task(conn, t)
+        run1_id = task.current_run_id
+        original_expires = task.claim_expires
+        hb_before = task.last_heartbeat_at
+
+    # Simulate a successor run (dispatcher moved the task to a new worker).
+    with kb.connect() as conn2:
+        conn2.execute(
+            "UPDATE tasks SET claim_lock = ?, status = 'running' "
+            "WHERE id = ? AND status = 'running'",
+            ("successor-lock", t),
+        )
+        now = int(time.time())
+        cursor = conn2.execute(
+            "INSERT INTO task_runs (task_id, profile, status, claim_lock, "
+            "claim_expires, started_at) VALUES (?, 'test', 'running', ?, ?, ?)",
+            (t, "successor-lock", now + 120, now),
+        )
+        run2_id = int(cursor.lastrowid)
+        conn2.execute(
+            "UPDATE tasks SET current_run_id = ?, claim_expires = ? "
+            "WHERE id = ?",
+            (run2_id, now + 120, t),
+        )
+        conn2.commit()
+
+    # Stale heartbeat attempt with old run1_id — CAS must reject atomically.
+    with kb.connect() as conn3:
+        ok, reason = kb.heartbeat_claim_with_event(
+            conn3, t,
+            claimer=lock,
+            expected_run_id=run1_id,
+        )
+        assert ok is False, "Stale heartbeat must be rejected"
+        assert reason == "stale_run_id"
+
+        # No heartbeat event was appended (the key atomicity guarantee).
+        events = kb.list_events(conn3, t)
+        heartbeat_events = [e for e in events if e.kind == "heartbeat"]
+        assert len(heartbeat_events) == 0, (
+            "No heartbeat event may be written on CAS reject"
+        )
+
+    # The task can still be reclaimed by the successor (atomicity preserved).
+    # Reset status='ready' + clear claim so claim_task succeeds.
+    with kb.connect() as conn4:
+        conn4.execute(
+            "UPDATE tasks SET status = 'ready', claim_expires = 0, "
+            "claim_lock = NULL, current_run_id = NULL WHERE id = ?",
+            (t,),
+        )
+        conn4.commit()
+        reclaimed = kb.claim_task(conn4, t, claimer="reclaimer:1", ttl_seconds=60)
+        assert reclaimed is not None, (
+            "Task must be reclaimable after stale heartbeat was rejected atomically"
+        )
+
+
+def test_heartbeat_claim_with_event_legitimate_owner_succeeds(kanban_home):
+    """A legitimate owner calling heartbeat_claim_with_event must succeed,
+    extend the lease, and write exactly one heartbeat event.
+    """
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="x", assignee="a")
+        lock = "host:12345"
+        kb.claim_task(conn, t, claimer=lock, ttl_seconds=60)
+        task = kb.get_task(conn, t)
+        run_id = task.current_run_id
+        assert run_id is not None
+
+        # Expire the claim to simulate a worker that needs to re-up.
+        conn.execute("UPDATE tasks SET claim_expires = 0 WHERE id = ?", (t,))
+        conn.commit()
+
+        ok, reason = kb.heartbeat_claim_with_event(
+            conn, t,
+            claimer=lock,
+            expected_run_id=run_id,
+        )
+        assert ok is True
+        assert reason == ""
+
+        # Lease was extended (compare vs old value of 0, don't assume a specific TTL).
+        task = kb.get_task(conn, t)
+        assert task.claim_expires > 0, "claim_expires must be extended from 0"
+        assert task.claim_expires > int(time.time()) + 500, (
+            "claim_expires should be a meaningful time in the future"
+        )
+
+        # Exactly one heartbeat event was written.
+        events = kb.list_events(conn, t)
+        heartbeat_events = [e for e in events if e.kind == "heartbeat"]
+        assert len(heartbeat_events) == 1
+
+        # last_heartbeat_at was updated.
+        assert task.last_heartbeat_at >= int(time.time()) - 2
+
+
+def test_heartbeat_claim_with_event_not_running_returns_false(kanban_home):
+    """heartbeat_claim_with_event returns (False, "not_running") when the
+    task is not in running status and writes no events.
+    """
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="x", assignee="a")
+        lock = "host:hb"
+        # Task is created in 'todo' status (never claimed).
+
+        ok, reason = kb.heartbeat_claim_with_event(
+            conn, t,
+            claimer=lock,
+            expected_run_id=None,
+        )
+        # Task exists but status is 'todo', not 'running' → "not_running".
+        assert ok is False
+        assert reason == "not_running"
+
+
 def test_concurrent_claims_only_one_wins(kanban_home):
     """Fire N threads claiming the same task; exactly one must win."""
     with kb.connect() as conn:

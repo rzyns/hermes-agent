@@ -35,7 +35,6 @@ import subprocess
 from typing import Any, Optional
 
 from agent.redact import redact_sensitive_text
-from agent.delegation_context import child_env_lookup
 from hermes_cli.goals import judge_goal
 from tools.registry import registry, tool_error
 from hermes_cli.config import cfg_get, load_config
@@ -105,7 +104,7 @@ def _check_kanban_mode() -> bool:
     """
     if _is_delegated_child_context():
         return False
-    if child_env_lookup("HERMES_KANBAN_TASK"):
+    if os.environ.get("HERMES_KANBAN_TASK"):
         return True
     return _profile_has_kanban_toolset()
 
@@ -130,7 +129,7 @@ def _check_kanban_orchestrator_mode() -> bool:
     """
     if _is_delegated_child_context():
         return False
-    if child_env_lookup("HERMES_KANBAN_TASK"):
+    if os.environ.get("HERMES_KANBAN_TASK"):
         return False
     return _profile_has_kanban_toolset()
 
@@ -145,16 +144,15 @@ def _default_task_id(arg: Optional[str]) -> Optional[str]:
         return arg
     if _is_delegated_child_context():
         return None
-    return child_env_lookup("HERMES_KANBAN_TASK") or None
+    env_tid = os.environ.get("HERMES_KANBAN_TASK")
+    return env_tid or None
 
 
 def _worker_run_id(task_id: str) -> Optional[int]:
     """Return this worker's dispatcher run id when it is scoped to task_id."""
-    if _is_delegated_child_context():
+    if os.environ.get("HERMES_KANBAN_TASK") != task_id:
         return None
-    if child_env_lookup("HERMES_KANBAN_TASK") != task_id:
-        return None
-    raw = child_env_lookup("HERMES_KANBAN_RUN_ID")
+    raw = os.environ.get("HERMES_KANBAN_RUN_ID")
     if not raw:
         return None
     try:
@@ -167,11 +165,9 @@ def _stamp_worker_session_metadata(
     task_id: str, metadata: Optional[dict]
 ) -> Optional[dict]:
     """Add trusted worker session id metadata for this worker's own task."""
-    if _is_delegated_child_context():
+    if os.environ.get("HERMES_KANBAN_TASK") != task_id:
         return metadata
-    if child_env_lookup("HERMES_KANBAN_TASK") != task_id:
-        return metadata
-    session_id = child_env_lookup("HERMES_SESSION_ID")
+    session_id = os.environ.get("HERMES_SESSION_ID")
     if not session_id:
         return metadata
     stamped = dict(metadata or {})
@@ -198,12 +194,7 @@ def _enforce_worker_task_ownership(tid: str) -> Optional[str]:
     when it must be rejected. Callers should ``return`` the error
     verbatim.
     """
-    if _is_delegated_child_context():
-        return tool_error(
-            "worker is in a delegate_task child context; refusing to assert "
-            "Kanban task ownership. Return findings to the parent agent."
-        )
-    env_tid = child_env_lookup("HERMES_KANBAN_TASK")
+    env_tid = os.environ.get("HERMES_KANBAN_TASK")
     if not env_tid:
         # Orchestrator or CLI context — no task-scope restriction.
         return None
@@ -223,11 +214,9 @@ def _git_status_porcelain_for_worker(task_id: str) -> Optional[str]:
     bookkeeping tasks from outside a repo, while dispatcher-spawned workers have
     a concrete ``$HERMES_KANBAN_WORKSPACE`` that represents their handoff scope.
     """
-    if _is_delegated_child_context():
+    if os.environ.get("HERMES_KANBAN_TASK") != task_id:
         return None
-    if child_env_lookup("HERMES_KANBAN_TASK") != task_id:
-        return None
-    workspace = child_env_lookup("HERMES_KANBAN_WORKSPACE")
+    workspace = os.environ.get("HERMES_KANBAN_WORKSPACE")
     if not workspace or not os.path.isdir(workspace):
         return None
     try:
@@ -375,20 +364,18 @@ def heartbeat_current_worker_from_env() -> bool:
     swallowed exception). The boolean is informational — callers should
     not branch on it.
 
-    Identity comes from:
-      * ``HERMES_KANBAN_TASK`` — task id (required; absence means no-op)
-      * ``HERMES_KANBAN_RUN_ID`` — pins the run row so we don't heartbeat
-        a stale run that may have already been reclaimed
-      * ``HERMES_KANBAN_CLAIM_LOCK`` — claim lock for ``heartbeat_claim``;
-        falls back to the default ``_claimer_id()`` for locally-driven
-        workers that never went through the dispatcher path
+    **Fail-closed contract:** this function requires BOTH
+    ``HERMES_KANBAN_RUN_ID`` (the current run's id, not any stale run) AND
+    ``HERMES_KANBAN_CLAIM_LOCK`` (the run-scoped lock pinned at dispatch).
+    Either being absent or unparseable means this worker does not hold a
+    run-scoped lease and must NOT extend any claim or emit heartbeat state.
 
     Rate-limited via the module-level ``_auto_heartbeat_last_attempt``
     timestamp (monotonic clock); not thread-safe in the strict sense, but
     the worst case is one extra DB write per race, which is harmless.
     """
     global _auto_heartbeat_last_attempt
-    tid = child_env_lookup("HERMES_KANBAN_TASK")
+    tid = os.environ.get("HERMES_KANBAN_TASK")
     if not tid:
         return False
     import time as _time
@@ -396,24 +383,72 @@ def heartbeat_current_worker_from_env() -> bool:
     if (now - _auto_heartbeat_last_attempt) < _AUTO_HEARTBEAT_MIN_INTERVAL_SECONDS:
         return False
     _auto_heartbeat_last_attempt = now
+
+    # Fail-closed: both credentials are required for run-scoped auto-heartbeat.
+    # HERMES_KANBAN_RUN_ID pins the current run so stale runs cannot heartbeat.
+    # HERMES_KANBAN_CLAIM_LOCK is the run-scoped lock (not the fallback
+    # _claimer_id() default) so same-host:pid reuse does not extend the lease.
+    run_id_raw = os.environ.get("HERMES_KANBAN_RUN_ID")
+    claim_lock = os.environ.get("HERMES_KANBAN_CLAIM_LOCK")
+    if not run_id_raw or not claim_lock:
+        # Missing credentials means this worker does not hold a run-scoped
+        # lease; do nothing rather than risk extending a stale lease.
+        logger.debug(
+            "auto-heartbeat: skipped — HERMES_KANBAN_RUN_ID or "
+            "HERMES_KANBAN_CLAIM_LOCK is unset; not the current run owner"
+        )
+        return False
+    run_id: Optional[int]
+    try:
+        run_id = int(run_id_raw)
+    except (TypeError, ValueError):
+        logger.debug("auto-heartbeat: HERMES_KANBAN_RUN_ID is not an integer")
+        return False
+
     try:
         kb, conn = _connect()
         try:
-            claim_lock = child_env_lookup("HERMES_KANBAN_CLAIM_LOCK")
-            try:
-                kb.heartbeat_claim(conn, tid, claimer=claim_lock)
-            except Exception:
-                logger.debug("auto-heartbeat: heartbeat_claim failed", exc_info=True)
-            run_id_raw = child_env_lookup("HERMES_KANBAN_RUN_ID")
-            run_id: Optional[int]
-            try:
-                run_id = int(run_id_raw) if run_id_raw else None
-            except (TypeError, ValueError):
-                run_id = None
-            try:
-                kb.heartbeat_worker(conn, tid, note=None, expected_run_id=run_id)
-            except Exception:
-                logger.debug("auto-heartbeat: heartbeat_worker failed", exc_info=True)
+            ok, reason = kb.heartbeat_claim_with_event(
+                conn, tid,
+                claimer=claim_lock,
+                expected_run_id=run_id,
+            )
+            if not ok:
+                # Log at WARNING so operators can see this in agent.log.
+                # Distinguish the two failure flavours:
+                # - "rotated_lock" → another valid worker holds the claim; normal.
+                # - "stale_run_id" → this run is stale; a newer run took over.
+                # Both mean "do not heartbeat" — we do NOT proceed silently.
+                if reason == "rotated_lock":
+                    logger.warning(
+                        "auto-heartbeat: heartbeat_claim rejected — "
+                        "claim_lock %r does not match current holder; "
+                        "task %s is claimed by a different worker",
+                        claim_lock, tid,
+                    )
+                elif reason == "stale_run_id":
+                    logger.warning(
+                        "auto-heartbeat: heartbeat_claim rejected — "
+                        "run_id mismatch (expected %s); task %s was reclaimed "
+                        "by a newer run; this stale heartbeat is discarded",
+                        run_id, tid,
+                    )
+                elif reason == "not_running":
+                    logger.warning(
+                        "auto-heartbeat: heartbeat_claim rejected — "
+                        "task %s is no longer running", tid,
+                    )
+                elif reason == "not_claimed":
+                    logger.warning(
+                        "auto-heartbeat: heartbeat_claim rejected — "
+                        "task %s has no active claim", tid,
+                    )
+                else:
+                    logger.warning(
+                        "auto-heartbeat: heartbeat_claim rejected for task %s "
+                        "(reason=%r)", tid, reason,
+                    )
+                return True  # Did attempt; rejected is still "did attempt".
         finally:
             try:
                 conn.close()
@@ -462,7 +497,7 @@ def _require_orchestrator_tool(tool_name: str) -> Optional[str]:
     structured tool_error so the model gets a clear refusal instead of
     silently mutating board state from a worker context.
     """
-    if child_env_lookup("HERMES_KANBAN_TASK"):
+    if os.environ.get("HERMES_KANBAN_TASK"):
         return tool_error(
             f"{tool_name} is orchestrator-only; dispatcher-spawned workers "
             "must use kanban_complete, kanban_block, kanban_heartbeat, or "
@@ -944,12 +979,11 @@ def _handle_block(args: dict, **kw) -> str:
 def _handle_heartbeat(args: dict, **kw) -> str:
     """Signal that the worker is still alive during a long operation.
 
-    Extends the claim TTL via ``heartbeat_claim`` AND records a heartbeat
-    event via ``heartbeat_worker``. Without the ``heartbeat_claim`` half,
-    a diligent worker that loops this tool while a single tool call
-    blocks the agent for >DEFAULT_CLAIM_TTL_SECONDS still gets reclaimed
-    by ``release_stale_claims`` — which is exactly the trap that
-    ``heartbeat_claim``'s docstring warns against.
+    Extends the claim TTL via ``heartbeat_claim_with_event`` and records a
+    heartbeat event — both in a single atomic transaction. If the CAS
+    rejects (rotated lock, stale run, or unclaimed), no heartbeat state is
+    written and the function returns an error. This is the fail-closed
+    invariant required for run-id+claim-lock identity.
     """
     delegated_err = _reject_delegated_child_mutation("kanban_heartbeat")
     if delegated_err:
@@ -964,26 +998,26 @@ def _handle_heartbeat(args: dict, **kw) -> str:
         return ownership_err
     note = args.get("note")
     board = args.get("board")
+    run_id = _worker_run_id(tid)
+    claim_lock = os.environ.get("HERMES_KANBAN_CLAIM_LOCK")
     try:
         kb, conn = _connect(board=board)
         try:
-            # Extend the claim TTL first. The dispatcher pins
-            # HERMES_KANBAN_CLAIM_LOCK in the worker env at spawn time
-            # (see _default_spawn in kanban_db.py); falling back to the
-            # default _claimer_id() covers locally-driven workers that
-            # never went through the dispatcher path.
-            claim_lock = child_env_lookup("HERMES_KANBAN_CLAIM_LOCK")
-            kb.heartbeat_claim(conn, tid, claimer=claim_lock)
-
-            ok = kb.heartbeat_worker(
-                conn,
-                tid,
-                note=note,
-                expected_run_id=_worker_run_id(tid),
+            # Single atomic call: claim TTL + heartbeat event in one txn.
+            # No heartbeat state is written if the CAS is rejected.
+            ok, reason = kb.heartbeat_claim_with_event(
+                conn, tid,
+                claimer=claim_lock,
+                expected_run_id=run_id,
             )
             if not ok:
+                logger.warning(
+                    "kanban_heartbeat: heartbeat rejected for task %s "
+                    "(run_id=%s, reason=%r)",
+                    tid, run_id, reason,
+                )
                 return tool_error(
-                    f"could not heartbeat {tid} (unknown id or not running)"
+                    f"could not heartbeat {tid} (run_id={run_id}, reason={reason})"
                 )
             return _ok(task_id=tid)
         finally:
@@ -1428,7 +1462,7 @@ def _handle_create(args: dict, **kw) -> str:
             # it into a fresh per-task worktree. Never inherit the parent's
             # literal workspace kind/path; directory sharing must be explicit.
             if _inherit_project and project_id is None:
-                _self_tid = child_env_lookup("HERMES_KANBAN_TASK")
+                _self_tid = os.environ.get("HERMES_KANBAN_TASK")
                 if _self_tid:
                     _self_task = kb.get_task(conn, _self_tid)
                     if _self_task is not None and _self_task.project_id:

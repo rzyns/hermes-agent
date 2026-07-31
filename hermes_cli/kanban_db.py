@@ -5208,20 +5208,35 @@ def heartbeat_claim(
     *,
     ttl_seconds: Optional[int] = None,
     claimer: Optional[str] = None,
+    expected_run_id: Optional[int] = None,
 ) -> bool:
     """Extend a running claim.  Returns True if we still own it.
 
     Workers that know they'll exceed 15 minutes should call this every
     few minutes to keep ownership.
+
+    Authorization requires BOTH ``claim_lock`` (the caller's host:pid or
+    explicit lock) AND the caller's ``expected_run_id`` to match the row's
+    ``current_run_id``.  This prevents a stale old run from extending a
+    successor run's lease when the same lock is reused (e.g. same host:pid
+    after a dispatcher restart or same-machine reclaim).
     """
     expires = int(time.time()) + _resolve_claim_ttl_seconds(ttl_seconds)
     lock = claimer or _claimer_id()
     with write_txn(conn):
-        cur = conn.execute(
-            "UPDATE tasks SET claim_expires = ? "
-            "WHERE id = ? AND status = 'running' AND claim_lock = ?",
-            (expires, task_id, lock),
-        )
+        if expected_run_id is None:
+            cur = conn.execute(
+                "UPDATE tasks SET claim_expires = ? "
+                "WHERE id = ? AND status = 'running' AND claim_lock = ?",
+                (expires, task_id, lock),
+            )
+        else:
+            cur = conn.execute(
+                "UPDATE tasks SET claim_expires = ? "
+                "WHERE id = ? AND status = 'running' "
+                "AND claim_lock = ? AND current_run_id = ?",
+                (expires, task_id, lock, int(expected_run_id)),
+            )
         if cur.rowcount == 1:
             run_id = _current_run_id(conn, task_id)
             if run_id is not None:
@@ -5231,6 +5246,123 @@ def heartbeat_claim(
                 )
             return True
         return False
+
+
+def heartbeat_claim_with_event(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    claimer: Optional[str] = None,
+    expected_run_id: Optional[int] = None,
+    note: Optional[str] = None,
+) -> tuple[bool, str]:
+    """Atomic claim TTL extension + heartbeat event in one transaction.
+
+    This is the only correct way to heartbeat a running task when
+    ``expected_run_id`` is known. It is strictly better than calling
+    ``heartbeat_claim`` and ``heartbeat_worker`` separately because:
+
+    - On CAS reject (rotated lock, stale run, or unclaimed task) the
+      heartbeat event is never written — the failure is fail-closed and
+      the two operations cannot split across transactions.
+    - The reject reason is determined from the row comparison and returned
+      as a string so the caller can log at the appropriate level.
+
+    Returns ``(True, "")`` on success.
+    Returns ``(False, reason)`` on reject; reason is one of:
+
+    - ``"rotated_lock"`` — the task is claimed by a different lock (a
+      rotated lock or a different host:pid). The task is claimed by
+      a live worker; do NOT reclaim.
+    - ``"stale_run_id"`` — the task is claimed by the same lock but
+      ``current_run_id`` does not match ``expected_run_id``. A stale
+      old run is trying to extend the successor's lease; do NOT extend.
+    - ``"not_running"`` — the task exists but is not in ``running`` status.
+    - ``"not_claimed"`` — the task has no claim_lock set; it was never
+      claimed or the claim was released.
+
+    Args:
+        expected_run_id: if provided, the UPDATE is additionally scoped to
+            the matching ``current_run_id``, preventing a stale run from
+            extending a successor's lease.
+    """
+    expires = int(time.time()) + _resolve_claim_ttl_seconds(None)
+    lock = claimer or _claimer_id()
+    with write_txn(conn):
+        if expected_run_id is None:
+            cur = conn.execute(
+                "UPDATE tasks SET claim_expires = ? "
+                "WHERE id = ? AND status = 'running' AND claim_lock = ?",
+                (expires, task_id, lock),
+            )
+        else:
+            cur = conn.execute(
+                "UPDATE tasks SET claim_expires = ? "
+                "WHERE id = ? AND status = 'running' "
+                "AND claim_lock = ? AND current_run_id = ?",
+                (expires, task_id, lock, int(expected_run_id)),
+            )
+        if cur.rowcount == 1:
+            run_id = _current_run_id(conn, task_id)
+            if run_id is not None:
+                conn.execute(
+                    "UPDATE task_runs SET claim_expires = ? WHERE id = ?",
+                    (expires, run_id),
+                )
+            # Heartbeat event + last_heartbeat_at bump — same txn, same run_id.
+            _heartbeat_event(conn, task_id, note=note, run_id=run_id)
+            return (True, "")
+        # CAS rejected — determine the reason from current row state so the
+        # caller can log at the right level and distinguish a live-rotated
+        # lock from a genuinely stale run attempting to extend.
+        row = conn.execute(
+            "SELECT status, claim_lock, current_run_id FROM tasks WHERE id = ?",
+            (task_id,),
+        ).fetchone()
+        if row is None:
+            return (False, "not_found")
+        if row["status"] != "running":
+            return (False, "not_running")
+        if row["claim_lock"] is None:
+            return (False, "not_claimed")
+        if row["current_run_id"] != expected_run_id:
+            # Same lock but run_id mismatch → stale old run trying to extend.
+            return (False, "stale_run_id")
+        # Lock mismatch: different worker holds the claim.
+        return (False, "rotated_lock")
+
+
+def _heartbeat_event(
+    conn: sqlite3.Connection,
+    task_id: str,
+    note: Optional[str],
+    run_id: Optional[int],
+) -> None:
+    """Write last_heartbeat_at + heartbeat event. Call inside write_txn."""
+    now = int(time.time())
+    if run_id is None:
+        cur = conn.execute(
+            "UPDATE tasks SET last_heartbeat_at = ? "
+            "WHERE id = ? AND status = 'running'",
+            (now, task_id),
+        )
+        run_id = _current_run_id(conn, task_id)
+    else:
+        cur = conn.execute(
+            "UPDATE tasks SET last_heartbeat_at = ? "
+            "WHERE id = ? AND status = 'running' AND current_run_id = ?",
+            (now, task_id, int(run_id)),
+        )
+    if cur.rowcount == 1 and run_id is not None:
+        conn.execute(
+            "UPDATE task_runs SET last_heartbeat_at = ? WHERE id = ?",
+            (now, run_id),
+        )
+    _append_event(
+        conn, task_id, "heartbeat",
+        {"note": note} if note else None,
+        run_id=run_id,
+    )
 
 
 def release_stale_claims(
