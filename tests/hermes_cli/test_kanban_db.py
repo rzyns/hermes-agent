@@ -17,6 +17,8 @@ import pytest
 
 import hermes_state
 from hermes_cli import kanban_db as kb
+from hermes_cli import kanban_dependencies as _kbd
+
 
 
 @pytest.fixture
@@ -819,6 +821,135 @@ def test_recompute_ready_deduplicates_stranded_dependency_child_for_sticky_block
             (child,),
         ).fetchone()[0]
         assert count == 1
+
+
+def test_recompute_ready_emits_stranded_dependency_child_under_external_blocker(
+    kanban_home,
+):
+    """External blockers must suppress auto-promotion but NOT suppress the
+    broad ``stranded_dependency_child`` telemetry. A blocked child whose
+    internal parents are all satisfied but which is held by a cross-board
+    blocker, a sticky block, or the circuit-breaker failure limit must
+    remain observable.
+    """
+    class _Provider:
+        name = "test-external-blocker"
+        blocked_tasks: set[str] = set()
+
+        def blockers_for(self, *, board, task_id):
+            if task_id in self.blocked_tasks:
+                return [{"parent_board": "other", "parent_id": "t_ext", "reason": "external gate"}]
+            return []
+
+    provider = _Provider()
+    with _kbd.scoped_dependency_provider(provider):
+        with kb.connect() as conn:
+            parent = kb.create_task(conn, title="parent")
+            child = kb.create_task(conn, title="child", parents=[parent])
+            kb.claim_task(conn, parent)
+            kb.complete_task(conn, parent, result="done")
+            provider.blocked_tasks.add(child)
+            conn.execute(
+                "UPDATE tasks SET status='blocked', consecutive_failures=0, "
+                "last_failure_error=NULL WHERE id=?",
+                (child,),
+            )
+            conn.commit()
+
+            promoted = kb.recompute_ready(conn)
+            assert promoted == 0
+            task = kb.get_task(conn, child)
+            assert task is not None
+            assert task.status == "blocked"
+
+            events = kb.list_events(conn, child)
+            stranded = [e for e in events if e.kind == "stranded_dependency_child"]
+            assert len(stranded) == 1
+            payload = stranded[0].payload
+            assert payload["parents"][0]["id"] == parent
+            assert payload["parents"][0]["status"] == "done"
+            assert payload["external_blockers"][0]["parent_id"] == "t_ext"
+
+
+def test_recompute_ready_emits_stranded_dependency_child_under_sticky_block(
+    kanban_home,
+):
+    """A sticky operator block must suppress promotion but not suppress the
+    broad ``stranded_dependency_child`` telemetry.
+    """
+    with kb.connect() as conn:
+        parent = kb.create_task(conn, title="parent")
+        child = kb.create_task(conn, title="child", parents=[parent])
+        kb.claim_task(conn, parent)
+        kb.complete_task(conn, parent, result="done")
+        assert kb.block_task(
+            conn, child,
+            kind="needs_input",
+            reason="operator hold",
+        )
+
+        promoted = kb.recompute_ready(conn)
+        assert promoted == 0
+        task = kb.get_task(conn, child)
+        assert task is not None
+        assert task.status == "blocked"
+        events = kb.list_events(conn, child)
+        stranded = [e for e in events if e.kind == "stranded_dependency_child"]
+        assert len(stranded) == 1
+        payload = stranded[0].payload
+        assert payload["parents"][0]["id"] == parent
+        assert payload["parents"][0]["status"] == "done"
+        assert payload["external_blockers"] == []
+
+
+def test_recompute_ready_external_blocker_then_clear_allows_promotion(
+    kanban_home,
+):
+    """When the external blocker clears, the same child should promote and
+    emit only one telemetry event (deduplicated against the prior stranded
+    event).
+    """
+    class _Provider:
+        name = "test-external-blocker"
+        satisfied = False
+        child_id: str = ""
+
+        def blockers_for(self, *, board, task_id):
+            if self.satisfied or task_id != self.child_id:
+                return []
+            return [{"parent_board": "other", "parent_id": "t_ext", "reason": "gate"}]
+
+    provider = _Provider()
+    with _kbd.scoped_dependency_provider(provider):
+        with kb.connect() as conn:
+            parent = kb.create_task(conn, title="parent")
+            child = kb.create_task(conn, title="child", parents=[parent])
+            kb.claim_task(conn, parent)
+            kb.complete_task(conn, parent, result="done")
+            provider.child_id = child
+            conn.execute(
+                "UPDATE tasks SET status='blocked', consecutive_failures=0, "
+                "last_failure_error=NULL WHERE id=?",
+                (child,),
+            )
+            conn.commit()
+
+            assert kb.recompute_ready(conn) == 0
+            assert kb.get_task(conn, child).status == "blocked"
+            assert any(
+                e.kind == "stranded_dependency_child"
+                for e in kb.list_events(conn, child)
+            )
+
+            provider.satisfied = True
+            assert kb.recompute_ready(conn) == 1
+            assert kb.get_task(conn, child).status == "ready"
+            count = conn.execute(
+                "SELECT COUNT(*) FROM task_events "
+                "WHERE task_id=? AND kind='stranded_dependency_child'",
+                (child,),
+            ).fetchone()[0]
+            assert count == 1
 
 
 # ---------------------------------------------------------------------------
@@ -2208,6 +2339,48 @@ def test_worker_context_excludes_archived_parent_without_completion(kanban_home)
     assert parent not in ctx.split("## Cross-task role history")[0]
 
 
+def test_parent_completion_predicate_single_source_no_literal_duplication(kanban_home):
+    """Every SQL predicate testing parent completion must be generated from
+    ``_parent_satisfied_sql`` so a change in the Python helper cannot drift
+    out of sync with any caller. This is a structural invariant, not a
+    behavior snapshot.
+    """
+    import inspect
+
+    source = inspect.getsource(kb._parent_satisfied_sql)
+    # The single-source function must exist and must reference both states.
+    assert "status = 'done'" in source
+    assert "status = 'archived'" in source
+    assert "completed_at IS NOT NULL" in source
+    assert "completed_at != 0" in source
+
+    # The module must contain no duplicated literal predicates that bypass
+    # the helper. Whitelist a few unavoidable string mentions in comments/docs.
+    module_source = Path(kb.__file__).read_text()
+    literal_predicates = [
+        "status = 'done' OR (status = 'archived'",
+        "status='done' OR (status='archived'",
+        "p.status = 'done' OR (p.status = 'archived'",
+        "t.status = 'done' OR (t.status = 'archived'",
+        "status = 'done' OR status = 'archived'",
+        "status='done' OR status='archived'",
+    ]
+    occurrences = []
+    for lit in literal_predicates:
+        idx = module_source.find(lit)
+        if idx != -1:
+            # Confirm this is not inside the helper definition itself.
+            helper_start = module_source.find("def _parent_satisfied_sql")
+            helper_end = module_source.find("\ndef ", helper_start + 1)
+            if helper_end == -1:
+                helper_end = len(module_source)
+            if not (helper_start <= idx < helper_end):
+                occurrences.append(lit)
+    assert not occurrences, (
+        "duplicated parent-completion SQL literal(s) found: " + ", ".join(occurrences)
+    )
+
+
 def test_parent_completion_predicate_invariant_across_null_zero_real_ts(kanban_home):
     """The same predicate must govern dependency gating, parent_results(), and
     build_worker_context(). Edge values: NULL, 0, real unix timestamp.
@@ -2243,18 +2416,23 @@ def test_parent_completion_predicate_invariant_across_null_zero_real_ts(kanban_h
             )
             assert in_parent_section is expected_satisfied, scenario
 
-            # 4. SQL fragment matches Python helper
+            # 4. SQL fragment function matches Python helper and all callers.
             row = conn.execute(
                 "SELECT status, completed_at FROM tasks WHERE id=?", (parent,)
             ).fetchone()
             sql_satisfied = bool(
                 conn.execute(
-                    f"SELECT 1 FROM tasks t WHERE t.id=? AND {kb._PARENT_SATISFIED_SQL}",
+                    f"SELECT 1 FROM tasks t WHERE t.id=? AND {kb._parent_satisfied_sql('t')}",
                     (parent,),
                 ).fetchone()
             )
             assert sql_satisfied is expected_satisfied, scenario
             assert sql_satisfied is kb._parent_dependency_satisfied(row), scenario
+
+            # 5. Unblock_task and requeue_due_transients use the same SQL.
+            undo_sql = f"SELECT 1 FROM task_links l JOIN tasks p ON p.id = l.parent_id WHERE l.child_id = ? AND NOT {kb._parent_satisfied_sql('p')} LIMIT 1"
+            undone = conn.execute(undo_sql, (child,)).fetchone()
+            assert bool(undone) is not expected_satisfied, scenario
 
 
 def test_dispatch_dry_run_does_not_claim(kanban_home, all_assignees_spawnable):
