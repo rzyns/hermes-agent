@@ -68,3 +68,37 @@ rg 'os\.environ\["HERMES_(KANBAN|INFERENCE)_|os\.environ\.get\("HERMES_(KANBAN|I
 Remaining matches are either infrastructure path/config reads (listed above)
 or pre-child CLI/gateway entry points. Identity/ownership reads in reachable
 in-process code paths are all overlay-aware.
+
+## Review-round repair (t_09b67162)
+
+Findings from independent review t_55389010 of commit ea86c4d980:
+
+1. **Absent-at-spawn run-scoped keys could leak.** ``tools/delegate_tool.py``
+   only tombstoned a key when it was already present in ``os.environ``. A key
+   introduced later (e.g. ``gateway/kanban_watchers.py`` temporarily mutating
+   ``HERMES_KANBAN_BOARD``) would fall through to ``os.environ`` in
+   ``child_env_lookup``. Fixed by unconditionally setting every
+   ``_RUN_SCOPED_ENV_VARS`` key to ``None`` in the child overlay.
+
+2. **Overlay storage was thread-local, not context-local.** The overlay was held
+   in ``threading.local``; when ``delegate_tool.py`` copied the context to a
+   ``DaemonThreadPoolExecutor`` worker, the overlay did not travel with the
+   child. Fixed by moving the overlay to a ``ContextVar
+   (``_CHILD_ENV_OVERLAY``) so it propagates through ``contextvars.copy_context``
+   and is restored on context exit.
+
+3. **Skill environment cache was context-blind.** ``_ENV_DETECT_CACHE`` keyed
+   by env name only, so a parent-warmed ``kanban=True`` result was reused for
+   delegated children (and vice versa). Fixed by including the delegated-child
+   flag in the cache key.
+
+New regressions added in ``tests/tools/test_delegate_env_leaks.py``:
+
+* ``test_absent_run_scoped_key_introduced_after_child_startup_is_scrubbed``
+  introduces ``HERMES_KANBAN_BOARD`` after child startup and asserts the
+  child still sees ``None`` while the parent sees the new value.
+* ``test_skill_env_cache_is_context_aware`` covers both orderings
+  (parent-warm then child, child-warm then parent) and asserts no cross-context
+  poisoning.
+
+Repair commit: ``ae18210eff``.

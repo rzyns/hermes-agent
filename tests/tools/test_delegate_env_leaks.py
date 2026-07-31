@@ -553,3 +553,96 @@ def test_env3_db_mutation_fails_closed_for_delegated_child(seeded_env, tmp_path,
     assert task is not None
     assert task.status == "running"
     assert task.current_run_id == parent_run_id
+
+
+def test_absent_run_scoped_key_introduced_after_child_startup_is_scrubbed(seeded_env, monkeypatch):
+    """A run-scoped key introduced into the parent env AFTER child startup must not leak.
+
+    This is the deterministic regression for the ENV-2c review finding:
+    ``child_env_lookup`` must return ``default`` for every scrubbed key even
+    when the parent process env is mutated by another thread after the overlay
+    was constructed.  The parent thread continues to see the new value.
+    """
+    import threading
+    import time
+
+    parent = _make_parent_agent()
+    child = _make_child_agent(parent)
+    parent._active_children.append(child)
+
+    # Ensure the target key is absent from the parent environment at overlay
+    # construction time.
+    target_key = "HERMES_KANBAN_BOARD"
+    monkeypatch.delenv(target_key, raising=False)
+    assert target_key not in os.environ, "target key must be absent before child starts"
+
+    gate = threading.Event()
+    parent_after_child_start = {}
+
+    def patched_run(*args, **kwargs):
+        # Signal that the child has started; then race with the parent thread.
+        gate.set()
+        time.sleep(0.05)
+        parent_after_child_start.update({k: child_env_lookup(k) for k in _RUN_SCOPED_VARS})
+        parent_after_child_start["subprocess_env"] = delegated_child_subprocess_env()
+        return {"final_response": "ok", "completed": True, "api_calls": 0, "messages": []}
+
+    with patch.object(child, "run_conversation", patched_run):
+        runner = threading.Thread(
+            target=lambda: _run_single_child(0, "late env probe", child, parent),
+            daemon=True,
+        )
+        runner.start()
+        # Wait until the child has entered run_conversation before mutating.
+        assert gate.wait(timeout=5), "child never started"
+        # Simulate another thread (e.g. gateway watcher) temporarily mutating
+        # the parent process env while the child is active.
+        monkeypatch.setenv(target_key, "late-introduced-board")
+        runner.join(timeout=5)
+
+    assert not runner.is_alive(), "child thread did not finish"
+    # Parent env sees the late-introduced value; child must not.
+    assert os.environ.get(target_key) == "late-introduced-board"
+    assert parent_after_child_start.get(target_key) is None, (
+        f"child saw {target_key} that was introduced after it started"
+    )
+    assert target_key not in parent_after_child_start["subprocess_env"], (
+        f"{target_key} leaked into child's subprocess env"
+    )
+
+
+def test_skill_env_cache_is_context_aware(seeded_env):
+    """_detect_environment's cache must not leak between parent and delegated child.
+
+    Regression for the ENV-2c review finding: a process-global cache warmed by
+    either context must not alter the result for the other context.
+    """
+    from agent.skill_utils import _ENV_DETECT_CACHE, _detect_environment
+
+    # Clear any stale cache from other tests.
+    _ENV_DETECT_CACHE.clear()
+
+    # Parent-warmed cache: parent sees kanban=True.
+    assert os.environ.get("HERMES_KANBAN_TASK")
+    parent_result = _detect_environment("kanban")
+    assert parent_result is True
+
+    # Same process, now inside a delegated child context: must be False.
+    with delegated_child_context(overlay={"HERMES_KANBAN_TASK": None, "HERMES_KANBAN_BOARD": None}):
+        child_result = _detect_environment("kanban")
+        assert child_result is False, "parent-warmed kanban cache leaked into delegated child"
+
+    # Back to parent: still True.
+    assert _detect_environment("kanban") is True
+
+    # Now reverse the order: child warms first.
+    _ENV_DETECT_CACHE.clear()
+    with delegated_child_context(overlay={"HERMES_KANBAN_TASK": None, "HERMES_KANBAN_BOARD": None}):
+        assert _detect_environment("kanban") is False
+
+    # Parent must still be True, not poisoned by the child-first false cache.
+    assert _detect_environment("kanban") is True, "child-first false cache poisoned parent kanban detection"
+
+    # And re-entering a child context stays False.
+    with delegated_child_context(overlay={"HERMES_KANBAN_TASK": None, "HERMES_KANBAN_BOARD": None}):
+        assert _detect_environment("kanban") is False

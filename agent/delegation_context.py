@@ -10,7 +10,6 @@ from __future__ import annotations
 
 from contextlib import contextmanager
 from contextvars import ContextVar
-from threading import local as _thread_local
 from typing import Iterator, Mapping, MutableMapping
 
 _DELEGATED_CHILD_CONTEXT: ContextVar[bool] = ContextVar(
@@ -51,16 +50,16 @@ _RUN_SCOPED_ENV_VARS: frozenset[str] = frozenset(
 )
 
 
-# Thread-local overlay: per-worker-thread dict of child-specific env values
-# that temporarily shadow os.environ for in-process resolution, without
-# mutating the process-global mapping.  A value of ``None`` means the key is
-# explicitly removed (returning ``default`` rather than falling back to the
-# parent's process env).
-class _ChildEnvThreadLocal(_thread_local):
-    overlay: dict[str, str | None] | None = None
-
-
-_child_env_overlay = _ChildEnvThreadLocal()
+# Context-local overlay: per-call environment map that shadows os.environ for
+# in-process resolution without mutating the process-global mapping. Using a
+# ContextVar means the overlay travels with the delegated-child context when it
+# is copied to a worker thread (e.g. by DaemonThreadPoolExecutor).
+# A value of ``None`` means the key is explicitly removed (returning ``default``
+# rather than falling back to the parent's process env).
+_CHILD_ENV_OVERLAY: ContextVar[dict[str, str | None] | None] = ContextVar(
+    "hermes_child_env_overlay",
+    default=None,
+)
 
 
 @contextmanager
@@ -76,16 +75,12 @@ def delegated_child_context(
     thread only.
     """
     token = _DELEGATED_CHILD_CONTEXT.set(True)
-    old_overlay = _child_env_overlay.overlay
-    if overlay is not None:
-        _child_env_overlay.overlay = dict(overlay)
-    else:
-        _child_env_overlay.overlay = None
+    overlay_token = _CHILD_ENV_OVERLAY.set(dict(overlay) if overlay is not None else None)
     try:
         yield
     finally:
         _DELEGATED_CHILD_CONTEXT.reset(token)
-        _child_env_overlay.overlay = old_overlay
+        _CHILD_ENV_OVERLAY.reset(overlay_token)
 
 
 def is_delegated_child_context() -> bool:
@@ -103,8 +98,8 @@ def is_delegated_child_process_context() -> bool:
 
 
 def child_env_overlay() -> dict[str, str | None] | None:
-    """Return the current worker thread's child env overlay, if any."""
-    return getattr(_child_env_overlay, "overlay", None)
+    """Return the current context's child env overlay, if any."""
+    return _CHILD_ENV_OVERLAY.get()
 
 
 def child_env_lookup(key: str, default: str | None = None) -> str | None:

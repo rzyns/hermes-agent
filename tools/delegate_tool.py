@@ -2162,10 +2162,12 @@ def _run_single_child(
 
         _overlay: Dict[str, Optional[str]] = scrub_run_scoped_env(dict(os.environ))
         # Explicitly mark run-scoped vars as removed so child_env_lookup returns
-        # default instead of falling back to the parent's process env.
+        # default instead of falling back to the parent's process env.  Do this
+        # unconditionally for every run-scoped key: a key introduced into the
+        # parent process environment by another thread AFTER the child starts
+        # must still be treated as absent inside the child.
         for _key in _RUN_SCOPED_ENV_VARS:
-            if _key in os.environ:
-                _overlay[_key] = None
+            _overlay[_key] = None
         _overlay[DELEGATED_CHILD_ENV_MARKER] = "1"
 
         _timeout_executor = DaemonThreadPoolExecutor(

@@ -281,9 +281,19 @@ def skill_matches_platform(frontmatter: Dict[str, Any]) -> bool:
 # ``--skills``), because an explicit request is explicit consent.
 #
 # Detection is cached for the process lifetime via ``_ENV_DETECT_CACHE``.
+# Because delegated children run in the same process as their parent but must
+# see a different environment, the cache is keyed by (delegated?, env) rather
+# than env alone.
 _KNOWN_ENVIRONMENTS = frozenset({"kanban", "docker", "s6"})
 
 _ENV_DETECT_CACHE: Dict[str, bool] = {}
+
+
+def _env_cache_key(env: str) -> str:
+    """Return a cache key that separates delegated and non-delegated contexts."""
+    from agent.delegation_context import is_delegated_child_context
+
+    return f"delegated:{is_delegated_child_context()}:{env}"
 
 
 def _detect_environment(env: str) -> bool:
@@ -292,8 +302,9 @@ def _detect_environment(env: str) -> bool:
     Cached per process. Unknown env names return True (fail-open: never hide a
     skill because of a tag we don't understand).
     """
-    if env in _ENV_DETECT_CACHE:
-        return _ENV_DETECT_CACHE[env]
+    cache_key = _env_cache_key(env)
+    if cache_key in _ENV_DETECT_CACHE:
+        return _ENV_DETECT_CACHE[cache_key]
 
     result = True
     if env == "kanban":
@@ -336,7 +347,7 @@ def _detect_environment(env: str) -> bool:
             "/package/admin/s6-overlay"
         )
 
-    _ENV_DETECT_CACHE[env] = result
+    _ENV_DETECT_CACHE[cache_key] = result
     return result
 
 
