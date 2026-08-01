@@ -3,11 +3,7 @@ import { useCallback, useMemo, useRef } from 'react'
 
 import { getCronJobs, listAllProfileSessions, listSidebarSessions, type SessionInfo } from '@/hermes'
 import { sameCronSignature } from '@/lib/session-signatures'
-import {
-  isMessagingSource,
-  LOCAL_SESSION_SOURCE_IDS,
-  normalizeSessionSource
-} from '@/lib/session-source'
+import { isMessagingSource, LOCAL_SESSION_SOURCE_IDS, normalizeSessionSource } from '@/lib/session-source'
 import { sessionMatchesSidebarSources, sidebarSessionSourceFilter } from '@/lib/sidebar-session-sources'
 import { setCronJobs } from '@/store/cron'
 import { $pinnedSessionIds, $sessionsLimit, bumpSessionsLimit, SIDEBAR_SESSIONS_PAGE_SIZE } from '@/store/layout'
@@ -31,11 +27,13 @@ import {
 } from '@/store/session'
 import { $workingSessionIds, getRecentlySettledSessionIds } from '@/store/session-states'
 
-// The recents list is local-only: cron rows have their own section, and each
-// messaging platform (telegram, discord, …) is fetched separately into its own
-// self-managed sidebar section (refreshMessagingSessions). Excluding both here
-// keeps "Load more" paging through interactive local chats instead of
+// The recents list is local-only: cron rows have their own section, kanban
+// dispatcher workers are read on the board, and each messaging platform
+// (telegram, discord, …) is fetched separately into its own self-managed
+// sidebar section (refreshMessagingSessions). Excluding them here keeps
+// "Load more" paging through interactive local chats instead of
 // interleaving gateway threads that bury them.
+const KANBAN_SESSION_SOURCE_ID = 'kanban'
 // The messaging slice is the inverse: drop cron + every local source so only
 // external-platform conversations remain, then split per platform in the UI.
 const MESSAGING_EXCLUDED_SOURCES = ['cron', ...LOCAL_SESSION_SOURCE_IDS]
@@ -78,10 +76,19 @@ export function useSessionListActions({ profileScope }: UseSessionListActionsArg
 
   const sidebarSessionSourceIds = useStore($sidebarSessionSourceIds)
 
-  const sidebarSourceFilter = useMemo(
-    () => sidebarSessionSourceFilter(sidebarSessionSourceIds),
-    [sidebarSessionSourceIds]
-  )
+  const sidebarSourceFilter = useMemo(() => {
+    const filter = sidebarSessionSourceFilter(sidebarSessionSourceIds)
+
+    // Kanban worker runs belong on the board, not in chat recents. Preserve
+    // explicit source selections, but extend the default exclusion policy.
+    if (filter.sources) {
+      return filter
+    }
+
+    return {
+      excludeSources: [...(filter.excludeSources ?? []), KANBAN_SESSION_SOURCE_ID]
+    }
+  }, [sidebarSessionSourceIds])
 
   const filterSidebarRows = useCallback(
     (rows: SessionInfo[]) => {
@@ -89,9 +96,7 @@ export function useSessionListActions({ profileScope }: UseSessionListActionsArg
         return rows
       }
 
-      const filtered = rows.filter(session =>
-        sessionMatchesSidebarSources(session.source, sidebarSessionSourceIds)
-      )
+      const filtered = rows.filter(session => sessionMatchesSidebarSources(session.source, sidebarSessionSourceIds))
 
       return filtered.length === rows.length ? rows : filtered
     },
@@ -262,12 +267,7 @@ export function useSessionListActions({ profileScope }: UseSessionListActionsArg
 
     // Cron *jobs* are a distinct API (getCronJobs), not a session slice.
     void refreshCronJobs()
-  }, [
-    filterSidebarRows,
-    profileScope,
-    refreshCronJobs,
-    sidebarSourceFilter
-  ])
+  }, [filterSidebarRows, profileScope, refreshCronJobs, sidebarSourceFilter])
 
   const loadMoreSessions = useCallback(async () => {
     bumpSessionsLimit()
@@ -276,25 +276,35 @@ export function useSessionListActions({ profileScope }: UseSessionListActionsArg
 
   // ALL-profiles view pages one profile at a time: fetch that profile's next
   // page and merge it in place, leaving every other profile's rows untouched.
-  const loadMoreSessionsForProfile = useCallback(async (profile: string) => {
-    const key = normalizeProfileKey(profile)
-    const inKey = (s: SessionInfo) => normalizeProfileKey(s.profile) === key
-    const loaded = filterSidebarRows($sessions.get().filter(inKey)).length
+  const loadMoreSessionsForProfile = useCallback(
+    async (profile: string) => {
+      const key = normalizeProfileKey(profile)
+      const inKey = (s: SessionInfo) => normalizeProfileKey(s.profile) === key
+      const loaded = filterSidebarRows($sessions.get().filter(inKey)).length
 
-    const result = await listAllProfileSessions(loaded + SIDEBAR_SESSIONS_PAGE_SIZE, 1, 'exclude', 'recent', key, sidebarSourceFilter)
+      const result = await listAllProfileSessions(
+        loaded + SIDEBAR_SESSIONS_PAGE_SIZE,
+        1,
+        'exclude',
+        'recent',
+        key,
+        sidebarSourceFilter
+      )
 
-    const incomingSessions = filterSidebarRows(result.sessions)
-    const keep = sessionsToKeep(key)
+      const incomingSessions = filterSidebarRows(result.sessions)
+      const keep = sessionsToKeep(key)
 
-    setSessions(prev => [
-      ...prev.filter(s => !inKey(s)),
-      ...mergeSessionPage(filterSidebarRows(prev.filter(inKey)), incomingSessions, keep)
-    ])
+      setSessions(prev => [
+        ...prev.filter(s => !inKey(s)),
+        ...mergeSessionPage(filterSidebarRows(prev.filter(inKey)), incomingSessions, keep)
+      ])
 
-    // A full window back means the profile still has more on disk.
-    const truncated = result.sessions.length >= loaded + SIDEBAR_SESSIONS_PAGE_SIZE
-    setSessionProfilesTruncated(prev => ({ ...prev, [key]: truncated }))
-  }, [filterSidebarRows, sidebarSourceFilter])
+      // A full window back means the profile still has more on disk.
+      const truncated = result.sessions.length >= loaded + SIDEBAR_SESSIONS_PAGE_SIZE
+      setSessionProfilesTruncated(prev => ({ ...prev, [key]: truncated }))
+    },
+    [filterSidebarRows, sidebarSourceFilter]
+  )
 
   return {
     loadMoreMessagingForPlatform,

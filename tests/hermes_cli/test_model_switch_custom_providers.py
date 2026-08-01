@@ -140,6 +140,74 @@ def test_resolve_provider_full_finds_named_custom_provider():
     assert resolved.source == "user-config"
 
 
+@pytest.mark.parametrize(
+    "requested",
+    [
+        "Local Ollama",
+        "local-ollama",
+        "local-127.0.0.1:11434",
+        "custom:local-ollama",
+        "custom:local-127.0.0.1:11434",
+    ],
+)
+def test_keyed_custom_provider_legacy_aliases_resolve_to_stable_key(requested):
+    """Every historical identity resolves, but keyed providers return one ID."""
+    resolved = resolve_provider_full(
+        requested,
+        user_providers={},
+        custom_providers=[
+            {
+                "name": "Local Ollama",
+                "provider_key": "local-127.0.0.1:11434",
+                "base_url": "http://127.0.0.1:11434/v1",
+            }
+        ],
+    )
+
+    assert resolved is not None
+    assert resolved.id == "custom:local-127.0.0.1:11434"
+    assert resolved.name == "Local Ollama"
+
+
+def test_keyed_custom_provider_bare_custom_fallback_uses_stable_key():
+    resolved = resolve_provider_full(
+        "custom",
+        user_providers={},
+        custom_providers=[
+            {
+                "name": "Local Ollama",
+                "provider_key": "local-127.0.0.1:11434",
+                "base_url": "http://127.0.0.1:11434/v1",
+            }
+        ],
+    )
+
+    assert resolved is not None
+    assert resolved.id == "custom:local-127.0.0.1:11434"
+
+
+@pytest.mark.parametrize(
+    "requested",
+    ["foo", "custom:foo", "custom:custom:foo"],
+)
+def test_prefixed_provider_key_does_not_accumulate_custom_prefixes(requested):
+    """Accept the historical doubled form without writing a third identity."""
+    resolved = resolve_provider_full(
+        requested,
+        user_providers={},
+        custom_providers=[
+            {
+                "name": "Foo Relay",
+                "provider_key": "custom:foo",
+                "base_url": "https://foo.example/v1",
+            }
+        ],
+    )
+
+    assert resolved is not None
+    assert resolved.id == "custom:foo"
+
+
 def test_list_authenticated_providers_includes_active_bare_custom_endpoint(monkeypatch):
     """Bare model.provider=custom + model.base_url should still populate /model.
 
@@ -779,6 +847,57 @@ def test_list_authenticated_providers_bare_custom_slug_recovers(monkeypatch):
     # Canonical slug, NOT the bare "custom" that caused #17478
     assert group["slug"] == "custom:ollama"
     assert group["is_current"] is True
+
+
+def test_compatible_keyed_provider_uses_stable_key_and_accepts_legacy_current_name(
+    monkeypatch,
+):
+    """The merged providers view keeps the config key while old IDs stay current."""
+    monkeypatch.setattr("agent.models_dev.fetch_models_dev", lambda: {})
+    monkeypatch.setattr(providers_mod, "HERMES_OVERLAYS", {})
+
+    providers = list_authenticated_providers(
+        current_provider="custom:local-ollama",
+        user_providers={},
+        custom_providers=[
+            {
+                "name": "Local Ollama",
+                "provider_key": "local-127.0.0.1:11434",
+                "base_url": "http://127.0.0.1:11434/v1",
+                "model": "qwen3.5:9b",
+            }
+        ],
+        max_models=50,
+        probe_custom_providers=False,
+    )
+
+    row = next(p for p in providers if p.get("is_user_defined"))
+    assert row["slug"] == "custom:local-127.0.0.1:11434"
+    assert row["is_current"] is True
+
+
+def test_user_provider_row_recognizes_stable_custom_key_as_current(monkeypatch):
+    """Section 3 keeps its legacy row slug but recognizes the stable ID."""
+    monkeypatch.setattr("agent.models_dev.fetch_models_dev", lambda: {})
+    monkeypatch.setattr(providers_mod, "HERMES_OVERLAYS", {})
+
+    providers = list_authenticated_providers(
+        current_provider="custom:local-127.0.0.1:11434",
+        user_providers={
+            "local-127.0.0.1:11434": {
+                "name": "Local Ollama",
+                "base_url": "http://127.0.0.1:11434/v1",
+                "default_model": "qwen3.5:9b",
+            }
+        },
+        custom_providers=[],
+        max_models=50,
+        probe_custom_providers=False,
+    )
+
+    row = next(p for p in providers if p.get("is_user_defined"))
+    assert row["slug"] == "local-127.0.0.1:11434"
+    assert row["is_current"] is True
 
 
 def test_list_authenticated_providers_distinct_endpoints_stay_separate(monkeypatch):

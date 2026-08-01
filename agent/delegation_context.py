@@ -64,20 +64,31 @@ _CHILD_ENV_OVERLAY: ContextVar[dict[str, str | None] | None] = ContextVar(
 
 @contextmanager
 def delegated_child_context(
+    session_id: str | None = None,
+    *,
     overlay: Mapping[str, str | None] | None = None,
 ) -> Iterator[None]:
-    """Mark the current execution context as a delegate_task child.
+    """Mark child execution and isolate its task-local state.
 
     ``overlay`` is a per-child environment map that can shadow process env
     without mutating ``os.environ``.  When provided, code that resolves
     run-scoped HERMES_* variables through :func:`child_env_lookup` will see
     the overlay values (or ``default`` for explicitly removed keys) for this
     thread only.
+
+    Child construction calls ``set_current_session_id`` internally, so even a
+    context entered without an id must restore the parent's ContextVar.  Child
+    execution passes its explicit id and receives it only for this scope.
     """
     token = _DELEGATED_CHILD_CONTEXT.set(True)
     overlay_token = _CHILD_ENV_OVERLAY.set(dict(overlay) if overlay is not None else None)
     try:
-        yield
+        # Import lazily: session_context calls is_delegated_child_context() when
+        # deciding whether the compatibility os.environ mirror is safe.
+        from gateway.session_context import scoped_current_session_id
+
+        with scoped_current_session_id(session_id):
+            yield
     finally:
         _DELEGATED_CHILD_CONTEXT.reset(token)
         _CHILD_ENV_OVERLAY.reset(overlay_token)

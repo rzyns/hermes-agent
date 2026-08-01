@@ -3349,6 +3349,35 @@ class TestMessageRouting:
         adapter.handle_message.assert_not_called()
 
     @pytest.mark.asyncio
+    async def test_accepted_mention_prompt_trusts_adapter_routing(self, adapter):
+        """Cleaned text must not make the model revalidate an accepted mention."""
+        adapter.config.extra.update({"require_mention": True, "strict_mention": True})
+        adapter._bot_display_name = "TestBot"
+        adapter._team_bot_names = {"T123": "WorkspaceBot"}
+        event = {
+            "text": "<@U_BOT> Hi",
+            "user": "U_USER",
+            "channel": "C123",
+            "channel_type": "channel",
+            "team": "T123",
+            "ts": "1234567890.000001",
+        }
+
+        await adapter._handle_slack_message(event)
+
+        adapter.handle_message.assert_awaited_once()
+        msg_event = adapter.handle_message.await_args.args[0]
+        prompt = msg_event.channel_prompt
+        assert msg_event.text == "Hi"
+        assert "@WorkspaceBot" in prompt
+        assert "already applied" in prompt
+        assert "may have been stripped" in prompt
+        assert "do not reject or ignore" in prompt
+        assert "intentionally routed" in prompt
+        assert "not a mention of you" in prompt
+        assert "Only treat a message as directed" not in prompt
+
+    @pytest.mark.asyncio
     async def test_allow_bots_mentions_ignores_bot_user_without_current_mention(
         self, adapter
     ):
@@ -8537,10 +8566,8 @@ class TestThreadImageContext:
         # No cold-start hydrate → no root image download.
         a._download_slack_file.assert_not_called()
 
-# =========================================================================
-# Markdown table preprocessing (Slack mrkdwn does not render GFM tables)
-# =========================================================================
-
+# ==================================================================# Markdown table preprocessing (Slack mrkdwn does not render GFM tables)
+# ==================================================================
 from plugins.platforms.slack.adapter import (  # noqa: E402
     _wrap_markdown_tables,
     _align_table,

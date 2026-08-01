@@ -69,6 +69,7 @@ def _make_runner(adapters):
     runner._running = True
     runner.adapters = adapters
     runner._kanban_sub_fail_counts = {}
+    runner._kanban_dispatcher_lock_handle = object()
     return runner
 
 

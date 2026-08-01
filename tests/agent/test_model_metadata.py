@@ -34,10 +34,8 @@ from agent.model_metadata import (
 )
 
 
-# =========================================================================
-# Token estimation
-# =========================================================================
-
+# ==================================================================# Token estimation
+# ==================================================================
 class TestEstimateTokensRough:
     def test_empty_string(self):
         assert estimate_tokens_rough("") == 0
@@ -119,6 +117,71 @@ class TestEstimateMessagesTokensRough:
         ]}
         result = estimate_messages_tokens_rough([msg])
         assert result < 5000
+    def test_api_content_substitutes_for_content_not_added_to_it(self):
+        """``api_content`` replaces ``content`` on the wire, so count one.
+
+        ``turn_context.substitute_api_content()`` pops the sidecar and
+        overwrites ``content`` at every API-bound build site. Counting both
+        doubled the estimate for any message carrying a sidecar.
+        """
+        body = "cached prompt bytes " * 2000
+        wire_shape = {"role": "user", "content": body}
+        persisted_shape = {"role": "user", "content": body, "api_content": body}
+
+        assert estimate_messages_tokens_rough([persisted_shape]) == \
+            estimate_messages_tokens_rough([wire_shape])
+
+    def test_api_content_is_counted_when_it_differs_from_content(self):
+        """The sidecar is what's sent, so its size is the one that matters."""
+        big_sidecar = "cached prompt bytes " * 2000
+        msg = {"role": "user", "content": "short", "api_content": big_sidecar}
+
+        result = estimate_messages_tokens_rough([msg])
+
+        # Lower bound: fails if the sidecar were dropped rather than
+        # substituted (which would undercount the real request).
+        assert result >= (len(big_sidecar) // 4) * 0.9
+
+    def test_non_string_api_content_does_not_displace_content(self):
+        """Only a sidecar shape the wire actually substitutes may displace content.
+
+        ``substitute_api_content()`` overwrites ``content`` only for a
+        non-empty STRING sidecar on a user/assistant row; every other shape
+        is popped and discarded, leaving the clean ``content`` on the wire.
+        The shadow must mirror that guard — substituting unconditionally
+        would drop the real content from the estimate and UNDERcount, which
+        is the dangerous direction (compaction fires too late and the turn
+        dies on a hard context error).
+        """
+        body = "clean stored content " * 2000
+        baseline = estimate_messages_tokens_rough([{"role": "user", "content": body}])
+
+        for bad_sidecar in (None, "", 42, ["not", "a", "string"]):
+            msg = {"role": "user", "content": body, "api_content": bad_sidecar}
+            assert estimate_messages_tokens_rough([msg]) >= baseline, bad_sidecar
+
+        # Same for a role the substitution never applies to.
+        tool_row = {"role": "tool", "content": body, "api_content": "ignored"}
+        assert estimate_messages_tokens_rough([tool_row]) >= baseline
+
+    def test_image_stripping_survives_shadow_extraction(self):
+        """Non-regression for the ``_wire_message_shadow()`` extraction.
+
+        Both estimator helpers now share one shadow builder; this pins the
+        flat per-image accounting that the extraction moved, independent of
+        the ``api_content`` fix (a valid sidecar is a string, so it cannot
+        carry an image list).
+        """
+        import base64
+        import os
+
+        payload = "data:image/png;base64," + base64.b64encode(os.urandom(300_000)).decode()
+        msg = {"role": "user",
+               "content": [{"type": "image_url", "image_url": {"url": payload}}]}
+
+        # Raw base64 would be ~100K tokens; the flat per-image model is ~1.5K.
+        assert estimate_messages_tokens_rough([msg]) < 5_000
+
 
 
 class TestEstimateRequestTokensRough:
@@ -169,11 +232,45 @@ class TestEstimateRequestTokensRough:
         assert len(mm._TOOLS_TOKENS_CACHE) == cap
 
 
-# =========================================================================
-# Default context lengths
-# =========================================================================
-
+# ==================================================================# Default context lengths
+# ==================================================================
 class TestDefaultContextLengths:
+    def test_nvidia_deepseek_v4_pro_context_is_endpoint_scoped(self):
+        """NVIDIA's 262K NIM window must not lower DeepSeek V4 globally."""
+        with patch("agent.model_metadata.get_cached_context_length", return_value=None), \
+             patch("agent.model_metadata.fetch_model_metadata", return_value={}), \
+             patch("agent.model_metadata.fetch_endpoint_model_metadata", return_value={}), \
+             patch("agent.model_metadata._query_ollama_api_show", return_value=None), \
+             patch("agent.models_dev.lookup_models_dev_context", return_value=None):
+            accepted_urls = (
+                "https://integrate.api.nvidia.com/v1",
+                "https://INTEGRATE.API.NVIDIA.COM/v1/",
+                "https://integrate.api.nvidia.com:443/v1",
+            )
+            rejected_urls = (
+                "http://integrate.api.nvidia.com/v1",
+                "https://integrate.api.nvidia.com:8443/v1",
+                "https://integrate.api.nvidia.com/v1/other",
+                "https://integrate.api.nvidia.com/v1?route=other",
+                "https://example.invalid/v1",
+                "https://api.deepseek.com/v1",
+                "https://openrouter.ai/api/v1",
+            )
+
+            for base_url in accepted_urls:
+                assert get_model_context_length(
+                    "deepseek-ai/deepseek-v4-pro",
+                    provider="nvidia",
+                    base_url=base_url,
+                ) == 262_144
+
+            for base_url in rejected_urls:
+                assert get_model_context_length(
+                    "deepseek-ai/deepseek-v4-pro",
+                    provider="nvidia",
+                    base_url=base_url,
+                ) == 1_000_000
+
     def test_k3_context_is_scoped_to_confirmed_coding_endpoint(self):
         """The bare ``k3`` slug's 1 Mi context must not leak to unverified endpoints.
 
@@ -426,10 +523,8 @@ class TestDefaultContextLengths:
             assert ctx != 32768, "Kimi 32k OR underreport must not be accepted"
 
 
-# =========================================================================
-# Codex OAuth context-window resolution (provider="openai-codex")
-# =========================================================================
-
+# ==================================================================# Codex OAuth context-window resolution (provider="openai-codex")
+# ==================================================================
 class TestCodexOAuthContextLength:
     """ChatGPT Codex OAuth context windows come from the authenticated
     /models catalogue and may differ from the static fallback table or the
@@ -698,10 +793,8 @@ class TestCodexOAuthContextLength:
         assert remaining.get(f"gpt-5.6-terra@{base_url}") == 372_000
 
 
-# =========================================================================
-# Nous Portal context-window resolution (provider="nous")
-# =========================================================================
-
+# ==================================================================# Nous Portal context-window resolution (provider="nous")
+# ==================================================================
 class TestNousPortalContextResolution:
     """Nous Portal /v1/models is authoritative for what Nous infra enforces
     and may diverge from the OpenRouter catalog.
@@ -932,10 +1025,8 @@ class TestNousPortalContextResolution:
             )
 
 
-# =========================================================================
-# get_model_context_length — resolution order
-# =========================================================================
-
+# ==================================================================# get_model_context_length — resolution order
+# ==================================================================
 class TestGetModelContextLength:
     @patch("agent.model_metadata.fetch_model_metadata")
     def test_known_model_from_api(self, mock_fetch):
@@ -1278,10 +1369,8 @@ class TestGetModelContextLength:
         mock_ollama_show.assert_called_once()
 
 
-# =========================================================================
-# Bedrock context resolution — must run BEFORE custom-endpoint probe
-# =========================================================================
-
+# ==================================================================# Bedrock context resolution — must run BEFORE custom-endpoint probe
+# ==================================================================
 class TestBedrockContextResolution:
     """Regression tests for Bedrock context-length resolution order.
 
@@ -1372,10 +1461,8 @@ class TestBedrockContextResolution:
         assert mock_fetch.called
 
 
-# =========================================================================
-# _strip_provider_prefix — Ollama model:tag vs provider:model
-# =========================================================================
-
+# ==================================================================# _strip_provider_prefix — Ollama model:tag vs provider:model
+# ==================================================================
 class TestStripProviderPrefix:
     def test_known_provider_prefix_is_stripped(self):
         assert _strip_provider_prefix("local:my-model") == "my-model"
@@ -1417,10 +1504,8 @@ class TestStripProviderPrefix:
         assert result == 32768
 
 
-# =========================================================================
-# fetch_model_metadata — caching, TTL, slugs, failures
-# =========================================================================
-
+# ==================================================================# fetch_model_metadata — caching, TTL, slugs, failures
+# ==================================================================
 class TestFetchModelMetadata:
     def _reset_cache(self):
         import agent.model_metadata as mm
@@ -1615,10 +1700,8 @@ class TestFetchModelMetadata:
         assert result == {}
 
 
-# =========================================================================
-# Context probe tiers
-# =========================================================================
-
+# ==================================================================# Context probe tiers
+# ==================================================================
 class TestContextProbeTiers:
     def test_tiers_descending(self):
         for i in range(len(CONTEXT_PROBE_TIERS) - 1):
@@ -1655,10 +1738,8 @@ class TestGetNextProbeTier:
         assert get_next_probe_tier(0) is None
 
 
-# =========================================================================
-# Error message parsing
-# =========================================================================
-
+# ==================================================================# Error message parsing
+# ==================================================================
 class TestParseContextLimitFromError:
     def test_openai_format(self):
         msg = "This model's maximum context length is 32768 tokens. However, your messages resulted in 45000 tokens."
@@ -1744,10 +1825,8 @@ class TestParseContextLimitFromError:
         assert parse_context_limit_from_error(msg) is None
 
 
-# =========================================================================
-# Persistent context length cache
-# =========================================================================
-
+# ==================================================================# Persistent context length cache
+# ==================================================================
 class TestContextLengthCache:
     def test_save_and_load(self, tmp_path):
         cache_file = tmp_path / "cache.yaml"

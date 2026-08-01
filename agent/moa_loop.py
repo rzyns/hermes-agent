@@ -8,11 +8,13 @@ iteration.
 
 from __future__ import annotations
 
+import copy
 import hashlib
 import logging
 import re
 import threading
 from concurrent.futures import ThreadPoolExecutor, wait as _futures_wait
+from types import SimpleNamespace
 from typing import Any
 
 from agent.auxiliary_client import call_llm
@@ -1300,6 +1302,53 @@ def aggregate_moa_context(
     )
 
 
+def _completed_response_as_stream_chunk(response: Any) -> Any:
+    """Convert a completed Chat Completions response into one delta stream chunk.
+
+    MoA's outer streaming consumer expects ``choices[0].delta`` chunks. A
+    completed aggregator response carries ``choices[0].message`` instead; adapt
+    it here, at the MoA facade boundary, so provider-specific Relay behavior and
+    other transports remain untouched.
+    """
+
+    choices = getattr(response, "choices", None)
+    first_choice = choices[0] if isinstance(choices, (list, tuple)) and choices else None
+    message = getattr(first_choice, "message", None)
+    raw_tool_calls = getattr(message, "tool_calls", None)
+    tool_call_deltas = None
+    if isinstance(raw_tool_calls, (list, tuple)) and raw_tool_calls:
+        tool_call_deltas = []
+        for index, tc in enumerate(raw_tool_calls):
+            function = getattr(tc, "function", None)
+            tool_call_deltas.append(SimpleNamespace(
+                index=getattr(tc, "index", index),
+                id=getattr(tc, "id", None),
+                type=getattr(tc, "type", None) or "function",
+                function=SimpleNamespace(
+                    name=getattr(function, "name", None),
+                    arguments=getattr(function, "arguments", None),
+                ),
+            ))
+    delta = SimpleNamespace(
+        content=getattr(message, "content", None),
+        tool_calls=tool_call_deltas,
+        reasoning_content=getattr(message, "reasoning_content", None),
+        reasoning=getattr(message, "reasoning", None),
+        reasoning_details=getattr(message, "reasoning_details", None),
+    )
+    choice = SimpleNamespace(
+        index=getattr(first_choice, "index", 0),
+        delta=delta,
+        finish_reason=getattr(first_choice, "finish_reason", None) or "stop",
+    )
+    return SimpleNamespace(
+        id=getattr(response, "id", None),
+        model=getattr(response, "model", None),
+        choices=[choice],
+        usage=getattr(response, "usage", None),
+    )
+
+
 def _attach_reference_guidance(agg_messages: list[dict[str, Any]], guidance: str) -> None:
     """Attach the per-turn reference block at the END of the aggregator prompt.
 
@@ -1609,6 +1658,59 @@ class MoAChatCompletions:
         max_tokens: Any = agg_kwargs.get("max_tokens")
         tools: Any = agg_kwargs.get("tools")
         extra_body: Any = agg_kwargs.get("extra_body")
+        agg_runtime = _slot_runtime(aggregator)
+        try:
+            from types import SimpleNamespace
+
+            from agent.agent_runtime_helpers import (
+                _direct_native_anthropic_tool_cache_capability,
+                anthropic_prompt_cache_policy,
+            )
+            from agent.prompt_caching import (
+                build_prompt_cache_plan,
+                strip_anthropic_cache_control,
+                strip_anthropic_tool_cache_control,
+            )
+
+            guidance = prepared.get("guidance")
+            canonical_messages = copy.deepcopy(agg_messages)
+            if guidance:
+                canonical_messages = peel_reference_guidance(
+                    canonical_messages,
+                    str(guidance),
+                )
+            strip_anthropic_cache_control(canonical_messages)
+            canonical_tools = strip_anthropic_tool_cache_control(tools)
+            cache_stub = SimpleNamespace(provider="", base_url="", api_mode="", model="")
+            should_cache, native_layout = anthropic_prompt_cache_policy(
+                cache_stub,
+                provider=agg_runtime.get("provider") or "",
+                base_url=agg_runtime.get("base_url") or "",
+                api_mode=agg_runtime.get("api_mode") or "",
+                model=agg_runtime.get("model") or "",
+            )
+            if should_cache:
+                plan = build_prompt_cache_plan(
+                    canonical_messages,
+                    canonical_tools,
+                    native_anthropic=native_layout,
+                    direct_native_tool_cache=_direct_native_anthropic_tool_cache_capability(
+                        cache_stub,
+                        provider=agg_runtime.get("provider") or "",
+                        base_url=agg_runtime.get("base_url") or "",
+                        api_mode=agg_runtime.get("api_mode") or "",
+                        model=agg_runtime.get("model") or "",
+                    ),
+                )
+                agg_messages = plan.messages
+                tools = plan.tools
+            else:
+                agg_messages = canonical_messages
+                tools = canonical_tools
+            if guidance:
+                _attach_reference_guidance(agg_messages, str(guidance))
+        except Exception as exc:  # pragma: no cover - cache planning must not block MoA
+            logger.debug("MoA aggregator cache plan skipped: %s", exc)
         # Record the exact aggregator INPUT (incl. the injected reference
         # context) into the pending trace so a trace captures what the
         # aggregator actually saw, not a reconstruction. Traces are a
@@ -1649,7 +1751,6 @@ class MoAChatCompletions:
             # actually governs the aggregator stream, not just call_llm's default.
             if api_kwargs.get("timeout") is not None:
                 stream_kwargs["timeout"] = api_kwargs["timeout"]
-        agg_runtime = _slot_runtime(aggregator)
         # _slot_runtime may carry the provider's request_overrides.extra_body;
         # pop it and merge with the caller's extra_body (caller wins) so the
         # explicit kwarg below never collides with **agg_runtime.
@@ -1685,6 +1786,14 @@ class MoAChatCompletions:
                     self._pending_trace["aggregator_output"] = _extract_text(_agg_response)
                 except Exception:  # pragma: no cover - defensive
                     self._pending_trace["aggregator_output"] = None
+        if stream and hasattr(_agg_response, "choices"):
+            # Some aggregator adapters (notably openai-codex Responses) consume
+            # their provider stream internally and return a completed response
+            # object even when the acting consumer requested token streaming.
+            # The outer chat-completions streaming loop expects delta chunks;
+            # hand it a one-chunk iterator instead of letting it iterate the
+            # SimpleNamespace response itself (#55933).
+            return iter((_completed_response_as_stream_chunk(_agg_response),))
         return _agg_response
 
     def create(self, **api_kwargs: Any) -> Any:
@@ -2174,8 +2283,24 @@ def build_moa_facade(agent, preset_name: Any = None) -> MoAClient:
         except Exception:
             pass
 
+    resolved_preset = preset_name
+    if resolved_preset is None and getattr(agent, "provider", None) == "moa":
+        resolved_preset = getattr(agent, "model", None)
+
+    resolved_preset = str(resolved_preset or "default")
+    try:
+        from hermes_cli.config import load_config
+        from hermes_cli.moa_config import normalize_moa_config
+
+        moa_cfg = normalize_moa_config(load_config().get("moa") or {})
+        presets = moa_cfg.get("presets") or {}
+        if resolved_preset not in presets:
+            resolved_preset = moa_cfg.get("default_preset") or "default"
+    except Exception:
+        resolved_preset = "default"
+
     return MoAClient(
-        str(preset_name or getattr(agent, "model", None) or "default"),
+        resolved_preset,
         reference_callback=_moa_reference_relay,
         # Thread the agent through so the reference fan-out wait can be
         # aborted on a user interrupt (see _run_references_parallel).
