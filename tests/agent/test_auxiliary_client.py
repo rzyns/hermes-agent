@@ -804,6 +804,154 @@ class TestBuildCodexClient:
         assert mock_openai.call_count == 2
 
 
+class TestExternalProviderFactoryResolution:
+    @staticmethod
+    def _register_external_provider(monkeypatch, *, with_factory=True):
+        import providers
+        from providers.base import ProviderProfile
+
+        monkeypatch.setattr(providers, "_REGISTRY", {})
+        monkeypatch.setattr(providers, "_ALIASES", {})
+        monkeypatch.setattr(providers, "_CLIENT_FACTORIES", {})
+        monkeypatch.setattr(providers, "_discovered", True)
+
+        profile = ProviderProfile(
+            name="test-external",
+            aliases=("claude-code", "claude-code-runtime-provider"),
+            base_url="test-external://local",
+            api_mode="chat_completions",
+            auth_type="external_process",
+        )
+        providers.register_provider(profile)
+
+        created = []
+        client = SimpleNamespace(
+            api_key="test-external-external-process",
+            base_url=profile.base_url,
+            chat=SimpleNamespace(
+                completions=SimpleNamespace(
+                    create=lambda **kwargs: SimpleNamespace(kwargs=kwargs),
+                ),
+            ),
+        )
+        if with_factory:
+            def factory(**kwargs):
+                created.append(kwargs)
+                return client
+
+            providers.register_provider_client_factory(profile.name, factory)
+        return profile, client, created
+
+    @pytest.mark.parametrize("selector", ["claude-code", "claude-code-runtime-provider"])
+    def test_marker_backed_alias_preserves_provider_identity(self, monkeypatch, selector):
+        profile, _client, _created = self._register_external_provider(monkeypatch)
+
+        resolved = _resolve_task_provider_model(
+            task="moa_aggregator",
+            provider=selector,
+            model="claude-fable-5",
+            base_url=profile.base_url,
+            api_key="test-external-external-process",
+        )
+
+        assert resolved == (
+            selector,
+            "claude-fable-5",
+            profile.base_url,
+            "test-external-external-process",
+            None,
+        )
+
+    @pytest.mark.parametrize("selector", ["claude-code", "claude-code-runtime-provider"])
+    def test_external_factory_preempts_auxiliary_alias_routing(self, monkeypatch, selector):
+        profile, expected_client, created = self._register_external_provider(monkeypatch)
+        monkeypatch.setattr(
+            "agent.auxiliary_client._try_anthropic",
+            lambda **_kwargs: pytest.fail("external provider fell through to Anthropic"),
+        )
+
+        client, model = resolve_provider_client(
+            selector,
+            "claude-fable-5",
+            explicit_base_url=profile.base_url,
+            explicit_api_key="test-external-external-process",
+            api_mode="chat_completions",
+            task="moa_aggregator",
+        )
+
+        assert client is expected_client
+        assert model == "claude-fable-5"
+        assert created == [{
+            "api_key": "test-external-external-process",
+            "base_url": profile.base_url,
+        }]
+
+    def test_external_provider_without_factory_fails_closed(self, monkeypatch):
+        import providers
+
+        profile, _client, _created = self._register_external_provider(
+            monkeypatch, with_factory=False,
+        )
+
+        with pytest.raises(
+            providers.ExternalProviderClientUnavailableError,
+            match="client factory is not available",
+        ):
+            resolve_provider_client(
+                "claude-code",
+                "claude-fable-5",
+                explicit_base_url=profile.base_url,
+            )
+
+    def test_external_provider_honors_disabled_alias_policy(self, monkeypatch):
+        profile, _client, _created = self._register_external_provider(monkeypatch)
+        monkeypatch.setattr(
+            "hermes_cli.config.load_config_readonly",
+            lambda: {"providers": {"claude-code": {"enabled": False}}},
+        )
+
+        with pytest.raises(ValueError, match="providers.claude-code.enabled: false"):
+            resolve_provider_client(
+                "claude-code",
+                "claude-fable-5",
+                explicit_base_url=profile.base_url,
+            )
+
+    @pytest.mark.asyncio
+    async def test_sync_external_factory_gets_async_auxiliary_adapter(self, monkeypatch):
+        profile, _client, _created = self._register_external_provider(monkeypatch)
+
+        client, model = resolve_provider_client(
+            "claude-code-runtime-provider",
+            "claude-fable-5",
+            async_mode=True,
+            explicit_base_url=profile.base_url,
+            explicit_api_key="test-external-external-process",
+        )
+        assert client is not None
+        response = await client.chat.completions.create(messages=[])
+
+        assert response.kwargs == {"messages": []}
+        assert model == "claude-fable-5"
+        assert client.base_url == profile.base_url
+
+    @pytest.mark.asyncio
+    async def test_sync_external_stream_gets_async_iterator(self, monkeypatch):
+        profile, sync_client, _created = self._register_external_provider(monkeypatch)
+        sync_client.chat.completions.create = lambda **_kwargs: iter(("one", "two"))
+
+        client, _model = resolve_provider_client(
+            "claude-code",
+            "claude-fable-5",
+            async_mode=True,
+            explicit_base_url=profile.base_url,
+        )
+        assert client is not None
+        chunks = await client.chat.completions.create(messages=[], stream=True)
+
+        assert [chunk async for chunk in chunks] == ["one", "two"]
+
+
 class TestResolveProviderClientUniversalModelFallback:
     """resolve_provider_client() picks a sensible model when callers pass none (#31845).
 
@@ -2782,6 +2930,23 @@ class TestCodexAdapterReasoningTranslation:
         assert captured.get("reasoning") == {"effort": "low", "summary": "auto"}
 
 
+    def test_stream_request_returns_iterable_chat_chunks(self):
+        """MoA's acting Codex aggregator requires an iterable chat stream."""
+        adapter, _captured = self._build_adapter()
+
+        chunks = list(adapter.create(
+            messages=[{"role": "user", "content": "hi"}],
+            stream=True,
+            stream_options={"include_usage": True},
+        ))
+
+        assert len(chunks) == 1
+        chunk = chunks[0]
+        assert chunk.choices[0].delta.content == "hi"
+        assert chunk.choices[0].finish_reason == "stop"
+        assert chunk.usage.prompt_tokens == 1
+
+
 
 
     def test_no_extra_body_means_no_reasoning_keys(self):
@@ -3479,6 +3644,18 @@ class TestBuildCallKwargsToolDedup:
             provider="openai", model="gpt-4o", messages=[], tools=[],
         )
         assert kwargs.get("tools") == [] or "tools" not in kwargs
+
+    @pytest.mark.parametrize("bad_type", [None, "", "   "])
+    def test_function_tool_empty_type_is_normalized_without_mutating_input(self, bad_type):
+        tool = self._make_tool("delegate_task")
+        tool["type"] = bad_type
+
+        kwargs = _build_call_kwargs(
+            provider="zai", model="glm-5.2", messages=[], tools=[tool],
+        )
+
+        assert kwargs["tools"][0]["type"] == "function"
+        assert tool["type"] == bad_type
 
 
 
