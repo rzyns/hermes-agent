@@ -131,6 +131,23 @@ _KANBAN_MUTATION_ISOLATION_ROOT: ContextVar[Optional[Path]] = ContextVar(
 )
 
 
+@dataclass(frozen=True)
+class _KanbanAuthScope:
+    """Authorization context recorded when a kanban DB connection is opened.
+
+    The guard in ``write_txn`` uses this to decide whether the connection's
+    actual on-disk identity (from ``PRAGMA database_list``) is still authorized
+    for writes.  An explicit ``db_path`` is honored as an intentional caller
+    override, but only while the effective kanban root has not shifted since
+    the connection was opened.  If ``HERMES_HOME`` changes after open time,
+    the connection must be re-evaluated against the new effective root.
+    """
+
+    effective_root_at_open: Path
+    isolation_root_at_open: Optional[Path] = None
+    explicit_path: Optional[Path] = None
+
+
 @contextlib.contextmanager
 def kanban_mutation_isolation(root: str | Path):
     """Temporarily require that all Kanban mutations target *root*.
@@ -288,10 +305,34 @@ def _assert_db_path_under_effective_root(
     when we are resolving the path from the current environment.
 
     When ``conn`` is supplied, the check uses the actual main database file
-    from ``PRAGMA database_list`` rather than re-resolving the env.
+    from ``PRAGMA database_list`` rather than re-resolving the env.  Connections
+    opened with an explicit ``db_path`` carry a connection-scoped authorization
+    scope; that provenance is honored only while the effective kanban root has
+    not shifted since the connection was opened.
     """
+    # An explicit ``db_path`` argument means the caller directly named the
+    # target file; we do not second-guess that decision at open time.
     if explicit:
         return
+    # An active ``kanban_mutation_isolation(root)`` envelope authorizes any
+    # path/connection under the declared temp root.  It is checked before this
+    # helper, so when it covers the target we honor it as the authoritative
+    # scope.  This lets verification matrices and repair scripts use a temp
+    # root that is intentionally not the same as ``kanban_home()``.
+    isolation_root = _get_mutation_isolation_root()
+    if isolation_root is not None:
+        if conn is not None:
+            identity = _resolve_db_identity(conn)
+            if identity is not None and _is_under_isolation_root(
+                identity, isolation_root
+            ):
+                return
+        elif path is not None and _is_under_isolation_root(path, isolation_root):
+            return
+        elif path is None and _is_under_isolation_root(
+            kanban_db_path(), isolation_root
+        ):
+            return
     # Only enforce for worker contexts; manual/test callers may use arbitrary
     # legacy HERMES_KANBAN_DB paths.
     if not os.environ.get("HERMES_KANBAN_TASK"):
@@ -303,6 +344,15 @@ def _assert_db_path_under_effective_root(
         if identity is None:
             return
         resolved = identity.expanduser().resolve()
+        # Explicit-path provenance is honored as an intentional caller override,
+        # but only while the effective root has not shifted since the connection
+        # was opened.  If HERMES_HOME changed after open time, the connection is
+        # re-evaluated against the new effective root like any env-resolved
+        # path.  See t_b3353f58 comment 314.
+        scope = getattr(conn, "_hermes_kanban_auth_scope", None)
+        if scope is not None and scope.explicit_path is not None:
+            if scope.effective_root_at_open == root:
+                return
     else:
         resolved = kanban_db_path() if path is None else path
         resolved = resolved.expanduser().resolve()
@@ -316,6 +366,24 @@ def _assert_db_path_under_effective_root(
             f"root, or use kanban_mutation_isolation(root) for intentional "
             f"temp-root work. See t_d69cfc23."
         )
+
+
+def _record_connection_auth_scope(
+    conn: sqlite3.Connection,
+    *,
+    explicit_path: Optional[Path] = None,
+) -> None:
+    """Stamp a connection with the authorization context at open time.
+
+    ``write_txn`` and other fail-closed mutators later compare the connection's
+    actual on-disk identity (``PRAGMA database_list``) against this scope.
+    """
+    scope = _KanbanAuthScope(
+        effective_root_at_open=_effective_kanban_root(),
+        isolation_root_at_open=_get_mutation_isolation_root(),
+        explicit_path=explicit_path,
+    )
+    setattr(conn, "_hermes_kanban_auth_scope", scope)
 
 
 def _kanban_dependencies():
@@ -2852,6 +2920,10 @@ def connect(
     else:
         path = kanban_db_path(board=board)
     _assert_mutation_isolation_permits(path)
+    # Fail closed before any filesystem or SQLite mutation.  This is the
+    # primary defense against in-process HERMES_HOME overrides that leave a
+    # stale HERMES_KANBAN_DB pointing at a live board (t_d69cfc23).
+    _assert_db_path_under_effective_root(path, explicit=db_path is not None)
     path.parent.mkdir(parents=True, exist_ok=True)
 
     # Fast path: once THIS process has initialized this path, the expensive
@@ -2866,6 +2938,10 @@ def connect(
     # connection with WAL/pragmas under the cheap in-process _INIT_LOCK.
     resolved = str(path.resolve())
     if resolved in _INITIALIZED_PATHS:
+        # Re-validate the effective-root guard on the fast path too: a
+        # connection that was first opened under a legitimate root must not be
+        # reused to write a stale-pinned live board after the env shifts.
+        _assert_db_path_under_effective_root(path, explicit=db_path is not None)
         conn = _sqlite_connect(path)
         try:
             conn.row_factory = sqlite3.Row
@@ -2880,6 +2956,9 @@ def connect(
         except Exception:
             conn.close()
             raise
+        _record_connection_auth_scope(
+            conn, explicit_path=path if db_path is not None else None
+        )
         return conn
 
     with _cross_process_init_lock(path):
@@ -2927,12 +3006,18 @@ def connect(
                 # Surface corrupt cells as read errors instead of silent
                 # wrong-data returns.
                 conn.execute("PRAGMA cell_size_check=ON")
+                # Stamp the authorization scope before any additive migration
+                # that enters write_txn, so explicit-path and isolation-root
+                # provenance is available to the fail-closed checks.
+                _record_connection_auth_scope(
+                    conn, explicit_path=path if db_path is not None else None
+                )
                 needs_init = resolved not in _INITIALIZED_PATHS
                 if needs_init:
                     # Idempotent: runs CREATE TABLE IF NOT EXISTS + the additive
                     # migrations. Cached so subsequent connect() calls in the same
                     # process are cheap. The lock prevents same-process dispatcher
-                    # threads from racing through the additive ALTER TABLE pass with
+                    # startup threads from racing through the additive ALTER TABLE pass with
                     # stale PRAGMA snapshots during gateway startup.
                     conn.executescript(SCHEMA_SQL)
                     _migrate_add_optional_columns(conn)
@@ -2948,6 +3033,7 @@ def connect(
         except Exception:
             conn.close()
             raise
+    # Auth scope was already recorded inside the init lock for the slow path.
     return conn
 
 
