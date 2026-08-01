@@ -247,6 +247,77 @@ def _assert_mutation_isolation_permits(
         )
 
 
+def _effective_kanban_root() -> Path:
+    """Return the effective root against which env-resolved DB paths are scoped.
+
+    In normal operation this equals :func:`kanban_home`.  It is evaluated at
+    call time so an in-process ``HERMES_HOME`` mutation is reflected
+    immediately.  If a process imports ``kanban_db`` while the dispatcher's
+    live-board env is in place, then mutates ``HERMES_HOME`` to a temp root
+    without updating ``HERMES_KANBAN_DB``, the resolved DB path will no longer
+    fall under this root and writes are refused.
+    """
+    return kanban_home().expanduser().resolve()
+
+
+def _assert_db_path_under_effective_root(
+    path: Optional[Path] = None,
+    *,
+    conn: Optional[sqlite3.Connection] = None,
+    explicit: bool = False,
+) -> None:
+    """Fail closed when an env-resolved DB path points outside the effective root.
+
+    This is the non-opt-in defense for in-process ``HERMES_HOME`` /
+    ``HERMES_KANBAN_HOME`` overrides that leave a stale ``HERMES_KANBAN_DB``
+    pointing at a live board (the wave-2 junk-card root cause in t_d69cfc23).
+    Callers that intentionally operate on a throwaway root should use
+    :func:`kanban_mutation_isolation` to declare the root; that envelope is
+    checked before this helper, so it remains the primary authority.
+
+    The guard is scoped to worker-like contexts (``HERMES_KANBAN_TASK`` set) so
+    that tests, manual CLI use, and legacy ``HERMES_KANBAN_DB`` overrides keep
+    working.  A dispatcher-spawned worker has ``HERMES_KANBAN_TASK`` set; if it
+    mutates ``HERMES_HOME`` in-process without rebinding ``HERMES_KANBAN_DB``,
+    the resolved DB path will fall outside the new :func:`kanban_home` and the
+    write is refused.
+
+    ``explicit`` should be ``True`` when the caller passed an explicit
+    ``db_path`` argument.  In that case the caller has directly named the
+    target file, so we do not second-guess it here.  The guard only applies
+    when we are resolving the path from the current environment.
+
+    When ``conn`` is supplied, the check uses the actual main database file
+    from ``PRAGMA database_list`` rather than re-resolving the env.
+    """
+    if explicit:
+        return
+    # Only enforce for worker contexts; manual/test callers may use arbitrary
+    # legacy HERMES_KANBAN_DB paths.
+    if not os.environ.get("HERMES_KANBAN_TASK"):
+        return
+    root = _effective_kanban_root()
+    if conn is not None:
+        identity = _resolve_db_identity(conn)
+        # Ambiguous / in-memory connections are not scoped by this guard.
+        if identity is None:
+            return
+        resolved = identity.expanduser().resolve()
+    else:
+        resolved = kanban_db_path() if path is None else path
+        resolved = resolved.expanduser().resolve()
+    try:
+        resolved.relative_to(root)
+    except (ValueError, OSError):
+        raise PermissionError(
+            f"kanban_db: resolved DB path {resolved} is outside the effective "
+            f"kanban root {root}. If you changed HERMES_HOME in-process, "
+            f"update HERMES_KANBAN_DB / HERMES_KANBAN_BOARD to match the new "
+            f"root, or use kanban_mutation_isolation(root) for intentional "
+            f"temp-root work. See t_d69cfc23."
+        )
+
+
 def _kanban_dependencies():
     """Return the current dependency-provider module.
 
@@ -2935,6 +3006,7 @@ def init_db(
     else:
         path = kanban_db_path(board=board)
     _assert_mutation_isolation_permits(path)
+    _assert_db_path_under_effective_root(path, explicit=db_path is not None)
     path.parent.mkdir(parents=True, exist_ok=True)
     resolved = str(path.resolve())
     # Clear the cache entry so the underlying connect() re-runs the
@@ -3470,6 +3542,7 @@ def write_txn(conn: sqlite3.Connection):
     """
     _assert_mutation_isolation_permits(None, conn=conn)
     _assert_not_delegated_child_mutation()
+    _assert_db_path_under_effective_root(conn=conn)
     _execute_boundary_with_retry(conn, "BEGIN IMMEDIATE")
     try:
         yield conn

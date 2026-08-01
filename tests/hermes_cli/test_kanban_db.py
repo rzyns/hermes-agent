@@ -4467,6 +4467,106 @@ class TestSharedBoardPaths:
         assert kb.kanban_db_path() == default_home / "kanban.db"
         assert kb.workspaces_root() == default_home / "kanban" / "workspaces"
 
+    def test_in_process_hermes_home_override_without_db_pin_fails_closed(
+        self, tmp_path, monkeypatch
+    ):
+        # Regression for the wave-2 junk-card root cause (t_d69cfc23):
+        # a process imports kanban_db under a live-board HERMES_HOME, then
+        # mutates HERMES_HOME (and even Path.home) to a temp root *without*
+        # rebinding HERMES_KANBAN_DB / HERMES_KANBAN_BOARD.  The stale env
+        # pins would otherwise keep pointing at the live board and the next
+        # write would land on production data.  The fail-closed guard must
+        # reject the write as soon as the resolved DB path falls outside the
+        # new effective kanban root.
+        live_root = tmp_path / "live_hermes"
+        live_root.mkdir(parents=True)
+        profile_home = live_root / "profiles" / "platform-eng"
+        profile_home.mkdir(parents=True)
+        temp_root = tmp_path / "mutant_repro"
+
+        # Start in the live worker context (dispatcher-spawn shape).
+        monkeypatch.setattr(Path, "home", lambda: tmp_path)
+        monkeypatch.setenv("HERMES_HOME", str(profile_home))
+        monkeypatch.setenv("HERMES_KANBAN_TASK", "t_f40d1287")
+        monkeypatch.setenv("HERMES_KANBAN_BOARD", "hermes")
+        monkeypatch.setenv("HERMES_KANBAN_DB", "")
+        monkeypatch.setenv("HERMES_KANBAN_HOME", "")
+        monkeypatch.setenv("HERMES_KANBAN_WORKSPACES_ROOT", "")
+
+        # Import under the live env and confirm resolution lands on the live root.
+        import importlib
+        import hermes_cli.kanban_db as _kb
+        importlib.reload(_kb)
+        live_db = _kb.kanban_db_path()
+        assert live_db.is_relative_to(live_root)
+        assert _kb.kanban_home() == live_root
+
+        # Now the repro: in-process override of HERMES_HOME + Path.home to a
+        # temp directory, *without* rebinding the board/db pins.  This is what
+        # the mutant-repro scripts did; without the guard it writes live data.
+        monkeypatch.setenv("HERMES_HOME", str(temp_root))
+        monkeypatch.setattr(Path, "home", lambda: temp_root)
+
+        assert _kb.kanban_home() == temp_root
+        resolved = _kb.kanban_db_path()
+        # With no explicit DB pin and the active board defaulting from the
+        # (non-existent) current file, kanban_db_path() now resolves under the
+        # new temp root.  The important thing is that *if* the resolved path
+        # still pointed at the live board (e.g. because HERMES_KANBAN_DB or
+        # HERMES_KANBAN_BOARD was pinning it), the guard would refuse writes.
+        # For this regression test we force that stale-pin scenario by keeping
+        # HERMES_KANBAN_DB pointed at the live DB.
+        monkeypatch.setenv("HERMES_KANBAN_DB", str(live_db))
+        resolved = _kb.kanban_db_path()
+        assert resolved == live_db
+        assert not resolved.is_relative_to(temp_root)
+
+        # init_db() and any write_txn path must fail closed.
+        with pytest.raises(PermissionError):
+            _kb.init_db()
+
+        with pytest.raises(PermissionError):
+            _kb.connect()
+
+        # Even if a caller opened the connection before overriding the env,
+        # write_txn must still check the connection's actual DB identity.
+        # We open the live DB *before* overriding HERMES_HOME so the connection
+        # is valid, then mutate the env and attempt a write.
+        monkeypatch.setenv("HERMES_HOME", str(live_root))
+        pre_conn = _kb.connect(db_path=live_db)
+        monkeypatch.setenv("HERMES_HOME", str(temp_root))
+        monkeypatch.setattr(Path, "home", lambda: temp_root)
+        with pytest.raises(PermissionError):
+            _kb.create_task(pre_conn, title="x", assignee="a")
+        pre_conn.close()
+
+        # If the caller legitimately wants a temp-root board, they must
+        # rebind HERMES_KANBAN_DB to a path under the new root (or use
+        # kanban_mutation_isolation).  Rebinding proves the guard is
+        # per-environment, not a blanket denial.
+        temp_db = temp_root / "kanban" / "boards" / "hermes" / "kanban.db"
+        monkeypatch.setenv("HERMES_KANBAN_DB", str(temp_db))
+        assert _kb.kanban_db_path().is_relative_to(temp_root)
+        _kb.init_db()
+        with _kb.connect() as conn:
+            tid = _kb.create_task(conn, title="fixture", assignee="reviewer")
+        assert tid.startswith("t_")
+        assert temp_db.exists()
+
+        # Legacy explicit db_path arguments are honored even when they fall
+        # outside the new effective root.  This preserves intentional
+        # caller-named targets (tests, repair scripts) while the guard only
+        # second-guesses env-resolved paths.  We pop HERMES_KANBAN_TASK so
+        # the worker-context guard is not active for this leg of the test.
+        monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
+        external_db = tmp_path / "external" / "board.db"
+        external_db.parent.mkdir(parents=True)
+        _kb.init_db(db_path=external_db)
+        with _kb.connect(db_path=external_db) as conn:
+            tid2 = _kb.create_task(conn, title="explicit", assignee="reviewer")
+        assert tid2.startswith("t_")
+        assert external_db.exists()
+
     def test_dispatcher_spawn_injects_kanban_paths_without_stale_session(
         self, tmp_path, monkeypatch
     ):
