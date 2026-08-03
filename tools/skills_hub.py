@@ -423,8 +423,9 @@ class GitHubAuth:
             if self._cached_method != "github-app" or time.time() < self._app_token_expiry:
                 return self._cached_token
 
-        # 1. Environment variable
-        token = os.environ.get("GITHUB_TOKEN") or os.environ.get("GH_TOKEN")
+        # 1. Environment variable (profile-scoped under a multiplexed gateway)
+        from agent.secret_scope import get_secret
+        token = get_secret("GITHUB_TOKEN") or get_secret("GH_TOKEN")
         if token:
             self._cached_token = token
             self._cached_method = "pat"
@@ -465,9 +466,10 @@ class GitHubAuth:
 
     def _try_github_app(self) -> Optional[str]:
         """Try GitHub App JWT authentication if credentials are configured."""
-        app_id = os.environ.get("GITHUB_APP_ID")
-        key_path = os.environ.get("GITHUB_APP_PRIVATE_KEY_PATH")
-        installation_id = os.environ.get("GITHUB_APP_INSTALLATION_ID")
+        from agent.secret_scope import get_secret
+        app_id = get_secret("GITHUB_APP_ID")
+        key_path = get_secret("GITHUB_APP_PRIVATE_KEY_PATH")
+        installation_id = get_secret("GITHUB_APP_INSTALLATION_ID")
 
         if not all([app_id, key_path, installation_id]):
             return None
@@ -503,7 +505,7 @@ class GitHubAuth:
             if resp.status_code == 201:
                 return resp.json().get("token")
         except Exception as e:
-            logger.debug(f"GitHub App auth failed: {e}")
+            logger.debug("GitHub App auth failed: %s", e)
 
         return None
 
@@ -664,7 +666,7 @@ class GitHubSource(SkillSource):
                     if query_lower in searchable:
                         results.append(skill)
             except Exception as e:
-                logger.debug(f"Failed to search {tap['repo']}: {e}")
+                logger.debug("Failed to search %s: %s", tap['repo'], e)
                 continue
 
         # Deduplicate by identifier, preferring higher trust levels.
@@ -4004,6 +4006,32 @@ def quarantine_bundle(bundle: SkillBundle) -> Path:
     return dest
 
 
+def _category_skill_dirs(directory: Path) -> List[str]:
+    """Names of direct children of *directory* that contain skills.
+
+    A child counts when it is a non-hidden directory holding at least one
+    active ``SKILL.md`` anywhere below it (recursive, so nested category
+    layouts like ``mlops/training/<skill>`` are detected). Vendored,
+    cache, and progressive-disclosure support paths are pruned via
+    :func:`is_excluded_skill_path` so a lone ``node_modules`` or
+    ``references/pkg/SKILL.md`` hit does not misclassify the directory as
+    a category. Shared by the install-time category guard here and
+    ``hermes_cli.skills_hub._existing_categories``.
+    """
+    skill_dirs: List[str] = []
+    for entry in directory.iterdir():
+        if not entry.is_dir() or entry.name.startswith("."):
+            continue
+        for skill_md in entry.rglob("SKILL.md"):
+            if is_excluded_skill_path(
+                skill_md.relative_to(directory), root=directory
+            ):
+                continue
+            skill_dirs.append(entry.name)
+            break
+    return skill_dirs
+
+
 def install_from_quarantine(
     quarantine_path: Path,
     skill_name: str,
@@ -4030,9 +4058,44 @@ def install_from_quarantine(
     # to replace by unlinking the symlink itself.
     install_dir = _resolve_install_target_path(install_rel_path, safe_skill_name)
 
-    if install_dir.is_symlink() or install_dir.is_file():
+    # Refuse to nest a skill inside an existing skill directory. Installing
+    # with ``--category <name-of-an-existing-skill>`` would create a hybrid
+    # skill-plus-category directory; a later update or uninstall of the outer
+    # skill would then rmtree the inner one.
+    skills_root = _skills_dir().resolve()
+    ancestor = install_dir.parent
+    while ancestor != skills_root and ancestor.is_relative_to(skills_root):
+        if (ancestor / "SKILL.md").is_file():
+            raise ValueError(
+                f"Refusing to install into '{ancestor.name}': it is an "
+                f"existing skill directory, not a category. Choose a "
+                f"different category."
+            )
+        ancestor = ancestor.parent
+
+    # Preserve replacement of an existing final-path symlink (including a
+    # broken one) without following it. Regular-file collisions are refused.
+    if install_dir.is_symlink():
         install_dir.unlink()
     elif install_dir.exists():
+        if not install_dir.is_dir():
+            raise ValueError(
+                f"Refusing to install: '{install_dir.name}' already exists "
+                f"and is not a directory. Remove it or choose a different "
+                f"skill name."
+            )
+        # Guard against silent data loss when the install target collides with
+        # an existing category bucket. A directory that directly contains
+        # SKILL.md remains an overwritable skill installation.
+        if not (install_dir / "SKILL.md").exists():
+            skill_dirs_in = _category_skill_dirs(install_dir)
+            if skill_dirs_in:
+                raise ValueError(
+                    f"Refusing to overwrite category directory '{install_dir}' "
+                    f"which contains {len(skill_dirs_in)} skill(s): "
+                    f"{', '.join(sorted(skill_dirs_in))}. "
+                    f"Use a different --name or install into a subcategory."
+                )
         shutil.rmtree(install_dir)
 
     # Warn (but don't block) if SKILL.md is very large

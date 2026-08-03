@@ -55,6 +55,7 @@ class ExternalProviderClientUnavailableError(RuntimeError):
 _REGISTRY: dict[str, ProviderProfile] = {}
 _ALIASES: dict[str, str] = {}
 _CLIENT_FACTORIES: dict[str, ProviderClientFactory] = {}
+_PROVIDER_LIST_CACHE: list[ProviderProfile] | None = None
 _discovered = False
 
 # Repo-root ``plugins/model-providers/`` — populated at discovery time.
@@ -72,6 +73,7 @@ def register_provider(profile: ProviderProfile) -> None:
     invalidates its prior client factory so an override cannot accidentally
     inherit another plugin's executable transport.
     """
+    global _PROVIDER_LIST_CACHE
     previous = _REGISTRY.get(profile.name)
     if previous is not None and previous is not profile:
         _CLIENT_FACTORIES.pop(profile.name, None)
@@ -81,6 +83,7 @@ def register_provider(profile: ProviderProfile) -> None:
     _REGISTRY[profile.name] = profile
     for alias in profile.aliases:
         _ALIASES[alias] = profile.name
+    _PROVIDER_LIST_CACHE = None
 
 
 def register_provider_client_factory(
@@ -136,8 +139,11 @@ def get_provider_profile(name: str) -> ProviderProfile | None:
 
 def list_providers() -> list[ProviderProfile]:
     """Return all registered provider profiles (one per canonical name)."""
+    global _PROVIDER_LIST_CACHE
     if not _discovered:
         _discover_providers()
+    if _PROVIDER_LIST_CACHE is not None:
+        return list(_PROVIDER_LIST_CACHE)
     # Deduplicate: _REGISTRY has canonical names; _ALIASES points to same objects
     seen: set[int] = set()
     result: list[ProviderProfile] = []
@@ -146,7 +152,8 @@ def list_providers() -> list[ProviderProfile]:
         if pid not in seen:
             seen.add(pid)
             result.append(profile)
-    return result
+    _PROVIDER_LIST_CACHE = result
+    return list(result)
 
 
 def _user_plugins_dir() -> Path | None:

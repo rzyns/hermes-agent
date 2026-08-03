@@ -5,6 +5,7 @@ import type { HermesConnection } from '@/global'
 import { HermesGateway } from '@/hermes'
 import { translateNow } from '@/i18n'
 import { desktopDefaultCwd } from '@/lib/desktop-fs'
+import { reconnectBackoffDelayMs } from '@/lib/reconnect-backoff'
 import {
   $desktopBoot,
   applyDesktopBootProgress,
@@ -42,12 +43,16 @@ import type { RpcEvent } from '@/types/hermes'
 
 import { stashGatewaySurvivor, survivorIsStale, takeGatewaySurvivor } from './gateway-hmr-survivor'
 
-// After this many consecutive failed reconnects (≈45s with the 1→15s backoff)
-// raise a recoverable boot error. Otherwise a dropped remote gateway loops the
-// backoff forever behind the fullscreen CONNECTING overlay with no way to reach
-// Settings / sign in / switch to local — the "lost connection breaks the app"
-// dead end. The next successful reconnect clears it.
-const RECONNECT_ESCALATE_AFTER = 6
+// After the reconnect loop has been failing for this long, raise a recoverable
+// boot error. Otherwise a dropped remote gateway loops the backoff forever
+// behind the fullscreen CONNECTING overlay with no way to reach Settings /
+// sign in / switch to local — the "lost connection breaks the app" dead end.
+// The next successful reconnect clears it. Time-based (not attempt-count)
+// because the full-jitter backoff makes attempt counts a meaningless clock:
+// six jittered attempts can elapse in ~9s, while the old deterministic
+// 1→15s ladder took ~45s to reach six failures — this threshold keeps that
+// original ~45s calibration.
+const RECONNECT_ESCALATE_AFTER_MS = 45_000
 
 interface GatewayBootOptions {
   beforeConnectionSwitch: () => void
@@ -114,17 +119,19 @@ export function useGatewayBoot({
     let reconnecting = false
     let reconnectTimer: ReturnType<typeof setTimeout> | null = null
     let reconnectAttempt = 0
+    // Wall-clock start of the current disconnect episode (first failed
+    // reconnect attempt); null while healthy. Drives the time-based
+    // escalation below. Reset on a clean open or a manual/wake reconnect.
+    let reconnectFailingSince: number | null = null
     // Surface "sign in again" once per disconnect episode, not on every backoff
     // tick — a stale OAuth ticket fails every attempt and would otherwise stack
     // identical error toasts (and their haptics). Reset on the next clean open.
     let reauthNotified = false
-    // After a healthy boot, a dropped gateway socket is usually transient
-    // (sleep/wake, remote restart, network flap). Keep retrying with backoff,
-    // but if the retry loop is still failing after RECONNECT_ESCALATE_AFTER
-    // attempts, raise the recovery overlay instead of leaving the fullscreen
-    // CONNECTING screen as a dead end. Reset on a clean open or a
-    // manual/wake-driven reconnect.
-    let reconnectRecoveryRaised = false
+    // Raised once the reconnect loop has been failing for
+    // RECONNECT_ESCALATE_AFTER_MS so the recovery overlay replaces the
+    // dead-end CONNECTING screen. Reset on a clean open or a manual/
+    // wake-driven reconnect.
+    let escalated = false
 
     // Wrap the live getter in a call so TS control-flow analysis doesn't narrow
     // `connectionState` to a constant across the early-return guards (the state
@@ -176,8 +183,9 @@ export function useGatewayBoot({
         }
 
         reconnectAttempt = 0
+        reconnectFailingSince = null
         reauthNotified = false
-        reconnectRecoveryRaised = false
+        escalated = false
 
         if (bootCompleted) {
           completeDesktopBoot()
@@ -198,20 +206,19 @@ export function useGatewayBoot({
           reauthNotified = true
           notifyError(err, translateNow('boot.errors.gatewaySignInRequired'))
         }
-
-        if (
-          !cancelled &&
-          bootCompleted &&
-          !reconnectRecoveryRaised &&
-          reconnectAttempt >= RECONNECT_ESCALATE_AFTER
-        ) {
-          reconnectRecoveryRaised = true
-          failDesktopBoot(translateNow('boot.errors.gatewayConnectionLost'))
-        }
       } finally {
         reconnecting = false
 
         if (!cancelled && !gatewayOpen() && !$gatewaySwitching.get()) {
+          if (reconnectFailingSince === null) {
+            reconnectFailingSince = Date.now()
+          }
+
+          if (Date.now() - reconnectFailingSince >= RECONNECT_ESCALATE_AFTER_MS && !escalated) {
+            escalated = true
+            failDesktopBoot(translateNow('boot.errors.gatewayConnectionLost'))
+          }
+
           scheduleReconnect()
         }
       }
@@ -222,8 +229,11 @@ export function useGatewayBoot({
         return
       }
 
-      // 1s, 2s, 4s … capped at 15s.
-      const delay = Math.min(15_000, 1_000 * 2 ** Math.min(reconnectAttempt, 4))
+      // Full-jitter exponential backoff (300ms base, 15s cap) so a gateway
+      // restart doesn't get redialed by every desktop client in lockstep —
+      // an immediate-retry reconnect storm can exhaust the gateway's file
+      // descriptors while it's still coming back up.
+      const delay = reconnectBackoffDelayMs(reconnectAttempt)
       reconnectAttempt += 1
       reconnectTimer = setTimeout(() => {
         reconnectTimer = null
@@ -238,7 +248,8 @@ export function useGatewayBoot({
 
       clearReconnectTimer()
       reconnectAttempt = 0
-      reconnectRecoveryRaised = false
+      reconnectFailingSince = null
+      escalated = false
       reconnectSecondaryGateways()
 
       if (!gatewayOpen()) {
@@ -284,7 +295,8 @@ export function useGatewayBoot({
       $gatewaySwitching.set(true)
       clearReconnectTimer()
       reconnectAttempt = 0
-      reconnectRecoveryRaised = false
+      reconnectFailingSince = null
+      escalated = false
       reauthNotified = false
       callbacksRef.current.beforeConnectionSwitch()
       wipeSessionListsForGatewaySwitch()
@@ -386,8 +398,9 @@ export function useGatewayBoot({
 
       if (st === 'open') {
         reconnectAttempt = 0
+        reconnectFailingSince = null
         reauthNotified = false
-        reconnectRecoveryRaised = false
+        escalated = false
         clearReconnectTimer()
 
         // A clean reopen resolves either recovery path: our prolonged-reconnect

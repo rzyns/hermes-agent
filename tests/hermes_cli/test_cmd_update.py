@@ -499,64 +499,44 @@ class TestCmdUpdateBranchFallback:
         # Mock it so the test doesn't actually shell out to ``tsc``.
         import subprocess as _subprocess
         build_ok = _subprocess.CompletedProcess([], 0, stdout="", stderr="")
+        install_ok = _subprocess.CompletedProcess([], 0, stdout="", stderr="")
         with patch.object(hm, "_is_termux_env", return_value=False), \
              patch.object(hm, "_web_ui_build_needed", return_value=True), \
+             patch.object(
+                 hm,
+                 "_run_npm_install_deterministic",
+                 return_value=install_ok,
+             ) as mock_npm_install, \
              patch.object(hm, "_run_with_idle_timeout", return_value=build_ok) as mock_idle:
             cmd_update(mock_args)
 
-        npm_calls = [
-            (call.args[0], call.kwargs.get("cwd"))
-            for call in mock_run.call_args_list
-            if call.args and call.args[0][0] == "/usr/bin/npm"
-        ]
-
-        # cmd_update runs npm commands in these locations:
-        #   1. repo root  — root-only install (--workspaces=false)
-        #   2. repo root  — workspace install (--workspace ui-tui --workspace web)
-        #   3. web/       — npm ci --include=dev --silent (if lockfile not at root)
-        #                  via _build_web_ui (subprocess.run)
-        #   4. web/       — npm run build (_run_with_idle_timeout)
-        #
-        # With a single workspace lockfile at the repo root, the root
-        # install covers all workspaces.  The web/ ci call runs from the
-        # workspace root too (parent of web_dir) when the root lockfile
-        # exists.
-        #
-        # The root install omits `--silent` and runs without
-        # `capture_output` so optional postinstall scripts (e.g.
-        # `@askjo/camofox-browser`'s browser-binary fetch) print progress —
-        # otherwise long downloads look like a hang (#18840).
-        root_flags = [
-            "/usr/bin/npm",
-            "ci",
-            "--include=dev",
+        # Node installs now go through the deterministic npm helper so failed
+        # ``npm ci`` runs can fall back without mutating the lockfile. Preserve
+        # the local update contract: root-only first, then just the TUI/web
+        # workspaces, both streaming postinstall progress (#18840).
+        assert mock_npm_install.call_count >= 2
+        root_call, workspace_call = mock_npm_install.call_args_list[:2]
+        assert root_call.args == ("/usr/bin/npm", PROJECT_ROOT)
+        assert root_call.kwargs["extra_args"] == (
             "--no-fund",
             "--no-audit",
+            "--prefer-offline",
             "--progress=false",
             "--workspaces=false",
-        ]
-        ws_flags = [
-            "/usr/bin/npm",
-            "ci",
-            "--include=dev",
+        )
+        assert root_call.kwargs["capture_output"] is False
+        assert workspace_call.args == ("/usr/bin/npm", PROJECT_ROOT)
+        assert workspace_call.kwargs["extra_args"] == (
             "--no-fund",
             "--no-audit",
+            "--prefer-offline",
             "--progress=false",
             "--workspace",
             "ui-tui",
             "--workspace",
             "web",
-        ]
-        assert npm_calls[:2] == [
-            (root_flags, PROJECT_ROOT),
-            (ws_flags, PROJECT_ROOT),
-        ]
-        if len(npm_calls) > 2:
-            # The web/ install runs from the workspace root when the root
-            # lockfile exists (npm workspaces hoist node_modules upward).
-            assert npm_calls[2:] == [
-                (["/usr/bin/npm", "ci", "--include=dev", "--workspace", "web", "--silent"], PROJECT_ROOT),
-            ]
+        )
+        assert workspace_call.kwargs["capture_output"] is False
 
         # The web UI build itself went through the streaming helper.
         mock_idle.assert_called_once()
@@ -564,25 +544,6 @@ class TestCmdUpdateBranchFallback:
         assert idle_args[0] == ["/usr/bin/npm", "run", "build"]
         assert idle_kwargs["cwd"] == PROJECT_ROOT / "web"
 
-        # Regression for #18840: root npm installs must stream output
-        # (capture_output=False) so postinstall progress is visible
-        # to the user.  The _build_web_ui install uses --silent and
-        # capture_output=True, so exclude it.
-        root_install_calls = [
-            call
-            for call in mock_run.call_args_list
-            if call.args
-            and call.args[0][0] == "/usr/bin/npm"
-            and call.args[0][1] == "ci"
-            and call.kwargs.get("cwd") == PROJECT_ROOT
-            and "--silent" not in call.args[0]
-        ]
-        assert len(root_install_calls) == 2  # root-only + workspace install
-        for call in root_install_calls:
-            assert call.kwargs.get("capture_output") is False, (
-                "repo-root npm install must stream output "
-                "(no capture_output) so postinstall progress is visible"
-            )
 
     def test_update_non_interactive_runs_safe_config_migrations(self, mock_args, capsys):
         """Dashboard/web updates apply non-interactive migrations before restart."""

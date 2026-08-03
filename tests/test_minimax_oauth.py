@@ -44,7 +44,13 @@ from hermes_cli.auth import (
 
 
 def _make_httpx_response(status_code: int, body: dict | None = None, text: str = ""):
-    """Return a minimal mock that quacks like httpx.Response."""
+    """Return a minimal mock that quacks like httpx.Response.
+
+    Includes the streamed-read surface used by ``_minimax_post_form`` /
+    ``_minimax_response_error_text``: ``is_stream_consumed`` is False and
+    ``iter_bytes()`` yields the body/text bytes, so non-200 paths exercise
+    the real bounded-read code instead of a truthy MagicMock attribute.
+    """
     resp = MagicMock()
     resp.status_code = status_code
     if body is not None:
@@ -54,6 +60,9 @@ def _make_httpx_response(status_code: int, body: dict | None = None, text: str =
         resp.json.side_effect = Exception("No body")
         resp.text = text
     resp.reason_phrase = "OK" if status_code == 200 else "Error"
+    resp.is_stream_consumed = False
+    resp.encoding = "utf-8"
+    resp.iter_bytes.return_value = iter([resp.text.encode("utf-8")] if resp.text else [])
     return resp
 
 
@@ -139,6 +148,7 @@ def test_request_user_code_happy_path():
 
     client = MagicMock()
     client.post.return_value = mock_response
+    client.send.return_value = mock_response
 
     result = _minimax_request_user_code(
         client,
@@ -153,8 +163,9 @@ def test_request_user_code_happy_path():
     assert result["state"] == state
 
     # Verify correct endpoint was called
-    call_args = client.post.call_args
-    assert "/oauth/code" in call_args[0][0]
+    call_args = client.build_request.call_args
+    assert call_args[0][0] == "POST"
+    assert "/oauth/code" in call_args[0][1]
     headers = call_args[1].get("headers", {})
     assert "x-request-id" in headers
 
@@ -177,6 +188,7 @@ def test_request_user_code_state_mismatch_raises():
 
     client = MagicMock()
     client.post.return_value = mock_response
+    client.send.return_value = mock_response
 
     with pytest.raises(AuthError) as exc_info:
         _minimax_request_user_code(
@@ -203,6 +215,7 @@ def test_request_user_code_non_200_raises():
 
     client = MagicMock()
     client.post.return_value = mock_response
+    client.send.return_value = mock_response
 
     with pytest.raises(AuthError) as exc_info:
         _minimax_request_user_code(
@@ -239,6 +252,7 @@ def test_poll_token_pending_then_success():
 
     client = MagicMock()
     client.post.side_effect = [pending_resp, pending_resp, success_resp]
+    client.send.side_effect = [pending_resp, pending_resp, success_resp]
 
     with patch("time.sleep"):  # don't actually sleep
         result = _minimax_poll_token(
@@ -254,7 +268,7 @@ def test_poll_token_pending_then_success():
     assert result["status"] == "success"
     assert result["access_token"] == "access-abc"
     assert result["refresh_token"] == "refresh-xyz"
-    assert client.post.call_count == 3
+    assert client.send.call_count == 3
 
 
 # ---------------------------------------------------------------------------
@@ -269,6 +283,7 @@ def test_poll_token_error_raises():
 
     client = MagicMock()
     client.post.return_value = error_resp
+    client.send.return_value = error_resp
 
     with pytest.raises(AuthError) as exc_info:
         _minimax_poll_token(
@@ -310,6 +325,7 @@ def test_poll_token_timeout_raises():
     client = MagicMock()
     pending_resp = _make_httpx_response(200, {"status": "pending"})
     client.post.return_value = pending_resp
+    client.send.return_value = pending_resp
 
     import hermes_cli.auth as auth_module
 
@@ -388,6 +404,7 @@ def test_refresh_updates_access_token():
         mock_client_instance.__enter__ = MagicMock(return_value=mock_client_instance)
         mock_client_instance.__exit__ = MagicMock(return_value=False)
         mock_client_instance.post.return_value = mock_resp
+        mock_client_instance.send.return_value = mock_resp
         mock_client_class.return_value = mock_client_instance
 
         # Patch _minimax_save_auth_state to avoid touching the auth store
@@ -427,6 +444,7 @@ def test_refresh_updates_access_token_absolute_ms_expired_in():
         mock_client_instance.__enter__ = MagicMock(return_value=mock_client_instance)
         mock_client_instance.__exit__ = MagicMock(return_value=False)
         mock_client_instance.post.return_value = mock_resp
+        mock_client_instance.send.return_value = mock_resp
         mock_client_class.return_value = mock_client_instance
 
         with patch("hermes_cli.auth._minimax_save_auth_state"):
@@ -465,6 +483,7 @@ def test_refresh_reuse_triggers_relogin_required():
         mock_client_instance.__enter__ = MagicMock(return_value=mock_client_instance)
         mock_client_instance.__exit__ = MagicMock(return_value=False)
         mock_client_instance.post.return_value = bad_resp
+        mock_client_instance.send.return_value = bad_resp
         mock_client_class.return_value = mock_client_instance
 
         with pytest.raises(AuthError) as exc_info:
@@ -749,6 +768,7 @@ def test_token_provider_refreshes_when_near_expiry():
         mock_instance.__enter__ = MagicMock(return_value=mock_instance)
         mock_instance.__exit__ = MagicMock(return_value=False)
         mock_instance.post.return_value = mock_resp
+        mock_instance.send.return_value = mock_resp
         mock_client_class.return_value = mock_instance
 
         token = provider()
@@ -836,6 +856,7 @@ def test_token_provider_quarantines_state_on_terminal_refresh():
         mock_instance.__enter__ = MagicMock(return_value=mock_instance)
         mock_instance.__exit__ = MagicMock(return_value=False)
         mock_instance.post.return_value = bad_resp
+        mock_instance.send.return_value = bad_resp
         mock_client_class.return_value = mock_instance
 
         with pytest.raises(AuthError) as exc_info:
@@ -886,3 +907,84 @@ def test_resolve_returns_string_by_default():
 
     assert creds["api_key"] == "tok"
     assert isinstance(creds["api_key"], str)
+# ---------------------------------------------------------------------------
+# Bounded error-body reads (#56548 / PR #56549)
+# ---------------------------------------------------------------------------
+
+def test_refresh_error_body_bounded_and_readable_with_real_client():
+    """Refresh non-200 path over a REAL socket transport.
+
+    The error body is obtained via a streamed response; the bounded read
+    must happen while the client context is still open.  A real socket is
+    required to bind this contract: closing the client tears the connection
+    down, so a read after the ``with httpx.Client(...)`` block raises
+    ReadError/StreamClosed.  (MockTransport buffers in memory and would NOT
+    catch the regression.)
+    """
+    import http.server
+    import socketserver
+    import threading
+
+    import httpx
+
+    from hermes_cli.auth import _refresh_minimax_oauth_state
+
+    big_body = b"invalid_grant " + b"x" * (64 * 1024)  # 64KB error body
+
+    class Handler(http.server.BaseHTTPRequestHandler):
+        def do_POST(self):
+            self.send_response(400)
+            self.send_header("Content-Length", str(len(big_body)))
+            self.end_headers()
+            self.wfile.write(big_body)
+
+        def log_message(self, *args):
+            pass
+
+    with socketserver.TCPServer(("127.0.0.1", 0), Handler) as server:
+        port = server.server_address[1]
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            state = {
+                "access_token": "expired",
+                "refresh_token": "burned-rt",
+                "portal_base_url": f"http://127.0.0.1:{port}",
+                "client_id": MINIMAX_OAUTH_CLIENT_ID,
+                "inference_base_url": MINIMAX_OAUTH_GLOBAL_INFERENCE,
+                "expires_at": _past_iso(100),
+            }
+            with pytest.raises(AuthError) as exc_info:
+                _refresh_minimax_oauth_state(state, force=True)
+        finally:
+            server.shutdown()
+
+    msg = str(exc_info.value)
+    assert "invalid_grant" in msg
+    assert exc_info.value.relogin_required is True
+    # Bounded: 16KB limit + truncation marker, never the full 64KB body.
+    assert len(msg) < 20 * 1024
+    assert "...[truncated]" in msg
+
+
+def test_minimax_response_error_text_truncates_above_limit():
+    """Bodies above the 16KB bound are cut and marked truncated."""
+    import httpx
+
+    from hermes_cli.auth import (
+        _MINIMAX_OAUTH_ERROR_BODY_LIMIT,
+        _minimax_response_error_text,
+    )
+
+    big = "e" * (_MINIMAX_OAUTH_ERROR_BODY_LIMIT * 4)
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(500, text=big)
+
+    with httpx.Client(transport=httpx.MockTransport(handler)) as client:
+        request = client.build_request("POST", "https://api.minimax.io/oauth/token")
+        response = client.send(request, stream=True)
+        text = _minimax_response_error_text(response)
+
+    assert text.endswith("...[truncated]")
+    assert len(text) <= _MINIMAX_OAUTH_ERROR_BODY_LIMIT + len("...[truncated]")
