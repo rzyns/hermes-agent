@@ -253,6 +253,28 @@ class TestConfig:
     def test_cloud_client_lazy_installs_dependency_before_import(self, tmp_path, monkeypatch):
         _assert_cloud_client_lazy_installed_before_import(tmp_path, monkeypatch, "cloud")
 
+    def test_cloud_client_uses_importable_dependency_before_lazy_install(
+        self, tmp_path, monkeypatch
+    ):
+        provider = _provider_for_mode(tmp_path, monkeypatch, "cloud")
+
+        class FakeHindsight:
+            def __init__(self, **kwargs):
+                self.kwargs = kwargs
+
+        monkeypatch.setitem(
+            sys.modules,
+            "hindsight_client",
+            SimpleNamespace(Hindsight=FakeHindsight),
+        )
+        ensure = MagicMock(side_effect=AssertionError("lazy install should not run"))
+        monkeypatch.setattr("tools.lazy_deps.ensure", ensure)
+
+        client = provider._get_client()
+
+        ensure.assert_not_called()
+        assert isinstance(client, FakeHindsight)
+
 
     def test_default_values(self, provider):
         assert provider._auto_retain is True
@@ -683,12 +705,14 @@ class TestPrefetchServerRetainVisibility:
 
     def test_operation_notfound_treated_as_complete(self, provider):
         """A NotFound (completed+evicted) op is treated as done, not pending."""
-        from hindsight_client_api.exceptions import NotFoundException
+        class NotFoundException(Exception):
+            def __init__(self):
+                self.status = 404
 
         client = _make_mock_client()
         client.operations = MagicMock()
         client.operations.get_operation_status = AsyncMock(
-            side_effect=NotFoundException(status=404, reason="gone")
+            side_effect=NotFoundException()
         )
         provider._client = client
 

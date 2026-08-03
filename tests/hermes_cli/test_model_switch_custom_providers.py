@@ -480,7 +480,9 @@ def test_custom_provider_no_key_singular_model_still_probes_live_models(monkeypa
         max_models=50,
     )
 
-    assert calls == [("", "http://localhost:11434/v1", {"headers": None})]
+    assert calls == [
+        ("", "http://localhost:11434/v1", {"timeout": 5.0, "headers": None})
+    ]
     row = next(p for p in providers if p["name"] == "Local Ollama")
     assert row["models"] == ["llama3", "mistral", "qwen3-coder"]
     assert row["total_models"] == 3
@@ -588,7 +590,9 @@ def test_custom_provider_current_only_probe_respects_explicit_catalog(monkeypatc
         probe_current_custom_provider=True,
     )
 
-    assert calls == [("", "http://active.local/v1", {"headers": None})]
+    assert calls == [
+        ("", "http://active.local/v1", {"timeout": 5.0, "headers": None})
+    ]
     rows = {row["name"]: row for row in providers if row.get("is_user_defined")}
     assert rows["Active"]["models"] == ["live-a", "live-b"]
     assert rows["Offline"]["models"] == ["offline-seed"]
@@ -654,7 +658,9 @@ def test_custom_provider_empty_explicit_list_allows_probe(monkeypatch):
         ],
     )
 
-    assert calls == [("", "http://local.test/v1", {"headers": None})]
+    assert calls == [
+        ("", "http://local.test/v1", {"timeout": 5.0, "headers": None})
+    ]
     row = next(p for p in providers if p["name"] == "Local")
     assert row["models"] == ["live-a", "live-b"]
 
@@ -1209,6 +1215,7 @@ def test_custom_provider_live_model_probe_uses_extra_headers(monkeypatch):
             "local-key",
             "http://localhost:8081/v1",
             {
+                "timeout": 5.0,
                 "headers": {
                     "sleeve-harness": "hermes",
                     "sleeve-base-url": "http://localhost:8081/v1",

@@ -403,6 +403,7 @@ class TestBuildWebUISkipsWhenFresh:
             "web",
             "--include-workspace-root=false",
             "--silent",
+            "--prefer-offline",
         ]
         assert kwargs["cwd"] == tmp_path
 
@@ -430,6 +431,7 @@ class TestBuildWebUISkipsWhenFresh:
             "--workspace",
             "web",
             "--silent",
+            "--prefer-offline",
         ]
         assert kwargs["cwd"] == tmp_path
 

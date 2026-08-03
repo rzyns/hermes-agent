@@ -153,7 +153,13 @@ def _check_local_runtime() -> tuple[bool, str | None]:
 
 
 def _ensure_cloud_client_dependency() -> None:
-    """Install the Hindsight cloud client lazily before importing it."""
+    """Use an importable cloud client or lazily install it when missing."""
+    try:
+        importlib.import_module("hindsight_client")
+        return
+    except ImportError:
+        pass
+
     try:
         from tools.lazy_deps import ensure as _lazy_ensure
         _lazy_ensure("memory.hindsight", prompt=False)
@@ -1115,13 +1121,6 @@ class HindsightMemoryProvider(MemoryProvider):
                         "Hindsight local runtime is unavailable"
                         + (f": {reason}" if reason else "")
                     )
-                try:
-                    from tools.lazy_deps import ensure as _lazy_ensure
-                    _lazy_ensure("memory.hindsight", prompt=False)
-                except ImportError:
-                    pass
-                except Exception as _e:
-                    raise ImportError(str(_e))
                 from hindsight import HindsightEmbedded
                 HindsightEmbedded.__del__ = lambda self: None
                 llm_provider = self._config.get("llm_provider", "")
@@ -1238,17 +1237,21 @@ class HindsightMemoryProvider(MemoryProvider):
         means "no longer pending" and is treated as done. Transient errors
         return False so the caller keeps waiting until its deadline.
         """
-        from hindsight_client_api.exceptions import NotFoundException
-
         try:
             resp = self._run_hindsight_operation(
                 lambda client: client.operations.get_operation_status(
                     bank_id=bank_id, operation_id=op_id
                 )
             )
-        except NotFoundException:
-            return True
         except Exception as exc:
+            # Generated Hindsight clients have exposed this exception through
+            # different module paths across releases. Avoid importing one
+            # particular generated package just to classify its HTTP status.
+            status = getattr(exc, "status", None)
+            if status is None:
+                status = getattr(exc, "status_code", None)
+            if str(status) == "404":
+                return True
             logger.debug("Prefetch: operation status check failed for %s: %s", op_id, exc)
             return False
         status = str(getattr(resp, "status", "") or "").lower()

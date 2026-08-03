@@ -52,19 +52,28 @@ class DaytonaEnvironment(BaseEnvironment):
         super().__init__(cwd=cwd, timeout=timeout)
 
         try:
-            from tools.lazy_deps import ensure as _lazy_ensure
-            _lazy_ensure("terminal.daytona", prompt=False)
+            from daytona import (
+                Daytona,
+                CreateSandboxFromImageParams,
+                DaytonaError,
+                Resources,
+                SandboxState,
+            )
         except ImportError:
-            pass
-        except Exception as e:
-            raise ImportError(str(e))
-        from daytona import (
-            Daytona,
-            CreateSandboxFromImageParams,
-            DaytonaError,
-            Resources,
-            SandboxState,
-        )
+            try:
+                from tools.lazy_deps import ensure as _lazy_ensure
+                _lazy_ensure("terminal.daytona", prompt=False)
+            except ImportError:
+                pass
+            except Exception as e:
+                raise ImportError(str(e))
+            from daytona import (
+                Daytona,
+                CreateSandboxFromImageParams,
+                DaytonaError,
+                Resources,
+                SandboxState,
+            )
 
         self._persistent = persistent_filesystem
         self._task_id = task_id

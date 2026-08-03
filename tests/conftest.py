@@ -1463,8 +1463,13 @@ def _moa_caches_isolated():
     """
     import agent.moa_loop as moa
 
-    moa._preset_cache.clear()
-    moa._runtime_cache.clear()
+    caches = [
+        cache
+        for name in ("_preset_cache", "_runtime_cache")
+        if (cache := getattr(moa, name, None)) is not None
+    ]
+    for cache in caches:
+        cache.clear()
     yield
-    moa._preset_cache.clear()
-    moa._runtime_cache.clear()
+    for cache in caches:
+        cache.clear()

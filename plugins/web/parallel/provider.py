@@ -28,6 +28,7 @@ Env vars::
 
 from __future__ import annotations
 
+import importlib
 import logging
 import os
 from typing import Any, Dict, List
@@ -51,6 +52,12 @@ def _ensure_parallel_sdk_installed() -> None:
     SDK is genuinely missing the subsequent ``from parallel import ...``
     raises ImportError that the caller can handle.
     """
+    try:
+        importlib.import_module("parallel")
+        return
+    except ImportError:
+        pass
+
     try:
         from tools.lazy_deps import ensure as _lazy_ensure
 
