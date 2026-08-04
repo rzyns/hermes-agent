@@ -952,7 +952,13 @@ def _handle_complete(args: dict, **kw) -> str:
 
 
 def _handle_block(args: dict, **kw) -> str:
-    """Transition the task to blocked with a reason a human will read."""
+    """Transition the task to blocked with a reason a human will read.
+
+    Mirrors ``kanban_complete`` for the non-terminal exit: optional
+    ``summary``/``metadata``/``artifacts`` can be handed off so a worker
+    that needs human input still preserves deliverables and structured
+    facts.
+    """
     delegated_err = _reject_delegated_child_mutation("kanban_block")
     if delegated_err:
         return delegated_err
@@ -975,6 +981,46 @@ def _handle_block(args: dict, **kw) -> str:
         return git_guard
     kind = args.get("kind")
     board = args.get("board")
+
+    metadata = args.get("metadata")
+    if metadata is not None and isinstance(metadata, dict):
+        meta_json = json.dumps(metadata)
+        meta_json = redact_sensitive_text(meta_json, force=True)
+        try:
+            metadata = json.loads(meta_json)
+        except json.JSONDecodeError:
+            pass
+    artifacts = args.get("artifacts")
+    if artifacts is not None:
+        if isinstance(artifacts, str):
+            artifacts = [artifacts]
+        if not isinstance(artifacts, (list, tuple)):
+            return tool_error(
+                f"artifacts must be a list of file paths, got "
+                f"{type(artifacts).__name__}"
+            )
+        artifacts = [str(p).strip() for p in artifacts if str(p).strip()]
+        if artifacts:
+            if metadata is None:
+                metadata = {}
+            elif not isinstance(metadata, dict):
+                return tool_error(
+                    f"metadata must be an object/dict, got "
+                    f"{type(metadata).__name__}"
+                )
+            existing = metadata.get("artifacts")
+            if isinstance(existing, (list, tuple)):
+                merged: list[str] = []
+                seen: set[str] = set()
+                for item in list(existing) + artifacts:
+                    s = str(item).strip()
+                    if s and s not in seen:
+                        seen.add(s)
+                        merged.append(s)
+                metadata["artifacts"] = merged
+            else:
+                metadata["artifacts"] = artifacts
+
     contract_fields = (
         "error_type",
         "fingerprint",
@@ -989,6 +1035,7 @@ def _handle_block(args: dict, **kw) -> str:
         if isinstance(text_value, str):
             contract[text_field] = redact_sensitive_text(text_value, force=True)
     contract_arg = contract or None
+    metadata = _stamp_worker_session_metadata(tid, metadata)
     try:
         kb, conn = _connect(board=board)
         if kind is not None and kind not in kb.VALID_BLOCK_KINDS:
@@ -1029,6 +1076,7 @@ def _handle_block(args: dict, **kw) -> str:
                 reason=reason,
                 kind=kind,
                 contract=contract_arg,
+                metadata=metadata,
                 expected_run_id=_worker_run_id(tid),
             )
             if not ok:
@@ -1045,6 +1093,13 @@ def _handle_block(args: dict, **kw) -> str:
                 run_id=run.id if run else None,
                 status=landed.status if landed else "blocked",
                 block_kind=landed.block_kind if landed else resolved_kind,
+            )
+        except kb.ArtifactPreservationError as artifact_err:
+            return tool_error(
+                f"kanban_block could not preserve the declared artifacts: "
+                f"{artifact_err}. Your task is still in-flight and its "
+                f"scratch workspace was kept. Fix the artifact path or "
+                f"storage error, then retry kanban_block with the same handoff."
             )
         finally:
             conn.close()
@@ -1290,12 +1345,18 @@ def _handle_attach(args: dict, **kw) -> str:
                 content_type=content_type,
                 uploaded_by="agent",
                 board=board,
+                collision_mode="error",
+                verify_hash=True,
             )
             return _ok(task_id=tid, attachment_id=att_id, size=len(data))
         finally:
             conn.close()
+    except kb.AttachmentNameCollisionError as e:
+        return tool_error(f"kanban_attach: filename collision: {e}")
     except kb.AttachmentTooLarge as e:
         return tool_error(f"kanban_attach: {e}")
+    except kb.ArtifactPreservationError as e:
+        return tool_error(f"kanban_attach: byte verification failed: {e}")
     except ValueError as e:
         return tool_error(f"kanban_attach: {e}")
     except Exception as e:
@@ -1417,12 +1478,18 @@ def _handle_attach_url(args: dict, **kw) -> str:
                 content_type=content_type or fetched_ct,
                 uploaded_by="agent",
                 board=board,
+                collision_mode="error",
+                verify_hash=True,
             )
             return _ok(task_id=tid, attachment_id=att_id, size=len(data))
         finally:
             conn.close()
+    except kb.AttachmentNameCollisionError as e:
+        return tool_error(f"kanban_attach_url: filename collision: {e}")
     except kb.AttachmentTooLarge as e:
         return tool_error(f"kanban_attach_url: {e}")
+    except kb.ArtifactPreservationError as e:
+        return tool_error(f"kanban_attach_url: byte verification failed: {e}")
     except ValueError as e:
         return tool_error(f"kanban_attach_url: {e}")
     except Exception as e:
@@ -2146,6 +2213,28 @@ KANBAN_BLOCK_SCHEMA = {
                 "type": "string",
                 "description": (
                     "Optional structured detail; defaults to the human reason."
+                ),
+            },
+            "metadata": {
+                "type": "object",
+                "description": (
+                    "Free-form dict of structured facts about this attempt — "
+                    "{\"changed_files\": [...], \"tests_run\": 12, \"findings\": [...]}. "
+                    "Use board-qualified refs for cross-board tasks. If deliverable "
+                    "files were produced, list them in `artifacts`; managed scratch "
+                    "workspace artifacts are copied to durable task attachments "
+                    "before the workspace can be lost."
+                ),
+            },
+            "artifacts": {
+                "type": "array",
+                "items": {"type": "string"},
+                "description": (
+                    "Optional list of absolute paths to deliverable files you "
+                    "produced during this run. Managed scratch workspace files "
+                    "are copied to durable task attachments so they survive "
+                    "workspace cleanup; a missing declared scratch artifact "
+                    "keeps the task in-flight so you can fix the path and retry."
                 ),
             },
             "board": _board_schema_prop(),

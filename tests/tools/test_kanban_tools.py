@@ -13,6 +13,7 @@ import os
 import subprocess
 import time
 from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
 
 import pytest
 
@@ -3364,6 +3365,195 @@ def test_attachments_unknown_task_errors(worker_env):
 
     out = kt._handle_attachments({"task_id": "t_nope"})
     assert "error" in json.loads(out)
+
+
+def test_attach_rejects_filename_collision(worker_env):
+    """The agent attach path must fail loudly on duplicate filenames."""
+    import base64
+
+    from hermes_cli import kanban_db as kb
+    from tools import kanban_tools as kt
+
+    kt._handle_attach({
+        "filename": "notes.txt",
+        "content_base64": base64.b64encode(b"first").decode(),
+    })
+    out = kt._handle_attach({
+        "filename": "notes.txt",
+        "content_base64": base64.b64encode(b"second").decode(),
+    })
+    d = json.loads(out)
+    assert "error" in d
+    assert "collision" in d["error"].lower()
+
+    conn = kb.connect()
+    try:
+        atts = kb.list_attachments(conn, worker_env)
+        assert [a.filename for a in atts] == ["notes.txt"]
+        assert Path(atts[0].stored_path).read_bytes() == b"first"
+    finally:
+        conn.close()
+
+
+def test_attach_url_rejects_filename_collision(worker_env, allow_private_urls):
+    """The URL attach path must also fail loudly on duplicate filenames."""
+    import base64
+    import http.server
+    import threading
+
+    from hermes_cli import kanban_db as kb
+    from tools import kanban_tools as kt
+
+    payload = b"remote body"
+
+    class _Handler(http.server.BaseHTTPRequestHandler):
+        def do_GET(self):  # noqa: N802
+            self.send_response(200)
+            self.send_header("Content-Type", "application/octet-stream")
+            self.send_header("Content-Length", str(len(payload)))
+            self.end_headers()
+            self.wfile.write(payload)
+
+        def log_message(self, *a):  # silence
+            pass
+
+    srv = http.server.HTTPServer(("127.0.0.1", 0), _Handler)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    try:
+        port = srv.server_address[1]
+        url = f"http://127.0.0.1:{port}/files/report.bin"
+        assert json.loads(kt._handle_attach_url({"url": url})).get("ok") is True
+        out = kt._handle_attach_url({"url": url})
+    finally:
+        srv.shutdown()
+    d = json.loads(out)
+    assert "error" in d
+    assert "collision" in d["error"].lower()
+
+    conn = kb.connect()
+    try:
+        atts = kb.list_attachments(conn, worker_env)
+        assert [a.filename for a in atts] == ["report.bin"]
+        assert Path(atts[0].stored_path).read_bytes() == payload
+    finally:
+        conn.close()
+
+
+def test_attach_blocks_with_hash_verification_failure(worker_env, monkeypatch):
+    """If the stored bytes don't match the source hash, the attach fails closed."""
+    import base64
+
+    from hermes_cli import kanban_db as kb
+    from tools import kanban_tools as kt
+
+    real_sha256_file = kb._sha256_file
+
+    def _corrupt_hash(path: Path) -> str:
+        digest = real_sha256_file(path)
+        # Flip the first hex digit so the verification mismatches.
+        flipped = hex((int(digest[0], 16) + 1) % 16)[2:]
+        return flipped + digest[1:]
+
+    monkeypatch.setattr(kb, "_sha256_file", _corrupt_hash)
+
+    out = kt._handle_attach({
+        "filename": "notes.txt",
+        "content_base64": base64.b64encode(b"hello").decode(),
+    })
+    d = json.loads(out)
+    assert "error" in d
+    assert "byte verification failed" in d["error"]
+
+    conn = kb.connect()
+    try:
+        assert kb.list_attachments(conn, worker_env) == []
+    finally:
+        conn.close()
+
+
+def test_block_persists_scratch_artifacts_and_keeps_task_blocked(worker_env):
+    """kanban_block copies declared scratch artifacts to durable attachments."""
+    from hermes_cli import kanban_db as kb
+    from tools import kanban_tools as kt
+
+    conn = kb.connect()
+    try:
+        task = kb.get_task(conn, worker_env)
+        ws = kb.resolve_workspace(task)
+        kb.set_workspace_path(conn, worker_env, ws)
+        report = ws / "partial.md"
+        report.write_text("partial findings", encoding="utf-8")
+    finally:
+        conn.close()
+
+    out = kt._handle_block({
+        "reason": "need clarification",
+        "artifacts": [str(report)],
+    })
+    d = json.loads(out)
+    assert d.get("ok") is True, out
+    assert d["status"] == "blocked"
+
+    conn = kb.connect()
+    try:
+        assert kb.get_task(conn, worker_env).status == "blocked"
+        run = kb.latest_run(conn, worker_env)
+        blocked = [e for e in kb.list_events(conn, worker_env) if e.kind == "blocked"][-1]
+        attachments = kb.list_attachments(conn, worker_env)
+    finally:
+        conn.close()
+
+    persisted = Path(run.metadata["artifacts"][0])
+    assert persisted.exists()
+    assert persisted.parent == kb.task_attachments_dir(worker_env)
+    assert persisted.name == "partial.md"
+    assert persisted.read_text(encoding="utf-8") == "partial findings"
+    assert blocked.payload.get("reason") == "need clarification"
+    assert [(a.filename, a.stored_path) for a in attachments] == [
+        ("partial.md", str(persisted.resolve()))
+    ]
+    # blocked_artifacts event is surfaced separately from the state event.
+    conn = kb.connect()
+    try:
+        artifact_events = [
+            e for e in kb.list_events(conn, worker_env) if e.kind == "blocked_artifacts"
+        ]
+        assert len(artifact_events) == 1
+        assert artifact_events[0].payload.get("artifacts") == [str(persisted)]
+    finally:
+        conn.close()
+
+
+def test_block_with_missing_scratch_artifact_stays_in_flight(worker_env):
+    """A missing declared scratch artifact keeps the task running on block."""
+    from hermes_cli import kanban_db as kb
+    from tools import kanban_tools as kt
+
+    conn = kb.connect()
+    try:
+        task = kb.get_task(conn, worker_env)
+        ws = kb.resolve_workspace(task)
+        kb.set_workspace_path(conn, worker_env, ws)
+        missing = ws / "missing.txt"
+    finally:
+        conn.close()
+
+    out = kt._handle_block({
+        "reason": "need input",
+        "artifacts": [str(missing)],
+    })
+    d = json.loads(out)
+    assert "error" in d
+    assert "could not preserve" in d["error"]
+    assert "still in-flight" in d["error"]
+
+    conn = kb.connect()
+    try:
+        assert kb.get_task(conn, worker_env).status == "running"
+        assert kb.list_attachments(conn, worker_env) == []
+    finally:
+        conn.close()
+    assert ws.exists(), "failed block must keep scratch available for retry"
 
 
 def test_attach_url_fetches_local_fixture(worker_env, allow_private_urls):

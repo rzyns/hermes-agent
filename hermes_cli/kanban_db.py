@@ -88,6 +88,7 @@ import logging
 import time
 from contextvars import ContextVar, Token
 from dataclasses import dataclass, field
+from functools import partial
 from pathlib import Path
 from typing import Any, Callable, Iterable, Mapping, Optional
 
@@ -97,6 +98,7 @@ from toolsets import get_toolset_names
 _log = logging.getLogger(__name__)
 
 
+# ---------------------------------------------------------------------------
 # Test-only hook for deterministic interleave verification.  Called inside
 # the heartbeat_claim_with_event write_txn, between the CAS UPDATE and the
 # heartbeat event write, while the SQLite writer lock is still held.
@@ -4759,6 +4761,8 @@ def store_attachment_bytes(
     uploaded_by: Optional[str] = None,
     board: Optional[str] = None,
     max_bytes: Optional[int] = None,
+    collision_mode: str = "rename",
+    verify_hash: bool = True,
 ) -> int:
     """Validate, size-check, persist a blob, and record its metadata row.
 
@@ -4776,6 +4780,18 @@ def store_attachment_bytes(
     or :class:`ValueError` for a bad filename / unknown task. On any failure
     after the blob is written (e.g. the task disappeared) the orphaned blob
     is removed before re-raising.
+
+    ``collision_mode``:
+      * ``rename`` (default) — append ``(1)``, ``(2)`` … as needed, the
+        historical behavior used by the dashboard and older agent tools.
+      * ``error`` — raise :class:`AttachmentNameCollisionError` if a file
+        with that name already exists under ``dest_dir``. Use this for
+        agent-driven scratch-to-durable copies where a duplicate name
+        signals a bug or overwrite intent that should not be hidden.
+
+    ``verify_hash`` — when True, compute a SHA-256 digest before/after the
+    write and raise :class:`ArtifactPreservationError` on mismatch, ensuring
+    the bytes that land on disk are the bytes the caller passed.
     """
     if max_bytes is None:
         max_bytes = KANBAN_ATTACHMENT_MAX_BYTES
@@ -4787,9 +4803,28 @@ def store_attachment_bytes(
     dest_dir = task_attachments_dir(task_id, board=board)
     _assert_mutation_isolation_permits(dest_dir)
     dest_dir.mkdir(parents=True, exist_ok=True)
-    dest_path = _collision_free_path(dest_dir, safe_name)
-    dest_path.write_bytes(data)
+    dest_path = _attachment_path_for_name(
+        dest_dir, safe_name, collision_mode=collision_mode
+    )
+
+    source_hash = _sha256_bytes(data) if verify_hash else None
+    # Use create mode so a race between path resolution and write cannot
+    # silently clobber an existing file. A collision here becomes an error
+    # that the caller surfaces, rather than a truncated overwrite.
+    with dest_path.open("xb") as handle:
+        handle.write(data)
     try:
+        if verify_hash and source_hash is not None:
+            dest_hash = _sha256_file(dest_path)
+            if dest_hash != source_hash:
+                try:
+                    dest_path.unlink(missing_ok=True)
+                except OSError:
+                    pass
+                raise ArtifactPreservationError(
+                    f"hash mismatch writing {dest_path}: "
+                    f"expected {source_hash}, got {dest_hash}"
+                )
         return add_attachment(
             conn,
             task_id,
@@ -6623,13 +6658,14 @@ def complete_task(
             _persist_scratch_completion_artifacts(conn, task_id, metadata)
             for stored_path in metadata.pop("_staged_artifacts", []):
                 path = Path(stored_path)
-                _insert_completion_attachment(
+                _insert_lifecycle_attachment(
                     conn,
                     task_id,
                     filename=path.name,
                     stored_path=str(path),
                     size=path.stat().st_size,
                     created_at=now,
+                    uploaded_by="kanban_complete",
                 )
         run_metadata = metadata
         if accepted_budget_run_id is not None:
@@ -6677,14 +6713,9 @@ def complete_task(
         # ``kanban_complete(artifacts=[...])`` which stashes the list in
         # ``metadata["artifacts"]`` — we promote it onto the event so
         # consumers don't have to fetch the run row to find it.
-        if isinstance(metadata, dict):
-            md_artifacts = metadata.get("artifacts")
-            if isinstance(md_artifacts, (list, tuple)):
-                cleaned_artifacts = [
-                    str(p).strip() for p in md_artifacts if isinstance(p, str) and str(p).strip()
-                ]
-                if cleaned_artifacts:
-                    completed_payload["artifacts"] = cleaned_artifacts
+        cleaned_artifacts = _artifact_list_from_metadata(metadata)
+        if cleaned_artifacts:
+            completed_payload["artifacts"] = cleaned_artifacts
         _append_event(
             conn, task_id, "completed",
             completed_payload,
@@ -6755,6 +6786,20 @@ def complete_task(
 # ---------------------------------------------------------------------------
 
 
+def _artifact_list_from_metadata(metadata: Optional[dict]) -> list[str]:
+    """Return the non-empty artifact paths stored in metadata, if any."""
+    if not isinstance(metadata, dict):
+        return []
+    raw = metadata.get("artifacts")
+    if not isinstance(raw, (list, tuple)):
+        return []
+    return [
+        str(p).strip()
+        for p in raw
+        if isinstance(p, str) and str(p).strip()
+    ]
+
+
 def _merge_completion_prose_artifacts(
     conn: sqlite3.Connection,
     task_id: str,
@@ -6802,12 +6847,21 @@ def _merge_completion_prose_artifacts(
     return updated
 
 
-def _persist_scratch_completion_artifacts(
+def _persist_scratch_lifecycle_artifacts(
     conn: sqlite3.Connection,
     task_id: str,
     metadata: dict,
+    *,
+    uploaded_by: str,
 ) -> None:
-    """Copy scratch-workspace completion artifacts before cleanup removes them."""
+    """Copy scratch-workspace artifacts to durable attachments before loss.
+
+    Used by both terminal completion and by ``block_task`` so that a
+    worker asking for human input can still hand over deliverables safely.
+    Only managed scratch workspaces are touched; ``dir``/``worktree`` and
+    out-of-scratch paths are left alone so we never silently relocate a
+    user's source tree.
+    """
     raw_artifacts = metadata.get("artifacts")
     if not isinstance(raw_artifacts, (list, tuple)):
         return
@@ -6902,6 +6956,43 @@ def _persist_scratch_completion_artifacts(
         ]
 
 
+# Backward-compatible alias used by complete_task.
+_persist_scratch_completion_artifacts = partial(
+    _persist_scratch_lifecycle_artifacts,
+    uploaded_by="kanban_complete",
+)
+
+
+def _record_lifecycle_staged_artifacts(
+    conn: sqlite3.Connection,
+    task_id: str,
+    metadata: dict,
+    *,
+    created_at: int,
+    uploaded_by: str,
+) -> None:
+    """Record staged lifecycle-preserved attachments and remove them from metadata.
+
+    Callers must run this after the task-state CAS UPDATE succeeds so we do
+    not attach files to a failed transition. The staged list is popped from
+    metadata before run metadata / event payloads are persisted.
+    """
+    staged = metadata.pop("_staged_artifacts", None)
+    if not isinstance(staged, (list, tuple)):
+        return
+    for stored_path in staged:
+        path = Path(stored_path)
+        _insert_lifecycle_attachment(
+            conn,
+            task_id,
+            filename=path.name,
+            stored_path=str(path),
+            size=path.stat().st_size,
+            created_at=created_at,
+            uploaded_by=uploaded_by,
+        )
+
+
 def _insert_lifecycle_attachment(
     conn: sqlite3.Connection,
     task_id: str,
@@ -6927,25 +7018,11 @@ def _insert_lifecycle_attachment(
     )
 
 
-def _insert_completion_attachment(
-    conn: sqlite3.Connection,
-    task_id: str,
-    *,
-    filename: str,
-    stored_path: str,
-    size: int,
-    created_at: int,
-) -> None:
-    """Record a worker-produced artifact in the existing attachment table."""
-    _insert_lifecycle_attachment(
-        conn,
-        task_id,
-        filename=filename,
-        stored_path=stored_path,
-        size=size,
-        created_at=created_at,
-        uploaded_by="kanban_complete",
-    )
+# Backward-compatible alias used by older call sites that did not name an uploader.
+_insert_completion_attachment = partial(
+    _insert_lifecycle_attachment,
+    uploaded_by="kanban_complete",
+)
 
 
 def _unique_attachment_path(directory: Path, filename: str, used: set[Path]) -> Path:
@@ -7419,6 +7496,7 @@ def block_task(
     reason: Optional[str] = None,
     kind: Optional[str] = None,
     contract: Optional[dict[str, Any]] = None,
+    metadata: Optional[dict[str, Any]] = None,
     expected_run_id: Optional[int] = None,
 ) -> bool:
     """Transition ``running``/``ready`` → ``blocked`` (or route elsewhere).
@@ -7445,6 +7523,11 @@ def block_task(
       can use it to signal "this might clear on its own"; it still participates
       in the loop breaker so a forever-flaky task eventually escalates.
 
+    ``metadata`` is a free-form dict of structured handoff facts (changed_files,
+    tests_run, findings, etc.) Just like :func:`complete_task`, declared
+    artifact paths inside a managed scratch workspace are copied to durable
+    task attachments before the workspace can be lost.
+
     Returns True on any successful transition (to ``blocked``, ``todo``, or
     ``triage``), False when the task wasn't in a blockable state.
     """
@@ -7462,6 +7545,10 @@ def block_task(
         contract_payload["error_type"],
     )
     recurrences = 0
+
+    metadata = dict(metadata) if isinstance(metadata, dict) else {}
+    now = int(time.time())
+
     with write_txn(conn):
         cur_row = conn.execute(
             "SELECT status, block_kind, block_recurrences FROM tasks WHERE id = ?",
@@ -7469,6 +7556,16 @@ def block_task(
         ).fetchone()
         if cur_row is None:
             return False
+
+        # Preserve declared scratch artifacts inside the state-transition
+        # transaction, mirroring complete_task. Failure here is loud so the
+        # worker can fix the path and retry; the DB is not mutated unless the
+        # copy succeeds and the state update lands.
+        if metadata:
+            _persist_scratch_lifecycle_artifacts(
+                conn, task_id, metadata, uploaded_by="kanban_block"
+            )
+
         prev_kind = cur_row["block_kind"] if "block_kind" in cur_row.keys() else None
         prev_recurrences = (
             int(cur_row["block_recurrences"])
@@ -7532,14 +7629,19 @@ def block_task(
             )
             if cur.rowcount != 1:
                 return False
+            _record_lifecycle_staged_artifacts(
+                conn, task_id, metadata, created_at=now, uploaded_by="kanban_block"
+            )
             run_id = _end_run(
                 conn, task_id,
                 outcome="blocked", status="blocked",
                 summary=reason,
+                metadata=metadata if metadata else None,
             )
             if run_id is None and reason:
                 run_id = _synthesize_ended_run(
                     conn, task_id, outcome="blocked", summary=reason,
+                    metadata=metadata if metadata else None,
                 )
             _append_event(
                 conn, task_id, "dependency_wait",
@@ -7564,6 +7666,7 @@ def block_task(
                 assignee=_blocked_task.assignee if _blocked_task else None,
                 run_id=run_id,
                 reason=reason,
+                metadata=metadata if metadata else None,
             )
             return True
 
@@ -7631,14 +7734,21 @@ def block_task(
             )
             if cur.rowcount != 1:
                 return False
+            _record_lifecycle_staged_artifacts(
+                conn, task_id, metadata, created_at=now, uploaded_by="kanban_block"
+            )
             run_id = _end_run(
                 conn, task_id,
                 outcome="blocked", status="blocked",
                 summary=reason,
+                metadata=metadata if metadata else None,
             )
             if run_id is None and reason:
                 run_id = _synthesize_ended_run(
-                    conn, task_id, outcome="blocked", summary=reason,
+                    conn, task_id,
+                    outcome="blocked",
+                    summary=reason,
+                    metadata=metadata if metadata else None,
                 )
             _append_event(
                 conn, task_id, "block_loop_detected",
@@ -7699,10 +7809,14 @@ def block_task(
                 )
             if cur.rowcount != 1:
                 return False
+            _record_lifecycle_staged_artifacts(
+                conn, task_id, metadata, created_at=now, uploaded_by="kanban_block"
+            )
             run_id = _end_run(
                 conn, task_id,
                 outcome="blocked", status="blocked",
                 summary=reason,
+                metadata=metadata if metadata else None,
             )
             # Synthesize a run when blocking a never-claimed task so the
             # reason is preserved in attempt history.
@@ -7711,6 +7825,7 @@ def block_task(
                     conn, task_id,
                     outcome="blocked",
                     summary=reason,
+                    metadata=metadata if metadata else None,
                 )
             _append_event(
                 conn, task_id, "blocked",
@@ -7722,6 +7837,14 @@ def block_task(
                 },
                 run_id=run_id,
             )
+            if isinstance(metadata, dict) and _artifact_list_from_metadata(metadata):
+                _append_event(
+                    conn, task_id, "blocked_artifacts",
+                    {
+                        "artifacts": _artifact_list_from_metadata(metadata),
+                    },
+                    run_id=run_id,
+                )
         _blocked_task = get_task(conn, task_id)
     _fire_kanban_lifecycle_hook(
         "kanban_task_blocked",
@@ -7730,6 +7853,7 @@ def block_task(
         assignee=_blocked_task.assignee if _blocked_task else None,
         run_id=run_id,
         reason=reason,
+        metadata=metadata if metadata else None,
     )
     return True
 

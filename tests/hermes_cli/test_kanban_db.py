@@ -2425,6 +2425,71 @@ def test_block_then_unblock(kanban_home):
         assert kb.get_task(conn, t).status == "ready"
 
 
+def test_block_task_persists_scratch_artifacts_before_workspace_loss(kanban_home):
+    """Blocking a scratch task can preserve declared artifacts like completion."""
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="blocked report")
+        task = kb.get_task(conn, t)
+        ws = kb.resolve_workspace(task)
+        kb.set_workspace_path(conn, t, ws)
+        report = ws / "partial.md"
+        report.write_text("partial findings", encoding="utf-8")
+
+        kb.claim_task(conn, t)
+        assert kb.block_task(
+            conn,
+            t,
+            reason="need clarification",
+            metadata={"artifacts": [str(report)]},
+        )
+
+        run = kb.latest_run(conn, t)
+        blocked_event = [e for e in kb.list_events(conn, t) if e.kind == "blocked"][-1]
+
+    assert run is not None
+    assert run.metadata["artifacts"] != [str(report)]
+    persisted = Path(run.metadata["artifacts"][0])
+    assert persisted.exists()
+    assert persisted.parent == kb.task_attachments_dir(t)
+    assert persisted.name == "partial.md"
+    assert persisted.read_text(encoding="utf-8") == "partial findings"
+    assert str(persisted) != str(report)
+    assert blocked_event.payload.get("reason") == "need clarification"
+    with kb.connect() as conn:
+        blocked_artifact_event = [
+            e for e in kb.list_events(conn, t) if e.kind == "blocked_artifacts"
+        ]
+    assert blocked_artifact_event
+    assert blocked_artifact_event[0].payload.get("artifacts") == [str(persisted)]
+    with kb.connect() as conn:
+        attachments = kb.list_attachments(conn, t)
+    assert [(a.filename, a.stored_path) for a in attachments] == [
+        ("partial.md", str(persisted.resolve()))
+    ]
+
+
+def test_block_task_rejects_missing_declared_scratch_artifact(kanban_home):
+    """A missing declared scratch artifact keeps the task in-flight on block."""
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="blocked missing")
+        task = kb.get_task(conn, t)
+        ws = kb.resolve_workspace(task)
+        kb.set_workspace_path(conn, t, ws)
+        missing = ws / "missing.txt"
+
+        with pytest.raises(kb.ArtifactPreservationError, match="unavailable"):
+            kb.block_task(
+                conn,
+                t,
+                reason="need input",
+                metadata={"artifacts": [str(missing)]},
+            )
+
+        assert kb.get_task(conn, t).status == "ready"
+        assert kb.list_attachments(conn, t) == []
+    assert ws.exists(), "failed block must keep scratch available for retry"
+
+
 def test_unblock_resets_failure_counters(kanban_home):
     """unblock_task must reset consecutive_failures and last_failure_error."""
     with kb.connect() as conn:
