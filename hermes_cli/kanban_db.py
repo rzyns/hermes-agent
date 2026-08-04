@@ -4650,6 +4650,105 @@ def _collision_free_path(dest_dir: Path, safe_name: str) -> Path:
     return dest_dir / candidate
 
 
+def _sha256_bytes(data: bytes) -> str:
+    """Return the SHA-256 hex digest of ``data``."""
+    return hashlib.sha256(data).hexdigest()
+
+
+def _sha256_file(path: Path) -> str:
+    """Return the SHA-256 hex digest of the file at ``path``."""
+    h = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+class AttachmentNameCollisionError(ValueError):
+    """Raised when an attachment filename collides with an existing row.
+
+    A duplicate name means either an overwrite intent or a bug; both
+    deserve a loud error rather than a silently renamed file.
+    """
+
+
+def _attachment_path_for_name(
+    dest_dir: Path, safe_name: str, *, collision_mode: str = "rename"
+) -> Path:
+    """Resolve a destination path for ``safe_name`` under ``dest_dir``.
+
+    ``collision_mode``:
+      * ``rename`` (default) — append ``(1)``, ``(2)`` … as needed, the
+        historical behavior used by the dashboard and older agent tools.
+      * ``error`` — raise :class:`AttachmentNameCollisionError` if a file
+        with that name already exists under ``dest_dir``. Use this for
+        agent-driven scratch-to-durable copies where a duplicate name
+        signals a bug or overwrite intent that should not be hidden.
+    """
+    candidate = dest_dir / safe_name
+    if not candidate.exists():
+        return candidate
+    if collision_mode == "error":
+        raise AttachmentNameCollisionError(
+            f"attachment filename already exists: {safe_name}"
+        )
+    return _collision_free_path(dest_dir, safe_name)
+
+
+def _copy_file_with_hash_verification(
+    src: Path,
+    dest: Path,
+    *,
+    max_bytes: Optional[int] = None,
+) -> tuple[int, str]:
+    """Copy ``src`` to ``dest`` in chunks, verify size/hash, return both.
+
+    The source digest is computed before the copy begins. The destination
+    is written with ``open("xb")`` so an existing file cannot be silently
+    overwritten. After the copy finishes, the destination hash is compared
+    to the source hash; a mismatch raises :class:`ArtifactPreservationError`.
+
+    ``max_bytes`` caps the total bytes copied; an overrun raises
+    :class:`ArtifactPreservationError`.
+    """
+    if max_bytes is None:
+        max_bytes = KANBAN_ATTACHMENT_MAX_BYTES
+    src_size = src.stat().st_size
+    if src_size > max_bytes:
+        raise ArtifactPreservationError(
+            f"artifact exceeds the {max_bytes}-byte limit: {src}"
+        )
+    source_hash = _sha256_file(src)
+    copied = 0
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    with src.open("rb") as source_file, dest.open("xb") as destination_file:
+        while chunk := source_file.read(1024 * 1024):
+            copied += len(chunk)
+            if copied > max_bytes:
+                raise ArtifactPreservationError(
+                    f"artifact grew beyond the {max_bytes}-byte limit: {src}"
+                )
+            destination_file.write(chunk)
+    if copied != src_size:
+        try:
+            dest.unlink(missing_ok=True)
+        except OSError:
+            pass
+        raise ArtifactPreservationError(
+            f"size mismatch copying {src}: expected {src_size}, wrote {copied}"
+        )
+    dest_hash = _sha256_file(dest)
+    if dest_hash != source_hash:
+        try:
+            dest.unlink(missing_ok=True)
+        except OSError:
+            pass
+        raise ArtifactPreservationError(
+            f"hash mismatch copying {src}: source {source_hash} != dest {dest_hash}"
+        )
+    return copied, dest_hash
+
+
 def store_attachment_bytes(
     conn: sqlite3.Connection,
     task_id: str,
@@ -6775,28 +6874,19 @@ def _persist_scratch_completion_artifacts(
                 f"{KANBAN_ATTACHMENT_MAX_BYTES}-byte limit: {artifact}"
             )
 
-        dest: Optional[Path] = None
+        attachment_dir.mkdir(parents=True, exist_ok=True)
+        dest = _unique_attachment_path(attachment_dir, resolved_src.name, used_destinations)
         try:
-            attachment_dir.mkdir(parents=True, exist_ok=True)
-            dest = _unique_attachment_path(attachment_dir, resolved_src.name, used_destinations)
-            with resolved_src.open("rb") as source_file, dest.open("xb") as destination_file:
-                copied = 0
-                while chunk := source_file.read(1024 * 1024):
-                    copied += len(chunk)
-                    if copied > KANBAN_ATTACHMENT_MAX_BYTES:
-                        raise ArtifactPreservationError(
-                            f"declared scratch artifact grew beyond the size limit: {artifact}"
-                        )
-                    destination_file.write(chunk)
-        except Exception as exc:
-            if dest is not None:
-                try:
-                    dest.unlink(missing_ok=True)
-                except OSError:
-                    pass
+            _copy_file_with_hash_verification(
+                resolved_src,
+                dest,
+                max_bytes=KANBAN_ATTACHMENT_MAX_BYTES,
+            )
+        except ArtifactPreservationError:
             _discard_copies()
-            if isinstance(exc, ArtifactPreservationError):
-                raise
+            raise
+        except Exception as exc:
+            _discard_copies()
             raise ArtifactPreservationError(
                 f"could not preserve declared scratch artifact {artifact}: {exc}"
             ) from exc
@@ -6812,6 +6902,31 @@ def _persist_scratch_completion_artifacts(
         ]
 
 
+def _insert_lifecycle_attachment(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    filename: str,
+    stored_path: str,
+    size: int,
+    created_at: int,
+    uploaded_by: str,
+) -> None:
+    """Record a lifecycle-preserved artifact in the existing attachment table."""
+    conn.execute(
+        "INSERT INTO task_attachments "
+        "(task_id, filename, stored_path, content_type, size, uploaded_by, created_at) "
+        "VALUES (?, ?, ?, NULL, ?, ?, ?)",
+        (task_id, filename, stored_path, size, uploaded_by, created_at),
+    )
+    _append_event(
+        conn,
+        task_id,
+        "attached",
+        {"filename": filename, "size": size, "by": uploaded_by},
+    )
+
+
 def _insert_completion_attachment(
     conn: sqlite3.Connection,
     task_id: str,
@@ -6822,17 +6937,14 @@ def _insert_completion_attachment(
     created_at: int,
 ) -> None:
     """Record a worker-produced artifact in the existing attachment table."""
-    conn.execute(
-        "INSERT INTO task_attachments "
-        "(task_id, filename, stored_path, content_type, size, uploaded_by, created_at) "
-        "VALUES (?, ?, ?, NULL, ?, 'kanban_complete', ?)",
-        (task_id, filename, stored_path, size, created_at),
-    )
-    _append_event(
+    _insert_lifecycle_attachment(
         conn,
         task_id,
-        "attached",
-        {"filename": filename, "size": size, "by": "kanban_complete"},
+        filename=filename,
+        stored_path=stored_path,
+        size=size,
+        created_at=created_at,
+        uploaded_by="kanban_complete",
     )
 
 
