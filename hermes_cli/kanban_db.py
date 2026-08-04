@@ -4697,58 +4697,158 @@ def _attachment_path_for_name(
     return _collision_free_path(dest_dir, safe_name)
 
 
+def _stage_file_path(dest_dir: Path, safe_name: str) -> Path:
+    """Return a unique, hidden staging path next to the intended final name.
+
+    The staging file lives in the same directory as the final attachment so
+    publishing can use a same-filesystem hard link and never crosses a mount
+    boundary.  Dot-prefix keeps the transient file out of casual directory
+    listings.
+    """
+    token = secrets.token_hex(8)
+    return dest_dir / f".{token}.{safe_name}.stage"
+
+
+def _remove_file_silent(path: Path) -> None:
+    """Best-effort remove; never raise."""
+    try:
+        path.unlink(missing_ok=True)
+    except OSError:
+        pass
+
+
+def _publish_staged_file(
+    staging_path: Path,
+    final_path: Path,
+    safe_name: str,
+) -> None:
+    """Atomically publish a verified staging file as ``final_path``.
+
+    Uses a same-filesystem hard link: the operation either succeeds with
+    both names pointing at the same inode, or fails with ``EEXIST`` if the
+    final name is already occupied.  The staging file is always removed,
+    success or failure.  No plain ``os.replace`` is used, so an existing
+    final file can never be overwritten.
+
+    Raises :class:`AttachmentNameCollisionError` when ``final_path``
+    already exists, or :class:`ArtifactPreservationError` for unexpected
+    publish failures.
+    """
+    try:
+        os.link(str(staging_path), str(final_path))
+    except FileExistsError as exc:
+        _remove_file_silent(staging_path)
+        raise AttachmentNameCollisionError(
+            f"attachment filename already exists: {safe_name}"
+        ) from exc
+    except OSError as exc:
+        _remove_file_silent(staging_path)
+        raise ArtifactPreservationError(
+            f"could not publish staged attachment to {final_path}: {exc}"
+        ) from exc
+    # Hard link succeeded; drop the extra link so only the final name remains.
+    _remove_file_silent(staging_path)
+
+
 def _copy_file_with_hash_verification(
     src: Path,
     dest: Path,
     *,
     max_bytes: Optional[int] = None,
-) -> tuple[int, str]:
-    """Copy ``src`` to ``dest`` in chunks, verify size/hash, return both.
+) -> Path:
+    """Copy ``src`` to ``dest`` atomically with byte-exact SHA-256 verification.
 
-    The source digest is computed before the copy begins. The destination
-    is written with ``open("xb")`` so an existing file cannot be silently
-    overwritten. After the copy finishes, the destination hash is compared
-    to the source hash; a mismatch raises :class:`ArtifactPreservationError`.
+    The source is opened **once**; its digest is computed from the bytes
+    actually streamed to the destination, eliminating the TOCTOU window
+    between a pre-copy hash and the real copy. A stable snapshot of the
+    source's size/mtime is recorded before and after the stream; a change
+    raises :class:`ArtifactPreservationError`.
+
+    The destination is written to a hidden same-directory staging file,
+    verified, then published with a no-clobber hard link so a partial or
+    failed copy can never leave a truncated file at ``dest``. Returns the
+    final ``dest`` path.
 
     ``max_bytes`` caps the total bytes copied; an overrun raises
     :class:`ArtifactPreservationError`.
     """
     if max_bytes is None:
         max_bytes = KANBAN_ATTACHMENT_MAX_BYTES
-    src_size = src.stat().st_size
+
+    # Pre-check: stat once and remember stable identity for the mutation check.
+    try:
+        pre_stat = src.stat()
+    except OSError as exc:
+        raise ArtifactPreservationError(f"cannot stat source artifact {src}: {exc}") from exc
+    src_size = pre_stat.st_size
     if src_size > max_bytes:
         raise ArtifactPreservationError(
             f"artifact exceeds the {max_bytes}-byte limit: {src}"
         )
-    source_hash = _sha256_file(src)
-    copied = 0
+
     dest.parent.mkdir(parents=True, exist_ok=True)
-    with src.open("rb") as source_file, dest.open("xb") as destination_file:
-        while chunk := source_file.read(1024 * 1024):
-            copied += len(chunk)
-            if copied > max_bytes:
-                raise ArtifactPreservationError(
-                    f"artifact grew beyond the {max_bytes}-byte limit: {src}"
-                )
-            destination_file.write(chunk)
+    staging_path = _stage_file_path(dest.parent, dest.name)
+    copied = 0
+    stream_hash = hashlib.sha256()
+
+    try:
+        with src.open("rb") as source_file:
+            with staging_path.open("xb") as destination_file:
+                while chunk := source_file.read(1024 * 1024):
+                    copied += len(chunk)
+                    if copied > max_bytes:
+                        raise ArtifactPreservationError(
+                            f"artifact grew beyond the {max_bytes}-byte limit: {src}"
+                        )
+                    destination_file.write(chunk)
+                    stream_hash.update(chunk)
+                destination_file.flush()
+                os.fsync(destination_file.fileno())
+    except ArtifactPreservationError:
+        _remove_file_silent(staging_path)
+        raise
+    except Exception as exc:
+        _remove_file_silent(staging_path)
+        raise ArtifactPreservationError(
+            f"could not copy artifact {src} to staging: {exc}"
+        ) from exc
+
     if copied != src_size:
-        try:
-            dest.unlink(missing_ok=True)
-        except OSError:
-            pass
+        _remove_file_silent(staging_path)
         raise ArtifactPreservationError(
             f"size mismatch copying {src}: expected {src_size}, wrote {copied}"
         )
-    dest_hash = _sha256_file(dest)
-    if dest_hash != source_hash:
-        try:
-            dest.unlink(missing_ok=True)
-        except OSError:
-            pass
+
+    # Verify the bytes that landed on disk match the bytes that left the source.
+    staging_hash = _sha256_file(staging_path)
+    if staging_hash != stream_hash.hexdigest():
+        _remove_file_silent(staging_path)
         raise ArtifactPreservationError(
-            f"hash mismatch copying {src}: source {source_hash} != dest {dest_hash}"
+            f"hash mismatch writing {src}: streamed {stream_hash.hexdigest()} "
+            f"!= staging {staging_hash}"
         )
-    return copied, dest_hash
+
+    # Detect source mutation that happened during the copy.
+    try:
+        post_stat = src.stat()
+    except OSError as exc:
+        _remove_file_silent(staging_path)
+        raise ArtifactPreservationError(
+            f"cannot re-stat source artifact {src} after copy: {exc}"
+        ) from exc
+    if (
+        post_stat.st_size != pre_stat.st_size
+        or getattr(post_stat, "st_mtime_ns", post_stat.st_mtime)
+        != getattr(pre_stat, "st_mtime_ns", pre_stat.st_mtime)
+    ):
+        _remove_file_silent(staging_path)
+        raise ArtifactPreservationError(
+            f"source artifact {src} changed during copy"
+        )
+
+    # Publish atomically: hard link to final name, then drop the staging link.
+    _publish_staged_file(staging_path, dest, dest.name)
+    return dest
 
 
 def store_attachment_bytes(
@@ -4772,14 +4872,15 @@ def store_attachment_bytes(
     collision-resolution all behave identically everywhere.
 
     Steps: enforce ``max_bytes``, sanitise ``filename`` to a safe basename,
-    write the bytes under :func:`task_attachments_dir` with a
-    collision-free name, then insert the ``task_attachments`` row via
-    :func:`add_attachment`. Returns the new attachment id.
+    stage the bytes under :func:`task_attachments_dir`, verify the hash,
+    publish with an atomic no-clobber hard link, then insert the
+    ``task_attachments`` row via :func:`add_attachment`. Returns the new
+    attachment id.
 
     Raises :class:`AttachmentTooLarge` when ``data`` exceeds ``max_bytes``,
     or :class:`ValueError` for a bad filename / unknown task. On any failure
-    after the blob is written (e.g. the task disappeared) the orphaned blob
-    is removed before re-raising.
+    no partial file is left at the canonical final path, and the staging
+    file is removed.
 
     ``collision_mode``:
       * ``rename`` (default) — append ``(1)``, ``(2)`` … as needed, the
@@ -4808,23 +4909,26 @@ def store_attachment_bytes(
     )
 
     source_hash = _sha256_bytes(data) if verify_hash else None
-    # Use create mode so a race between path resolution and write cannot
-    # silently clobber an existing file. A collision here becomes an error
-    # that the caller surfaces, rather than a truncated overwrite.
-    with dest_path.open("xb") as handle:
-        handle.write(data)
+    staging_path = _stage_file_path(dest_dir, safe_name)
+    published_final: Optional[Path] = None
+
     try:
+        with staging_path.open("xb") as handle:
+            handle.write(data)
+            handle.flush()
+            os.fsync(handle.fileno())
+
         if verify_hash and source_hash is not None:
-            dest_hash = _sha256_file(dest_path)
-            if dest_hash != source_hash:
-                try:
-                    dest_path.unlink(missing_ok=True)
-                except OSError:
-                    pass
+            staging_hash = _sha256_file(staging_path)
+            if staging_hash != source_hash:
                 raise ArtifactPreservationError(
                     f"hash mismatch writing {dest_path}: "
-                    f"expected {source_hash}, got {dest_hash}"
+                    f"expected {source_hash}, got {staging_hash}"
                 )
+
+        _publish_staged_file(staging_path, dest_path, safe_name)
+        published_final = dest_path
+
         return add_attachment(
             conn,
             task_id,
@@ -4834,13 +4938,17 @@ def store_attachment_bytes(
             size=len(data),
             uploaded_by=uploaded_by,
         )
+    except ArtifactPreservationError:
+        _remove_file_silent(staging_path)
+        if published_final is not None:
+            _remove_file_silent(published_final)
+        raise
     except Exception:
         # Don't leave an orphan blob if the metadata insert fails (most
-        # commonly: the task id doesn't exist).
-        try:
-            dest_path.unlink(missing_ok=True)
-        except OSError:
-            pass
+        # commonly: the task id doesn't exist), and never leave a staging file.
+        _remove_file_silent(staging_path)
+        if published_final is not None:
+            _remove_file_silent(published_final)
         raise
 
 
@@ -6800,6 +6908,25 @@ def _artifact_list_from_metadata(metadata: Optional[dict]) -> list[str]:
     ]
 
 
+def _emit_blocked_artifacts_event(
+    conn: sqlite3.Connection,
+    task_id: str,
+    metadata: dict,
+    *,
+    run_id: Optional[int],
+) -> None:
+    """Emit a ``blocked_artifacts`` event when declared artifacts are present."""
+    artifacts = _artifact_list_from_metadata(metadata)
+    if artifacts:
+        _append_event(
+            conn,
+            task_id,
+            "blocked_artifacts",
+            {"artifacts": artifacts},
+            run_id=run_id,
+        )
+
+
 def _merge_completion_prose_artifacts(
     conn: sqlite3.Connection,
     task_id: str,
@@ -7526,7 +7653,17 @@ def block_task(
     ``metadata`` is a free-form dict of structured handoff facts (changed_files,
     tests_run, findings, etc.) Just like :func:`complete_task`, declared
     artifact paths inside a managed scratch workspace are copied to durable
-    task attachments before the workspace can be lost.
+    task attachments before the workspace can be lost. This only covers orderly
+    worker-invoked blocks that pass ``metadata["artifacts"]``; crash and
+    budget-exhaustion paths do not declare artifacts and are not recovered here.
+
+    Filesystem copies are performed **after** the state-transition CAS UPDATE
+    succeeds, inside the same ``BEGIN IMMEDIATE`` transaction. SQLite cannot
+    roll back filesystem writes, so any exception after a successful copy
+    (including a failed COMMIT) triggers explicit compensation that removes
+    staged files. A stale ``expected_run_id`` therefore reaches the
+    ``rowcount != 1`` path before any filesystem mutation, leaving no orphan
+    attachment.
 
     Returns True on any successful transition (to ``blocked``, ``todo``, or
     ``triage``), False when the task wasn't in a blockable state.
@@ -7548,304 +7685,310 @@ def block_task(
 
     metadata = dict(metadata) if isinstance(metadata, dict) else {}
     now = int(time.time())
+    run_id: Optional[int] = None
+    _blocked_task: Optional[Any] = None
 
-    with write_txn(conn):
-        cur_row = conn.execute(
-            "SELECT status, block_kind, block_recurrences FROM tasks WHERE id = ?",
-            (task_id,),
-        ).fetchone()
-        if cur_row is None:
-            return False
+    def _compensate_staged_files() -> None:
+        """Remove any durable files staged during a failed block transition."""
+        staged = metadata.get("_staged_artifacts", [])
+        if not isinstance(staged, (list, tuple)):
+            return
+        for stored_path in staged:
+            try:
+                Path(stored_path).unlink(missing_ok=True)
+            except OSError:
+                pass
 
-        # Preserve declared scratch artifacts inside the state-transition
-        # transaction, mirroring complete_task. Failure here is loud so the
-        # worker can fix the path and retry; the DB is not mutated unless the
-        # copy succeeds and the state update lands.
+    def _copy_declared_artifacts() -> None:
+        """Copy declared scratch artifacts and record their attachment rows."""
         if metadata:
             _persist_scratch_lifecycle_artifacts(
                 conn, task_id, metadata, uploaded_by="kanban_block"
             )
-
-        prev_kind = cur_row["block_kind"] if "block_kind" in cur_row.keys() else None
-        prev_recurrences = (
-            int(cur_row["block_recurrences"])
-            if "block_recurrences" in cur_row.keys()
-            and cur_row["block_recurrences"] is not None
-            else 0
+        _record_lifecycle_staged_artifacts(
+            conn, task_id, metadata, created_at=now, uploaded_by="kanban_block"
         )
 
-        # Dependency blocks never enter the human ``blocked`` bucket — they
-        # wait in ``todo`` and let ``recompute_ready`` gate on parents. Routing
-        # here (rather than ``blocked``) is what keeps a cron from ever seeing
-        # a dependency-wait as something to "unblock".
-        if kind == "dependency":
-            # Compute the dependency fingerprint BEFORE the UPDATE so
-            # recompute_ready can detect "same blocking condition" and
-            # refuse to re-promote (DISP-1: 2026-07-27 incident, 122 wasted
-            # runs in a dependency_wait → promote → spawn → dependency_wait
-            # loop). The worker already told us it can't proceed; we must
-            # not re-dispatch until the dependency materially changes.
-            dep_fp = _dependency_fingerprint(conn, task_id)
-            # Read the current dep_wait_count so we can increment it. On
-            # the first dependency block for this task it's 0 → 1.
-            dep_count_row = conn.execute(
-                "SELECT dep_wait_count FROM tasks WHERE id = ?",
+    try:
+        with write_txn(conn):
+            cur_row = conn.execute(
+                "SELECT status, block_kind, block_recurrences FROM tasks WHERE id = ?",
                 (task_id,),
             ).fetchone()
-            prev_dep_count = (
-                int(dep_count_row["dep_wait_count"])
-                if dep_count_row
-                and dep_count_row["dep_wait_count"] is not None
+            if cur_row is None:
+                return False
+
+            prev_kind = cur_row["block_kind"] if "block_kind" in cur_row.keys() else None
+            prev_recurrences = (
+                int(cur_row["block_recurrences"])
+                if "block_recurrences" in cur_row.keys()
+                and cur_row["block_recurrences"] is not None
                 else 0
             )
-            # Independent wait-window counter: unlike the sticky fingerprint,
-            # this deliberately survives dependency changes and promotion.
-            # Only explicit operator unblock (or completion) starts a new
-            # window, so a flickering dependency cannot evade the cap.
-            new_dep_count = prev_dep_count + 1
-            cur = conn.execute(
-                """
-                UPDATE tasks
-                   SET status        = 'todo',
-                       claim_lock    = NULL,
-                       claim_expires = NULL,
-                       worker_pid    = NULL,
-                       block_kind    = ?,
-                       block_fingerprint = ?,
-                       block_deadline = ?,
-                       block_retry_after = ?,
-                       block_error_type = ?,
-                       dep_wait_fingerprint = ?,
-                       dep_wait_count = ?
-                 WHERE id = ?
-                   AND status IN ('running', 'ready')
-                """ + ("" if expected_run_id is None else " AND current_run_id = ?"),
-                (kind, *block_values, dep_fp, new_dep_count, task_id)
-                if expected_run_id is None
-                else (
-                    kind, *block_values, dep_fp, new_dep_count, task_id,
-                    int(expected_run_id),
-                ),
-            )
-            if cur.rowcount != 1:
-                return False
-            _record_lifecycle_staged_artifacts(
-                conn, task_id, metadata, created_at=now, uploaded_by="kanban_block"
-            )
-            run_id = _end_run(
-                conn, task_id,
-                outcome="blocked", status="blocked",
-                summary=reason,
-                metadata=metadata if metadata else None,
-            )
-            if run_id is None and reason:
-                run_id = _synthesize_ended_run(
-                    conn, task_id, outcome="blocked", summary=reason,
-                    metadata=metadata if metadata else None,
-                )
-            _append_event(
-                conn, task_id, "dependency_wait",
-                {
-                    "reason": reason,
-                    "kind": kind,
-                    "contract": contract_payload,
-                    "dep_wait_fingerprint": dep_fp,
-                    "dep_wait_count": new_dep_count,
-                },
-                run_id=run_id,
-            )
-            if new_dep_count >= DEP_WAIT_REDISPATCH_CAP:
-                _maybe_emit_dep_wait_backstop(
-                    conn, task_id, new_dep_count, dep_fp
-                )
-            _blocked_task = get_task(conn, task_id)
-            _fire_kanban_lifecycle_hook(
-                "kanban_task_blocked",
-                task_id,
-                board=get_current_board(),
-                assignee=_blocked_task.assignee if _blocked_task else None,
-                run_id=run_id,
-                reason=reason,
-                metadata=metadata if metadata else None,
-            )
-            return True
 
-        # Truly-blocked kinds. Increment the unblock-loop counter when this is a
-        # re-block for the SAME reason after a prior unblock. block_task only
-        # fires from running/ready (i.e. AFTER an unblock returned the task to
-        # the work pool), so a stored block_kind that matches the incoming kind
-        # means: blocked → unblocked → about-to-re-block for the same cause.
-        # An un-typed (None) block compares as "same" to a prior un-typed block.
-        same_cause = prev_kind == kind
-        if kind == "transient":
-            # The retry sweep owns this counter. Keeping block_task neutral
-            # avoids counting a requeue and its following re-block as two
-            # separate retry cycles.
-            recurrences = prev_recurrences if same_cause else 0
-            base_retry_after = contract_payload["retry_after"]
-            if base_retry_after is None:
-                base_retry_after = _BLOCK_DEFAULT_DEADLINE_SECONDS["transient"]
-            retry_after = min(
-                int(base_retry_after) * (2 ** min(recurrences, 14)),
-                _TRANSIENT_RETRY_MAX_SECONDS,
-            )
-            contract_payload["retry_after"] = retry_after
-            block_deadline = int(time.time()) + retry_after
-            block_values = (
-                contract_payload["fingerprint"],
-                block_deadline,
-                retry_after,
-                contract_payload["error_type"],
-            )
-        else:
-            recurrences = prev_recurrences + 1 if same_cause else 1
-
-        if recurrences >= BLOCK_RECURRENCE_LIMIT:
-            # Loop detected — stop letting the unblocker spin this task. Route
-            # to triage for a human-in-the-loop decision instead of blocked.
-            block_deadline = (
-                int(time.time()) + _BLOCK_DEFAULT_DEADLINE_SECONDS["triage"]
-            )
-            block_values = (
-                contract_payload["fingerprint"],
-                block_deadline,
-                contract_payload["retry_after"],
-                contract_payload["error_type"],
-            )
-            cur = conn.execute(
-                """
-                UPDATE tasks
-                   SET status        = 'triage',
-                       claim_lock    = NULL,
-                       claim_expires = NULL,
-                       worker_pid    = NULL,
-                       block_kind    = ?,
-                       block_recurrences = ?,
-                       block_fingerprint = ?,
-                       block_deadline = ?,
-                       block_retry_after = ?,
-                       block_error_type = ?
-                 WHERE id = ?
-                   AND status IN ('running', 'ready')
-                """ + ("" if expected_run_id is None else " AND current_run_id = ?"),
-                (kind, recurrences, *block_values, task_id)
-                if expected_run_id is None
-                else (kind, recurrences, *block_values, task_id, int(expected_run_id)),
-            )
-            if cur.rowcount != 1:
-                return False
-            _record_lifecycle_staged_artifacts(
-                conn, task_id, metadata, created_at=now, uploaded_by="kanban_block"
-            )
-            run_id = _end_run(
-                conn, task_id,
-                outcome="blocked", status="blocked",
-                summary=reason,
-                metadata=metadata if metadata else None,
-            )
-            if run_id is None and reason:
-                run_id = _synthesize_ended_run(
-                    conn, task_id,
-                    outcome="blocked",
-                    summary=reason,
-                    metadata=metadata if metadata else None,
+            # Dependency blocks never enter the human ``blocked`` bucket — they
+            # wait in ``todo`` and let ``recompute_ready`` gate on parents. Routing
+            # here (rather than ``blocked``) is what keeps a cron from ever seeing
+            # a dependency-wait as something to "unblock".
+            if kind == "dependency":
+                # Compute the dependency fingerprint BEFORE the UPDATE so
+                # recompute_ready can detect "same blocking condition" and
+                # refuse to re-promote (DISP-1: 2026-07-27 incident, 122 wasted
+                # runs in a dependency_wait → promote → spawn → dependency_wait
+                # loop). The worker already told us it can't proceed; we must
+                # not re-dispatch until the dependency materially changes.
+                dep_fp = _dependency_fingerprint(conn, task_id)
+                # Read the current dep_wait_count so we can increment it. On
+                # the first dependency block for this task it's 0 → 1.
+                dep_count_row = conn.execute(
+                    "SELECT dep_wait_count FROM tasks WHERE id = ?",
+                    (task_id,),
+                ).fetchone()
+                prev_dep_count = (
+                    int(dep_count_row["dep_wait_count"])
+                    if dep_count_row
+                    and dep_count_row["dep_wait_count"] is not None
+                    else 0
                 )
-            _append_event(
-                conn, task_id, "block_loop_detected",
-                {
-                    "reason": reason,
-                    "kind": kind,
-                    "recurrences": recurrences,
-                    "limit": BLOCK_RECURRENCE_LIMIT,
-                    "contract": contract_payload,
-                },
-                run_id=run_id,
-            )
-        else:
-            if expected_run_id is None:
+                # Independent wait-window counter: unlike the sticky fingerprint,
+                # this deliberately survives dependency changes and promotion.
+                # Only explicit operator unblock (or completion) starts a new
+                # window, so a flickering dependency cannot evade the cap.
+                new_dep_count = prev_dep_count + 1
                 cur = conn.execute(
                     """
                     UPDATE tasks
-                       SET status        = 'blocked',
+                       SET status        = 'todo',
                            claim_lock    = NULL,
                            claim_expires = NULL,
                            worker_pid    = NULL,
                            block_kind    = ?,
-                           block_recurrences = ?,
                            block_fingerprint = ?,
                            block_deadline = ?,
                            block_retry_after = ?,
-                           block_error_type = ?
+                           block_error_type = ?,
+                           dep_wait_fingerprint = ?,
+                           dep_wait_count = ?
                      WHERE id = ?
                        AND status IN ('running', 'ready')
-                    """,
-                    (kind, recurrences, *block_values, task_id),
-                )
-            else:
-                cur = conn.execute(
-                    """
-                    UPDATE tasks
-                       SET status        = 'blocked',
-                           claim_lock    = NULL,
-                           claim_expires = NULL,
-                           worker_pid    = NULL,
-                           block_kind    = ?,
-                           block_recurrences = ?,
-                           block_fingerprint = ?,
-                           block_deadline = ?,
-                           block_retry_after = ?,
-                           block_error_type = ?
-                     WHERE id = ?
-                       AND status IN ('running', 'ready')
-                       AND current_run_id = ?
-                    """,
-                    (
-                        kind,
-                        recurrences,
-                        *block_values,
-                        task_id,
+                    """ + ("" if expected_run_id is None else " AND current_run_id = ?"),
+                    (kind, *block_values, dep_fp, new_dep_count, task_id)
+                    if expected_run_id is None
+                    else (
+                        kind, *block_values, dep_fp, new_dep_count, task_id,
                         int(expected_run_id),
                     ),
                 )
-            if cur.rowcount != 1:
-                return False
-            _record_lifecycle_staged_artifacts(
-                conn, task_id, metadata, created_at=now, uploaded_by="kanban_block"
-            )
-            run_id = _end_run(
-                conn, task_id,
-                outcome="blocked", status="blocked",
-                summary=reason,
-                metadata=metadata if metadata else None,
-            )
-            # Synthesize a run when blocking a never-claimed task so the
-            # reason is preserved in attempt history.
-            if run_id is None and reason:
-                run_id = _synthesize_ended_run(
+                if cur.rowcount != 1:
+                    return False
+
+                # CAS succeeded: now it is safe to touch filesystem artifacts.
+                _copy_declared_artifacts()
+                run_id = _end_run(
                     conn, task_id,
-                    outcome="blocked",
+                    outcome="blocked", status="blocked",
                     summary=reason,
                     metadata=metadata if metadata else None,
                 )
-            _append_event(
-                conn, task_id, "blocked",
-                {
-                    "reason": reason,
-                    "kind": kind,
-                    "recurrences": recurrences,
-                    "contract": contract_payload,
-                },
-                run_id=run_id,
-            )
-            if isinstance(metadata, dict) and _artifact_list_from_metadata(metadata):
+                if run_id is None and reason:
+                    run_id = _synthesize_ended_run(
+                        conn, task_id, outcome="blocked", summary=reason,
+                        metadata=metadata if metadata else None,
+                    )
+                _emit_blocked_artifacts_event(conn, task_id, metadata, run_id=run_id)
                 _append_event(
-                    conn, task_id, "blocked_artifacts",
+                    conn, task_id, "dependency_wait",
                     {
-                        "artifacts": _artifact_list_from_metadata(metadata),
+                        "reason": reason,
+                        "kind": kind,
+                        "contract": contract_payload,
+                        "dep_wait_fingerprint": dep_fp,
+                        "dep_wait_count": new_dep_count,
                     },
                     run_id=run_id,
                 )
-        _blocked_task = get_task(conn, task_id)
+                if new_dep_count >= DEP_WAIT_REDISPATCH_CAP:
+                    _maybe_emit_dep_wait_backstop(
+                        conn, task_id, new_dep_count, dep_fp
+                    )
+                _blocked_task = get_task(conn, task_id)
+                return True
+
+            # Truly-blocked kinds. Increment the unblock-loop counter when this is a
+            # re-block for the SAME reason after a prior unblock. block_task only
+            # fires from running/ready (i.e. AFTER an unblock returned the task to
+            # the work pool), so a stored block_kind that matches the incoming kind
+            # means: blocked → unblocked → about-to-re-block for the same cause.
+            # An un-typed (None) block compares as "same" to a prior un-typed block.
+            same_cause = prev_kind == kind
+            if kind == "transient":
+                # The retry sweep owns this counter. Keeping block_task neutral
+                # avoids counting a requeue and its following re-block as two
+                # separate retry cycles.
+                recurrences = prev_recurrences if same_cause else 0
+                base_retry_after = contract_payload["retry_after"]
+                if base_retry_after is None:
+                    base_retry_after = _BLOCK_DEFAULT_DEADLINE_SECONDS["transient"]
+                retry_after = min(
+                    int(base_retry_after) * (2 ** min(recurrences, 14)),
+                    _TRANSIENT_RETRY_MAX_SECONDS,
+                )
+                contract_payload["retry_after"] = retry_after
+                block_deadline = int(time.time()) + retry_after
+                block_values = (
+                    contract_payload["fingerprint"],
+                    block_deadline,
+                    retry_after,
+                    contract_payload["error_type"],
+                )
+            else:
+                recurrences = prev_recurrences + 1 if same_cause else 1
+
+            if recurrences >= BLOCK_RECURRENCE_LIMIT:
+                # Loop detected — stop letting the unblocker spin this task. Route
+                # to triage for a human-in-the-loop decision instead of blocked.
+                block_deadline = (
+                    int(time.time()) + _BLOCK_DEFAULT_DEADLINE_SECONDS["triage"]
+                )
+                block_values = (
+                    contract_payload["fingerprint"],
+                    block_deadline,
+                    contract_payload["retry_after"],
+                    contract_payload["error_type"],
+                )
+                cur = conn.execute(
+                    """
+                    UPDATE tasks
+                       SET status        = 'triage',
+                           claim_lock    = NULL,
+                           claim_expires = NULL,
+                           worker_pid    = NULL,
+                           block_kind    = ?,
+                           block_recurrences = ?,
+                           block_fingerprint = ?,
+                           block_deadline = ?,
+                           block_retry_after = ?,
+                           block_error_type = ?
+                     WHERE id = ?
+                       AND status IN ('running', 'ready')
+                    """ + ("" if expected_run_id is None else " AND current_run_id = ?"),
+                    (kind, recurrences, *block_values, task_id)
+                    if expected_run_id is None
+                    else (kind, recurrences, *block_values, task_id, int(expected_run_id)),
+                )
+                if cur.rowcount != 1:
+                    return False
+
+                _copy_declared_artifacts()
+                run_id = _end_run(
+                    conn, task_id,
+                    outcome="blocked", status="blocked",
+                    summary=reason,
+                    metadata=metadata if metadata else None,
+                )
+                if run_id is None and reason:
+                    run_id = _synthesize_ended_run(
+                        conn, task_id,
+                        outcome="blocked",
+                        summary=reason,
+                        metadata=metadata if metadata else None,
+                    )
+                _emit_blocked_artifacts_event(conn, task_id, metadata, run_id=run_id)
+                _append_event(
+                    conn, task_id, "block_loop_detected",
+                    {
+                        "reason": reason,
+                        "kind": kind,
+                        "recurrences": recurrences,
+                        "limit": BLOCK_RECURRENCE_LIMIT,
+                        "contract": contract_payload,
+                    },
+                    run_id=run_id,
+                )
+            else:
+                if expected_run_id is None:
+                    cur = conn.execute(
+                        """
+                        UPDATE tasks
+                           SET status        = 'blocked',
+                               claim_lock    = NULL,
+                               claim_expires = NULL,
+                               worker_pid    = NULL,
+                               block_kind    = ?,
+                               block_recurrences = ?,
+                               block_fingerprint = ?,
+                               block_deadline = ?,
+                               block_retry_after = ?,
+                               block_error_type = ?
+                         WHERE id = ?
+                           AND status IN ('running', 'ready')
+                        """,
+                        (kind, recurrences, *block_values, task_id),
+                    )
+                else:
+                    cur = conn.execute(
+                        """
+                        UPDATE tasks
+                           SET status        = 'blocked',
+                               claim_lock    = NULL,
+                               claim_expires = NULL,
+                               worker_pid    = NULL,
+                               block_kind    = ?,
+                               block_recurrences = ?,
+                               block_fingerprint = ?,
+                               block_deadline = ?,
+                               block_retry_after = ?,
+                               block_error_type = ?
+                         WHERE id = ?
+                           AND status IN ('running', 'ready')
+                           AND current_run_id = ?
+                        """,
+                        (
+                            kind,
+                            recurrences,
+                            *block_values,
+                            task_id,
+                            int(expected_run_id),
+                        ),
+                    )
+                if cur.rowcount != 1:
+                    return False
+
+                _copy_declared_artifacts()
+                run_id = _end_run(
+                    conn, task_id,
+                    outcome="blocked", status="blocked",
+                    summary=reason,
+                    metadata=metadata if metadata else None,
+                )
+                # Synthesize a run when blocking a never-claimed task so the
+                # reason is preserved in attempt history.
+                if run_id is None and reason:
+                    run_id = _synthesize_ended_run(
+                        conn, task_id,
+                        outcome="blocked",
+                        summary=reason,
+                        metadata=metadata if metadata else None,
+                    )
+                _emit_blocked_artifacts_event(conn, task_id, metadata, run_id=run_id)
+                _append_event(
+                    conn, task_id, "blocked",
+                    {
+                        "reason": reason,
+                        "kind": kind,
+                        "recurrences": recurrences,
+                        "contract": contract_payload,
+                    },
+                    run_id=run_id,
+                )
+            _blocked_task = get_task(conn, task_id)
+    except Exception:
+        # SQLite cannot roll back filesystem writes. If a copy succeeded but a
+        # later event / run / commit failed, remove any staged durable files so
+        # the next attempt does not see filename churn from orphan attachments.
+        _compensate_staged_files()
+        raise
+
     _fire_kanban_lifecycle_hook(
         "kanban_task_blocked",
         task_id,
@@ -7856,8 +7999,6 @@ def block_task(
         metadata=metadata if metadata else None,
     )
     return True
-
-
 def record_blocked_hold(
     conn: sqlite3.Connection,
     task_id: str,

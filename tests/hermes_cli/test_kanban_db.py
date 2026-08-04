@@ -3999,6 +3999,252 @@ def test_cleanup_workspace_refuses_path_outside_scratch_root(kanban_home, tmp_pa
     assert (real_source / "README.md").read_text(encoding="utf-8") == "important"
 
 
+# ---------------------------------------------------------------------------
+# Attachments
+# ---------------------------------------------------------------------------
+
+def test_store_attachment_bytes_partial_write_leaves_no_truncated_file(
+    kanban_home,
+):
+    """A failed mid-write flush must not leave a partial canonical file."""
+    from unittest.mock import patch
+
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="attach target")
+
+    class _FailingFile:
+        def __init__(self, real_handle):
+            self._real = real_handle
+            self._written = 0
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            self._real.__exit__(exc_type, exc, tb)
+            return False
+
+        def write(self, data):
+            if self._written == 0:
+                self._real.write(data[:3])
+                self._written = 3
+                raise OSError("simulated disk full")
+            self._real.write(data)
+
+        def flush(self):
+            self._real.flush()
+
+        def fileno(self):
+            return self._real.fileno()
+
+    original_open = Path.open
+
+    def _wrapped_open(self, *args, **kwargs):
+        handle = original_open(self, *args, **kwargs)
+        # Only intercept staging files (dot-prefix hidden files).
+        if self.name.startswith(".") and self.name.endswith(".stage"):
+            return _FailingFile(handle)
+        return handle
+
+    with patch.object(Path, "open", _wrapped_open):
+        with pytest.raises((kb.ArtifactPreservationError, OSError), match="disk full"):
+            with kb.connect() as conn:
+                kb.store_attachment_bytes(
+                    conn,
+                    t,
+                    "report.txt",
+                    b"full content",
+                    uploaded_by="agent",
+                    collision_mode="error",
+                )
+
+    with kb.connect() as conn:
+        assert kb.list_attachments(conn, t) == []
+    dest_dir = kb.task_attachments_dir(t)
+    assert not any(p.name == "report.txt" for p in dest_dir.glob("*"))
+
+
+def test_publish_staged_file_no_clobber_removes_staging(kanban_home):
+    """A race where the final name appears during staging is a loud collision."""
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="race target")
+    dest_dir = kb.task_attachments_dir(t)
+    dest_dir.mkdir(parents=True, exist_ok=True)
+    staging = dest_dir / ".abc123.report.txt.stage"
+    final = dest_dir / "report.txt"
+    staging.write_text("staged body", encoding="utf-8")
+    final.write_text("existing body", encoding="utf-8")
+
+    with pytest.raises(kb.AttachmentNameCollisionError, match="already exists"):
+        kb._publish_staged_file(staging, final, "report.txt")
+
+    assert not staging.exists()
+    assert final.read_text(encoding="utf-8") == "existing body"
+
+
+def test_copy_file_with_hash_verification_rejects_source_mutation(kanban_home):
+    """A source file modified after the pre-copy stat is rejected."""
+    import types
+
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="copy target")
+    src_dir = kanban_home / "srcs"
+    src_dir.mkdir(parents=True, exist_ok=True)
+    src = src_dir / "mutating.txt"
+    src.write_text("original", encoding="utf-8")
+
+    # PosixPath.stat is read-only, so wrap the path in a tiny proxy.
+    real_stat = src.stat
+    call_count = 0
+
+    class _MutableStatPath:
+        def __init__(self, target):
+            self._target = target
+
+        def __getattr__(self, name):
+            return getattr(self._target, name)
+
+        def stat(self, *args, **kwargs):
+            nonlocal call_count
+            call_count += 1
+            if call_count == 1:
+                fake = types.SimpleNamespace(
+                    st_size=8,
+                    st_mtime_ns=real_stat().st_mtime_ns - 1_000_000_000,
+                    st_mtime=real_stat().st_mtime - 1,
+                )
+                return fake
+            return real_stat()
+
+    wrapped_src = _MutableStatPath(src)
+    dest_dir = kb.task_attachments_dir(t)
+
+    with pytest.raises(kb.ArtifactPreservationError, match="changed during copy"):
+        kb._copy_file_with_hash_verification(wrapped_src, dest_dir / "mutating.txt")
+
+    assert not (dest_dir / "mutating.txt").exists()
+    assert not list(dest_dir.glob("*.stage"))
+
+
+def test_block_task_stale_run_id_leaves_no_orphan_artifact(kanban_home):
+    """A stale expected_run_id fails before any filesystem copy, leaving no orphan."""
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="stale block")
+        task = kb.get_task(conn, t)
+        ws = kb.resolve_workspace(task)
+        kb.set_workspace_path(conn, t, ws)
+        report = ws / "verdict.md"
+        report.write_text("verdict", encoding="utf-8")
+
+        kb.claim_task(conn, t)
+        old_run_id = kb.get_task(conn, t).current_run_id
+        # End the run so current_run_id becomes NULL, making old_run_id stale.
+        kb._record_task_failure(
+            conn, t, error="fake", outcome="timed_out",
+            release_claim=True, end_run=True,
+        )
+        assert kb.get_task(conn, t).status == "ready"
+        assert kb.get_task(conn, t).current_run_id is None
+
+        ok = kb.block_task(
+            conn, t,
+            reason="need input",
+            metadata={"artifacts": [str(report)]},
+            expected_run_id=old_run_id,
+        )
+
+    assert not ok
+    with kb.connect() as conn:
+        assert kb.get_task(conn, t).status == "ready"
+        assert kb.list_attachments(conn, t) == []
+    dest_dir = kb.task_attachments_dir(t)
+    assert not list(dest_dir.glob("verdict*"))
+
+
+def test_block_task_dependency_emits_blocked_artifacts_event(kanban_home):
+    """Dependency blocks still persist declared artifacts and emit the event."""
+    with kb.connect() as conn:
+        parent = kb.create_task(conn, title="parent")
+        kb.complete_task(conn, parent, result="ok")
+        child = kb.create_task(conn, title="child", parents=[parent], assignee="a")
+        task = kb.get_task(conn, child)
+        ws = kb.resolve_workspace(task)
+        kb.set_workspace_path(conn, child, ws)
+        report = ws / "dep_findings.md"
+        report.write_text("findings", encoding="utf-8")
+
+        kb.claim_task(conn, child)
+        assert kb.block_task(
+            conn,
+            child,
+            reason="waiting on parent",
+            kind="dependency",
+            metadata={"artifacts": [str(report)]},
+        )
+
+        assert kb.get_task(conn, child).status == "todo"
+        artifact_events = [
+            e for e in kb.list_events(conn, child) if e.kind == "blocked_artifacts"
+        ]
+        attachments = kb.list_attachments(conn, child)
+
+    assert len(artifact_events) == 1
+    persisted = Path(artifact_events[0].payload["artifacts"][0])
+    assert persisted.exists()
+    assert persisted.name == "dep_findings.md"
+    assert [(a.filename, a.stored_path) for a in attachments] == [
+        ("dep_findings.md", str(persisted.resolve()))
+    ]
+
+
+def test_block_task_triage_emits_blocked_artifacts_event(kanban_home):
+    """A block routed to triage still persists declared artifacts and emits the event."""
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="loop task", assignee="a")
+        task = kb.get_task(conn, t)
+        ws = kb.resolve_workspace(task)
+        kb.set_workspace_path(conn, t, ws)
+        report = ws / "loop_review.md"
+    report.write_text("review", encoding="utf-8")
+
+    # Drive the task to just under the recurrence limit.
+    for _ in range(kb.BLOCK_RECURRENCE_LIMIT - 1):
+        with kb.connect() as conn:
+            kb.claim_task(conn, t)
+            kb.block_task(
+                conn, t,
+                reason="need input",
+                kind="needs_input",
+                metadata={"artifacts": [str(report)]},
+            )
+            kb.unblock_task(conn, t)
+
+    # One more block lands in triage.
+    with kb.connect() as conn:
+        kb.claim_task(conn, t)
+        assert kb.block_task(
+            conn, t,
+            reason="need input again",
+            kind="needs_input",
+            metadata={"artifacts": [str(report)]},
+        )
+
+        assert kb.get_task(conn, t).status == "triage"
+        artifact_events = [
+            e for e in kb.list_events(conn, t) if e.kind == "blocked_artifacts"
+        ]
+        attachments = kb.list_attachments(conn, t)
+
+    assert len(artifact_events) >= 1
+    last_event = artifact_events[-1]
+    persisted = Path(last_event.payload["artifacts"][0])
+    assert persisted.exists()
+    # Deduplication may add an index suffix when the same file is persisted repeatedly.
+    assert persisted.name.startswith("loop_review")
+    assert persisted.suffix == ".md"
+    assert any(a.filename.startswith("loop_review") for a in attachments)
+
+
 def test_cleanup_workspace_honors_workspaces_root_env_override(tmp_path, monkeypatch):
     """``HERMES_KANBAN_WORKSPACES_ROOT`` extends the managed-scratch set.
 
