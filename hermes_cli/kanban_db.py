@@ -2101,7 +2101,7 @@ CREATE TABLE IF NOT EXISTS review_requests (
     resolved_by_run_id INTEGER,
     resolution         TEXT,
     reason             TEXT,
-    UNIQUE(candidate_id, reviewer_task_id, requested_at)
+    UNIQUE(candidate_id, reviewer_task_id, requested_at, requested_by_run_id)
 );
 
 CREATE INDEX IF NOT EXISTS idx_tasks_assignee_status ON tasks(assignee, status);
@@ -3429,7 +3429,7 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
                 resolved_by_run_id INTEGER,
                 resolution         TEXT,
                 reason             TEXT,
-                UNIQUE(candidate_id, reviewer_task_id, requested_at)
+                UNIQUE(candidate_id, reviewer_task_id, requested_at, requested_by_run_id)
             )
             """
         )
@@ -6728,10 +6728,11 @@ def complete_task(
         # Record independent review requests inside the same txn so the
         # candidate status and the review relation are atomically consistent.
         if review_pending_ids:
+            now = int(time.time())
             for reviewer_id in review_pending_ids:
-                request_review(
+                _request_review_in_txn(
                     conn, task_id, reviewer_id, run_id,
-                    reason=effective_result,
+                    now=now, reason=effective_result,
                 )
     # Prose-scan the summary + result for task-id references. Advisory — does
     # not block the completion. Runs in its own txn so the completion itself is
@@ -6819,71 +6820,87 @@ def request_review(
     """
     now = int(time.time())
     with write_txn(conn):
-        candidate = conn.execute(
-            "SELECT id, status FROM tasks WHERE id = ?",
-            (candidate_id,),
-        ).fetchone()
-        if candidate is None:
-            raise ValueError(f"candidate task {candidate_id!r} does not exist")
-        if candidate["status"] in {"done", "archived"}:
-            raise ValueError(
-                f"candidate task {candidate_id!r} is already terminal "
-                f"({candidate['status']})"
-            )
-        reviewer = conn.execute(
-            "SELECT id, status FROM tasks WHERE id = ?",
-            (reviewer_task_id,),
-        ).fetchone()
-        if reviewer is None:
-            raise ValueError(f"reviewer task {reviewer_task_id!r} does not exist")
-        if reviewer["status"] in {"done", "archived"}:
-            raise ValueError(
-                f"reviewer task {reviewer_task_id!r} is already terminal "
-                f"({reviewer['status']})"
-            )
-
-        # Reuse an existing pending request for the same candidate/reviewer
-        # so a create-with-review_of followed by complete-with-review_pending
-        # does not insert two active requests.
-        existing = conn.execute(
-            """
-            SELECT id FROM review_requests
-             WHERE candidate_id = ? AND reviewer_task_id = ? AND status = 'pending'
-             ORDER BY requested_at DESC, id DESC
-             LIMIT 1
-            """,
-            (candidate_id, reviewer_task_id),
-        ).fetchone()
-        if existing is not None:
-            review_id = int(existing["id"])
-            if reason is not None:
-                conn.execute(
-                    "UPDATE review_requests SET reason = ? WHERE id = ?",
-                    (reason, review_id),
-                )
-        else:
-            cur = conn.execute(
-                """
-                INSERT INTO review_requests (
-                    candidate_id, reviewer_task_id, status,
-                    requested_by_run_id, requested_at, reason
-                ) VALUES (?, ?, 'pending', ?, ?, ?)
-                """,
-                (candidate_id, reviewer_task_id, requested_by_run_id, now, reason),
-            )
-            review_id = int(cur.lastrowid or 0)
-        _append_event(
-            conn,
-            candidate_id,
-            "review_requested",
-            {
-                "review_id": review_id,
-                "reviewer_task_id": reviewer_task_id,
-                "requested_by_run_id": requested_by_run_id,
-                "reason": reason,
-            },
-            run_id=requested_by_run_id,
+        return _request_review_in_txn(
+            conn, candidate_id, reviewer_task_id,
+            requested_by_run_id, now=now, reason=reason,
         )
+
+
+def _request_review_in_txn(
+    conn: sqlite3.Connection,
+    candidate_id: str,
+    reviewer_task_id: str,
+    requested_by_run_id: Optional[int],
+    *,
+    now: int,
+    reason: Optional[str] = None,
+) -> int:
+    """Inner transactional implementation used when a write_txn is already active."""
+    candidate = conn.execute(
+        "SELECT id, status FROM tasks WHERE id = ?",
+        (candidate_id,),
+    ).fetchone()
+    if candidate is None:
+        raise ValueError(f"candidate task {candidate_id!r} does not exist")
+    if candidate["status"] in {"done", "archived"}:
+        raise ValueError(
+            f"candidate task {candidate_id!r} is already terminal "
+            f"({candidate['status']})"
+        )
+    reviewer = conn.execute(
+        "SELECT id, status FROM tasks WHERE id = ?",
+        (reviewer_task_id,),
+    ).fetchone()
+    if reviewer is None:
+        raise ValueError(f"reviewer task {reviewer_task_id!r} does not exist")
+    if reviewer["status"] in {"done", "archived"}:
+        raise ValueError(
+            f"reviewer task {reviewer_task_id!r} is already terminal "
+            f"({reviewer['status']})"
+        )
+
+    # Reuse an existing pending request for the same candidate/reviewer
+    # so a create-with-review_of followed by complete-with-review_pending
+    # does not insert two active requests.
+    existing = conn.execute(
+        """
+        SELECT id FROM review_requests
+         WHERE candidate_id = ? AND reviewer_task_id = ? AND status = 'pending'
+         ORDER BY requested_at DESC, id DESC
+         LIMIT 1
+        """,
+        (candidate_id, reviewer_task_id),
+    ).fetchone()
+    if existing is not None:
+        review_id = int(existing["id"])
+        if reason is not None:
+            conn.execute(
+                "UPDATE review_requests SET reason = ? WHERE id = ?",
+                (reason, review_id),
+            )
+    else:
+        cur = conn.execute(
+            """
+            INSERT INTO review_requests (
+                candidate_id, reviewer_task_id, status,
+                requested_by_run_id, requested_at, reason
+            ) VALUES (?, ?, 'pending', ?, ?, ?)
+            """,
+            (candidate_id, reviewer_task_id, requested_by_run_id, now, reason),
+        )
+        review_id = int(cur.lastrowid or 0)
+    _append_event(
+        conn,
+        candidate_id,
+        "review_requested",
+        {
+            "review_id": review_id,
+            "reviewer_task_id": reviewer_task_id,
+            "requested_by_run_id": requested_by_run_id,
+            "reason": reason,
+        },
+        run_id=requested_by_run_id,
+    )
     return review_id
 
 
@@ -6966,7 +6983,7 @@ def resolve_review(
                     f"reviewer task {bound_reviewer_id}"
                 )
 
-        if (
+        if resolution == "clear" and (
             requested_by_run_id is not None
             and resolving_run_id is not None
             and int(requested_by_run_id) == int(resolving_run_id)
@@ -11847,85 +11864,17 @@ def _dispatch_once_locked(
                 result.auto_blocked.append(claimed.id)
 
     # ---- review column dispatch ----
-    # Review tasks are tasks that a worker moved to 'review' after
-    # creating a PR.  The dispatcher spawns a review agent (loading
-    # sdlc-review skill) that verifies the PR and either merges (→ done)
-    # or rejects (→ back to running for the worker to fix).
+    # Tasks in 'review' are waiting for a *separate* reviewer task to be
+    # claimed and resolved via ``kanban_resolve_review``.  The candidate
+    # itself must not be re-spawned; only a bound reviewer task (which is
+    # just an ordinary ready task, selected above) should run.  We keep
+    # this section empty intentionally: dispatching review candidates would
+    # violate the independent-review gate and would force-load the
+    # sdlc-review skill onto work that is not a review task.
     #
-    # Same concurrency model as ready dispatch: review spawns count
-    # against max_spawn alongside ready tasks, so the total number of
-    # running workers stays bounded.
-    review_rows = conn.execute(
-        "SELECT id, assignee FROM tasks "
-        "WHERE status = 'review' AND claim_lock IS NULL "
-        "ORDER BY priority DESC, created_at ASC"
-    ).fetchall()
-    for row in review_rows:
-        if max_spawn is not None and running_count + spawned >= max_spawn:
-            break
-        if not row["assignee"]:
-            result.skipped_unassigned.append(row["id"])
-            continue
-        try:
-            from hermes_cli.profiles import profile_exists
-        except Exception:
-            profile_exists = None  # type: ignore[assignment]
-        if profile_exists is not None and not profile_exists(row["assignee"]):
-            result.skipped_nonspawnable.append(row["id"])
-            continue
-        if dry_run:
-            result.spawned.append((row["id"], row["assignee"], ""))
-            continue
-        claimed = claim_review_task(conn, row["id"], ttl_seconds=ttl_seconds)
-        if claimed is None:
-            continue
-        try:
-            resolved_branch_name = None
-            if claimed.workspace_kind == "worktree":
-                workspace, resolved_branch_name = _resolve_worktree_workspace(claimed, board=board)
-            else:
-                workspace = resolve_workspace(claimed, board=board)
-        except Exception as exc:
-            auto = _record_spawn_failure(
-                conn, claimed.id, f"workspace: {exc}",
-                failure_limit=failure_limit,
-            )
-            if auto:
-                result.auto_blocked.append(claimed.id)
-            continue
-        # Persist the resolved workspace path so the worker can cd there.
-        set_workspace_path(conn, claimed.id, str(workspace))
-        if claimed.workspace_kind == "worktree":
-            set_branch_name(conn, claimed.id, resolved_branch_name or (claimed.branch_name or "").strip() or f"wt/{claimed.id}")
-        _maybe_emit_scratch_tip(conn, claimed.id, claimed.workspace_kind)
-        # Force-load the sdlc-review skill for review agents — it carries
-        # the review logic (AC verification, merge, etc.). The mandatory
-        # kanban lifecycle is already injected into every worker's system
-        # prompt via KANBAN_GUIDANCE, so this is the only extra skill the
-        # review agent needs.
-        claimed.skills = ["sdlc-review"]
-        _spawn = spawn_fn if spawn_fn is not None else _default_spawn
-        try:
-            import inspect
-            try:
-                sig = inspect.signature(_spawn)
-                if "board" in sig.parameters:
-                    pid = _spawn(claimed, str(workspace), board=board)
-                else:
-                    pid = _spawn(claimed, str(workspace))
-            except (TypeError, ValueError):
-                pid = _spawn(claimed, str(workspace))
-            if pid:
-                _set_worker_pid(conn, claimed.id, int(pid))
-            result.spawned.append((claimed.id, claimed.assignee or "", str(workspace)))
-            spawned += 1
-        except Exception as exc:
-            auto = _record_spawn_failure(
-                conn, claimed.id, str(exc),
-                failure_limit=failure_limit,
-            )
-            if auto:
-                result.auto_blocked.append(claimed.id)
+    # (Previous iterations spawned review-status tasks directly and
+    # overwrote their skills; that design mixed candidate and reviewer
+    # lifecycles and is no longer supported.)
     return result
 
 

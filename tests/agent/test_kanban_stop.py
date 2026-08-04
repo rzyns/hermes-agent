@@ -72,7 +72,11 @@ def test_nudge_when_no_terminal_tool(clear_kanban_env):
 
 
 def test_progress_flag_off_preserves_pre_feature_nudge_bytes(clear_kanban_env):
-    """Default-OFF must preserve the exact pre-kanban_progress wire text."""
+    """Default-OFF must preserve the exact pre-kanban_progress wire text.
+
+    The review_pending option is part of the core kanban handoff grammar,
+    not the kanban_progress feature, so it is expected to appear.
+    """
     clear_kanban_env.setenv("HERMES_KANBAN_TASK", "t_46be8aa5")
     expected = (
         "[System: You are a Hermes kanban worker. A plain-text reply is NOT a "
@@ -83,7 +87,9 @@ def test_progress_flag_off_preserves_pre_feature_nudge_bytes(clear_kanban_env):
         "Do this immediately in your next response — do not narrate intent:\n"
         "1. Finish any remaining deliverable (write the required file(s) now).\n"
         "2. Call `kanban_complete(summary=..., artifacts=[...])` if the work "
-        "is done, OR `kanban_block(reason=...)` if you are blocked.\n\n"
+        "is done, OR `kanban_complete(summary=..., review_pending=[reviewer_task_id])` "
+        "if the work is finished but needs independent review "
+        "OR `kanban_block(reason=...)` if you are blocked.\n\n"
         "Never end a turn with only a promise of future action. Repeated "
         "protocol violations will block this task and require manual intervention.]"
     )

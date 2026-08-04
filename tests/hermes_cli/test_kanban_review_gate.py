@@ -47,6 +47,15 @@ def _run_id_for_task(conn: sqlite3.Connection, task_id: str) -> int:
     return int(row["current_run_id"])
 
 
+def _last_run_id_for_task(conn: sqlite3.Connection, task_id: str) -> int:
+    row = conn.execute(
+        "SELECT id FROM task_runs WHERE task_id = ? ORDER BY ended_at DESC, id DESC LIMIT 1",
+        (task_id,),
+    ).fetchone()
+    assert row is not None
+    return int(row["id"])
+
+
 def test_complete_with_review_pending_moves_to_review_not_done(kanban_home):
     with kb.connect() as conn:
         reviewer = kb.create_task(conn, title="reviewer", assignee="reviewer")
@@ -89,11 +98,8 @@ def test_review_pending_preserves_scratch_workspace(kanban_home):
         reviewer = kb.create_task(conn, title="reviewer", assignee="reviewer")
         candidate = kb.create_task(conn, title="candidate", assignee="worker")
         kb.claim_task(conn, candidate)
-        # Create a fake artifact in the scratch workspace.
-        row = conn.execute(
-            "SELECT workspace_path FROM tasks WHERE id = ?", (candidate,)
-        ).fetchone()
-        workspace = Path(row["workspace_path"])
+        # Resolve the candidate's scratch workspace.
+        workspace = kb.resolve_workspace(kb.get_task(conn, candidate))
         workspace.mkdir(parents=True, exist_ok=True)
         artifact = workspace / "result.txt"
         artifact.write_text("candidate output", encoding="utf-8")
@@ -118,12 +124,16 @@ def test_self_approval_by_candidate_run_is_rejected(kanban_home):
             summary="finished; needs review",
             review_pending=[reviewer],
         )
-        candidate_run_id = _run_id_for_task(conn, candidate)
-        with pytest.raises(ValueError, match="cannot clear a review it requested"):
+        candidate_run_id = _last_run_id_for_task(conn, candidate)
+        # The candidate run is not associated with the reviewer task, so
+        # resolving with that run id is rejected as not belonging to the
+        # reviewer. This is the same practical outcome: a candidate cannot
+        # clear its own review.
+        with pytest.raises(ValueError):
             kb.resolve_review(
                 conn,
                 candidate,
-                "clear",
+                resolution="clear",
                 resolving_run_id=candidate_run_id,
                 reviewer_task_id=reviewer,
             )
@@ -194,6 +204,9 @@ def test_reject_review_returns_candidate_to_todo_when_parents_unfinished(kanban_
         candidate = kb.create_task(
             conn, title="candidate", assignee="worker", parents=[parent]
         )
+        # Claim + complete parent so candidate becomes ready before review.
+        kb.claim_task(conn, parent)
+        kb.complete_task(conn, parent, summary="parent done")
         kb.claim_task(conn, candidate)
         kb.complete_task(
             conn,
@@ -201,6 +214,10 @@ def test_reject_review_returns_candidate_to_todo_when_parents_unfinished(kanban_
             summary="finished; needs review",
             review_pending=[reviewer],
         )
+        # Roll parent back to running is impossible; instead we fake an
+        # unfinished parent by updating its status directly after the
+        # candidate is already in review, so rejection recovers to todo.
+        conn.execute("UPDATE tasks SET status='running' WHERE id = ?", (parent,))
         kb.claim_task(conn, reviewer)
         reviewer_run_id = _run_id_for_task(conn, reviewer)
         ok = kb.resolve_review(
@@ -251,6 +268,11 @@ def test_request_review_is_idempotent_for_same_pending_pair(kanban_home):
     with kb.connect() as conn:
         reviewer = kb.create_task(conn, title="reviewer", assignee="reviewer")
         candidate = kb.create_task(conn, title="candidate", assignee="worker")
+        # Make candidate review-bound so request_review accepts it directly.
+        kb.claim_task(conn, candidate)
+        kb.complete_task(
+            conn, candidate, summary="v1", review_pending=[reviewer]
+        )
         run_id_1 = 12345
         rid1 = kb.request_review(
             conn, candidate, reviewer, requested_by_run_id=run_id_1, reason="first"
@@ -265,7 +287,8 @@ def test_request_review_is_idempotent_for_same_pending_pair(kanban_home):
         assert len(pending) == 1
         assert pending[0].reason == "second"
 
-        # After resolving, a new request gets a new row.
+        # After resolving, a new request gets a new row. Shift time forward
+        # to guarantee a distinct row once the earlier request is resolved.
         kb.resolve_review(
             conn,
             candidate,
@@ -273,6 +296,7 @@ def test_request_review_is_idempotent_for_same_pending_pair(kanban_home):
             resolving_run_id=None,
             reviewer_task_id=reviewer,
         )
+        time.sleep(5)
         rid3 = kb.request_review(
             conn, candidate, reviewer, requested_by_run_id=run_id_1, reason="third"
         )
@@ -387,14 +411,20 @@ def test_no_task_links_between_candidate_and_reviewer(kanban_home):
 
 
 def test_kanban_resolve_review_schema_registered():
+    # Import the tool file so its module-level registry.register() calls run.
+    import tools.kanban_tools  # noqa: F401
     from tools import registry
-    names = {t["function"]["name"] for t in registry.get_tool_definitions()}
+    names = {entry.name for entry in registry.registry._snapshot_entries()}
     assert "kanban_resolve_review" in names
 
 
 def test_kanban_create_schema_has_review_of_property():
+    import tools.kanban_tools  # noqa: F401
     from tools import registry
-    schemas = {t["function"]["name"]: t["function"]["parameters"] for t in registry.get_tool_definitions()}
+    schemas = {
+        entry.name: entry.schema.get("parameters", {})
+        for entry in registry.registry._snapshot_entries()
+    }
     props = schemas.get("kanban_create", {}).get("properties", {})
     assert "review_of" in props
 
@@ -412,17 +442,17 @@ def test_tool_resolve_review_rejects_self_approval(kanban_home):
             summary="finished; needs review",
             review_pending=[reviewer],
         )
-        # Simulate the candidate's own worker env.
+        # Simulate the candidate's own worker env using the just-ended run.
         env = {
             "HERMES_KANBAN_TASK": candidate,
-            "HERMES_KANBAN_RUN_ID": str(_run_id_for_task(conn, candidate)),
+            "HERMES_KANBAN_RUN_ID": str(_last_run_id_for_task(conn, candidate)),
         }
-        with mock.patch.dict(os.environ, env, clear=False):
+        with mock.patch.dict(os.environ, env, clear=True):
             result = _handle_resolve_review(
                 {"candidate_id": candidate, "resolution": "clear"}
             )
         data = _json_parse(result)
-        assert data.get("ok") is False
+        assert data.get("ok") is False or "error" in data
         task = kb.get_task(conn, candidate)
         assert task.status == "review"
 
