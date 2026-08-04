@@ -1875,6 +1875,22 @@ class ReviewRequest:
     reason: Optional[str]
     idempotency_key: Optional[str]
 
+    @classmethod
+    def from_row(cls, row: sqlite3.Row) -> "ReviewRequest":
+        return cls(
+            id=int(row["id"]),
+            candidate_id=row["candidate_id"],
+            reviewer_task_id=row["reviewer_task_id"],
+            status=row["status"],
+            requested_by_run_id=row["requested_by_run_id"],
+            requested_at=int(row["requested_at"]),
+            resolved_at=int(row["resolved_at"]) if row["resolved_at"] is not None else None,
+            resolved_by_run_id=row["resolved_by_run_id"],
+            resolution=row["resolution"],
+            reason=row["reason"],
+            idempotency_key=row["idempotency_key"],
+        )
+
 
 # ---------------------------------------------------------------------------
 # Schema
@@ -7015,14 +7031,19 @@ def resolve_review(
     reviewer_task_id: Optional[str] = None,
     reason: Optional[str] = None,
     operator_mode: bool = False,
+    operator_actor: Optional[str] = None,
+    claim_lock: Optional[str] = None,
 ) -> bool:
     """Resolve a pending review request for ``candidate_id``.
 
     ``resolution`` must be ``"clear"`` or ``"reject"``. When ``reviewer_task_id``
     is provided, only a pending request bound to that reviewer task may be
     resolved. The resolving run must be the current run of the bound reviewer
-    task, establishing that the clearance came from the reviewer task's own
-    execution rather than the candidate's run or a profile-name match.
+    task (``tasks.current_run_id == resolving_run_id``) and must still hold a
+    running ``task_runs`` row. When ``claim_lock`` is provided (the normal worker
+    tool path), it must also match ``tasks.claim_lock`` and ``task_runs.claim_lock``
+    so that a stale or ended reviewer run cannot clear a review after its
+    authority has been reclaimed.
 
     * ``clear`` removes one pending review. The candidate stays in ``review``
       until no pending requests remain, then transitions to ``done``. This is
@@ -7036,13 +7057,19 @@ def resolve_review(
     ``operator_mode`` bypasses the run-identity check for authenticated
     operator/CLI callers that clear or reject a review explicitly. A worker
     tool must never pass ``operator_mode=True``; absence of a run id is not
-    an operator action and is rejected.
+    an operator action and is rejected. Operator callers must also pass
+    ``operator_actor`` (e.g. ``"cli:<user>"`` or ``"dashboard:<operator>"``) so
+    the resolution event is durably attributable; a bare boolean is rejected.
     """
     if resolution not in REVIEW_RESOLUTIONS:
         raise ValueError(
             f"resolution must be one of {sorted(REVIEW_RESOLUTIONS)}, "
             f"got {resolution!r}"
         )
+    if operator_mode:
+        if not operator_actor or not str(operator_actor).strip():
+            raise ValueError("operator_mode=True requires operator_actor")
+        operator_actor = str(operator_actor).strip()
     now = int(time.time())
     with write_txn(conn):
         candidate = conn.execute(
@@ -7089,15 +7116,35 @@ def resolve_review(
                     "resolving run id is required unless operator_mode=True"
                 )
         else:
+            # The resolving run must be the live, current run of the bound
+            # reviewer task. Checking task_runs.task_id alone is not enough: a
+            # stale run from a previous claim or a reclaimed task still has a
+            # historical row, but it is no longer the current owner.
             run_row = conn.execute(
-                "SELECT task_id FROM task_runs WHERE id = ?",
-                (int(resolving_run_id),),
+                """
+                SELECT r.task_id, r.status, r.claim_lock
+                  FROM task_runs r
+                  JOIN tasks t ON t.id = r.task_id
+                 WHERE r.id = ?
+                   AND t.current_run_id = ?
+                """,
+                (int(resolving_run_id), int(resolving_run_id)),
             ).fetchone()
             if run_row is None or run_row["task_id"] != bound_reviewer_id:
                 raise ValueError(
-                    f"resolving run {resolving_run_id} does not belong to "
-                    f"reviewer task {bound_reviewer_id}"
+                    f"resolving run {resolving_run_id} is not the current run "
+                    f"of reviewer task {bound_reviewer_id}"
                 )
+            if run_row["status"] != "running":
+                raise ValueError(
+                    f"resolving run {resolving_run_id} is not running "
+                    f"(status={run_row['status']!r})"
+                )
+            if claim_lock is not None:
+                if run_row["claim_lock"] != claim_lock:
+                    raise ValueError(
+                        "resolving run claim lock does not match the caller"
+                    )
 
         if resolution == "clear" and not operator_mode and (
             requested_by_run_id is not None
@@ -7126,17 +7173,21 @@ def resolve_review(
                 int(request_row["id"]),
             ),
         )
+
+        event_payload = {
+            "review_id": int(request_row["id"]),
+            "reviewer_task_id": bound_reviewer_id,
+            "resolving_run_id": resolving_run_id,
+            "requested_by_run_id": requested_by_run_id,
+            "reason": reason,
+        }
+        if operator_actor:
+            event_payload["operator_actor"] = operator_actor
         _append_event(
             conn,
             candidate_id,
             "review_cleared" if resolution == "clear" else "review_rejected",
-            {
-                "review_id": int(request_row["id"]),
-                "reviewer_task_id": bound_reviewer_id,
-                "resolving_run_id": resolving_run_id,
-                "requested_by_run_id": requested_by_run_id,
-                "reason": reason,
-            },
+            event_payload,
             run_id=resolving_run_id,
         )
 
@@ -7258,22 +7309,7 @@ def get_review_requests(
         """,
         tuple(params),
     ).fetchall()
-    return [
-        ReviewRequest(
-            id=int(r["id"]),
-            candidate_id=r["candidate_id"],
-            reviewer_task_id=r["reviewer_task_id"],
-            status=r["status"],
-            requested_by_run_id=r["requested_by_run_id"],
-            requested_at=int(r["requested_at"]),
-            resolved_at=r["resolved_at"],
-            resolved_by_run_id=r["resolved_by_run_id"],
-            resolution=r["resolution"],
-            reason=r["reason"],
-            idempotency_key=r["idempotency_key"],
-        )
-        for r in rows
-    ]
+    return [ReviewRequest.from_row(r) for r in rows]
 
 
 def has_pending_review(

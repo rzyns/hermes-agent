@@ -150,7 +150,16 @@ def test_resolve_review_requires_run_or_operator_mode(kanban_home):
                 resolving_run_id=None,
                 reviewer_task_id=reviewer,
             )
-        # Operator-mode bypass is allowed.
+        # Operator-mode bypass is allowed only with an attributable actor.
+        with pytest.raises(ValueError, match="operator_actor"):
+            kb.resolve_review(
+                conn,
+                candidate,
+                "clear",
+                resolving_run_id=None,
+                reviewer_task_id=reviewer,
+                operator_mode=True,
+            )
         ok = kb.resolve_review(
             conn,
             candidate,
@@ -158,9 +167,16 @@ def test_resolve_review_requires_run_or_operator_mode(kanban_home):
             resolving_run_id=None,
             reviewer_task_id=reviewer,
             operator_mode=True,
+            operator_actor="cli:test-operator",
         )
         assert ok is True
         assert kb.get_task(conn, candidate).status == "done"
+        event = conn.execute(
+            "SELECT payload FROM task_events WHERE task_id = ? AND kind = 'review_cleared'",
+            (candidate,),
+        ).fetchone()
+        payload = json.loads(event["payload"])
+        assert payload.get("operator_actor") == "cli:test-operator"
 
 
 def test_multiple_reviewers_clear_and_gate(kanban_home):
@@ -237,6 +253,100 @@ def test_self_approval_by_candidate_run_is_rejected(kanban_home):
         task = kb.get_task(conn, candidate)
         assert task.status == "review"
         assert kb.has_pending_review(conn, candidate) is True
+
+
+def test_resolve_review_rejects_stale_ended_reviewer_run(kanban_home):
+    with kb.connect() as conn:
+        reviewer = kb.create_task(conn, title="reviewer", assignee="reviewer")
+        candidate = kb.create_task(conn, title="candidate", assignee="worker")
+        kb.claim_task(conn, candidate)
+        kb.complete_task(
+            conn,
+            candidate,
+            summary="finished; needs review",
+            review_pending=[reviewer],
+        )
+        kb.claim_task(conn, reviewer)
+        stale_run_id = _run_id_for_task(conn, reviewer)
+        # Reclaim the reviewer task, clearing current_run_id and claim_lock.
+        kb.reclaim_task(conn, reviewer)
+        assert kb.get_task(conn, reviewer).current_run_id is None
+        assert kb.get_task(conn, reviewer).claim_lock is None
+        assert kb.get_task(conn, reviewer).status == "ready"
+
+        # Stale run can no longer clear the review.
+        with pytest.raises(ValueError, match="not the current run"):
+            kb.resolve_review(
+                conn,
+                candidate,
+                "clear",
+                resolving_run_id=stale_run_id,
+                reviewer_task_id=reviewer,
+            )
+        task = kb.get_task(conn, candidate)
+        assert task.status == "review"
+        assert kb.has_pending_review(conn, candidate) is True
+
+
+def test_tool_resolve_review_rejects_missing_claim_lock(kanban_home):
+    from tools.kanban_tools import _handle_resolve_review
+
+    with kb.connect() as conn:
+        reviewer = kb.create_task(conn, title="reviewer", assignee="reviewer")
+        candidate = kb.create_task(conn, title="candidate", assignee="worker")
+        kb.claim_task(conn, candidate)
+        kb.complete_task(
+            conn,
+            candidate,
+            summary="finished; needs review",
+            review_pending=[reviewer],
+        )
+        kb.claim_task(conn, reviewer)
+        env = {
+            "HERMES_KANBAN_TASK": reviewer,
+            "HERMES_KANBAN_RUN_ID": str(_run_id_for_task(conn, reviewer)),
+            # Deliberately omit HERMES_KANBAN_CLAIM_LOCK.
+        }
+        with mock.patch.dict(os.environ, env, clear=True):
+            result = _handle_resolve_review(
+                {"candidate_id": candidate, "resolution": "clear"}
+            )
+        data = _json_parse(result)
+        assert "error" in data
+        assert "claim lock" in data["error"].lower()
+        assert kb.get_task(conn, candidate).status == "review"
+
+
+def test_tool_resolve_review_rejects_stale_reviewer_run(kanban_home):
+    from tools.kanban_tools import _handle_resolve_review
+
+    with kb.connect() as conn:
+        reviewer = kb.create_task(conn, title="reviewer", assignee="reviewer")
+        candidate = kb.create_task(conn, title="candidate", assignee="worker")
+        kb.claim_task(conn, candidate)
+        kb.complete_task(
+            conn,
+            candidate,
+            summary="finished; needs review",
+            review_pending=[reviewer],
+        )
+        kb.claim_task(conn, reviewer)
+        stale_run_id = _run_id_for_task(conn, reviewer)
+        stale_lock = kb.get_task(conn, reviewer).claim_lock
+        kb._end_run(conn, reviewer, outcome="timed_out")
+
+        env = {
+            "HERMES_KANBAN_TASK": reviewer,
+            "HERMES_KANBAN_RUN_ID": str(stale_run_id),
+            "HERMES_KANBAN_CLAIM_LOCK": str(stale_lock) if stale_lock else "stale",
+        }
+        with mock.patch.dict(os.environ, env, clear=True):
+            result = _handle_resolve_review(
+                {"candidate_id": candidate, "resolution": "clear"}
+            )
+        data = _json_parse(result)
+        assert "error" in data
+        assert kb.get_task(conn, candidate).status == "review"
 
 
 def test_bound_reviewer_can_clear_review(kanban_home):
@@ -394,6 +504,7 @@ def test_request_review_is_idempotent_for_same_pending_pair(kanban_home):
             resolving_run_id=None,
             reviewer_task_id=reviewer,
             operator_mode=True,
+            operator_actor="test:fixture",
         )
         rid3 = kb.request_review(
             conn, candidate, reviewer, requested_by_run_id=run_id_1, reason="third"
@@ -646,6 +757,7 @@ def test_tool_resolve_review_bound_reviewer_can_clear(kanban_home):
         env = {
             "HERMES_KANBAN_TASK": reviewer,
             "HERMES_KANBAN_RUN_ID": str(_run_id_for_task(conn, reviewer)),
+            "HERMES_KANBAN_CLAIM_LOCK": kb.get_task(conn, reviewer).claim_lock,
         }
         with mock.patch.dict(os.environ, env, clear=False):
             result = _handle_resolve_review(
@@ -711,3 +823,6 @@ def test_tool_complete_with_review_pending(kanban_home):
 def _json_parse(text: str) -> dict[str, Any]:
     import json
     return json.loads(text)
+
+
+import json  # noqa: E402

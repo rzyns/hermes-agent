@@ -1843,8 +1843,8 @@ def _handle_resolve_review(args: dict, **kw) -> str:
     A reviewer worker calls this to clear (approve) or reject a task that
     was handed off via ``kanban_complete(review_pending=...)``. Clearance
     moves the candidate to ``done``; rejection returns it to ``ready``/``todo``
-    for repair. The resolving run must belong to the reviewer task bound to
-    the pending request; the candidate's own run cannot clear its own review.
+    for repair. The resolving run must be the current, live run of the bound
+    reviewer task; a stale or ended reviewer run cannot clear a review.
     """
     delegated_err = _reject_delegated_child_mutation("kanban_resolve_review")
     if delegated_err:
@@ -1878,6 +1878,17 @@ def _handle_resolve_review(args: dict, **kw) -> str:
             "reviewer worker if its run id is missing"
         )
 
+    # Require the run-scoped claim lock for live-run ownership. A stale or
+    # ended reviewer run loses both HERMES_KANBAN_CLAIM_LOCK and the task's
+    # current_run_id, so requiring it here prevents clearance after authority
+    # has been reclaimed or the run has ended.
+    claim_lock = os.environ.get("HERMES_KANBAN_CLAIM_LOCK")
+    if not claim_lock:
+        return tool_error(
+            "kanban_resolve_review requires a run-scoped claim lock; "
+            "the reviewer run has ended or lost authority"
+        )
+
     try:
         kb, conn = _connect(board=board)
         try:
@@ -1888,6 +1899,7 @@ def _handle_resolve_review(args: dict, **kw) -> str:
                 resolving_run_id,
                 reviewer_task_id=reviewer_task_id,
                 reason=reason,
+                claim_lock=claim_lock,
             )
             if not ok:
                 return tool_error(
