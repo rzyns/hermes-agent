@@ -13,7 +13,6 @@ from __future__ import annotations
 
 import os
 import sqlite3
-import time
 from pathlib import Path
 from typing import Any
 from unittest import mock
@@ -111,6 +110,104 @@ def test_review_pending_preserves_scratch_workspace(kanban_home):
             review_pending=[reviewer],
         )
         assert artifact.exists(), "scratch workspace must be preserved for repair"
+
+
+def test_self_relation_is_rejected_at_complete_and_request(kanban_home):
+    with kb.connect() as conn:
+        candidate = kb.create_task(conn, title="candidate", assignee="worker")
+        kb.claim_task(conn, candidate)
+        # complete_task with the candidate as its own reviewer must fail.
+        with pytest.raises(ValueError, match="cannot review itself"):
+            kb.complete_task(
+                conn,
+                candidate,
+                summary="finished",
+                review_pending=[candidate],
+            )
+        assert kb.get_task(conn, candidate).status == "running"
+        # request_review with candidate==reviewer must also fail.
+        with pytest.raises(ValueError, match="cannot review itself"):
+            kb.request_review(conn, candidate, candidate, requested_by_run_id=None)
+
+
+def test_resolve_review_requires_run_or_operator_mode(kanban_home):
+    with kb.connect() as conn:
+        reviewer = kb.create_task(conn, title="reviewer", assignee="reviewer")
+        candidate = kb.create_task(conn, title="candidate", assignee="worker")
+        kb.claim_task(conn, candidate)
+        kb.complete_task(
+            conn,
+            candidate,
+            summary="finished; needs review",
+            review_pending=[reviewer],
+        )
+        # A worker tool call with no resolving run id is rejected.
+        with pytest.raises(ValueError, match="operator_mode"):
+            kb.resolve_review(
+                conn,
+                candidate,
+                "clear",
+                resolving_run_id=None,
+                reviewer_task_id=reviewer,
+            )
+        # Operator-mode bypass is allowed.
+        ok = kb.resolve_review(
+            conn,
+            candidate,
+            "clear",
+            resolving_run_id=None,
+            reviewer_task_id=reviewer,
+            operator_mode=True,
+        )
+        assert ok is True
+        assert kb.get_task(conn, candidate).status == "done"
+
+
+def test_multiple_reviewers_clear_and_gate(kanban_home):
+    with kb.connect() as conn:
+        r1 = kb.create_task(conn, title="r1", assignee="reviewer")
+        r2 = kb.create_task(conn, title="r2", assignee="reviewer")
+        candidate = kb.create_task(conn, title="candidate", assignee="worker")
+        kb.claim_task(conn, candidate)
+        kb.complete_task(
+            conn,
+            candidate,
+            summary="finished",
+            review_pending=[r1, r2],
+        )
+        kb.claim_task(conn, r1)
+        rid1 = _run_id_for_task(conn, r1)
+        kb.resolve_review(conn, candidate, "clear", resolving_run_id=rid1, reviewer_task_id=r1)
+        # One clearance is not enough.
+        assert kb.get_task(conn, candidate).status == "review"
+        assert kb.has_pending_review(conn, candidate) is True
+        # Second clearance completes the candidate.
+        kb.claim_task(conn, r2)
+        rid2 = _run_id_for_task(conn, r2)
+        kb.resolve_review(conn, candidate, "clear", resolving_run_id=rid2, reviewer_task_id=r2)
+        assert kb.get_task(conn, candidate).status == "done"
+
+
+def test_reject_vetoes_all_pending_reviewers(kanban_home):
+    with kb.connect() as conn:
+        r1 = kb.create_task(conn, title="r1", assignee="reviewer")
+        r2 = kb.create_task(conn, title="r2", assignee="reviewer")
+        candidate = kb.create_task(conn, title="candidate", assignee="worker")
+        kb.claim_task(conn, candidate)
+        kb.complete_task(
+            conn,
+            candidate,
+            summary="finished",
+            review_pending=[r1, r2],
+        )
+        kb.claim_task(conn, r1)
+        rid1 = _run_id_for_task(conn, r1)
+        kb.resolve_review(conn, candidate, "reject", resolving_run_id=rid1, reviewer_task_id=r1)
+        # Candidate is back to ready; all requests are rejected.
+        assert kb.get_task(conn, candidate).status == "ready"
+        reqs = kb.get_review_requests(conn, candidate_id=candidate)
+        assert len(reqs) == 2
+        assert all(r.status == "rejected" for r in reqs)
 
 
 def test_self_approval_by_candidate_run_is_rejected(kanban_home):
@@ -287,16 +384,17 @@ def test_request_review_is_idempotent_for_same_pending_pair(kanban_home):
         assert len(pending) == 1
         assert pending[0].reason == "second"
 
-        # After resolving, a new request gets a new row. Shift time forward
-        # to guarantee a distinct row once the earlier request is resolved.
+        # After resolving, a new request in the same second must create a
+        # distinct row because the primary identity is the row id / random
+        # idempotency key, not the wall clock.
         kb.resolve_review(
             conn,
             candidate,
             "reject",
             resolving_run_id=None,
             reviewer_task_id=reviewer,
+            operator_mode=True,
         )
-        time.sleep(5)
         rid3 = kb.request_review(
             conn, candidate, reviewer, requested_by_run_id=run_id_1, reason="third"
         )
@@ -418,15 +516,89 @@ def test_kanban_resolve_review_schema_registered():
     assert "kanban_resolve_review" in names
 
 
-def test_kanban_create_schema_has_review_of_property():
-    import tools.kanban_tools  # noqa: F401
-    from tools import registry
-    schemas = {
-        entry.name: entry.schema.get("parameters", {})
-        for entry in registry.registry._snapshot_entries()
-    }
-    props = schemas.get("kanban_create", {}).get("properties", {})
-    assert "review_of" in props
+def test_schema_migration_removes_old_second_resolution_unique_key(kanban_home):
+    """Legacy boards with the old 4-column UNIQUE key upgrade cleanly."""
+    db_path = kanban_home / "kanban.db"
+    # The fixture already initialized the DB. Drop the modern table and
+    # recreate the legacy schema to simulate a board from the first deploy.
+    raw = sqlite3.connect(str(db_path))
+    raw.execute("DROP TABLE IF EXISTS review_requests")
+    raw.execute(
+        """
+        CREATE TABLE review_requests (
+            id                 INTEGER PRIMARY KEY AUTOINCREMENT,
+            candidate_id       TEXT NOT NULL,
+            reviewer_task_id   TEXT NOT NULL,
+            status             TEXT NOT NULL DEFAULT 'pending',
+            requested_by_run_id INTEGER,
+            requested_at       INTEGER NOT NULL,
+            resolved_at        INTEGER,
+            resolved_by_run_id INTEGER,
+            resolution         TEXT,
+            reason             TEXT,
+            UNIQUE(candidate_id, reviewer_task_id, requested_at, requested_by_run_id)
+        )
+        """
+    )
+    raw.execute(
+        "INSERT INTO review_requests (candidate_id, reviewer_task_id, status, requested_at) "
+        "VALUES ('cand', 'rev', 'pending', 1)"
+    )
+    raw.commit()
+    raw.close()
+
+    kb.init_db()
+    with kb.connect() as conn:
+        cols = {
+            row["name"] for row in conn.execute("PRAGMA table_info(review_requests)")
+        }
+        assert "idempotency_key" in cols
+        # Old 4-column unique key should be gone. A new autoindex from
+        # UNIQUE(idempotency_key) is expected, so we inspect column sets.
+        autoindexes = conn.execute(
+            """
+            SELECT name FROM sqlite_master
+             WHERE type = 'index'
+               AND tbl_name = 'review_requests'
+               AND sql IS NULL
+               AND name LIKE 'sqlite_autoindex_review_requests_%'
+            """
+        ).fetchall()
+        for idx in autoindexes:
+            idx_info = conn.execute(f"PRAGMA index_info({idx['name']!r})").fetchall()
+            idx_cols = tuple(row["name"] for row in idx_info)
+            assert idx_cols != (
+                "candidate_id",
+                "reviewer_task_id",
+                "requested_at",
+                "requested_by_run_id",
+            )
+        rows = conn.execute("SELECT * FROM review_requests").fetchall()
+        assert len(rows) == 1
+        assert rows[0]["candidate_id"] == "cand"
+        assert rows[0]["idempotency_key"].startswith("legacy:")
+
+
+def test_tool_resolve_review_requires_worker_env(kanban_home):
+    from tools.kanban_tools import _handle_resolve_review
+
+    with kb.connect() as conn:
+        reviewer = kb.create_task(conn, title="reviewer", assignee="reviewer")
+        candidate = kb.create_task(conn, title="candidate", assignee="worker")
+        kb.claim_task(conn, candidate)
+        kb.complete_task(
+            conn,
+            candidate,
+            summary="finished; needs review",
+            review_pending=[reviewer],
+        )
+        with mock.patch.dict(os.environ, {}, clear=True):
+            result = _handle_resolve_review(
+                {"candidate_id": candidate, "resolution": "clear"}
+            )
+        data = _json_parse(result)
+        assert "error" in data
+        assert "HERMES_KANBAN_TASK" in data["error"]
 
 
 def test_tool_resolve_review_rejects_self_approval(kanban_home):

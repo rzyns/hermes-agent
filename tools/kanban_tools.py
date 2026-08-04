@@ -31,6 +31,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import secrets
 import subprocess
 from typing import Any, Optional
 
@@ -1622,12 +1623,15 @@ def _handle_create(args: dict, **kw) -> str:
                 # Bind the newly created reviewer task to the candidate. Use
                 # the current candidate's run id when the worker creating the
                 # reviewer task is the candidate itself; otherwise leave the
-                # request unbound for operator-created reviewers.
+                # request unbound for operator-created reviewers. The row
+                # identity is a fresh collision-free key; idempotency of the
+                # same pending candidate/reviewer pair is handled by the DB.
                 candidate_run_id = _worker_run_id(review_of)
                 kb.request_review(
                     conn, review_of, new_tid,
                     requested_by_run_id=candidate_run_id,
                     reason=f"reviewer task created: {new_tid}",
+                    idempotency_key=secrets.token_urlsafe(16),
                 )
             new_task = kb.get_task(conn, new_tid)
             subscribed = _maybe_auto_subscribe(conn, new_tid)
@@ -1859,8 +1863,20 @@ def _handle_resolve_review(args: dict, **kw) -> str:
 
     # The tool runs in the reviewer task's worker context, so the env-scoped
     # task id is the reviewer task id. Its run id is the resolving authority.
+    # Absence of either is not an operator action and is rejected here; the
+    # DB layer additionally requires operator_mode=True to bypass run identity.
     reviewer_task_id = os.environ.get("HERMES_KANBAN_TASK")
-    resolving_run_id = _worker_run_id(reviewer_task_id) if reviewer_task_id else None
+    if not reviewer_task_id:
+        return tool_error(
+            "kanban_resolve_review must run in a worker context with "
+            "HERMES_KANBAN_TASK set"
+        )
+    resolving_run_id = _worker_run_id(reviewer_task_id)
+    if resolving_run_id is None:
+        return tool_error(
+            "kanban_resolve_review requires a scoped run id; restart the "
+            "reviewer worker if its run id is missing"
+        )
 
     try:
         kb, conn = _connect(board=board)

@@ -1873,6 +1873,7 @@ class ReviewRequest:
     resolved_by_run_id: Optional[int]
     resolution: Optional[str]
     reason: Optional[str]
+    idempotency_key: Optional[str]
 
 
 # ---------------------------------------------------------------------------
@@ -2101,7 +2102,7 @@ CREATE TABLE IF NOT EXISTS review_requests (
     resolved_by_run_id INTEGER,
     resolution         TEXT,
     reason             TEXT,
-    UNIQUE(candidate_id, reviewer_task_id, requested_at, requested_by_run_id)
+    idempotency_key    TEXT NOT NULL
 );
 
 CREATE INDEX IF NOT EXISTS idx_tasks_assignee_status ON tasks(assignee, status);
@@ -3411,7 +3412,11 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
         )
 
     # Independent review-gate relation (t_79a96299). Created additively so
-    # legacy boards upgrade without losing data.
+    # legacy boards upgrade without losing data. The initial deployment used a
+    # second-resolution UNIQUE key on (candidate_id, reviewer_task_id,
+    # requested_at, requested_by_run_id). That collides when a reject and a fresh
+    # request happen in the same second, so the current schema uses a mandatory
+    # idempotency_key with its own UNIQUE index instead.
     review_table_exists = conn.execute(
         "SELECT name FROM sqlite_master WHERE type='table' AND name='review_requests'"
     ).fetchone() is not None
@@ -3429,10 +3434,87 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
                 resolved_by_run_id INTEGER,
                 resolution         TEXT,
                 reason             TEXT,
-                UNIQUE(candidate_id, reviewer_task_id, requested_at, requested_by_run_id)
+                idempotency_key    TEXT NOT NULL,
+                UNIQUE(idempotency_key)
             )
             """
         )
+    else:
+        review_cols = {
+            row["name"] for row in conn.execute("PRAGMA table_info(review_requests)")
+        }
+        if "idempotency_key" not in review_cols:
+            _add_column_if_missing(
+                conn, "review_requests", "idempotency_key", "idempotency_key TEXT"
+            )
+            # Back-fill existing rows with collision-free keys so the NOT NULL
+            # invariant and unique index can be enforced.
+            for row in conn.execute(
+                "SELECT id FROM review_requests WHERE idempotency_key IS NULL"
+            ):
+                conn.execute(
+                    "UPDATE review_requests SET idempotency_key = ? WHERE id = ?",
+                    (f"legacy:{row['id']}:{int(time.time())}", row["id"]),
+                )
+        # Detect and remove the old second-resolution UNIQUE constraint by
+        # recreating the table. The constraint appears as an autoindex over the
+        # four columns; we drop it while preserving all rows and indexes.
+        old_autoindex = conn.execute(
+            """
+            SELECT name FROM sqlite_master
+             WHERE type = 'index'
+               AND tbl_name = 'review_requests'
+               AND sql IS NULL
+               AND name LIKE 'sqlite_autoindex_review_requests_%'
+            """
+        ).fetchone()
+        if old_autoindex is not None:
+            # Determine whether the autoindex covers the old 4-column key.
+            old_idx_info = conn.execute(
+                f"PRAGMA index_info({old_autoindex['name']!r})"
+            ).fetchall()
+            old_idx_cols = tuple(row["name"] for row in old_idx_info)
+            if old_idx_cols == (
+                "candidate_id",
+                "reviewer_task_id",
+                "requested_at",
+                "requested_by_run_id",
+            ):
+                conn.execute(
+                    """
+                    CREATE TABLE review_requests_new (
+                        id                 INTEGER PRIMARY KEY AUTOINCREMENT,
+                        candidate_id       TEXT NOT NULL,
+                        reviewer_task_id   TEXT NOT NULL,
+                        status             TEXT NOT NULL DEFAULT 'pending',
+                        requested_by_run_id INTEGER,
+                        requested_at       INTEGER NOT NULL,
+                        resolved_at        INTEGER,
+                        resolved_by_run_id INTEGER,
+                        resolution         TEXT,
+                        reason             TEXT,
+                        idempotency_key    TEXT NOT NULL
+                    )
+                    """
+                )
+                conn.execute(
+                    """
+                    INSERT INTO review_requests_new (
+                        id, candidate_id, reviewer_task_id, status,
+                        requested_by_run_id, requested_at, resolved_at,
+                        resolved_by_run_id, resolution, reason, idempotency_key
+                    )
+                    SELECT id, candidate_id, reviewer_task_id, status,
+                           requested_by_run_id, requested_at, resolved_at,
+                           resolved_by_run_id, resolution, reason,
+                           COALESCE(idempotency_key, 'legacy:' || id)
+                      FROM review_requests
+                    """
+                )
+                conn.execute("DROP TABLE review_requests")
+                conn.execute(
+                    "ALTER TABLE review_requests_new RENAME TO review_requests"
+                )
     conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_review_candidate "
         "ON review_requests(candidate_id, status)"
@@ -3440,6 +3522,10 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
     conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_review_reviewer "
         "ON review_requests(reviewer_task_id, status)"
+    )
+    conn.execute(
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_review_idempotency "
+        "ON review_requests(idempotency_key)"
     )
 
     # Indexes over additive ``tasks`` columns must be created after the
@@ -6508,9 +6594,13 @@ def complete_task(
     terminal_status = "review" if review_pending_ids else "done"
     terminal_outcome = "review_pending" if review_pending_ids else "completed"
     with write_txn(conn):
-        # Verify reviewer task ids exist and are not terminal before we
-        # commit the candidate to a review handoff.
+        # Verify reviewer task ids exist, are distinct from the candidate, and
+        # are not terminal before we commit the candidate to a review handoff.
         for reviewer_id in review_pending_ids:
+            if reviewer_id == task_id:
+                raise ValueError(
+                    f"candidate task cannot review itself ({task_id!r})"
+                )
             reviewer = conn.execute(
                 "SELECT id, status FROM tasks WHERE id = ?",
                 (reviewer_id,),
@@ -6809,6 +6899,7 @@ def request_review(
     requested_by_run_id: Optional[int],
     *,
     reason: Optional[str] = None,
+    idempotency_key: Optional[str] = None,
 ) -> int:
     """Record a review request binding ``candidate_id`` to ``reviewer_task_id``.
 
@@ -6823,6 +6914,7 @@ def request_review(
         return _request_review_in_txn(
             conn, candidate_id, reviewer_task_id,
             requested_by_run_id, now=now, reason=reason,
+            idempotency_key=idempotency_key,
         )
 
 
@@ -6834,8 +6926,13 @@ def _request_review_in_txn(
     *,
     now: int,
     reason: Optional[str] = None,
+    idempotency_key: Optional[str] = None,
 ) -> int:
     """Inner transactional implementation used when a write_txn is already active."""
+    if candidate_id == reviewer_task_id:
+        raise ValueError(
+            f"candidate task cannot review itself ({candidate_id!r})"
+        )
     candidate = conn.execute(
         "SELECT id, status FROM tasks WHERE id = ?",
         (candidate_id,),
@@ -6879,14 +6976,19 @@ def _request_review_in_txn(
                 (reason, review_id),
             )
     else:
+        if not idempotency_key:
+            idempotency_key = secrets.token_urlsafe(16)
         cur = conn.execute(
             """
             INSERT INTO review_requests (
                 candidate_id, reviewer_task_id, status,
-                requested_by_run_id, requested_at, reason
-            ) VALUES (?, ?, 'pending', ?, ?, ?)
+                requested_by_run_id, requested_at, reason, idempotency_key
+            ) VALUES (?, ?, 'pending', ?, ?, ?, ?)
             """,
-            (candidate_id, reviewer_task_id, requested_by_run_id, now, reason),
+            (
+                candidate_id, reviewer_task_id, requested_by_run_id,
+                now, reason, idempotency_key,
+            ),
         )
         review_id = int(cur.lastrowid or 0)
     _append_event(
@@ -6912,6 +7014,7 @@ def resolve_review(
     *,
     reviewer_task_id: Optional[str] = None,
     reason: Optional[str] = None,
+    operator_mode: bool = False,
 ) -> bool:
     """Resolve a pending review request for ``candidate_id``.
 
@@ -6921,11 +7024,19 @@ def resolve_review(
     task, establishing that the clearance came from the reviewer task's own
     execution rather than the candidate's run or a profile-name match.
 
-    * ``clear`` transitions the candidate from ``review`` to ``done``.
-    * ``reject`` transitions the candidate from ``review`` back to ``todo``
-      (if it has unsatisfied parents) or ``ready`` (if not) so the worker can
-      repair it. Neither path touches ``block_recurrences`` or routes to
-      ``triage``.
+    * ``clear`` removes one pending review. The candidate stays in ``review``
+      until no pending requests remain, then transitions to ``done``. This is
+      an AND gate: when multiple reviewers are bound, all must clear.
+    * ``reject`` is a veto: the candidate transitions from ``review`` back to
+      ``todo`` (if it has unsatisfied parents) or ``ready`` (if not) so the
+      worker can repair it. Any other pending requests for the same candidate
+      are also marked rejected because the round has been voided. Neither path
+      touches ``block_recurrences`` or routes to ``triage``.
+
+    ``operator_mode`` bypasses the run-identity check for authenticated
+    operator/CLI callers that clear or reject a review explicitly. A worker
+    tool must never pass ``operator_mode=True``; absence of a run id is not
+    an operator action and is rejected.
     """
     if resolution not in REVIEW_RESOLUTIONS:
         raise ValueError(
@@ -6972,7 +7083,12 @@ def resolve_review(
         bound_reviewer_id = request_row["reviewer_task_id"]
         requested_by_run_id = request_row["requested_by_run_id"]
 
-        if resolving_run_id is not None:
+        if resolving_run_id is None:
+            if not operator_mode:
+                raise ValueError(
+                    "resolving run id is required unless operator_mode=True"
+                )
+        else:
             run_row = conn.execute(
                 "SELECT task_id FROM task_runs WHERE id = ?",
                 (int(resolving_run_id),),
@@ -6983,7 +7099,7 @@ def resolve_review(
                     f"reviewer task {bound_reviewer_id}"
                 )
 
-        if resolution == "clear" and (
+        if resolution == "clear" and not operator_mode and (
             requested_by_run_id is not None
             and resolving_run_id is not None
             and int(requested_by_run_id) == int(resolving_run_id)
@@ -7025,17 +7141,63 @@ def resolve_review(
         )
 
         if resolution == "clear":
-            conn.execute(
-                """
-                UPDATE tasks
-                   SET status = 'done',
-                       completed_at = ?
-                 WHERE id = ?
-                   AND status = 'review'
-                """,
-                (now, candidate_id),
-            )
+            # AND semantics: the candidate is only done once every bound
+            # reviewer has cleared. If any pending requests remain, leave the
+            # candidate in review.
+            still_pending = conn.execute(
+                "SELECT 1 FROM review_requests "
+                "WHERE candidate_id = ? AND status = 'pending' LIMIT 1",
+                (candidate_id,),
+            ).fetchone()
+            if still_pending is None:
+                conn.execute(
+                    """
+                    UPDATE tasks
+                       SET status = 'done',
+                           completed_at = ?
+                     WHERE id = ?
+                       AND status = 'review'
+                    """,
+                    (now, candidate_id),
+                )
         else:
+            # A reject is an ANY veto: void every remaining pending request for
+            # this candidate so the round cannot be partially cleared later.
+            superseded = conn.execute(
+                """
+                SELECT id FROM review_requests
+                 WHERE candidate_id = ? AND status = 'pending' AND id != ?
+                """,
+                (candidate_id, int(request_row["id"])),
+            ).fetchall()
+            if superseded:
+                for row in superseded:
+                    conn.execute(
+                        """
+                        UPDATE review_requests
+                           SET status = 'rejected',
+                               resolution = 'reject',
+                               resolved_at = ?,
+                               resolved_by_run_id = ?,
+                               reason = ?
+                         WHERE id = ?
+                           AND status = 'pending'
+                        """,
+                        (now, resolving_run_id, "superseded by veto", int(row["id"])),
+                    )
+                    _append_event(
+                        conn,
+                        candidate_id,
+                        "review_rejected",
+                        {
+                            "review_id": int(row["id"]),
+                            "reviewer_task_id": bound_reviewer_id,
+                            "resolving_run_id": resolving_run_id,
+                            "requested_by_run_id": requested_by_run_id,
+                            "reason": "superseded by veto",
+                        },
+                        run_id=resolving_run_id,
+                    )
             undone_parents = conn.execute(
                 "SELECT 1 FROM task_links l "
                 "JOIN tasks p ON p.id = l.parent_id "
@@ -7059,7 +7221,9 @@ def resolve_review(
 
     recompute_ready(conn)
     if resolution == "clear":
-        _cleanup_workspace(conn, candidate_id)
+        # Only clean up the workspace once the candidate is actually done.
+        if not has_pending_review(conn, candidate_id):
+            _cleanup_workspace(conn, candidate_id)
     return True
 
 
@@ -7087,7 +7251,7 @@ def get_review_requests(
         f"""
         SELECT id, candidate_id, reviewer_task_id, status,
                requested_by_run_id, requested_at, resolved_at,
-               resolved_by_run_id, resolution, reason
+               resolved_by_run_id, resolution, reason, idempotency_key
           FROM review_requests
          {where}
          ORDER BY requested_at ASC, id ASC
@@ -7106,6 +7270,7 @@ def get_review_requests(
             resolved_by_run_id=r["resolved_by_run_id"],
             resolution=r["resolution"],
             reason=r["reason"],
+            idempotency_key=r["idempotency_key"],
         )
         for r in rows
     ]
