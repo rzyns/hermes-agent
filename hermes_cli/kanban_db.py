@@ -3664,12 +3664,17 @@ def _execute_boundary_with_retry(conn: sqlite3.Connection, sql: str) -> None:
 
 
 @contextlib.contextmanager
-def write_txn(conn: sqlite3.Connection):
+def write_txn(conn: sqlite3.Connection, *, on_committed: Optional[Callable[[], None]] = None):
     """Context manager for an IMMEDIATE write transaction.
 
     Use for any multi-statement write (creating a task + link, claiming a
     task + recording an event, etc.).  A claim CAS inside this context is
     atomic -- at most one concurrent writer can succeed.
+
+    The optional ``on_committed`` callback is invoked after ``COMMIT`` has
+    succeeded and before the post-commit invariant checks. Callers can use
+    it to mark filesystem state as committed, so post-commit failures are
+    not mistaken for rollback cases.
 
     The explicit ROLLBACK on exception is wrapped in try/except so that
     a SQLite auto-rollback (which leaves no active transaction) does not
@@ -3687,7 +3692,7 @@ def write_txn(conn: sqlite3.Connection):
         except sqlite3.OperationalError:
             # SQLite has already auto-rolled-back the transaction (typical
             # under EIO, lock contention, or corruption). Nothing to undo;
-            # do not let this secondary failure shadow the real one.
+            # do not let this secondary failure shadow the real exception.
             pass
         raise
     else:
@@ -3701,6 +3706,8 @@ def write_txn(conn: sqlite3.Connection):
             except sqlite3.OperationalError:
                 pass
             raise
+        if on_committed is not None:
+            on_committed()
         # Post-commit file-length check: header page_count must match actual file pages.
         # A discrepancy means a torn-extend — raise now rather than silently corrupt.
         _check_file_length_invariant(conn)
@@ -4710,7 +4717,14 @@ def _stage_file_path(dest_dir: Path, safe_name: str) -> Path:
 
 
 def _remove_file_silent(path: Path) -> None:
-    """Best-effort remove; never raise."""
+    """Best-effort remove; never raise.
+
+    Used for transient staging files and for rollback compensation. A real
+    permission or I/O failure here is recorded by the surrounding context,
+    not swallowed silently; this helper is intentionally narrow so that
+    cleanup failures do not get promoted to a misleading claim of
+    unconditional removal.
+    """
     try:
         path.unlink(missing_ok=True)
     except OSError:
@@ -4726,9 +4740,9 @@ def _publish_staged_file(
 
     Uses a same-filesystem hard link: the operation either succeeds with
     both names pointing at the same inode, or fails with ``EEXIST`` if the
-    final name is already occupied.  The staging file is always removed,
-    success or failure.  No plain ``os.replace`` is used, so an existing
-    final file can never be overwritten.
+    final name is already occupied.  The staging file is always removed on
+    return, success or failure, best-effort.  No plain ``os.replace`` is
+    used, so an existing final file can never be silently overwritten.
 
     Raises :class:`AttachmentNameCollisionError` when ``final_path``
     already exists, or :class:`ArtifactPreservationError` for unexpected
@@ -4761,8 +4775,9 @@ def _copy_file_with_hash_verification(
     The source is opened **once**; its digest is computed from the bytes
     actually streamed to the destination, eliminating the TOCTOU window
     between a pre-copy hash and the real copy. A stable snapshot of the
-    source's size/mtime is recorded before and after the stream; a change
-    raises :class:`ArtifactPreservationError`.
+    source's identity (device, inode, size, mtime, and ctime on Unix) is
+    recorded before and after the stream; any change raises
+    :class:`ArtifactPreservationError`.
 
     The destination is written to a hidden same-directory staging file,
     verified, then published with a no-clobber hard link so a partial or
@@ -4828,7 +4843,9 @@ def _copy_file_with_hash_verification(
                 )
 
             # Verify the bytes that landed on disk match the bytes that left the
-            # source, using the same opened handle's view of the world.
+            # source, using the same opened handle's view of the world. Re-reading
+            # the staging file is part of the protected region so a failure here
+            # also removes the staging file.
             staging_hash = _sha256_file(staging_path)
             if staging_hash != stream_hash.hexdigest():
                 raise ArtifactPreservationError(
@@ -4851,6 +4868,31 @@ def _copy_file_with_hash_verification(
                 raise ArtifactPreservationError(
                     f"source artifact {src} changed during copy"
                 )
+
+            # Detect path-level replacement or unlink after the handle was opened.
+            # The opened inode and the path must still name the same object; a
+            # different inode means the path was replaced, and a missing path means
+            # the source was unlinked.
+            try:
+                post_path_stat = os.stat(src)
+            except OSError as exc:
+                raise ArtifactPreservationError(
+                    f"source artifact {src} disappeared or became inaccessible after copy: {exc}"
+                ) from exc
+            if (
+                post_path_stat.st_dev != pre_handle_stat.st_dev
+                or post_path_stat.st_ino != pre_handle_stat.st_ino
+            ):
+                raise ArtifactPreservationError(
+                    f"source artifact {src} was replaced during copy (inode mismatch)"
+                )
+            if sys.platform != "win32":
+                if getattr(post_path_stat, "st_ctime_ns", post_path_stat.st_ctime) != getattr(
+                    pre_handle_stat, "st_ctime_ns", pre_handle_stat.st_ctime
+                ):
+                    raise ArtifactPreservationError(
+                        f"source artifact {src} was mutated during copy (ctime changed)"
+                    )
 
         # Publish atomically: hard link to final name, then drop staging link.
         _publish_staged_file(staging_path, dest, dest.name)
@@ -6786,18 +6828,11 @@ def complete_task(
                 return False
             accepted_budget_run_id = int(budget_run["id"])
         if isinstance(metadata, dict):
-            _persist_scratch_completion_artifacts(conn, task_id, metadata)
-            for stored_path in metadata.pop("_staged_artifacts", []):
-                path = Path(stored_path)
-                _insert_lifecycle_attachment(
-                    conn,
-                    task_id,
-                    filename=path.name,
-                    stored_path=str(path),
-                    size=path.stat().st_size,
-                    created_at=now,
-                    uploaded_by="kanban_complete",
-                )
+            staged_paths = _persist_scratch_completion_artifacts(conn, task_id, metadata)
+            _record_lifecycle_staged_artifacts(
+                conn, task_id, metadata, created_at=now,
+                uploaded_by="kanban_complete", staged_paths=staged_paths,
+            )
         run_metadata = metadata
         if accepted_budget_run_id is not None:
             run_metadata = dict(metadata) if isinstance(metadata, dict) else {}
@@ -7003,7 +7038,7 @@ def _persist_scratch_lifecycle_artifacts(
     metadata: dict,
     *,
     uploaded_by: str,
-) -> None:
+) -> list[Path]:
     """Copy scratch-workspace artifacts to durable attachments before loss.
 
     Used by both terminal completion and by ``block_task`` so that a
@@ -7011,32 +7046,38 @@ def _persist_scratch_lifecycle_artifacts(
     Only managed scratch workspaces are touched; ``dir``/``worktree`` and
     out-of-scratch paths are left alone so we never silently relocate a
     user's source tree.
+
+    Returns the list of durable filesystem paths that were published. The
+    caller owns these files until the containing transaction commits; on
+    any later failure the caller must compensate by unlinking them, because
+    SQLite cannot roll back filesystem writes.
     """
     raw_artifacts = metadata.get("artifacts")
     if not isinstance(raw_artifacts, (list, tuple)):
-        return
+        return []
 
     row = conn.execute(
         "SELECT workspace_kind, workspace_path FROM tasks WHERE id = ?",
         (task_id,),
     ).fetchone()
     if not row or row["workspace_kind"] != "scratch" or not row["workspace_path"]:
-        return
+        return []
 
     workspace = Path(row["workspace_path"]).expanduser()
     is_managed, board = _managed_scratch_path_info(workspace)
     if not is_managed:
-        return
+        return []
 
     try:
         workspace_root = workspace.resolve()
     except OSError:
-        return
+        return []
 
     attachment_dir = task_attachments_dir(task_id, board=board)
     persisted: list[str] = []
     used_destinations: set[Path] = set()
     changed = False
+    published_paths: list[Path] = []
 
     def _discard_copies() -> None:
         for copied in used_destinations:
@@ -7097,6 +7138,7 @@ def _persist_scratch_lifecycle_artifacts(
 
         used_destinations.add(dest)
         persisted.append(str(dest.resolve()))
+        published_paths.append(dest)
         changed = True
 
     if changed:
@@ -7105,6 +7147,7 @@ def _persist_scratch_lifecycle_artifacts(
             path for path in persisted if path.startswith(str(attachment_dir.resolve()))
         ]
 
+    return published_paths
 
 # Backward-compatible alias used by complete_task.
 _persist_scratch_completion_artifacts = partial(
@@ -7120,19 +7163,21 @@ def _record_lifecycle_staged_artifacts(
     *,
     created_at: int,
     uploaded_by: str,
+    staged_paths: Optional[list[Path]] = None,
 ) -> list[Path]:
-    """Record staged lifecycle-preserved attachments and remove them from metadata.
+    """Record staged lifecycle-preserved attachments.
 
     Callers must run this after the task-state CAS UPDATE succeeds so we do
-    not attach files to a failed transition. The staged list is popped from
-    metadata before run metadata / event payloads are persisted.
+    not attach files to a failed transition. The staged list is taken from
+    the explicit ``staged_paths`` argument when provided; otherwise it is
+    popped from ``metadata["_staged_artifacts"]`` for backwards compatibility.
 
     Returns the list of filesystem paths that were durably published and now
     belong to the task. Callers should keep this list in a local variable so
     they can compensate (unlink) these files on any later exception or commit
     failure, because SQLite cannot roll back filesystem writes.
     """
-    staged = metadata.pop("_staged_artifacts", None)
+    staged = staged_paths if staged_paths is not None else metadata.pop("_staged_artifacts", None)
     recorded: list[Path] = []
     if not isinstance(staged, (list, tuple)):
         return recorded
@@ -7149,6 +7194,7 @@ def _record_lifecycle_staged_artifacts(
         )
         recorded.append(path)
     return recorded
+
 
 
 def _insert_lifecycle_attachment(
@@ -7175,12 +7221,6 @@ def _insert_lifecycle_attachment(
         {"filename": filename, "size": size, "by": uploaded_by},
     )
 
-
-# Backward-compatible alias used by older call sites that did not name an uploader.
-_insert_completion_attachment = partial(
-    _insert_lifecycle_attachment,
-    uploaded_by="kanban_complete",
-)
 
 
 def _unique_attachment_path(directory: Path, filename: str, used: set[Path]) -> Path:
@@ -7690,11 +7730,13 @@ def block_task(
 
     Filesystem copies are performed **after** the state-transition CAS UPDATE
     succeeds, inside the same ``BEGIN IMMEDIATE`` transaction. SQLite cannot
-    roll back filesystem writes, so any exception after a successful copy
-    (including a failed COMMIT) triggers explicit compensation that removes
-    staged files. A stale ``expected_run_id`` therefore reaches the
-    ``rowcount != 1`` path before any filesystem mutation, leaving no orphan
-    attachment.
+    roll back filesystem writes, so any exception before a successful COMMIT
+    triggers explicit compensation that removes staged files. A stale
+    ``expected_run_id`` therefore reaches the ``rowcount != 1`` path before
+    any filesystem mutation, leaving no orphan attachment. Once COMMIT has
+    succeeded, filesystem state is treated as committed: a post-commit
+    exception (e.g. the file-length invariant check) does not delete the
+    files, because doing so would orphan durable attachment rows.
 
     Returns True on any successful transition (to ``blocked``, ``todo``, or
     ``triage``), False when the task wasn't in a blockable state.
@@ -7727,23 +7769,40 @@ def block_task(
             except OSError:
                 pass
 
-    def _copy_declared_artifacts() -> list[Path]:
-        """Copy declared scratch artifacts and record their attachment rows."""
-        if metadata:
-            _persist_scratch_lifecycle_artifacts(
-                conn, task_id, metadata, uploaded_by="kanban_block"
-            )
-        return _record_lifecycle_staged_artifacts(
-            conn, task_id, metadata, created_at=now, uploaded_by="kanban_block"
-        )
-
     # Filesystem paths that this block attempt has published into the durable
     # attachment directory. SQLite cannot roll back filesystem writes, so this
-    # local list must outlive metadata mutations and survive until commit.
+    # local list must be assigned immediately after publication and before any
+    # metadata/row/event recording can fail. It is independent of metadata.
     owned_files: list[Path] = []
 
+    # True only after write_txn's COMMIT has succeeded. Post-commit exceptions
+    # (e.g. the file-length invariant check) must not compensate, because the
+    # database transition is already durable and deleting the files would
+    # orphan committed attachment rows.
+    txn_committed = False
+
+    def _mark_committed() -> None:
+        nonlocal txn_committed
+        txn_committed = True
+
+    def _copy_declared_artifacts() -> list[Path]:
+        """Copy declared scratch artifacts and record their attachment rows."""
+        if not metadata:
+            return []
+        staged_paths = _persist_scratch_lifecycle_artifacts(
+            conn, task_id, metadata, uploaded_by="kanban_block"
+        )
+        # Ownership is captured *before* row/event recording so a failure in
+        # the recorder can still be compensated.
+        owned_files.extend(staged_paths)
+        _record_lifecycle_staged_artifacts(
+            conn, task_id, metadata, created_at=now,
+            uploaded_by="kanban_block", staged_paths=staged_paths,
+        )
+        return staged_paths
+
     try:
-        with write_txn(conn):
+        with write_txn(conn, on_committed=_mark_committed):
             cur_row = conn.execute(
                 "SELECT status, block_kind, block_recurrences FROM tasks WHERE id = ?",
                 (task_id,),
@@ -8019,7 +8078,11 @@ def block_task(
         # SQLite cannot roll back filesystem writes. If a copy succeeded but a
         # later event / run / commit failed, remove any staged durable files so
         # the next attempt does not see filename churn from orphan attachments.
-        _compensate_staged_files(owned_files)
+        # Do NOT compensate if the transaction already committed; at that point
+        # the attachment rows and events are durable and deleting the files
+        # would leave the database pointing at non-existent blobs.
+        if not txn_committed:
+            _compensate_staged_files(owned_files)
         raise
 
     _fire_kanban_lifecycle_hook(

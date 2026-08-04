@@ -4379,6 +4379,220 @@ def test_copy_file_with_hash_verification_rejects_source_mutation_mid_copy(
     assert not dest.exists()
     assert not list(kb.task_attachments_dir(t).glob("*.stage"))
 
+def test_copy_file_rejects_source_replacement_after_open(kanban_home):
+    """A source path replaced by a different inode after streaming is rejected."""
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="replacement target")
+    src_dir = kanban_home / "srcs"
+    src_dir.mkdir(parents=True, exist_ok=True)
+    src = src_dir / "source.bin"
+    original = b"A" * (1024 * 1024 + 257)
+    src.write_bytes(original)
+    dest = kb.task_attachments_dir(t) / "source.bin"
+
+    real_sha256_file = kb._sha256_file
+
+    def _replace_then_hash(path):
+        # Replace the source path with a new file of the same size after the
+        # source handle has been opened and streamed.
+        replacement = src.with_name("replacement.bin")
+        replacement.write_bytes(b"R" * src.stat().st_size)
+        os.replace(replacement, src)
+        return real_sha256_file(path)
+
+    with unittest.mock.patch.object(kb, "_sha256_file", _replace_then_hash):
+        with pytest.raises(kb.ArtifactPreservationError, match="replaced during copy"):
+            kb._copy_file_with_hash_verification(src, dest)
+
+    assert not dest.exists()
+    assert not list(kb.task_attachments_dir(t).glob("*.stage"))
+
+
+def test_copy_file_rejects_same_size_mutation_with_restored_mtime(kanban_home):
+    """A same-size overwrite with restored mtime is still detected via ctime."""
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="same-size mutation target")
+    src_dir = kanban_home / "srcs"
+    src_dir.mkdir(parents=True, exist_ok=True)
+    src = src_dir / "source.bin"
+    original = b"M" * 4096
+    src.write_bytes(original)
+    dest = kb.task_attachments_dir(t) / "source.bin"
+
+    real_sha256_file = kb._sha256_file
+
+    def _mutate_then_hash(path):
+        before = src.stat()
+        src.write_bytes(b"N" * before.st_size)
+        os.utime(src, ns=(before.st_atime_ns, before.st_mtime_ns))
+        return real_sha256_file(path)
+
+    with unittest.mock.patch.object(kb, "_sha256_file", _mutate_then_hash):
+        with pytest.raises(kb.ArtifactPreservationError, match="mutated during copy"):
+            kb._copy_file_with_hash_verification(src, dest)
+
+    assert not dest.exists()
+    assert not list(kb.task_attachments_dir(t).glob("*.stage"))
+
+
+def test_copy_file_rejects_unlink_after_open(kanban_home):
+    """A source unlinked after the handle is opened is rejected."""
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="unlink target")
+    src_dir = kanban_home / "srcs"
+    src_dir.mkdir(parents=True, exist_ok=True)
+    src = src_dir / "source.bin"
+    src.write_bytes(b"source bytes")
+    dest = kb.task_attachments_dir(t) / "source.bin"
+
+    real_open = Path.open
+
+    def _unlink_then_open(path, *args, **kwargs):
+        if path == src and src.exists():
+            src.unlink()
+        return real_open(path, *args, **kwargs)
+
+    with unittest.mock.patch.object(Path, "open", _unlink_then_open):
+        with pytest.raises(kb.ArtifactPreservationError, match="No such file or directory"):
+            kb._copy_file_with_hash_verification(src, dest)
+
+    assert not dest.exists()
+    assert not list(kb.task_attachments_dir(t).glob("*.stage"))
+
+
+def test_block_task_attachment_record_failure_compensates_filesystem(kanban_home):
+    """A failure while inserting the attachment row must remove the published file.
+
+    Ownership is captured before row/event recording, so the failure cannot
+    leave a canonical orphan that forces a retry suffix.
+    """
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="attachment record failure")
+        task = kb.get_task(conn, t)
+        ws = kb.resolve_workspace(task)
+        kb.set_workspace_path(conn, t, ws)
+        report = ws / "verdict.md"
+        report.write_text("verdict", encoding="utf-8")
+        kb.claim_task(conn, t)
+        run_id = kb.get_task(conn, t).current_run_id
+
+    with unittest.mock.patch.object(
+        kb, "_insert_lifecycle_attachment", side_effect=RuntimeError("injected attachment row failure")
+    ):
+        with pytest.raises(RuntimeError, match="injected attachment row failure"):
+            with kb.connect() as conn:
+                kb.block_task(
+                    conn,
+                    t,
+                    reason="needs review",
+                    metadata={"artifacts": [str(report)]},
+                    expected_run_id=run_id,
+                )
+
+    with kb.connect() as conn:
+        task = kb.get_task(conn, t)
+        assert task.status == "running"
+        assert kb.list_attachments(conn, t) == []
+    dest_dir = kb.task_attachments_dir(t)
+    assert not list(dest_dir.glob("verdict*"))
+
+    # Retry succeeds and takes the canonical name.
+    with kb.connect() as conn:
+        kb.block_task(
+            conn,
+            t,
+            reason="needs review",
+            metadata={"artifacts": [str(report)]},
+            expected_run_id=run_id,
+        )
+        attachments = kb.list_attachments(conn, t)
+    assert len(attachments) == 1
+    assert attachments[0].filename == "verdict.md"
+
+
+def test_block_task_multi_artifact_record_failure_compensates_all(kanban_home):
+    """A failure on item N removes every file owned by the block attempt."""
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="multi artifact record failure")
+        task = kb.get_task(conn, t)
+        ws = kb.resolve_workspace(task)
+        kb.set_workspace_path(conn, t, ws)
+        a = ws / "a.md"
+        a.write_text("a", encoding="utf-8")
+        b = ws / "b.md"
+        b.write_text("b", encoding="utf-8")
+        kb.claim_task(conn, t)
+        run_id = kb.get_task(conn, t).current_run_id
+
+    calls = []
+
+    def _fail_on_second(*args, **kwargs):
+        calls.append(kwargs)
+        if len(calls) >= 2:
+            raise RuntimeError("injected second attachment row failure")
+
+    with unittest.mock.patch.object(kb, "_insert_lifecycle_attachment", _fail_on_second):
+        with pytest.raises(RuntimeError, match="injected second attachment row failure"):
+            with kb.connect() as conn:
+                kb.block_task(
+                    conn,
+                    t,
+                    reason="needs review",
+                    metadata={"artifacts": [str(a), str(b)]},
+                    expected_run_id=run_id,
+                )
+
+    dest_dir = kb.task_attachments_dir(t)
+    assert not list(dest_dir.glob("*.md"))
+
+    # Retry is canonical for both files.
+    with kb.connect() as conn:
+        kb.block_task(
+            conn,
+            t,
+            reason="needs review",
+            metadata={"artifacts": [str(a), str(b)]},
+            expected_run_id=run_id,
+        )
+        attachments = {att.filename for att in kb.list_attachments(conn, t)}
+    assert attachments == {"a.md", "b.md"}
+
+
+def test_block_task_post_commit_invariant_preserves_committed_file(kanban_home):
+    """A failure after COMMIT must not delete the durable file it already owns."""
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="post-commit invariant failure")
+        task = kb.get_task(conn, t)
+        ws = kb.resolve_workspace(task)
+        kb.set_workspace_path(conn, t, ws)
+        report = ws / "verdict.md"
+        report.write_text("verdict", encoding="utf-8")
+        kb.claim_task(conn, t)
+        run_id = kb.get_task(conn, t).current_run_id
+
+    with unittest.mock.patch.object(
+        kb, "_check_file_length_invariant", side_effect=RuntimeError("injected post-commit invariant failure")
+    ):
+        with pytest.raises(RuntimeError, match="injected post-commit invariant failure"):
+            with kb.connect() as conn:
+                kb.block_task(
+                    conn,
+                    t,
+                    reason="needs review",
+                    metadata={"artifacts": [str(report)]},
+                    expected_run_id=run_id,
+                )
+
+    with kb.connect() as conn:
+        task = kb.get_task(conn, t)
+        # The block transition committed before the invariant check failed.
+        assert task.status == "blocked"
+        attachments = kb.list_attachments(conn, t)
+    assert len(attachments) == 1
+    assert attachments[0].filename == "verdict.md"
+    assert Path(attachments[0].stored_path).exists()
+    assert Path(attachments[0].stored_path).read_text(encoding="utf-8") == "verdict"
+
 
 def test_cleanup_workspace_honors_workspaces_root_env_override(tmp_path, monkeypatch):
     """``HERMES_KANBAN_WORKSPACES_ROOT`` extends the managed-scratch set.
