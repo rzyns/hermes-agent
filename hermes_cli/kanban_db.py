@@ -4788,11 +4788,28 @@ def _copy_file_with_hash_verification(
 
     dest.parent.mkdir(parents=True, exist_ok=True)
     staging_path = _stage_file_path(dest.parent, dest.name)
-    copied = 0
     stream_hash = hashlib.sha256()
+    published_final: Optional[Path] = None
 
     try:
         with src.open("rb") as source_file:
+            # Bind verification to the single opened handle so the identity
+            # (size, mtime) and the streamed bytes are guaranteed to come from
+            # the same file incarnation. This closes the TOCTOU window between a
+            # pre-copy hash and the real copy.
+            try:
+                pre_handle_stat = os.fstat(source_file.fileno())
+            except OSError as exc:
+                raise ArtifactPreservationError(
+                    f"cannot stat opened source artifact {src}: {exc}"
+                ) from exc
+            handle_size = pre_handle_stat.st_size
+            if handle_size > max_bytes:
+                raise ArtifactPreservationError(
+                    f"artifact exceeds the {max_bytes}-byte limit: {src}"
+                )
+
+            copied = 0
             with staging_path.open("xb") as destination_file:
                 while chunk := source_file.read(1024 * 1024):
                     copied += len(chunk)
@@ -4804,51 +4821,57 @@ def _copy_file_with_hash_verification(
                     stream_hash.update(chunk)
                 destination_file.flush()
                 os.fsync(destination_file.fileno())
+
+            if copied != handle_size:
+                raise ArtifactPreservationError(
+                    f"size mismatch copying {src}: expected {handle_size}, wrote {copied}"
+                )
+
+            # Verify the bytes that landed on disk match the bytes that left the
+            # source, using the same opened handle's view of the world.
+            staging_hash = _sha256_file(staging_path)
+            if staging_hash != stream_hash.hexdigest():
+                raise ArtifactPreservationError(
+                    f"hash mismatch writing {src}: streamed {stream_hash.hexdigest()} "
+                    f"!= staging {staging_hash}"
+                )
+
+            # Detect source mutation that happened while the handle was open.
+            try:
+                post_handle_stat = os.fstat(source_file.fileno())
+            except OSError as exc:
+                raise ArtifactPreservationError(
+                    f"cannot re-stat opened source artifact {src} after copy: {exc}"
+                ) from exc
+            if (
+                post_handle_stat.st_size != pre_handle_stat.st_size
+                or getattr(post_handle_stat, "st_mtime_ns", post_handle_stat.st_mtime)
+                != getattr(pre_handle_stat, "st_mtime_ns", pre_handle_stat.st_mtime)
+            ):
+                raise ArtifactPreservationError(
+                    f"source artifact {src} changed during copy"
+                )
+
+        # Publish atomically: hard link to final name, then drop staging link.
+        _publish_staged_file(staging_path, dest, dest.name)
+        published_final = dest
+        return dest
     except ArtifactPreservationError:
         _remove_file_silent(staging_path)
+        if published_final is not None:
+            _remove_file_silent(published_final)
         raise
     except Exception as exc:
         _remove_file_silent(staging_path)
+        if published_final is not None:
+            _remove_file_silent(published_final)
         raise ArtifactPreservationError(
             f"could not copy artifact {src} to staging: {exc}"
         ) from exc
-
-    if copied != src_size:
+    finally:
+        # Always remove the staging file; if publish succeeded the extra hard
+        # link is already gone, and on failure we never want a hidden partial.
         _remove_file_silent(staging_path)
-        raise ArtifactPreservationError(
-            f"size mismatch copying {src}: expected {src_size}, wrote {copied}"
-        )
-
-    # Verify the bytes that landed on disk match the bytes that left the source.
-    staging_hash = _sha256_file(staging_path)
-    if staging_hash != stream_hash.hexdigest():
-        _remove_file_silent(staging_path)
-        raise ArtifactPreservationError(
-            f"hash mismatch writing {src}: streamed {stream_hash.hexdigest()} "
-            f"!= staging {staging_hash}"
-        )
-
-    # Detect source mutation that happened during the copy.
-    try:
-        post_stat = src.stat()
-    except OSError as exc:
-        _remove_file_silent(staging_path)
-        raise ArtifactPreservationError(
-            f"cannot re-stat source artifact {src} after copy: {exc}"
-        ) from exc
-    if (
-        post_stat.st_size != pre_stat.st_size
-        or getattr(post_stat, "st_mtime_ns", post_stat.st_mtime)
-        != getattr(pre_stat, "st_mtime_ns", pre_stat.st_mtime)
-    ):
-        _remove_file_silent(staging_path)
-        raise ArtifactPreservationError(
-            f"source artifact {src} changed during copy"
-        )
-
-    # Publish atomically: hard link to final name, then drop the staging link.
-    _publish_staged_file(staging_path, dest, dest.name)
-    return dest
 
 
 def store_attachment_bytes(
@@ -7097,16 +7120,22 @@ def _record_lifecycle_staged_artifacts(
     *,
     created_at: int,
     uploaded_by: str,
-) -> None:
+) -> list[Path]:
     """Record staged lifecycle-preserved attachments and remove them from metadata.
 
     Callers must run this after the task-state CAS UPDATE succeeds so we do
     not attach files to a failed transition. The staged list is popped from
     metadata before run metadata / event payloads are persisted.
+
+    Returns the list of filesystem paths that were durably published and now
+    belong to the task. Callers should keep this list in a local variable so
+    they can compensate (unlink) these files on any later exception or commit
+    failure, because SQLite cannot roll back filesystem writes.
     """
     staged = metadata.pop("_staged_artifacts", None)
+    recorded: list[Path] = []
     if not isinstance(staged, (list, tuple)):
-        return
+        return recorded
     for stored_path in staged:
         path = Path(stored_path)
         _insert_lifecycle_attachment(
@@ -7118,6 +7147,8 @@ def _record_lifecycle_staged_artifacts(
             created_at=created_at,
             uploaded_by=uploaded_by,
         )
+        recorded.append(path)
+    return recorded
 
 
 def _insert_lifecycle_attachment(
@@ -7688,26 +7719,28 @@ def block_task(
     run_id: Optional[int] = None
     _blocked_task: Optional[Any] = None
 
-    def _compensate_staged_files() -> None:
+    def _compensate_staged_files(paths: Iterable[Path]) -> None:
         """Remove any durable files staged during a failed block transition."""
-        staged = metadata.get("_staged_artifacts", [])
-        if not isinstance(staged, (list, tuple)):
-            return
-        for stored_path in staged:
+        for path in paths:
             try:
-                Path(stored_path).unlink(missing_ok=True)
+                path.unlink(missing_ok=True)
             except OSError:
                 pass
 
-    def _copy_declared_artifacts() -> None:
+    def _copy_declared_artifacts() -> list[Path]:
         """Copy declared scratch artifacts and record their attachment rows."""
         if metadata:
             _persist_scratch_lifecycle_artifacts(
                 conn, task_id, metadata, uploaded_by="kanban_block"
             )
-        _record_lifecycle_staged_artifacts(
+        return _record_lifecycle_staged_artifacts(
             conn, task_id, metadata, created_at=now, uploaded_by="kanban_block"
         )
+
+    # Filesystem paths that this block attempt has published into the durable
+    # attachment directory. SQLite cannot roll back filesystem writes, so this
+    # local list must outlive metadata mutations and survive until commit.
+    owned_files: list[Path] = []
 
     try:
         with write_txn(conn):
@@ -7783,7 +7816,7 @@ def block_task(
                     return False
 
                 # CAS succeeded: now it is safe to touch filesystem artifacts.
-                _copy_declared_artifacts()
+                owned_files = _copy_declared_artifacts()
                 run_id = _end_run(
                     conn, task_id,
                     outcome="blocked", status="blocked",
@@ -7879,7 +7912,7 @@ def block_task(
                 if cur.rowcount != 1:
                     return False
 
-                _copy_declared_artifacts()
+                owned_files = _copy_declared_artifacts()
                 run_id = _end_run(
                     conn, task_id,
                     outcome="blocked", status="blocked",
@@ -7954,7 +7987,7 @@ def block_task(
                 if cur.rowcount != 1:
                     return False
 
-                _copy_declared_artifacts()
+                owned_files = _copy_declared_artifacts()
                 run_id = _end_run(
                     conn, task_id,
                     outcome="blocked", status="blocked",
@@ -7986,7 +8019,7 @@ def block_task(
         # SQLite cannot roll back filesystem writes. If a copy succeeded but a
         # later event / run / commit failed, remove any staged durable files so
         # the next attempt does not see filename churn from orphan attachments.
-        _compensate_staged_files()
+        _compensate_staged_files(owned_files)
         raise
 
     _fire_kanban_lifecycle_hook(

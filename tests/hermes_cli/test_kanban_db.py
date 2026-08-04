@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import concurrent.futures
+import contextlib
 import json
 import os
 import sqlite3
@@ -4083,47 +4084,30 @@ def test_publish_staged_file_no_clobber_removes_staging(kanban_home):
 
 
 def test_copy_file_with_hash_verification_rejects_source_mutation(kanban_home):
-    """A source file modified after the pre-copy stat is rejected."""
-    import types
-
+    """A source file modified in-place after streaming but before publish is rejected."""
     with kb.connect() as conn:
         t = kb.create_task(conn, title="copy target")
     src_dir = kanban_home / "srcs"
     src_dir.mkdir(parents=True, exist_ok=True)
     src = src_dir / "mutating.txt"
     src.write_text("original", encoding="utf-8")
+    dest = kb.task_attachments_dir(t) / "mutating.txt"
 
-    # PosixPath.stat is read-only, so wrap the path in a tiny proxy.
-    real_stat = src.stat
-    call_count = 0
+    original_sha256_file = kb._sha256_file
 
-    class _MutableStatPath:
-        def __init__(self, target):
-            self._target = target
+    def _mutating_sha256_file(path):
+        # Mutate the source on disk between the size check and the post-stream
+        # handle stat, so the second fstat detects a size/mtime change.
+        with open(str(src), "wb") as mutation_handle:
+            mutation_handle.write(b"mutated content is longer")
+        return original_sha256_file(path)
 
-        def __getattr__(self, name):
-            return getattr(self._target, name)
+    with unittest.mock.patch.object(kb, "_sha256_file", _mutating_sha256_file):
+        with pytest.raises(kb.ArtifactPreservationError, match="changed during copy"):
+            kb._copy_file_with_hash_verification(src, dest)
 
-        def stat(self, *args, **kwargs):
-            nonlocal call_count
-            call_count += 1
-            if call_count == 1:
-                fake = types.SimpleNamespace(
-                    st_size=8,
-                    st_mtime_ns=real_stat().st_mtime_ns - 1_000_000_000,
-                    st_mtime=real_stat().st_mtime - 1,
-                )
-                return fake
-            return real_stat()
-
-    wrapped_src = _MutableStatPath(src)
-    dest_dir = kb.task_attachments_dir(t)
-
-    with pytest.raises(kb.ArtifactPreservationError, match="changed during copy"):
-        kb._copy_file_with_hash_verification(wrapped_src, dest_dir / "mutating.txt")
-
-    assert not (dest_dir / "mutating.txt").exists()
-    assert not list(dest_dir.glob("*.stage"))
+    assert not dest.exists()
+    assert not list(kb.task_attachments_dir(t).glob("*.stage"))
 
 
 def test_block_task_stale_run_id_leaves_no_orphan_artifact(kanban_home):
@@ -4243,6 +4227,157 @@ def test_block_task_triage_emits_blocked_artifacts_event(kanban_home):
     assert persisted.name.startswith("loop_review")
     assert persisted.suffix == ".md"
     assert any(a.filename.startswith("loop_review") for a in attachments)
+
+
+def test_block_task_post_copy_db_failure_compensates_filesystem(kanban_home):
+    """A failure after artifact copy but before commit must not leave an orphan file.
+
+    SQLite cannot roll back filesystem writes, so ``block_task`` keeps a local
+    list of published paths and unlinks them on any exception or commit failure.
+    A legitimate retry must then get the canonical filename, not a suffix.
+    """
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="rollback after copy")
+        task = kb.get_task(conn, t)
+        ws = kb.resolve_workspace(task)
+        kb.set_workspace_path(conn, t, ws)
+        report = ws / "verdict.md"
+        report.write_text("verdict", encoding="utf-8")
+        kb.claim_task(conn, t)
+        run_id = kb.get_task(conn, t).current_run_id
+
+    original_end_run = kb._end_run
+
+    def _failing_end_run(*args, **kwargs):
+        raise RuntimeError("simulated post-copy DB-path failure")
+
+    kb._end_run = _failing_end_run
+    try:
+        with pytest.raises(RuntimeError, match="simulated post-copy DB-path failure"):
+            with kb.connect() as conn:
+                kb.block_task(
+                    conn,
+                    t,
+                    reason="needs review",
+                    metadata={"artifacts": [str(report)]},
+                    expected_run_id=run_id,
+                )
+    finally:
+        kb._end_run = original_end_run
+
+    with kb.connect() as conn:
+        task = kb.get_task(conn, t)
+        assert task.status == "running"
+        assert kb.list_attachments(conn, t) == []
+    dest_dir = kb.task_attachments_dir(t)
+    assert not list(dest_dir.glob("verdict*"))
+
+    # Retry succeeds and takes the canonical name.
+    with kb.connect() as conn:
+        kb.block_task(
+            conn,
+            t,
+            reason="needs review",
+            metadata={"artifacts": [str(report)]},
+            expected_run_id=run_id,
+        )
+        attachments = kb.list_attachments(conn, t)
+    assert len(attachments) == 1
+    assert attachments[0].filename == "verdict.md"
+    assert Path(attachments[0].stored_path).read_text(encoding="utf-8") == "verdict"
+
+
+def test_block_task_commit_failure_compensates_filesystem(kanban_home):
+    """A commit failure after artifact copy must remove the published files."""
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="commit failure")
+        task = kb.get_task(conn, t)
+        ws = kb.resolve_workspace(task)
+        kb.set_workspace_path(conn, t, ws)
+        report = ws / "verdict.md"
+        report.write_text("verdict", encoding="utf-8")
+        kb.claim_task(conn, t)
+        run_id = kb.get_task(conn, t).current_run_id
+
+    real_execute_boundary = kb._execute_boundary_with_retry
+
+    def _failing_execute_boundary(conn, sql):
+        if sql.strip().upper().startswith("COMMIT"):
+            raise RuntimeError("simulated commit failure")
+        real_execute_boundary(conn, sql)
+
+    with unittest.mock.patch.object(kb, "_execute_boundary_with_retry", _failing_execute_boundary):
+        with pytest.raises(RuntimeError, match="simulated commit failure"):
+            with kb.connect() as conn:
+                kb.block_task(
+                    conn,
+                    t,
+                    reason="needs review",
+                    metadata={"artifacts": [str(report)]},
+                    expected_run_id=run_id,
+                )
+
+    with kb.connect() as conn:
+        task = kb.get_task(conn, t)
+        assert task.status == "running"
+        assert kb.list_attachments(conn, t) == []
+    dest_dir = kb.task_attachments_dir(t)
+    assert not list(dest_dir.glob("verdict*"))
+
+
+def test_copy_file_staging_hash_failure_cleans_staging_file(kanban_home):
+    """A failure during the staging re-hash must remove the hidden staging file."""
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="hash failure")
+    src_dir = kanban_home / "srcs"
+    src_dir.mkdir(parents=True, exist_ok=True)
+    src = src_dir / "source.txt"
+    src.write_text("source bytes", encoding="utf-8")
+    dest = kb.task_attachments_dir(t) / "source.txt"
+
+    original_sha256_file = kb._sha256_file
+
+    def _failing_sha256_file(path):
+        raise OSError("simulated staging hash read failure")
+
+    kb._sha256_file = _failing_sha256_file
+    try:
+        with pytest.raises(kb.ArtifactPreservationError, match="staging hash"):
+            kb._copy_file_with_hash_verification(src, dest)
+    finally:
+        kb._sha256_file = original_sha256_file
+
+    assert not dest.exists()
+    assert not list(kb.task_attachments_dir(t).glob("*.stage"))
+
+
+def test_copy_file_with_hash_verification_rejects_source_mutation_mid_copy(
+    kanban_home,
+):
+    """A source file modified in-place after streaming but before publish is rejected."""
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="mutation target")
+    src_dir = kanban_home / "srcs"
+    src_dir.mkdir(parents=True, exist_ok=True)
+    src = src_dir / "mutating.txt"
+    src.write_text("initial content", encoding="utf-8")
+    dest = kb.task_attachments_dir(t) / "mutating.txt"
+
+    original_sha256_file = kb._sha256_file
+
+    def _mutating_sha256_file(path):
+        # Mutate the source on disk between the size check and the post-stream
+        # handle stat, so the second fstat detects a size/mtime change.
+        with open(str(src), "wb") as mutation_handle:
+            mutation_handle.write(b"mutated content is longer")
+        return original_sha256_file(path)
+
+    with unittest.mock.patch.object(kb, "_sha256_file", _mutating_sha256_file):
+        with pytest.raises(kb.ArtifactPreservationError, match="changed during copy"):
+            kb._copy_file_with_hash_verification(src, dest)
+
+    assert not dest.exists()
+    assert not list(kb.task_attachments_dir(t).glob("*.stage"))
 
 
 def test_cleanup_workspace_honors_workspaces_root_env_override(tmp_path, monkeypatch):
