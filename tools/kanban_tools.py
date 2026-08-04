@@ -161,6 +161,20 @@ def _worker_run_id(task_id: str) -> Optional[int]:
         return None
 
 
+def _normalize_review_pending(value: Any) -> Optional[list[str]]:
+    """Accept a single reviewer task id or a list of ids."""
+    if value is None:
+        return None
+    if isinstance(value, str):
+        if not value.strip():
+            return None
+        return [value.strip()]
+    if isinstance(value, (list, tuple)):
+        ids = [str(v).strip() for v in value if str(v).strip()]
+        return ids if ids else None
+    return None
+
+
 def _stamp_worker_session_metadata(
     task_id: str, metadata: Optional[dict]
 ) -> Optional[dict]:
@@ -896,6 +910,7 @@ def _handle_complete(args: dict, **kw) -> str:
                     result=result, summary=summary, metadata=metadata,
                     created_cards=created_cards,
                     expected_run_id=_worker_run_id(tid),
+                    review_pending=_normalize_review_pending(args.get("review_pending")),
                 )
             except kb.ArtifactPreservationError as artifact_err:
                 return tool_error(
@@ -1473,7 +1488,9 @@ def _handle_create(args: dict, **kw) -> str:
     """Create a child task. Orchestrator workers use this to fan out.
 
     ``parents`` can be a list of task ids; dependency-gated promotion
-    works as usual.
+    works as usual. ``review_of`` creates a reviewer task for an existing
+    candidate task. The reviewer task is NOT a dependency of the candidate;
+    instead, an independent review request binds candidate to reviewer.
     """
     delegated_err = _reject_delegated_child_mutation("kanban_create")
     if delegated_err:
@@ -1489,6 +1506,12 @@ def _handle_create(args: dict, **kw) -> str:
         )
     body = args.get("body")
     parents = args.get("parents") or []
+    review_of = args.get("review_of")
+    if review_of:
+        if isinstance(review_of, str):
+            review_of = review_of.strip()
+        else:
+            return tool_error("review_of must be a single candidate task id")
     tenant = args.get("tenant") or os.environ.get("HERMES_TENANT")
     # Stamp the originating session id when the agent loop runs under
     # ACP (which sets HERMES_SESSION_ID before invoking tools). NULL on
@@ -1595,6 +1618,17 @@ def _handle_create(args: dict, **kw) -> str:
                 created_by=os.environ.get("HERMES_PROFILE") or "worker",
                 session_id=session_id,
             )
+            if review_of:
+                # Bind the newly created reviewer task to the candidate. Use
+                # the current candidate's run id when the worker creating the
+                # reviewer task is the candidate itself; otherwise leave the
+                # request unbound for operator-created reviewers.
+                candidate_run_id = _worker_run_id(review_of)
+                kb.request_review(
+                    conn, review_of, new_tid,
+                    requested_by_run_id=candidate_run_id,
+                    reason=f"reviewer task created: {new_tid}",
+                )
             new_task = kb.get_task(conn, new_tid)
             subscribed = _maybe_auto_subscribe(conn, new_tid)
             return _ok(
@@ -1797,6 +1831,66 @@ def _maybe_auto_subscribe(conn: Any, task_id: str) -> bool:
             _exc, platform, bool(chat_id),
         )
         return False
+
+
+def _handle_resolve_review(args: dict, **kw) -> str:
+    """Resolve an independent review request for a candidate task.
+
+    A reviewer worker calls this to clear (approve) or reject a task that
+    was handed off via ``kanban_complete(review_pending=...)``. Clearance
+    moves the candidate to ``done``; rejection returns it to ``ready``/``todo``
+    for repair. The resolving run must belong to the reviewer task bound to
+    the pending request; the candidate's own run cannot clear its own review.
+    """
+    delegated_err = _reject_delegated_child_mutation("kanban_resolve_review")
+    if delegated_err:
+        return delegated_err
+
+    candidate_id = args.get("candidate_id")
+    if not candidate_id:
+        return tool_error("candidate_id is required")
+    resolution = args.get("resolution")
+    if resolution not in {"clear", "reject"}:
+        return tool_error("resolution must be 'clear' or 'reject'")
+    reason = args.get("reason")
+    if reason is not None:
+        reason = redact_sensitive_text(str(reason), force=True)
+    board = args.get("board")
+
+    # The tool runs in the reviewer task's worker context, so the env-scoped
+    # task id is the reviewer task id. Its run id is the resolving authority.
+    reviewer_task_id = os.environ.get("HERMES_KANBAN_TASK")
+    resolving_run_id = _worker_run_id(reviewer_task_id) if reviewer_task_id else None
+
+    try:
+        kb, conn = _connect(board=board)
+        try:
+            ok = kb.resolve_review(
+                conn,
+                candidate_id,
+                resolution,
+                resolving_run_id,
+                reviewer_task_id=reviewer_task_id,
+                reason=reason,
+            )
+            if not ok:
+                return tool_error(
+                    f"could not resolve review for {candidate_id} "
+                    f"(no pending review or candidate not in review status)"
+                )
+            candidate = kb.get_task(conn, candidate_id)
+            return _ok(
+                candidate_id=candidate_id,
+                resolution=resolution,
+                status=candidate.status if candidate else None,
+            )
+        finally:
+            conn.close()
+    except ValueError as e:
+        return tool_error(f"kanban_resolve_review: {e}")
+    except Exception as e:
+        logger.exception("kanban_resolve_review failed")
+        return tool_error(f"kanban_resolve_review: {e}")
 
 
 def _handle_unblock(args: dict, **kw) -> str:
@@ -2050,6 +2144,19 @@ KANBAN_COMPLETE_SCHEMA = {
                     "workspace are copied to durable task attachments before "
                     "cleanup; a missing declared scratch artifact keeps the "
                     "task in-flight so you can fix the path and retry."
+                ),
+            },
+            "review_pending": {
+                "type": "array",
+                "items": {"type": "string"},
+                "description": (
+                    "Optional list of reviewer task ids. When provided, the "
+                    "task does not become 'done'; it enters 'review' and each "
+                    "reviewer must clear it independently. Use this to hand "
+                    "off finished work for code review or human approval "
+                    "without blocking the board. A rejected review returns "
+                    "the task to 'ready'/'todo' for repair; clearance moves "
+                    "it to 'done'."
                 ),
             },
             "board": _board_schema_prop(),
@@ -2426,6 +2533,18 @@ KANBAN_CREATE_SCHEMA = {
                     "synthesizer task."
                 ),
             },
+            "review_of": {
+                "type": "string",
+                "description": (
+                    "Candidate task id this new task will review. When set, "
+                    "an independent review request binds the candidate to "
+                    "this new reviewer task; they are NOT linked as "
+                    "parent/child dependencies. Use only when the candidate "
+                    "is already in 'review' status (e.g. adding another "
+                    "reviewer), or combine with completing the candidate "
+                    "using ``review_pending`` to hand off for review."
+                ),
+            },
             "tenant": {
                 "type": "string",
                 "description": (
@@ -2588,6 +2707,39 @@ KANBAN_UNBLOCK_SCHEMA = {
             "board": _board_schema_prop(),
         },
         "required": ["task_id"],
+    },
+}
+
+KANBAN_RESOLVE_REVIEW_SCHEMA = {
+    "name": "kanban_resolve_review",
+    "description": (
+        "Resolve an independent review request for a candidate task. "
+        "A reviewer worker calls this to clear (approve) or reject a task "
+        "that was handed off via ``kanban_complete(review_pending=...)``. "
+        "Clearance moves the candidate to 'done'; rejection returns it to "
+        "'ready'/'todo' for repair. The candidate's own run cannot clear its "
+        "own review; clearance must come from the bound reviewer task's run "
+        "or an explicit operator action."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "candidate_id": {
+                "type": "string",
+                "description": "Candidate task id whose review request is being resolved.",
+            },
+            "resolution": {
+                "type": "string",
+                "enum": ["clear", "reject"],
+                "description": "'clear' to approve, 'reject' to send back for repair.",
+            },
+            "reason": {
+                "type": "string",
+                "description": "Optional human-readable reason for the resolution.",
+            },
+            "board": _board_schema_prop(),
+        },
+        "required": ["candidate_id", "resolution"],
     },
 }
 
@@ -2765,6 +2917,15 @@ registry.register(
     handler=_handle_create,
     check_fn=_check_kanban_mode,
     emoji="➕",
+)
+
+registry.register(
+    name="kanban_resolve_review",
+    toolset="kanban",
+    schema=KANBAN_RESOLVE_REVIEW_SCHEMA,
+    handler=_handle_resolve_review,
+    check_fn=_check_kanban_mode,
+    emoji="✅",
 )
 
 registry.register(

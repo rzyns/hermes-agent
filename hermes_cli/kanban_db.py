@@ -398,7 +398,10 @@ def _kanban_dependencies():
     return _kd
 
 
-def _parent_dependency_satisfied(parent: sqlite3.Row) -> bool:
+def _parent_dependency_satisfied(
+    parent: sqlite3.Row,
+    conn: Optional[sqlite3.Connection] = None,
+) -> bool:
     """Return True when a parent row proves the dependency is complete.
 
     A dependency is satisfied only when the parent is genuinely terminal:
@@ -410,10 +413,23 @@ def _parent_dependency_satisfied(parent: sqlite3.Row) -> bool:
     legitimate epoch value, the codebase never records real completions at
     the epoch). Archived parents lacking real completion evidence must NOT
     unblock their children; otherwise abandoned work masquerades as success.
+
+    A parent in ``done`` is NOT satisfied when it still has an unresolved
+    independent review request.  Such a parent is "completed plus handoff"
+    rather than truly terminal, so its children must wait until the review
+    clears.  Pass ``conn`` to enable that check.
     """
     status = parent["status"]
     if status == "done":
-        return True
+        if conn is None:
+            return True
+        row = conn.execute(
+            "SELECT 1 FROM review_requests "
+            "WHERE candidate_id = ? AND status = 'pending' "
+            "LIMIT 1",
+            (parent["id"],),
+        ).fetchone()
+        return row is None
     if status == "archived":
         completed_at = parent["completed_at"]
         return completed_at is not None and completed_at != 0
@@ -428,7 +444,16 @@ def _parent_satisfied_sql(alias: str = "t") -> str:
     fragment that tests the same conditions as the helper above. The returned
     string is quoted/parameter-free and safe to embed into SQL literals.
     """
-    return f"({alias}.status = 'done' OR ({alias}.status = 'archived' AND {alias}.completed_at IS NOT NULL AND {alias}.completed_at != 0))"
+    return (
+        f"(({alias}.status = 'done' "
+        f"AND NOT EXISTS ("
+        f"SELECT 1 FROM review_requests "
+        f"WHERE candidate_id = {alias}.id AND status = 'pending'"
+        f")) "
+        f"OR ({alias}.status = 'archived' "
+        f"AND {alias}.completed_at IS NOT NULL "
+        f"AND {alias}.completed_at != 0))"
+    )
 
 
 def _dependency_fingerprint(conn: sqlite3.Connection, task_id: str) -> str:
@@ -438,11 +463,14 @@ def _dependency_fingerprint(conn: sqlite3.Connection, task_id: str) -> str:
     can clear: each parent's id, status, and completed_at. When any of these
     change (parent completes, parent re-opens, link removed, link added),
     the fingerprint changes and the sticky gate releases. When nothing has
-    changed since the last dependency_wait block, the fingerprint matches
+    changed since the last dependency block, the fingerprint matches
     and the task stays parked.
 
     We include the parent id in the hash (not just status/completed_at) so
     adding or removing a link is itself a material change.
+
+    A ``done`` parent with an unresolved review request changes the
+    fingerprint, so the child is not promoted until the review clears.
     """
     rows = conn.execute(
         "SELECT t.id, t.status, t.completed_at FROM tasks t "
@@ -453,7 +481,19 @@ def _dependency_fingerprint(conn: sqlite3.Connection, task_id: str) -> str:
     ).fetchall()
     parts = []
     for r in rows:
-        parts.append(f"{r['id']}:{r['status']}:{r['completed_at']}")
+        has_pending = 0
+        if r["status"] == "done":
+            has_pending = (
+                1
+                if conn.execute(
+                    "SELECT 1 FROM review_requests "
+                    "WHERE candidate_id = ? AND status = 'pending' "
+                    "LIMIT 1",
+                    (r["id"],),
+                ).fetchone()
+                else 0
+            )
+        parts.append(f"{r['id']}:{r['status']}:{r['completed_at']}:{has_pending}")
     raw = "|".join(parts)
     return hashlib.sha256(raw.encode()).hexdigest()
 
@@ -1819,6 +1859,22 @@ class Event:
     run_id: Optional[int] = None
 
 
+@dataclass
+class ReviewRequest:
+    """In-memory view of a row from the ``review_requests`` table."""
+
+    id: int
+    candidate_id: str
+    reviewer_task_id: str
+    status: str
+    requested_by_run_id: Optional[int]
+    requested_at: int
+    resolved_at: Optional[int]
+    resolved_by_run_id: Optional[int]
+    resolution: Optional[str]
+    reason: Optional[str]
+
+
 # ---------------------------------------------------------------------------
 # Schema
 # ---------------------------------------------------------------------------
@@ -2030,6 +2086,24 @@ CREATE TABLE IF NOT EXISTS kanban_notify_subs (
     PRIMARY KEY (task_id, platform, chat_id, thread_id)
 );
 
+-- Independent review gate relation, separate from task_links dependencies.
+-- A candidate task hands off to a distinct reviewer task for clearance.
+-- Multiple review rounds (rejection -> repair -> re-review) create multiple rows,
+-- so earlier verdicts remain readable after a later one resolves.
+CREATE TABLE IF NOT EXISTS review_requests (
+    id                 INTEGER PRIMARY KEY AUTOINCREMENT,
+    candidate_id       TEXT NOT NULL,
+    reviewer_task_id   TEXT NOT NULL,
+    status             TEXT NOT NULL DEFAULT 'pending',
+    requested_by_run_id INTEGER,
+    requested_at       INTEGER NOT NULL,
+    resolved_at        INTEGER,
+    resolved_by_run_id INTEGER,
+    resolution         TEXT,
+    reason             TEXT,
+    UNIQUE(candidate_id, reviewer_task_id, requested_at)
+);
+
 CREATE INDEX IF NOT EXISTS idx_tasks_assignee_status ON tasks(assignee, status);
 CREATE INDEX IF NOT EXISTS idx_tasks_status          ON tasks(status);
 CREATE INDEX IF NOT EXISTS idx_links_child           ON task_links(child_id);
@@ -2040,6 +2114,8 @@ CREATE INDEX IF NOT EXISTS idx_runs_task             ON task_runs(task_id, start
 CREATE INDEX IF NOT EXISTS idx_runs_status           ON task_runs(status);
 CREATE INDEX IF NOT EXISTS idx_attachments_task      ON task_attachments(task_id, created_at);
 CREATE INDEX IF NOT EXISTS idx_notify_task           ON kanban_notify_subs(task_id);
+CREATE INDEX IF NOT EXISTS idx_review_candidate      ON review_requests(candidate_id, status);
+CREATE INDEX IF NOT EXISTS idx_review_reviewer      ON review_requests(reviewer_task_id, status);
 """
 
 
@@ -3334,6 +3410,38 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
             "dep_wait_backstop_tripped INTEGER NOT NULL DEFAULT 0",
         )
 
+    # Independent review-gate relation (t_79a96299). Created additively so
+    # legacy boards upgrade without losing data.
+    review_table_exists = conn.execute(
+        "SELECT name FROM sqlite_master WHERE type='table' AND name='review_requests'"
+    ).fetchone() is not None
+    if not review_table_exists:
+        conn.execute(
+            """
+            CREATE TABLE review_requests (
+                id                 INTEGER PRIMARY KEY AUTOINCREMENT,
+                candidate_id       TEXT NOT NULL,
+                reviewer_task_id   TEXT NOT NULL,
+                status             TEXT NOT NULL DEFAULT 'pending',
+                requested_by_run_id INTEGER,
+                requested_at       INTEGER NOT NULL,
+                resolved_at        INTEGER,
+                resolved_by_run_id INTEGER,
+                resolution         TEXT,
+                reason             TEXT,
+                UNIQUE(candidate_id, reviewer_task_id, requested_at)
+            )
+            """
+        )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_review_candidate "
+        "ON review_requests(candidate_id, status)"
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_review_reviewer "
+        "ON review_requests(reviewer_task_id, status)"
+    )
+
     # Indexes over additive ``tasks`` columns must be created after the
     # columns exist. Keeping them in SCHEMA_SQL breaks legacy boards: SQLite
     # parses each statement in ``executescript`` against the live schema, so a
@@ -4051,7 +4159,7 @@ def create_task(
                             parents,
                         ).fetchall()
                         if any(
-                            not _parent_dependency_satisfied(p)
+                            not _parent_dependency_satisfied(p, conn)
                             for p in parent_rows
                         ):
                             task_status = "todo"
@@ -5172,7 +5280,7 @@ def recompute_ready(
                 "WHERE l.child_id = ? ORDER BY t.id",
                 (task_id,),
             ).fetchall()
-            if all(_parent_dependency_satisfied(p) for p in parents):
+            if all(_parent_dependency_satisfied(p, conn) for p in parents):
                 external_blockers = _kanban_dependencies().unsatisfied_blockers_for(
                     board=effective_board,
                     task_id=task_id,
@@ -5327,7 +5435,7 @@ def claim_task(
             "WHERE l.child_id = ?",
             (task_id,),
         ).fetchall()
-        if any(not _parent_dependency_satisfied(p) for p in parents):
+        if any(not _parent_dependency_satisfied(p, conn) for p in parents):
             conn.execute(
                 "UPDATE tasks SET status = 'todo' "
                 "WHERE id = ? AND status = 'ready'",
@@ -6308,6 +6416,7 @@ def complete_task(
     metadata: Optional[dict] = None,
     created_cards: Optional[Iterable[str]] = None,
     expected_run_id: Optional[int] = None,
+    review_pending: Optional[Iterable[str]] = None,
 ) -> bool:
     """Transition ``running|ready -> done`` and record ``result``.
 
@@ -6331,6 +6440,14 @@ def complete_task(
     attempt is auditable. When all ids verify, they are recorded on the
     ``completed`` event payload.
 
+    ``review_pending`` is an optional list of reviewer task ids. When
+    provided, the task does not transition to ``done``; it becomes
+    ``review`` and an independent review request is recorded for each
+    reviewer task. This is the handoff path for work that needs
+    independent clearance before the board treats it as complete. The
+    candidate's run ends with outcome ``review_pending`` and its scratch
+    workspace is preserved so a rejection can be repaired in place.
+
     After a successful completion, ``summary`` and ``result`` are scanned
     for prose references like ``t_deadbeefcafe``. Genuinely unresolved
     refs are recorded as ``suspected_hallucinated_references``; bare refs
@@ -6346,6 +6463,7 @@ def complete_task(
     operator can distinguish this state from an unknown-id/terminal rejection.
     """
     now = int(time.time())
+    review_pending_ids = tuple(r for r in (review_pending or ()) if r)
 
     # Non-blank effective result guard. ``summary`` is the canonical
     # handoff field; fall back to ``result`` for single-run callers. When
@@ -6387,12 +6505,28 @@ def complete_task(
         conn, task_id, metadata, summary=summary, result=result,
     )
     accepted_budget_run_id: Optional[int] = None
+    terminal_status = "review" if review_pending_ids else "done"
+    terminal_outcome = "review_pending" if review_pending_ids else "completed"
     with write_txn(conn):
+        # Verify reviewer task ids exist and are not terminal before we
+        # commit the candidate to a review handoff.
+        for reviewer_id in review_pending_ids:
+            reviewer = conn.execute(
+                "SELECT id, status FROM tasks WHERE id = ?",
+                (reviewer_id,),
+            ).fetchone()
+            if reviewer is None:
+                raise ValueError(f"reviewer task {reviewer_id!r} does not exist")
+            if reviewer["status"] in {"done", "archived"}:
+                raise ValueError(
+                    f"reviewer task {reviewer_id!r} is already terminal "
+                    f"({reviewer['status']})"
+                )
         if expected_run_id is None:
             cur = conn.execute(
                 """
                 UPDATE tasks
-                   SET status       = 'done',
+                   SET status       = ?,
                        result       = ?,
                        completed_at = ?,
                        claim_lock   = NULL,
@@ -6410,13 +6544,13 @@ def complete_task(
                  WHERE id = ?
                    AND status IN ('running', 'ready', 'blocked')
                 """,
-                (effective_result, now, task_id),
+                (terminal_status, effective_result, now if terminal_status == "done" else None, task_id),
             )
         else:
             cur = conn.execute(
                 """
                 UPDATE tasks
-                   SET status       = 'done',
+                   SET status       = ?,
                        result       = ?,
                        completed_at = ?,
                        claim_lock   = NULL,
@@ -6435,7 +6569,7 @@ def complete_task(
                    AND status IN ('running', 'ready', 'blocked')
                    AND current_run_id = ?
                 """,
-                (effective_result, now, task_id, int(expected_run_id)),
+                (terminal_status, effective_result, now if terminal_status == "done" else None, task_id, int(expected_run_id)),
             )
         if cur.rowcount != 1:
             if expected_run_id is None:
@@ -6496,7 +6630,7 @@ def complete_task(
             cur = conn.execute(
                 """
                 UPDATE tasks
-                   SET status       = 'done',
+                   SET status       = ?,
                        result       = ?,
                        completed_at = ?,
                        claim_lock   = NULL,
@@ -6515,7 +6649,7 @@ def complete_task(
                    AND status IN ('ready', 'blocked')
                    AND current_run_id IS NULL
                 """,
-                (effective_result, now, task_id),
+                (terminal_status, effective_result, now if terminal_status == "done" else None, task_id),
             )
             if cur.rowcount != 1:
                 return False
@@ -6538,18 +6672,18 @@ def complete_task(
             run_metadata["accepted_after_budget_run_id"] = accepted_budget_run_id
         run_id = _end_run(
             conn, task_id,
-            outcome="completed", status="done",
+            outcome=terminal_outcome, status=terminal_status,
             summary=effective_result,
             metadata=run_metadata,
         )
         # If complete_task was called on a never-claimed task (ready or
-        # blocked → done with no run in flight), synthesize a
+        # blocked -> done with no run in flight), synthesize a
         # zero-duration run so the handoff fields are persisted in
         # attempt history instead of silently lost.
         if run_id is None and (effective_result or metadata):
             run_id = _synthesize_ended_run(
                 conn, task_id,
-                outcome="completed",
+                outcome=terminal_outcome,
                 summary=effective_result,
                 metadata=run_metadata,
             )
@@ -6587,10 +6721,18 @@ def complete_task(
                 if cleaned_artifacts:
                     completed_payload["artifacts"] = cleaned_artifacts
         _append_event(
-            conn, task_id, "completed",
+            conn, task_id, terminal_outcome,
             completed_payload,
             run_id=run_id,
         )
+        # Record independent review requests inside the same txn so the
+        # candidate status and the review relation are atomically consistent.
+        if review_pending_ids:
+            for reviewer_id in review_pending_ids:
+                request_review(
+                    conn, task_id, reviewer_id, run_id,
+                    reason=effective_result,
+                )
     # Prose-scan the summary + result for task-id references. Advisory — does
     # not block the completion. Runs in its own txn so the completion itself is
     # already durable by the time we emit any warning.
@@ -6638,7 +6780,10 @@ def complete_task(
     # Recompute ready status for dependents (separate txn so children see done).
     recompute_ready(conn)
     # Clean up the scratch workspace and any stale tmux session for the worker.
-    _cleanup_workspace(conn, task_id)
+    # Preserve the workspace while the task is under independent review so
+    # a rejection can be repaired in place.
+    if not review_pending_ids:
+        _cleanup_workspace(conn, task_id)
     _done_task = get_task(conn, task_id)
     _fire_kanban_lifecycle_hook(
         "kanban_task_completed",
@@ -6649,6 +6794,322 @@ def complete_task(
         summary=effective_result,
     )
     return True
+# ---------------------------------------------------------------------------
+# Review gate (independent of blocking / dependency edges)
+# ---------------------------------------------------------------------------
+
+REVIEW_RESOLUTIONS = {"clear", "reject"}
+
+
+def request_review(
+    conn: sqlite3.Connection,
+    candidate_id: str,
+    reviewer_task_id: str,
+    requested_by_run_id: Optional[int],
+    *,
+    reason: Optional[str] = None,
+) -> int:
+    """Record a review request binding ``candidate_id`` to ``reviewer_task_id``.
+
+    If a pending request for the same candidate and reviewer already exists,
+    the existing row is reused rather than creating a duplicate. This makes
+    the common flow (create reviewer task, then complete candidate with
+    ``review_pending=[reviewer_id]``) idempotent while still preserving each
+    distinct review round in the table once the earlier request is resolved.
+    """
+    now = int(time.time())
+    with write_txn(conn):
+        candidate = conn.execute(
+            "SELECT id, status FROM tasks WHERE id = ?",
+            (candidate_id,),
+        ).fetchone()
+        if candidate is None:
+            raise ValueError(f"candidate task {candidate_id!r} does not exist")
+        if candidate["status"] in {"done", "archived"}:
+            raise ValueError(
+                f"candidate task {candidate_id!r} is already terminal "
+                f"({candidate['status']})"
+            )
+        reviewer = conn.execute(
+            "SELECT id, status FROM tasks WHERE id = ?",
+            (reviewer_task_id,),
+        ).fetchone()
+        if reviewer is None:
+            raise ValueError(f"reviewer task {reviewer_task_id!r} does not exist")
+        if reviewer["status"] in {"done", "archived"}:
+            raise ValueError(
+                f"reviewer task {reviewer_task_id!r} is already terminal "
+                f"({reviewer['status']})"
+            )
+
+        # Reuse an existing pending request for the same candidate/reviewer
+        # so a create-with-review_of followed by complete-with-review_pending
+        # does not insert two active requests.
+        existing = conn.execute(
+            """
+            SELECT id FROM review_requests
+             WHERE candidate_id = ? AND reviewer_task_id = ? AND status = 'pending'
+             ORDER BY requested_at DESC, id DESC
+             LIMIT 1
+            """,
+            (candidate_id, reviewer_task_id),
+        ).fetchone()
+        if existing is not None:
+            review_id = int(existing["id"])
+            if reason is not None:
+                conn.execute(
+                    "UPDATE review_requests SET reason = ? WHERE id = ?",
+                    (reason, review_id),
+                )
+        else:
+            cur = conn.execute(
+                """
+                INSERT INTO review_requests (
+                    candidate_id, reviewer_task_id, status,
+                    requested_by_run_id, requested_at, reason
+                ) VALUES (?, ?, 'pending', ?, ?, ?)
+                """,
+                (candidate_id, reviewer_task_id, requested_by_run_id, now, reason),
+            )
+            review_id = int(cur.lastrowid or 0)
+        _append_event(
+            conn,
+            candidate_id,
+            "review_requested",
+            {
+                "review_id": review_id,
+                "reviewer_task_id": reviewer_task_id,
+                "requested_by_run_id": requested_by_run_id,
+                "reason": reason,
+            },
+            run_id=requested_by_run_id,
+        )
+    return review_id
+
+
+def resolve_review(
+    conn: sqlite3.Connection,
+    candidate_id: str,
+    resolution: str,
+    resolving_run_id: Optional[int],
+    *,
+    reviewer_task_id: Optional[str] = None,
+    reason: Optional[str] = None,
+) -> bool:
+    """Resolve a pending review request for ``candidate_id``.
+
+    ``resolution`` must be ``"clear"`` or ``"reject"``. When ``reviewer_task_id``
+    is provided, only a pending request bound to that reviewer task may be
+    resolved. The resolving run must be the current run of the bound reviewer
+    task, establishing that the clearance came from the reviewer task's own
+    execution rather than the candidate's run or a profile-name match.
+
+    * ``clear`` transitions the candidate from ``review`` to ``done``.
+    * ``reject`` transitions the candidate from ``review`` back to ``todo``
+      (if it has unsatisfied parents) or ``ready`` (if not) so the worker can
+      repair it. Neither path touches ``block_recurrences`` or routes to
+      ``triage``.
+    """
+    if resolution not in REVIEW_RESOLUTIONS:
+        raise ValueError(
+            f"resolution must be one of {sorted(REVIEW_RESOLUTIONS)}, "
+            f"got {resolution!r}"
+        )
+    now = int(time.time())
+    with write_txn(conn):
+        candidate = conn.execute(
+            "SELECT status FROM tasks WHERE id = ?",
+            (candidate_id,),
+        ).fetchone()
+        if candidate is None or candidate["status"] != "review":
+            return False
+
+        if reviewer_task_id:
+            request_row = conn.execute(
+                """
+                SELECT id, reviewer_task_id, requested_by_run_id
+                  FROM review_requests
+                 WHERE candidate_id = ?
+                   AND reviewer_task_id = ?
+                   AND status = 'pending'
+                 ORDER BY requested_at DESC
+                 LIMIT 1
+                """,
+                (candidate_id, reviewer_task_id),
+            ).fetchone()
+        else:
+            request_row = conn.execute(
+                """
+                SELECT id, reviewer_task_id, requested_by_run_id
+                  FROM review_requests
+                 WHERE candidate_id = ?
+                   AND status = 'pending'
+                 ORDER BY requested_at DESC
+                 LIMIT 1
+                """,
+                (candidate_id,),
+            ).fetchone()
+        if request_row is None:
+            return False
+
+        bound_reviewer_id = request_row["reviewer_task_id"]
+        requested_by_run_id = request_row["requested_by_run_id"]
+
+        if resolving_run_id is not None:
+            run_row = conn.execute(
+                "SELECT task_id FROM task_runs WHERE id = ?",
+                (int(resolving_run_id),),
+            ).fetchone()
+            if run_row is None or run_row["task_id"] != bound_reviewer_id:
+                raise ValueError(
+                    f"resolving run {resolving_run_id} does not belong to "
+                    f"reviewer task {bound_reviewer_id}"
+                )
+
+        if (
+            requested_by_run_id is not None
+            and resolving_run_id is not None
+            and int(requested_by_run_id) == int(resolving_run_id)
+        ):
+            raise ValueError("a run cannot clear a review it requested")
+
+        conn.execute(
+            """
+            UPDATE review_requests
+               SET status = ?,
+                   resolution = ?,
+                   resolved_at = ?,
+                   resolved_by_run_id = ?,
+                   reason = ?
+             WHERE id = ?
+               AND status = 'pending'
+            """,
+            (
+                "cleared" if resolution == "clear" else "rejected",
+                resolution,
+                now,
+                resolving_run_id,
+                reason,
+                int(request_row["id"]),
+            ),
+        )
+        _append_event(
+            conn,
+            candidate_id,
+            "review_cleared" if resolution == "clear" else "review_rejected",
+            {
+                "review_id": int(request_row["id"]),
+                "reviewer_task_id": bound_reviewer_id,
+                "resolving_run_id": resolving_run_id,
+                "requested_by_run_id": requested_by_run_id,
+                "reason": reason,
+            },
+            run_id=resolving_run_id,
+        )
+
+        if resolution == "clear":
+            conn.execute(
+                """
+                UPDATE tasks
+                   SET status = 'done',
+                       completed_at = ?
+                 WHERE id = ?
+                   AND status = 'review'
+                """,
+                (now, candidate_id),
+            )
+        else:
+            undone_parents = conn.execute(
+                "SELECT 1 FROM task_links l "
+                "JOIN tasks p ON p.id = l.parent_id "
+                f"WHERE l.child_id = ? AND NOT {_parent_satisfied_sql('p')} LIMIT 1",
+                (candidate_id,),
+            ).fetchone()
+            new_status = "todo" if undone_parents else "ready"
+            conn.execute(
+                """
+                UPDATE tasks
+                   SET status = ?,
+                       claim_lock = NULL,
+                       claim_expires = NULL,
+                       worker_pid = NULL,
+                       current_run_id = NULL
+                 WHERE id = ?
+                   AND status = 'review'
+                """,
+                (new_status, candidate_id),
+            )
+
+    recompute_ready(conn)
+    if resolution == "clear":
+        _cleanup_workspace(conn, candidate_id)
+    return True
+
+
+def get_review_requests(
+    conn: sqlite3.Connection,
+    *,
+    candidate_id: Optional[str] = None,
+    reviewer_task_id: Optional[str] = None,
+    status: Optional[str] = None,
+) -> list[ReviewRequest]:
+    """Return matching review requests ordered oldest first."""
+    clauses: list[str] = []
+    params: list[Any] = []
+    if candidate_id:
+        clauses.append("candidate_id = ?")
+        params.append(candidate_id)
+    if reviewer_task_id:
+        clauses.append("reviewer_task_id = ?")
+        params.append(reviewer_task_id)
+    if status:
+        clauses.append("status = ?")
+        params.append(status)
+    where = "WHERE " + " AND ".join(clauses) if clauses else ""
+    rows = conn.execute(
+        f"""
+        SELECT id, candidate_id, reviewer_task_id, status,
+               requested_by_run_id, requested_at, resolved_at,
+               resolved_by_run_id, resolution, reason
+          FROM review_requests
+         {where}
+         ORDER BY requested_at ASC, id ASC
+        """,
+        tuple(params),
+    ).fetchall()
+    return [
+        ReviewRequest(
+            id=int(r["id"]),
+            candidate_id=r["candidate_id"],
+            reviewer_task_id=r["reviewer_task_id"],
+            status=r["status"],
+            requested_by_run_id=r["requested_by_run_id"],
+            requested_at=int(r["requested_at"]),
+            resolved_at=r["resolved_at"],
+            resolved_by_run_id=r["resolved_by_run_id"],
+            resolution=r["resolution"],
+            reason=r["reason"],
+        )
+        for r in rows
+    ]
+
+
+def has_pending_review(
+    conn: sqlite3.Connection,
+    candidate_id: str,
+) -> bool:
+    """Return True when the candidate has at least one unresolved review request."""
+    row = conn.execute(
+        """
+        SELECT 1 FROM review_requests
+         WHERE candidate_id = ? AND status = 'pending'
+         LIMIT 1
+        """,
+        (candidate_id,),
+    ).fetchone()
+    return bool(row)
+
+
 
 
 # ---------------------------------------------------------------------------
@@ -7708,7 +8169,7 @@ def promote_task(
         ).fetchall()
         unsatisfied = [
             p["id"] for p in parents
-            if not _parent_dependency_satisfied(p)
+            if not _parent_dependency_satisfied(p, conn)
         ]
         if unsatisfied:
             return False, (

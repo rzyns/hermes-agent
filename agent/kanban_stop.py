@@ -157,6 +157,10 @@ def build_kanban_stop_nudge(
         else ""
     )
     terminal_tools = "`kanban_complete` / `kanban_block`"
+    review_option = (
+        " OR `kanban_complete(summary=..., review_pending=[reviewer_task_id])` "
+        "if the work is finished but needs independent review"
+    )
     if progress_enabled:
         terminal_tools += " / enabled checkpoint"
     return (
@@ -168,8 +172,8 @@ def build_kanban_stop_nudge(
         "Do this immediately in your next response — do not narrate intent:\n"
         "1. Finish any remaining deliverable (write the required file(s) now).\n"
         "2. Call `kanban_complete(summary=..., artifacts=[...])` if the work "
-        "is done, OR `kanban_block(reason=...)` if you are blocked"
-        f"{progress_option}.\n\n"
+        f"is done,{review_option} OR `kanban_block(reason=...)` if you are "
+        f"blocked{progress_option}.\n\n"
         "Never end a turn with only a promise of future action. Repeated "
         "protocol violations will block this task and require manual intervention.]"
     )
