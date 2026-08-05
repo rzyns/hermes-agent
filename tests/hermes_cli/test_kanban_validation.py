@@ -1,9 +1,18 @@
 """Tests for hermes_cli.kanban_validation.
 
-These tests enforce the kernel contract and make it impossible for future
-surfaces to silently re-implement their own workspace/branch rules: any new
-validation path that does not call ``validate_workspace_spec`` or import from
-``kanban_validation`` will be detectable by the divergence tests below.
+These tests enforce the kernel contract and act as a **literal-copy tripwire**
+against future surfaces re-implementing their own workspace/branch rules.
+
+Scope of the guarantee, stated precisely because it is easy to overstate: the
+divergence tests below scan for copies of the kernel's canonical error strings
+and constants. They catch copy-paste re-implementation. They do **not** make
+divergence impossible -- a paraphrased second validator, written from scratch
+without reusing the canonical strings, evades the scan. Confirmed by the
+independent review of this module (t_90d4e7ae, 2026-08-05), which defeated the
+scan deliberately.
+
+Treat a passing divergence test as "nobody copied the rules", not as "nobody
+reimplemented the rules".
 """
 
 from __future__ import annotations
