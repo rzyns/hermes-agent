@@ -1110,6 +1110,11 @@ class UpdateTaskBody(BaseModel):
     # override doesn't silently reset the depth the operator chose.
     reasoning_effort: Optional[str] = None
     clear_reasoning_effort: bool = False
+    # Workspace repair fields. Changing where a worker writes is dangerous;
+    # these are only accepted when the task is not running and not terminal.
+    workspace_kind: Optional[str] = None
+    workspace_path: Optional[str] = None
+    branch_name: Optional[str] = None
 
     # Structured failure contract. These canonical producer-side names map
     # onto the ``block_*`` read fields exposed by Task.
@@ -1304,6 +1309,34 @@ def update_task(task_id: str, payload: UpdateTaskBody, board: Optional[str] = Qu
                     (task_id, json.dumps({"priority": int(payload.priority)}),
                      int(time.time())),
                 )
+
+        # --- workspace ----------------------------------------------------
+        if (
+            payload.workspace_kind is not None
+            or payload.workspace_path is not None
+            or payload.branch_name is not None
+        ):
+            supplied = {
+                field
+                for field in ("workspace_kind", "workspace_path", "branch_name")
+                if getattr(payload, field) is not None
+            }
+            try:
+                kanban_db.update_task_workspace(
+                    conn,
+                    task_id,
+                    workspace_kind=payload.workspace_kind,
+                    workspace_path=payload.workspace_path,
+                    branch_name=payload.branch_name,
+                )
+            except kanban_db.WorkspaceUpdateError as exc:
+                raise HTTPException(status_code=400, detail=str(exc))
+            except kanban_db.TaskIsLiveError as exc:
+                raise HTTPException(status_code=409, detail=str(exc))
+            except kanban_db.WorkspaceUpdateBlockedError as exc:
+                raise HTTPException(status_code=409, detail=str(exc))
+            except ValueError as exc:
+                raise HTTPException(status_code=400, detail=str(exc))
 
         # --- title / body -------------------------------------------------
         if payload.title is not None or payload.body is not None:

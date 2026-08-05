@@ -533,6 +533,144 @@ def test_branch_name_requires_worktree_workspace(kanban_home):
         )
 
 
+def test_update_task_workspace_changes_kind_path_branch(kanban_home, tmp_path):
+    target = tmp_path / "my-dir"
+    target.mkdir()
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="miscreated scratch")
+        payload = kb.update_task_workspace(
+            conn,
+            tid,
+            workspace_kind="dir",
+            workspace_path=str(target),
+        )
+        task = kb.get_task(conn, tid)
+        events = kb.list_events(conn, tid)
+    assert task.workspace_kind == "dir"
+    assert task.workspace_path == str(target)
+    assert payload["old"]["workspace_kind"] == "scratch"
+    assert payload["new"]["workspace_kind"] == "dir"
+    change_event = next(e for e in events if e.kind == "workspace_changed")
+    assert change_event.payload["old"]["workspace_path"] is None
+    assert change_event.payload["new"]["workspace_path"] == str(target)
+
+
+def test_update_task_workspace_changes_branch_name(kanban_home, tmp_path):
+    repo = tmp_path / "repo"
+    _init_git_repo(repo)
+    target = repo / ".worktrees" / "t-branchy"
+    with kb.connect() as conn:
+        tid = kb.create_task(
+            conn,
+            title="worktree",
+            workspace_kind="worktree",
+            workspace_path=str(target),
+            branch_name="wt/old",
+        )
+        payload = kb.update_task_workspace(
+            conn,
+            tid,
+            branch_name="wt/new",
+        )
+        task = kb.get_task(conn, tid)
+    assert task.branch_name == "wt/new"
+    assert payload["old"]["branch_name"] == "wt/old"
+    assert payload["new"]["branch_name"] == "wt/new"
+
+
+def test_update_task_workspace_requires_path_for_dir(kanban_home, tmp_path):
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="scratch")
+        with pytest.raises(kb.WorkspaceUpdateError, match="workspace_path"):
+            kb.update_task_workspace(conn, tid, workspace_kind="dir")
+        task = kb.get_task(conn, tid)
+    assert task.workspace_kind == "scratch"
+
+
+def test_update_task_workspace_rejects_branch_for_non_worktree(kanban_home):
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="scratch")
+        with pytest.raises(kb.WorkspaceUpdateError, match="worktree"):
+            kb.update_task_workspace(conn, tid, branch_name="wt/bad")
+        task = kb.get_task(conn, tid)
+    assert task.branch_name is None
+
+
+def test_update_task_workspace_requires_absolute_path(kanban_home, tmp_path):
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="scratch")
+        with pytest.raises(kb.WorkspaceUpdateError, match="absolute"):
+            kb.update_task_workspace(
+                conn, tid, workspace_kind="dir", workspace_path="relative/path"
+            )
+        task = kb.get_task(conn, tid)
+    assert task.workspace_kind == "scratch"
+
+
+def test_update_task_workspace_refuses_running_task(kanban_home):
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="running task")
+        # Simulate a claim without needing a real worker.
+        kb.claim_task(conn, tid, ttl_seconds=600)
+        with pytest.raises(kb.TaskIsLiveError, match="live run"):
+            kb.update_task_workspace(
+                conn, tid, workspace_kind="dir", workspace_path="/tmp/x"
+            )
+        task = kb.get_task(conn, tid)
+    assert task.workspace_kind == "scratch"
+
+
+def test_update_task_workspace_refuses_done_task(kanban_home, tmp_path):
+    target = tmp_path / "my-dir"
+    target.mkdir()
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="done task")
+        kb.complete_task(conn, tid, result="done")
+        with pytest.raises(kb.WorkspaceUpdateBlockedError, match="terminal"):
+            kb.update_task_workspace(
+                conn, tid, workspace_kind="dir", workspace_path=str(target)
+            )
+        task = kb.get_task(conn, tid)
+    assert task.workspace_kind == "scratch"
+
+
+def test_update_task_workspace_refuses_archived_task(kanban_home, tmp_path):
+    target = tmp_path / "my-dir"
+    target.mkdir()
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="archived task")
+        kb.complete_task(conn, tid, result="done")
+        kb.archive_task(conn, tid)
+        with pytest.raises(kb.WorkspaceUpdateBlockedError, match="terminal"):
+            kb.update_task_workspace(
+                conn, tid, workspace_kind="dir", workspace_path=str(target)
+            )
+        task = kb.get_task(conn, tid)
+    assert task.workspace_kind == "scratch"
+
+
+def test_update_task_workspace_partial_invalid_does_not_apply(kanban_home, tmp_path):
+    """A batch with one invalid field must not half-apply the others."""
+    target = tmp_path / "my-dir"
+    target.mkdir()
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="partial attempt", workspace_kind="scratch")
+        with pytest.raises(kb.WorkspaceUpdateError, match="worktree"):
+            kb.update_task_workspace(
+                conn,
+                tid,
+                workspace_kind="dir",
+                workspace_path=str(target),
+                branch_name="wt/not-allowed",
+            )
+        task = kb.get_task(conn, tid)
+        events = kb.list_events(conn, tid)
+    # Neither the valid kind/path change nor the event should have landed.
+    assert task.workspace_kind == "scratch"
+    assert task.workspace_path is None
+    assert not any(e.kind == "workspace_changed" for e in events)
+
+
 # ---------------------------------------------------------------------------
 # Links + dependency resolution
 # ---------------------------------------------------------------------------

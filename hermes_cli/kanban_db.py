@@ -9640,6 +9640,18 @@ def set_workspace_path(
         )
 
 
+class WorkspaceUpdateError(ValueError):
+    """Raised when a task workspace update violates a creation-parity rule."""
+
+
+class TaskIsLiveError(RuntimeError):
+    """Raised when a workspace update targets a task with an active claim/run."""
+
+
+class WorkspaceUpdateBlockedError(RuntimeError):
+    """Raised when a workspace update is refused on a terminal-status task."""
+
+
 def set_workspace(
     conn: sqlite3.Connection,
     task_id: str,
@@ -9668,6 +9680,141 @@ def set_workspace(
                 task_id,
             ),
         )
+
+
+def update_task_workspace(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    workspace_kind: Optional[str] = None,
+    workspace_path: Optional[str] = None,
+    branch_name: Optional[str] = None,
+) -> dict[str, Any]:
+    """Update a task's workspace kind, path, and branch name.
+
+    Validation matches creation-time rules in :func:`create_task`:
+
+    * ``workspace_kind`` must be one of :data:`VALID_WORKSPACE_KINDS`.
+    * ``workspace_path`` is required when ``workspace_kind`` is ``dir`` or
+      ``worktree`` and must be absolute.
+    * ``branch_name`` is only permitted when ``workspace_kind`` is
+      ``worktree``.
+
+    Guards:
+
+    * If the task has a live claim/run, raise :class:`TaskIsLiveError`.
+    * If the task is terminal (``done`` or ``archived``), raise
+      :class:`WorkspaceUpdateBlockedError`.
+    * If any supplied field is invalid, raise :class:`WorkspaceUpdateError`
+      and perform no write.
+
+    Emits a ``workspace_changed`` event recording the old and new values.
+    Returns a dict with the old and new values for callers that want to
+    surface them.
+    """
+    now = int(time.time())
+
+    with write_txn(conn):
+        row = conn.execute(
+            "SELECT status, workspace_kind, workspace_path, branch_name, "
+            "       claim_lock, claim_expires, current_run_id "
+            "FROM tasks WHERE id = ?",
+            (task_id,),
+        ).fetchone()
+        if row is None:
+            raise WorkspaceUpdateError(f"task {task_id} not found")
+
+        old_status = row["status"]
+        if old_status in {"done", "archived"}:
+            raise WorkspaceUpdateBlockedError(
+                f"workspace update refused for terminal status {old_status!r}"
+            )
+
+        # Live-claim/run guard. A running status is the obvious case, but a
+        # non-running status with an unexpired claim lock also means a worker
+        # is (or could imminently be) writing into the workspace.
+        claim_lock = row["claim_lock"]
+        claim_expires = row["claim_expires"]
+        current_run_id = row["current_run_id"]
+        is_live = (
+            old_status == "running"
+            or current_run_id is not None
+            or (
+                claim_lock is not None
+                and claim_expires is not None
+                and int(claim_expires) >= now
+            )
+        )
+        if is_live:
+            raise TaskIsLiveError(
+                f"workspace update refused: task {task_id} has a live run "
+                f"(status={old_status!r}, run_id={current_run_id})"
+            )
+
+        old_kind = row["workspace_kind"]
+        old_path = row["workspace_path"]
+        old_branch = row["branch_name"]
+
+        new_kind = workspace_kind if workspace_kind is not None else old_kind
+        new_path = workspace_path if workspace_path is not None else old_path
+        new_branch = branch_name if branch_name is not None else old_branch
+
+        new_kind = str(new_kind).strip()
+        if new_kind not in VALID_WORKSPACE_KINDS:
+            raise WorkspaceUpdateError(
+                f"workspace_kind must be one of {sorted(VALID_WORKSPACE_KINDS)}, "
+                f"got {new_kind!r}"
+            )
+
+        if new_path is not None:
+            new_path = str(new_path).strip() or None
+        if new_branch is not None:
+            new_branch = str(new_branch).strip() or None
+
+        if new_branch and new_kind != "worktree":
+            raise WorkspaceUpdateError(
+                "branch_name is only valid for worktree workspaces"
+            )
+
+        if new_kind in {"dir", "worktree"} and not new_path:
+            raise WorkspaceUpdateError(
+                f"workspace_path is required for workspace_kind={new_kind!r}"
+            )
+
+        if new_path is not None:
+            p = Path(new_path).expanduser()
+            if not p.is_absolute():
+                raise WorkspaceUpdateError(
+                    f"workspace_path must be absolute, got {new_path!r}"
+                )
+            new_path = str(p)
+
+        conn.execute(
+            """
+            UPDATE tasks
+               SET workspace_kind = ?,
+                   workspace_path = ?,
+                   branch_name = ?
+             WHERE id = ?
+            """,
+            (new_kind, new_path, new_branch, task_id),
+        )
+
+        payload = {
+            "old": {
+                "workspace_kind": old_kind,
+                "workspace_path": old_path,
+                "branch_name": old_branch,
+            },
+            "new": {
+                "workspace_kind": new_kind,
+                "workspace_path": new_path,
+                "branch_name": new_branch,
+            },
+        }
+        _append_event(conn, task_id, "workspace_changed", payload)
+
+    return payload
 
 
 def update_task_body(

@@ -676,6 +676,124 @@ def test_patch_rejects_unknown_fields_instead_of_silently_dropping_them(client):
     assert "block_fignerprint" in response.text
 
 
+def test_patch_workspace_kind_and_path(client, tmp_path):
+    target = tmp_path / "repair-dir"
+    target.mkdir()
+    task = client.post("/api/plugins/kanban/tasks", json={"title": "x"}).json()["task"]
+
+    response = client.patch(
+        f"/api/plugins/kanban/tasks/{task['id']}",
+        json={"workspace_kind": "dir", "workspace_path": str(target)},
+    )
+
+    assert response.status_code == 200, response.text
+    updated = response.json()["task"]
+    assert updated["workspace_kind"] == "dir"
+    assert updated["workspace_path"] == str(target)
+
+
+def test_patch_branch_name_only_valid_for_worktree(client, tmp_path):
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    subprocess.run(["git", "init", "-b", "main", str(repo)], check=True, capture_output=True, text=True)
+    target = repo / ".worktrees" / "t-branchy"
+    task = client.post(
+        "/api/plugins/kanban/tasks",
+        json={"title": "x", "workspace_kind": "worktree", "workspace_path": str(target)},
+    ).json()["task"]
+
+    response = client.patch(
+        f"/api/plugins/kanban/tasks/{task['id']}",
+        json={"branch_name": "wt/new"},
+    )
+    assert response.status_code == 200, response.text
+    assert response.json()["task"]["branch_name"] == "wt/new"
+
+    scratch = client.post("/api/plugins/kanban/tasks", json={"title": "y"}).json()["task"]
+    response = client.patch(
+        f"/api/plugins/kanban/tasks/{scratch['id']}",
+        json={"branch_name": "wt/bad"},
+    )
+    assert response.status_code == 400
+    assert "worktree" in response.json()["detail"]
+
+
+def test_patch_workspace_requires_path_for_dir(client):
+    task = client.post("/api/plugins/kanban/tasks", json={"title": "x"}).json()["task"]
+    response = client.patch(
+        f"/api/plugins/kanban/tasks/{task['id']}",
+        json={"workspace_kind": "dir"},
+    )
+    assert response.status_code == 400
+    assert "workspace_path" in response.json()["detail"]
+
+
+def test_patch_workspace_rejects_running_task(client):
+    task = client.post("/api/plugins/kanban/tasks", json={"title": "x"}).json()["task"]
+    with kb.connect() as conn:
+        kb.claim_task(conn, task["id"], ttl_seconds=600)
+    response = client.patch(
+        f"/api/plugins/kanban/tasks/{task['id']}",
+        json={"workspace_kind": "dir", "workspace_path": "/tmp/x"},
+    )
+    assert response.status_code == 409
+    assert "live run" in response.json()["detail"]
+
+
+def test_patch_workspace_rejects_terminal_task(client, tmp_path):
+    target = tmp_path / "repair-dir"
+    target.mkdir()
+    task = client.post("/api/plugins/kanban/tasks", json={"title": "x"}).json()["task"]
+    with kb.connect() as conn:
+        kb.complete_task(conn, task["id"], result="done")
+    response = client.patch(
+        f"/api/plugins/kanban/tasks/{task['id']}",
+        json={"workspace_kind": "dir", "workspace_path": str(target)},
+    )
+    assert response.status_code == 409
+    assert "terminal" in response.json()["detail"]
+
+
+def test_patch_workspace_emits_event(client, tmp_path):
+    target = tmp_path / "repair-dir"
+    target.mkdir()
+    task = client.post("/api/plugins/kanban/tasks", json={"title": "x"}).json()["task"]
+
+    response = client.patch(
+        f"/api/plugins/kanban/tasks/{task['id']}",
+        json={"workspace_kind": "dir", "workspace_path": str(target)},
+    )
+    assert response.status_code == 200, response.text
+
+    detail = client.get(f"/api/plugins/kanban/tasks/{task['id']}").json()
+    change_event = next(
+        e for e in detail["events"] if e["kind"] == "workspace_changed"
+    )
+    assert change_event["payload"]["old"]["workspace_kind"] == "scratch"
+    assert change_event["payload"]["new"]["workspace_path"] == str(target)
+
+
+def test_patch_workspace_partial_invalid_does_not_apply(client, tmp_path):
+    target = tmp_path / "repair-dir"
+    target.mkdir()
+    task = client.post("/api/plugins/kanban/tasks", json={"title": "x"}).json()["task"]
+
+    response = client.patch(
+        f"/api/plugins/kanban/tasks/{task['id']}",
+        json={
+            "workspace_kind": "dir",
+            "workspace_path": str(target),
+            "branch_name": "wt/not-allowed",
+        },
+    )
+    assert response.status_code == 400
+    assert "worktree" in response.json()["detail"]
+
+    detail = client.get(f"/api/plugins/kanban/tasks/{task['id']}").json()
+    assert detail["task"]["workspace_kind"] == "scratch"
+    assert not any(e["kind"] == "workspace_changed" for e in detail["events"])
+
+
 def test_dashboard_refuses_ready_for_materialize_only_route_target(client):
     kb.init_db(board="attention-intake")
     kb.init_db(board="agent-research-intake")
