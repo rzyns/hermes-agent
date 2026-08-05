@@ -418,6 +418,91 @@ def test_max_retries_none_falls_through_to_dispatcher_limit(kanban_home, all_ass
         conn.close()
 
 
+def test_max_retries_authoritative_and_budget_ladder(kanban_home):
+    """``resolve_task_retry_budget`` and the CLI show output agree with the
+    same single source of truth the breaker uses: task > dispatcher > default.
+
+    Also verifies that the ``budget_ladder`` projection event is emitted at
+    creation when overrides are present, and that show --json surfaces the
+    same projection without conflating retries with conversation/goal budgets.
+    """
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(
+            conn,
+            title="budget ladder demo",
+            assignee="worker",
+            max_retries=5,
+            worker_max_turns=100,
+            goal_mode=True,
+            goal_max_turns=15,
+        )
+
+        # Creation emitted a budget_ladder event.
+        events = kb.list_events(conn, tid)
+        ladder_events = [e for e in events if e.kind == "budget_ladder"]
+        assert ladder_events, f"expected budget_ladder event, got {[e.kind for e in events]}"
+        payload = ladder_events[0].payload
+        assert payload["retry_breaker"] == {"limit": 5, "source": "task"}
+        assert payload["worker_max_turns"]["limit"] == 100
+        assert payload["worker_max_turns"]["source"] == "task"
+        assert payload["goal_max_turns"]["enabled"] is True
+        assert payload["goal_max_turns"]["limit"] == 15
+        assert payload["goal_max_turns"]["source"] == "task"
+
+        # Helper itself is deterministic and matches the breaker.
+        task = kb.get_task(conn, tid)
+        assert kb.resolve_task_retry_budget(task, failure_limit=10) == {
+            "limit": 5, "source": "task"
+        }
+        assert kb.resolve_task_retry_budget(task, failure_limit=2) == {
+            "limit": 5, "source": "task"
+        }
+    finally:
+        conn.close()
+
+    out = run_slash(f"show {tid} --json")
+    data = json.loads(out)
+    bl = data["task"]["budget_ladder"]
+    assert bl["retry_breaker"] == {"limit": 5, "source": "task"}
+    assert bl["worker_max_turns"]["limit"] == 100
+    assert bl["goal_max_turns"]["limit"] == 15
+
+    plain = run_slash(f"show {tid}")
+    assert "  max-retries: 5 (task)" in plain
+    assert "  worker-max-turns: 100 (task)" in plain
+    assert "  goal-max-turns: 15 (task)" in plain
+
+
+def test_max_retries_config_authoritative_when_no_task_override(kanban_home):
+    """When no per-task ``max_retries`` is set, the displayed retry budget
+    falls through to ``kanban.failure_limit`` from the active config.
+    """
+    # Write a config that changes the dispatcher limit.
+    config_path = kanban_home / "config.yaml"
+    config_path.write_text("kanban:\n  failure_limit: 8\n", encoding="utf-8")
+
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(conn, title="config-budget", assignee="worker")
+        task = kb.get_task(conn, tid)
+        assert kb.resolve_task_retry_budget(task, failure_limit=8) == {
+            "limit": 8, "source": "dispatcher"
+        }
+    finally:
+        conn.close()
+
+    # No overrides: no budget_ladder event, but show still resolves correctly.
+    out = run_slash(f"show {tid} --json")
+    data = json.loads(out)
+    assert data["task"]["budget_ladder"]["retry_breaker"] == {
+        "limit": 8, "source": "dispatcher"
+    }
+
+    plain = run_slash(f"show {tid}")
+    assert "  max-retries: 8 (dispatcher)" in plain
+
+
 def test_workspace_resolution_failure_also_counts(kanban_home, all_assignees_spawnable):
     """`dir:` workspace with no path should fail workspace resolution AND
     count against the failure budget — not just crash the tick."""
