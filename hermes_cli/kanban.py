@@ -847,6 +847,42 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
         ),
     )
 
+    p_review_clear = sub.add_parser(
+        "review-clear",
+        aliases=["review-resolve"],
+        help="Resolve a review request as an operator (clear or reject)",
+        description=(
+            "Explicit operator path for resolving an independent review gate. "
+            "The operator name is required and recorded on the review request "
+            "row and in the resolution event. This is the only path that may "
+            "clear a review without a live reviewer run; worker reviewers use "
+            "kanban_resolve_review inside their task."
+        ),
+    )
+    p_review_clear.add_argument("candidate_id", help="Candidate task id awaiting review")
+    p_review_clear.add_argument(
+        "--operator",
+        required=True,
+        help="Operator identity recorded on the resolution (required, e.g. your name)",
+    )
+    p_review_clear.add_argument(
+        "--resolution",
+        choices=["clear", "reject"],
+        default="clear",
+        help="Resolution action (default: clear)",
+    )
+    p_review_clear.add_argument(
+        "--reviewer",
+        default=None,
+        help="Specific reviewer task id to resolve (defaults to any pending request)",
+    )
+    p_review_clear.add_argument(
+        "--reason",
+        default=None,
+        help="Optional reason recorded on the resolution and appended as a comment",
+    )
+    p_review_clear.add_argument("--json", action="store_true", help="Emit JSON output")
+
     p_schedule = sub.add_parser("schedule", help="Park one or more tasks in Scheduled (waiting on time, not human input)")
     p_schedule.add_argument("task_id")
     p_schedule.add_argument("reason", nargs="*", help="Reason/timing note (also appended as a comment)")
@@ -1270,6 +1306,8 @@ def kanban_command(args: argparse.Namespace) -> int:
             "promote":  _cmd_promote,
             "archive":  _cmd_archive,
             "tail":     _cmd_tail,
+            "review-clear": _cmd_review_clear,
+            "review-resolve": _cmd_review_clear,
             "dispatch": _cmd_dispatch,
             "daemon":   _cmd_daemon,
             "watch":    _cmd_watch,
@@ -1336,6 +1374,8 @@ _DELEGATED_CHILD_DENIED_ACTIONS: frozenset[str] = frozenset({
     "complete",
     "edit",
     "block",
+    "review-clear",
+    "review-resolve",
     "schedule",
     "unblock",
     "promote",
@@ -2860,6 +2900,65 @@ def _cmd_schedule(args: argparse.Namespace) -> int:
             else:
                 print(f"Scheduled {tid}" + (f": {reason}" if reason else ""))
     return 0 if not failed else 1
+
+
+def _cmd_review_clear(args: argparse.Namespace) -> int:
+    """Operator/CLI resolution of a pending review request."""
+    candidate_id = args.candidate_id
+    operator = getattr(args, "operator", None)
+    if not operator or not str(operator).strip():
+        _cmd_arg_error(args, "--operator is required")
+        return 2
+    operator_actor = f"cli:{str(operator).strip()}"
+    resolution = getattr(args, "resolution", "clear")
+    reviewer = getattr(args, "reviewer", None)
+    reason = getattr(args, "reason", None)
+    try:
+        with kb.connect_closing() as conn:
+            candidate = kb.get_task(conn, candidate_id)
+            if candidate is None:
+                _cmd_arg_error(args, f"no such task: {candidate_id}")
+                return 1
+            ok = kb.operator_clear_review(
+                conn,
+                candidate_id,
+                resolution,
+                operator_actor,
+                reviewer_task_id=reviewer,
+                reason=reason,
+            )
+            if not ok:
+                _cmd_arg_error(
+                    args,
+                    f"cannot {resolution} review for {candidate_id} "
+                    f"(not awaiting review or no pending request)"
+                )
+                return 1
+            candidate = kb.get_task(conn, candidate_id)
+    except ValueError as exc:
+        _cmd_arg_error(args, f"kanban review-clear: {exc}")
+        return 2
+    if getattr(args, "json", False):
+        print(
+            json.dumps(
+                {
+                    "ok": True,
+                    "candidate_id": candidate_id,
+                    "resolution": resolution,
+                    "operator_actor": operator_actor,
+                    "status": candidate.status if candidate else None,
+                },
+                indent=2,
+                ensure_ascii=False,
+            )
+        )
+    else:
+        print(f"Review {resolution} for {candidate_id} by {operator_actor}")
+        if candidate and candidate.status == "done":
+            print(f"Candidate {candidate_id} is now done")
+        elif candidate:
+            print(f"Candidate {candidate_id} is now {candidate.status}")
+    return 0
 
 
 def _cmd_unblock(args: argparse.Namespace) -> int:

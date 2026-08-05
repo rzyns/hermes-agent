@@ -1863,8 +1863,8 @@ def _handle_resolve_review(args: dict, **kw) -> str:
 
     # The tool runs in the reviewer task's worker context, so the env-scoped
     # task id is the reviewer task id. Its run id is the resolving authority.
-    # Absence of either is not an operator action and is rejected here; the
-    # DB layer additionally requires operator_mode=True to bypass run identity.
+    # Absence of either is not an operator action and is rejected here; the DB
+    # layer has a separate operator_clear_review entry point for CLI callers.
     reviewer_task_id = os.environ.get("HERMES_KANBAN_TASK")
     if not reviewer_task_id:
         return tool_error(

@@ -1874,6 +1874,7 @@ class ReviewRequest:
     resolution: Optional[str]
     reason: Optional[str]
     idempotency_key: Optional[str]
+    resolved_by_operator: Optional[str]
 
     @classmethod
     def from_row(cls, row: sqlite3.Row) -> "ReviewRequest":
@@ -1889,6 +1890,11 @@ class ReviewRequest:
             resolution=row["resolution"],
             reason=row["reason"],
             idempotency_key=row["idempotency_key"],
+            resolved_by_operator=(
+                row["resolved_by_operator"]
+                if "resolved_by_operator" in row.keys()
+                else None
+            ),
         )
 
 
@@ -2118,7 +2124,8 @@ CREATE TABLE IF NOT EXISTS review_requests (
     resolved_by_run_id INTEGER,
     resolution         TEXT,
     reason             TEXT,
-    idempotency_key    TEXT NOT NULL
+    idempotency_key    TEXT NOT NULL,
+    resolved_by_operator TEXT
 );
 
 CREATE INDEX IF NOT EXISTS idx_tasks_assignee_status ON tasks(assignee, status);
@@ -3451,6 +3458,7 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
                 resolution         TEXT,
                 reason             TEXT,
                 idempotency_key    TEXT NOT NULL,
+                resolved_by_operator TEXT,
                 UNIQUE(idempotency_key)
             )
             """
@@ -3472,6 +3480,13 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
                     "UPDATE review_requests SET idempotency_key = ? WHERE id = ?",
                     (f"legacy:{row['id']}:{int(time.time())}", row["id"]),
                 )
+        if "resolved_by_operator" not in review_cols:
+            _add_column_if_missing(
+                conn,
+                "review_requests",
+                "resolved_by_operator",
+                "resolved_by_operator TEXT",
+            )
         # Detect and remove the old second-resolution UNIQUE constraint by
         # recreating the table. The constraint appears as an autoindex over the
         # four columns; we drop it while preserving all rows and indexes.
@@ -3509,7 +3524,8 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
                         resolved_by_run_id INTEGER,
                         resolution         TEXT,
                         reason             TEXT,
-                        idempotency_key    TEXT NOT NULL
+                        idempotency_key    TEXT NOT NULL,
+                        resolved_by_operator TEXT
                     )
                     """
                 )
@@ -3518,12 +3534,14 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
                     INSERT INTO review_requests_new (
                         id, candidate_id, reviewer_task_id, status,
                         requested_by_run_id, requested_at, resolved_at,
-                        resolved_by_run_id, resolution, reason, idempotency_key
+                        resolved_by_run_id, resolution, reason, idempotency_key,
+                        resolved_by_operator
                     )
                     SELECT id, candidate_id, reviewer_task_id, status,
                            requested_by_run_id, requested_at, resolved_at,
                            resolved_by_run_id, resolution, reason,
-                           COALESCE(idempotency_key, 'legacy:' || id)
+                           COALESCE(idempotency_key, 'legacy:' || id),
+                           resolved_by_operator
                       FROM review_requests
                     """
                 )
@@ -7022,6 +7040,228 @@ def _request_review_in_txn(
     return review_id
 
 
+def _resolve_review_in_txn(
+    conn: sqlite3.Connection,
+    candidate_id: str,
+    resolution: str,
+    resolving_run_id: Optional[int],
+    reviewer_task_id: Optional[str],
+    reason: Optional[str],
+    claim_lock: Optional[str],
+    *,
+    is_operator: bool,
+    operator_actor: Optional[str],
+) -> bool:
+    """Transactional core shared by worker ``resolve_review`` and operator clearance."""
+    candidate = conn.execute(
+        "SELECT status FROM tasks WHERE id = ?",
+        (candidate_id,),
+    ).fetchone()
+    if candidate is None or candidate["status"] != "review":
+        return False
+
+    if reviewer_task_id:
+        request_row = conn.execute(
+            """
+            SELECT id, reviewer_task_id, requested_by_run_id
+              FROM review_requests
+             WHERE candidate_id = ?
+               AND reviewer_task_id = ?
+               AND status = 'pending'
+             ORDER BY requested_at DESC
+             LIMIT 1
+            """,
+            (candidate_id, reviewer_task_id),
+        ).fetchone()
+    else:
+        request_row = conn.execute(
+            """
+            SELECT id, reviewer_task_id, requested_by_run_id
+              FROM review_requests
+             WHERE candidate_id = ?
+               AND status = 'pending'
+             ORDER BY requested_at DESC
+             LIMIT 1
+            """,
+            (candidate_id,),
+        ).fetchone()
+    if request_row is None:
+        return False
+
+    bound_reviewer_id = request_row["reviewer_task_id"]
+    requested_by_run_id = request_row["requested_by_run_id"]
+
+    if is_operator:
+        if not operator_actor or not str(operator_actor).strip():
+            raise ValueError("operator review clearance requires operator_actor")
+        operator_actor = str(operator_actor).strip()
+    else:
+        if resolving_run_id is None:
+            raise ValueError(
+                "resolving run id is required for worker review clearance; "
+                "use operator_clear_review for operator actions"
+            )
+        # The resolving run must be the live, current run of the bound
+        # reviewer task. Checking task_runs.task_id alone is not enough: a
+        # stale run from a previous claim or a reclaimed task still has a
+        # historical row, but it is no longer the current owner.
+        run_row = conn.execute(
+            """
+            SELECT r.task_id, r.status, r.claim_lock
+              FROM task_runs r
+              JOIN tasks t ON t.id = r.task_id
+             WHERE r.id = ?
+               AND t.current_run_id = ?
+            """,
+            (int(resolving_run_id), int(resolving_run_id)),
+        ).fetchone()
+        if run_row is None or run_row["task_id"] != bound_reviewer_id:
+            raise ValueError(
+                f"resolving run {resolving_run_id} is not the current run "
+                f"of reviewer task {bound_reviewer_id}"
+            )
+        if run_row["status"] != "running":
+            raise ValueError(
+                f"resolving run {resolving_run_id} is not running "
+                f"(status={run_row['status']!r})"
+            )
+        if claim_lock is not None:
+            if run_row["claim_lock"] != claim_lock:
+                raise ValueError(
+                    "resolving run claim lock does not match the caller"
+                )
+
+        if resolution == "clear" and (
+            requested_by_run_id is not None
+            and int(requested_by_run_id) == int(resolving_run_id)
+        ):
+            raise ValueError("a run cannot clear a review it requested")
+
+    now = int(time.time())
+    resolved_by_run_id = None if is_operator else resolving_run_id
+    conn.execute(
+        """
+        UPDATE review_requests
+           SET status = ?,
+               resolution = ?,
+               resolved_at = ?,
+               resolved_by_run_id = ?,
+               resolved_by_operator = ?,
+               reason = ?
+         WHERE id = ?
+           AND status = 'pending'
+        """,
+        (
+            "cleared" if resolution == "clear" else "rejected",
+            resolution,
+            now,
+            resolved_by_run_id,
+            operator_actor,
+            reason,
+            int(request_row["id"]),
+        ),
+    )
+
+    event_payload = {
+        "review_id": int(request_row["id"]),
+        "reviewer_task_id": bound_reviewer_id,
+        "resolving_run_id": resolving_run_id,
+        "requested_by_run_id": requested_by_run_id,
+        "reason": reason,
+    }
+    if operator_actor:
+        event_payload["operator_actor"] = operator_actor
+    _append_event(
+        conn,
+        candidate_id,
+        "review_cleared" if resolution == "clear" else "review_rejected",
+        event_payload,
+        run_id=resolved_by_run_id,
+    )
+
+    if resolution == "clear":
+        # AND semantics: the candidate is only done once every bound
+        # reviewer has cleared. If any pending requests remain, leave the
+        # candidate in review.
+        still_pending = conn.execute(
+            "SELECT 1 FROM review_requests "
+            "WHERE candidate_id = ? AND status = 'pending' LIMIT 1",
+            (candidate_id,),
+        ).fetchone()
+        if still_pending is None:
+            conn.execute(
+                """
+                UPDATE tasks
+                   SET status = 'done',
+                       completed_at = ?
+                 WHERE id = ?
+                   AND status = 'review'
+                """,
+                (now, candidate_id),
+            )
+    else:
+        # A reject is an ANY veto: void every remaining pending request for
+        # this candidate so the round cannot be partially cleared later.
+        superseded = conn.execute(
+            """
+            SELECT id FROM review_requests
+             WHERE candidate_id = ? AND status = 'pending' AND id != ?
+            """,
+            (candidate_id, int(request_row["id"])),
+        ).fetchall()
+        if superseded:
+            for row in superseded:
+                conn.execute(
+                    """
+                    UPDATE review_requests
+                       SET status = 'rejected',
+                           resolution = 'reject',
+                           resolved_at = ?,
+                           resolved_by_run_id = ?,
+                           resolved_by_operator = ?,
+                           reason = ?
+                     WHERE id = ?
+                       AND status = 'pending'
+                    """,
+                    (now, resolved_by_run_id, operator_actor, "superseded by veto", int(row["id"])),
+                )
+                _append_event(
+                    conn,
+                    candidate_id,
+                    "review_rejected",
+                    {
+                        "review_id": int(row["id"]),
+                        "reviewer_task_id": bound_reviewer_id,
+                        "resolving_run_id": resolved_by_run_id,
+                        "requested_by_run_id": requested_by_run_id,
+                        "reason": "superseded by veto",
+                    },
+                    run_id=resolved_by_run_id,
+                )
+        undone_parents = conn.execute(
+            "SELECT 1 FROM task_links l "
+            "JOIN tasks p ON p.id = l.parent_id "
+            f"WHERE l.child_id = ? AND NOT {_parent_satisfied_sql('p')} LIMIT 1",
+            (candidate_id,),
+        ).fetchone()
+        new_status = "todo" if undone_parents else "ready"
+        conn.execute(
+            """
+            UPDATE tasks
+               SET status = ?,
+                   claim_lock = NULL,
+                   claim_expires = NULL,
+                   worker_pid = NULL,
+                   current_run_id = NULL
+             WHERE id = ?
+               AND status = 'review'
+            """,
+            (new_status, candidate_id),
+        )
+
+    return True
+
+
 def resolve_review(
     conn: sqlite3.Connection,
     candidate_id: str,
@@ -7030,11 +7270,9 @@ def resolve_review(
     *,
     reviewer_task_id: Optional[str] = None,
     reason: Optional[str] = None,
-    operator_mode: bool = False,
-    operator_actor: Optional[str] = None,
     claim_lock: Optional[str] = None,
 ) -> bool:
-    """Resolve a pending review request for ``candidate_id``.
+    """Resolve a pending review request for ``candidate_id`` from a worker run.
 
     ``resolution`` must be ``"clear"`` or ``"reject"``. When ``reviewer_task_id``
     is provided, only a pending request bound to that reviewer task may be
@@ -7054,228 +7292,80 @@ def resolve_review(
       are also marked rejected because the round has been voided. Neither path
       touches ``block_recurrences`` or routes to ``triage``.
 
-    ``operator_mode`` bypasses the run-identity check for authenticated
-    operator/CLI callers that clear or reject a review explicitly. A worker
-    tool must never pass ``operator_mode=True``; absence of a run id is not
-    an operator action and is rejected. Operator callers must also pass
-    ``operator_actor`` (e.g. ``"cli:<user>"`` or ``"dashboard:<operator>"``) so
-    the resolution event is durably attributable; a bare boolean is rejected.
+    Operator/CLI callers must use ``operator_clear_review``; this function no
+    longer accepts an ``operator_mode`` boolean and rejects a missing run id.
     """
     if resolution not in REVIEW_RESOLUTIONS:
         raise ValueError(
             f"resolution must be one of {sorted(REVIEW_RESOLUTIONS)}, "
             f"got {resolution!r}"
         )
-    if operator_mode:
-        if not operator_actor or not str(operator_actor).strip():
-            raise ValueError("operator_mode=True requires operator_actor")
-        operator_actor = str(operator_actor).strip()
-    now = int(time.time())
     with write_txn(conn):
-        candidate = conn.execute(
-            "SELECT status FROM tasks WHERE id = ?",
-            (candidate_id,),
-        ).fetchone()
-        if candidate is None or candidate["status"] != "review":
-            return False
-
-        if reviewer_task_id:
-            request_row = conn.execute(
-                """
-                SELECT id, reviewer_task_id, requested_by_run_id
-                  FROM review_requests
-                 WHERE candidate_id = ?
-                   AND reviewer_task_id = ?
-                   AND status = 'pending'
-                 ORDER BY requested_at DESC
-                 LIMIT 1
-                """,
-                (candidate_id, reviewer_task_id),
-            ).fetchone()
-        else:
-            request_row = conn.execute(
-                """
-                SELECT id, reviewer_task_id, requested_by_run_id
-                  FROM review_requests
-                 WHERE candidate_id = ?
-                   AND status = 'pending'
-                 ORDER BY requested_at DESC
-                 LIMIT 1
-                """,
-                (candidate_id,),
-            ).fetchone()
-        if request_row is None:
-            return False
-
-        bound_reviewer_id = request_row["reviewer_task_id"]
-        requested_by_run_id = request_row["requested_by_run_id"]
-
-        if resolving_run_id is None:
-            if not operator_mode:
-                raise ValueError(
-                    "resolving run id is required unless operator_mode=True"
-                )
-        else:
-            # The resolving run must be the live, current run of the bound
-            # reviewer task. Checking task_runs.task_id alone is not enough: a
-            # stale run from a previous claim or a reclaimed task still has a
-            # historical row, but it is no longer the current owner.
-            run_row = conn.execute(
-                """
-                SELECT r.task_id, r.status, r.claim_lock
-                  FROM task_runs r
-                  JOIN tasks t ON t.id = r.task_id
-                 WHERE r.id = ?
-                   AND t.current_run_id = ?
-                """,
-                (int(resolving_run_id), int(resolving_run_id)),
-            ).fetchone()
-            if run_row is None or run_row["task_id"] != bound_reviewer_id:
-                raise ValueError(
-                    f"resolving run {resolving_run_id} is not the current run "
-                    f"of reviewer task {bound_reviewer_id}"
-                )
-            if run_row["status"] != "running":
-                raise ValueError(
-                    f"resolving run {resolving_run_id} is not running "
-                    f"(status={run_row['status']!r})"
-                )
-            if claim_lock is not None:
-                if run_row["claim_lock"] != claim_lock:
-                    raise ValueError(
-                        "resolving run claim lock does not match the caller"
-                    )
-
-        if resolution == "clear" and not operator_mode and (
-            requested_by_run_id is not None
-            and resolving_run_id is not None
-            and int(requested_by_run_id) == int(resolving_run_id)
-        ):
-            raise ValueError("a run cannot clear a review it requested")
-
-        conn.execute(
-            """
-            UPDATE review_requests
-               SET status = ?,
-                   resolution = ?,
-                   resolved_at = ?,
-                   resolved_by_run_id = ?,
-                   reason = ?
-             WHERE id = ?
-               AND status = 'pending'
-            """,
-            (
-                "cleared" if resolution == "clear" else "rejected",
-                resolution,
-                now,
-                resolving_run_id,
-                reason,
-                int(request_row["id"]),
-            ),
-        )
-
-        event_payload = {
-            "review_id": int(request_row["id"]),
-            "reviewer_task_id": bound_reviewer_id,
-            "resolving_run_id": resolving_run_id,
-            "requested_by_run_id": requested_by_run_id,
-            "reason": reason,
-        }
-        if operator_actor:
-            event_payload["operator_actor"] = operator_actor
-        _append_event(
+        ok = _resolve_review_in_txn(
             conn,
             candidate_id,
-            "review_cleared" if resolution == "clear" else "review_rejected",
-            event_payload,
-            run_id=resolving_run_id,
+            resolution,
+            resolving_run_id,
+            reviewer_task_id,
+            reason,
+            claim_lock,
+            is_operator=False,
+            operator_actor=None,
         )
-
-        if resolution == "clear":
-            # AND semantics: the candidate is only done once every bound
-            # reviewer has cleared. If any pending requests remain, leave the
-            # candidate in review.
-            still_pending = conn.execute(
-                "SELECT 1 FROM review_requests "
-                "WHERE candidate_id = ? AND status = 'pending' LIMIT 1",
-                (candidate_id,),
-            ).fetchone()
-            if still_pending is None:
-                conn.execute(
-                    """
-                    UPDATE tasks
-                       SET status = 'done',
-                           completed_at = ?
-                     WHERE id = ?
-                       AND status = 'review'
-                    """,
-                    (now, candidate_id),
-                )
-        else:
-            # A reject is an ANY veto: void every remaining pending request for
-            # this candidate so the round cannot be partially cleared later.
-            superseded = conn.execute(
-                """
-                SELECT id FROM review_requests
-                 WHERE candidate_id = ? AND status = 'pending' AND id != ?
-                """,
-                (candidate_id, int(request_row["id"])),
-            ).fetchall()
-            if superseded:
-                for row in superseded:
-                    conn.execute(
-                        """
-                        UPDATE review_requests
-                           SET status = 'rejected',
-                               resolution = 'reject',
-                               resolved_at = ?,
-                               resolved_by_run_id = ?,
-                               reason = ?
-                         WHERE id = ?
-                           AND status = 'pending'
-                        """,
-                        (now, resolving_run_id, "superseded by veto", int(row["id"])),
-                    )
-                    _append_event(
-                        conn,
-                        candidate_id,
-                        "review_rejected",
-                        {
-                            "review_id": int(row["id"]),
-                            "reviewer_task_id": bound_reviewer_id,
-                            "resolving_run_id": resolving_run_id,
-                            "requested_by_run_id": requested_by_run_id,
-                            "reason": "superseded by veto",
-                        },
-                        run_id=resolving_run_id,
-                    )
-            undone_parents = conn.execute(
-                "SELECT 1 FROM task_links l "
-                "JOIN tasks p ON p.id = l.parent_id "
-                f"WHERE l.child_id = ? AND NOT {_parent_satisfied_sql('p')} LIMIT 1",
-                (candidate_id,),
-            ).fetchone()
-            new_status = "todo" if undone_parents else "ready"
-            conn.execute(
-                """
-                UPDATE tasks
-                   SET status = ?,
-                       claim_lock = NULL,
-                       claim_expires = NULL,
-                       worker_pid = NULL,
-                       current_run_id = NULL
-                 WHERE id = ?
-                   AND status = 'review'
-                """,
-                (new_status, candidate_id),
-            )
-
     recompute_ready(conn)
     if resolution == "clear":
         # Only clean up the workspace once the candidate is actually done.
         if not has_pending_review(conn, candidate_id):
             _cleanup_workspace(conn, candidate_id)
-    return True
+    return ok
+
+
+def operator_clear_review(
+    conn: sqlite3.Connection,
+    candidate_id: str,
+    resolution: str,
+    operator_actor: str,
+    *,
+    reviewer_task_id: Optional[str] = None,
+    reason: Optional[str] = None,
+) -> bool:
+    """Explicit operator/CLI path for resolving a pending review request.
+
+    ``operator_actor`` is a typed, durable identity (e.g. ``"cli:<user>"`` or
+    ``"dashboard:<operator>``) recorded on the review request row and in the
+    resolution event. There is no credential verification in this single-operator
+    local install, but the actor name is mandatory and stored so the clearance is
+    distinguishable from an unattributed caller.
+
+    The worker tool path must use ``resolve_review`` with a live run id; this
+    function does not accept run identity and is the only code path that may
+    clear a review without one.
+    """
+    if resolution not in REVIEW_RESOLUTIONS:
+        raise ValueError(
+            f"resolution must be one of {sorted(REVIEW_RESOLUTIONS)}, "
+            f"got {resolution!r}"
+        )
+    if not operator_actor or not str(operator_actor).strip():
+        raise ValueError("operator_actor is required for operator review clearance")
+    with write_txn(conn):
+        ok = _resolve_review_in_txn(
+            conn,
+            candidate_id,
+            resolution,
+            resolving_run_id=None,
+            reviewer_task_id=reviewer_task_id,
+            reason=reason,
+            claim_lock=None,
+            is_operator=True,
+            operator_actor=operator_actor,
+        )
+    recompute_ready(conn)
+    if resolution == "clear":
+        # Only clean up the workspace once the candidate is actually done.
+        if not has_pending_review(conn, candidate_id):
+            _cleanup_workspace(conn, candidate_id)
+    return ok
 
 
 def get_review_requests(
@@ -7302,7 +7392,8 @@ def get_review_requests(
         f"""
         SELECT id, candidate_id, reviewer_task_id, status,
                requested_by_run_id, requested_at, resolved_at,
-               resolved_by_run_id, resolution, reason, idempotency_key
+               resolved_by_run_id, resolution, reason, idempotency_key,
+               resolved_by_operator
           FROM review_requests
          {where}
          ORDER BY requested_at ASC, id ASC

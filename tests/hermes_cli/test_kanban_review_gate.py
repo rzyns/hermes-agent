@@ -130,7 +130,7 @@ def test_self_relation_is_rejected_at_complete_and_request(kanban_home):
             kb.request_review(conn, candidate, candidate, requested_by_run_id=None)
 
 
-def test_resolve_review_requires_run_or_operator_mode(kanban_home):
+def test_resolve_review_requires_run_and_operator_clear_review_works(kanban_home):
     with kb.connect() as conn:
         reviewer = kb.create_task(conn, title="reviewer", assignee="reviewer")
         candidate = kb.create_task(conn, title="candidate", assignee="worker")
@@ -142,7 +142,7 @@ def test_resolve_review_requires_run_or_operator_mode(kanban_home):
             review_pending=[reviewer],
         )
         # A worker tool call with no resolving run id is rejected.
-        with pytest.raises(ValueError, match="operator_mode"):
+        with pytest.raises(ValueError, match="resolving run id is required"):
             kb.resolve_review(
                 conn,
                 candidate,
@@ -150,8 +150,8 @@ def test_resolve_review_requires_run_or_operator_mode(kanban_home):
                 resolving_run_id=None,
                 reviewer_task_id=reviewer,
             )
-        # Operator-mode bypass is allowed only with an attributable actor.
-        with pytest.raises(ValueError, match="operator_actor"):
+        # The worker path no longer accepts an operator_mode boolean.
+        with pytest.raises(TypeError):
             kb.resolve_review(
                 conn,
                 candidate,
@@ -160,14 +160,20 @@ def test_resolve_review_requires_run_or_operator_mode(kanban_home):
                 reviewer_task_id=reviewer,
                 operator_mode=True,
             )
-        ok = kb.resolve_review(
+        # Operator path requires an attributable actor.
+        with pytest.raises(ValueError, match="operator_actor"):
+            kb.operator_clear_review(
+                conn,
+                candidate,
+                "clear",
+                "",
+            )
+        ok = kb.operator_clear_review(
             conn,
             candidate,
             "clear",
-            resolving_run_id=None,
+            "cli:test-operator",
             reviewer_task_id=reviewer,
-            operator_mode=True,
-            operator_actor="cli:test-operator",
         )
         assert ok is True
         assert kb.get_task(conn, candidate).status == "done"
@@ -177,6 +183,9 @@ def test_resolve_review_requires_run_or_operator_mode(kanban_home):
         ).fetchone()
         payload = json.loads(event["payload"])
         assert payload.get("operator_actor") == "cli:test-operator"
+        requests = kb.get_review_requests(conn, candidate_id=candidate)
+        assert requests[-1].resolved_by_operator == "cli:test-operator"
+        assert requests[-1].resolved_by_run_id is None
 
 
 def test_multiple_reviewers_clear_and_gate(kanban_home):
@@ -497,14 +506,12 @@ def test_request_review_is_idempotent_for_same_pending_pair(kanban_home):
         # After resolving, a new request in the same second must create a
         # distinct row because the primary identity is the row id / random
         # idempotency key, not the wall clock.
-        kb.resolve_review(
+        kb.operator_clear_review(
             conn,
             candidate,
             "reject",
-            resolving_run_id=None,
+            "test:fixture",
             reviewer_task_id=reviewer,
-            operator_mode=True,
-            operator_actor="test:fixture",
         )
         rid3 = kb.request_review(
             conn, candidate, reviewer, requested_by_run_id=run_id_1, reason="third"
@@ -664,6 +671,7 @@ def test_schema_migration_removes_old_second_resolution_unique_key(kanban_home):
             row["name"] for row in conn.execute("PRAGMA table_info(review_requests)")
         }
         assert "idempotency_key" in cols
+        assert "resolved_by_operator" in cols
         # Old 4-column unique key should be gone. A new autoindex from
         # UNIQUE(idempotency_key) is expected, so we inspect column sets.
         autoindexes = conn.execute(
@@ -826,3 +834,45 @@ def _json_parse(text: str) -> dict[str, Any]:
 
 
 import json  # noqa: E402
+
+
+def test_cli_review_clear_as_operator(kanban_home, capsys):
+    """hermes kanban review-clear records the operator actor durably."""
+    import argparse
+    import hermes_cli.kanban as kanban_cli
+
+    with kb.connect() as conn:
+        reviewer = kb.create_task(conn, title="reviewer", assignee="reviewer")
+        candidate = kb.create_task(conn, title="candidate", assignee="worker")
+        kb.claim_task(conn, candidate)
+        kb.complete_task(
+            conn,
+            candidate,
+            summary="finished; needs review",
+            review_pending=[reviewer],
+        )
+
+    parent = argparse.ArgumentParser().add_subparsers()
+    parser = kanban_cli.build_parser(parent_subparsers=parent)
+    args = parser.parse_args(
+        ["review-clear", candidate, "--operator", "ops:alice", "--json"]
+    )
+    rc = kanban_cli._cmd_review_clear(args)
+    assert rc == 0
+    out, err = capsys.readouterr()
+    data = json.loads(out)
+    assert data["ok"] is True
+    assert data["status"] == "done"
+    assert data["operator_actor"] == "cli:ops:alice"
+
+    with kb.connect() as conn:
+        req = kb.get_review_requests(conn, candidate_id=candidate)[0]
+        assert req.resolved_by_operator == "cli:ops:alice"
+        assert req.resolved_by_run_id is None
+        assert req.resolution == "clear"
+        event = conn.execute(
+            "SELECT payload FROM task_events WHERE task_id = ? AND kind = 'review_cleared'",
+            (candidate,),
+        ).fetchone()
+        payload = json.loads(event["payload"])
+        assert payload.get("operator_actor") == "cli:ops:alice"
