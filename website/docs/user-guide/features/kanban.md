@@ -745,7 +745,22 @@ hermes kanban gc [--event-retention-days N]            # workspaces + old events
 
 All commands are also available as a slash command in the interactive CLI and in the messaging gateway (see [`/kanban` slash command](#kanban-slash-command) below).
 
-`--max-retries` is a per-task circuit-breaker override for the dispatcher. `--max-retries 1` blocks the task on the first non-successful attempt, while `--max-retries 3` allows two retries and blocks on the third failure. Omit it to use `kanban.failure_limit` from `config.yaml`, then the built-in default.
+`--max-retries` is a per-task circuit-breaker override for the dispatcher. It is only one layer of the budget authority ladder; `--max-retries 1` blocks the task on the first non-successful attempt, while `--max-retries 3` allows two retries and blocks on the third failure. Omit it to use `kanban.failure_limit` from `config.yaml`, then the built-in default.
+
+### Budget authority ladder
+
+Four independent authority layers cap different things on a kanban card. They are deliberately separate so operators can tune retries, conversation length, and judge loops independently.
+
+| Layer | Source order | Caps |
+|---|---|---|
+| Retry breaker | `task.max_retries` → `kanban.failure_limit` → built-in `DEFAULT_FAILURE_LIMIT` | Consecutive non-success runs (`spawn_failed`, `timed_out`, `crashed`). Trips on the Nth failure. |
+| `worker_max_turns` | task override → assignee profile `agent.max_turns` | The worker's per-conversation API/tool loop. Passed to the worker as `--max-turns` when set on the task. |
+| `goal_max_turns` | task override → `goals.DEFAULT_MAX_TURNS` (20) | The judge/goal loop for `--goal` cards. Each turn an auxiliary judge re-evaluates the worker's output against the card title/body; the loop blocks the card when the budget is exhausted. |
+| Profile `agent.max_turns` | CLI `--max-turns` → `agent.max_turns` → `HERMES_MAX_ITERATIONS` → 500 | Hard ceiling on the active chat session across CLI, TUI, and messaging. This is the runtime default the worker inherits when no task-level override is set. |
+
+`hermes kanban show <id>` now prints the resolved retry breaker and the conversation/goal budgets as separate lines. `hermes kanban show <id> --json` exposes the same data under `task.budget_ladder`. A `budget_ladder` event is recorded at task creation whenever any of `max_retries`, `worker_max_turns`, `goal_max_turns`, or `--goal` is set, so the event log itself carries the projection.
+
+The `gave_up` event's `effective_limit` is **only** the retry breaker. It does not reflect `worker_max_turns`, `goal_max_turns`, or `agent.max_turns`.
 
 ### Concurrency, scheduling, and child promotion config
 
@@ -1022,7 +1037,8 @@ Every transition appends a row to `task_events`. Each row carries an optional `r
 | `respawn_guarded` | `{reason}` | Dispatcher refused to re-spawn this ready task this tick. Reasons: `blocker_auth` (last failure was a quota/auth/429 error — wait for the rate window to reset), `recent_success` (a completed run happened in the last hour — wait for review before re-running), `active_pr` (a GitHub PR URL appears in a recent comment — a prior worker already opened a PR). The task stays in `ready`; the next tick gets another chance to spawn. If the underlying condition persists, the normal `consecutive_failures` circuit breaker will auto-block via `gave_up` after `failure_limit` failures. |
 | `spawn_failed` | `{error, failures}` | One spawn attempt failed (missing PATH, workspace unmountable, …). Counter increments; task returns to `ready` for retry. |
 | `protocol_violation` | `{pid, claimer, exit_code, protocol_violation}` | Worker exited successfully while the task was still `running`, usually because it answered without calling `kanban_complete` or `kanban_block`. Emitted on every violation (the payload's `protocol_violation: true` marker is copied into the run metadata and feeds the violation-only retry budget). Below the budget — up to `_PROTOCOL_VIOLATION_FAILURE_LIMIT` (default 3) *consecutive* violations, per-task `max_retries` overriding — the task simply returns to `ready` for another attempt; when the streak reaches the bound the dispatcher also emits `gave_up` and auto-blocks. |
-| `gave_up` | `{failures, effective_limit, limit_source, error}` | Circuit breaker fired after N consecutive non-successful attempts. Task auto-blocks with the last error. The effective limit resolves as task `max_retries`, then dispatcher `failure_limit` / `kanban.failure_limit`, then the built-in default. |
+| `budget_ladder` | `{retry_breaker, worker_max_turns, goal_max_turns, authority_order}` | Informational projection recorded at task creation whenever any of `max_retries`, `worker_max_turns`, `goal_max_turns`, or `--goal` is set. Shows the four-layer authority ladder as resolved from the task row. |
+| `gave_up` | `{failures, effective_limit, limit_source, error}` | Circuit breaker fired after N consecutive non-successful attempts. Task auto-blocks with the last error. The effective limit is **only** the retry breaker: it resolves as task `max_retries`, then dispatcher `failure_limit` / `kanban.failure_limit`, then the built-in default. It does not include `worker_max_turns`, `goal_max_turns`, or profile `agent.max_turns`. |
 
 `hermes kanban tail <id>` shows these for a single task. `hermes kanban watch` streams them board-wide.
 

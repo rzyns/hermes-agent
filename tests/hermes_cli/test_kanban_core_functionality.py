@@ -418,6 +418,91 @@ def test_max_retries_none_falls_through_to_dispatcher_limit(kanban_home, all_ass
         conn.close()
 
 
+def test_max_retries_authoritative_and_budget_ladder(kanban_home):
+    """``resolve_task_retry_budget`` and the CLI show output agree with the
+    same single source of truth the breaker uses: task > dispatcher > default.
+
+    Also verifies that the ``budget_ladder`` projection event is emitted at
+    creation when overrides are present, and that show --json surfaces the
+    same projection without conflating retries with conversation/goal budgets.
+    """
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(
+            conn,
+            title="budget ladder demo",
+            assignee="worker",
+            max_retries=5,
+            worker_max_turns=100,
+            goal_mode=True,
+            goal_max_turns=15,
+        )
+
+        # Creation emitted a budget_ladder event.
+        events = kb.list_events(conn, tid)
+        ladder_events = [e for e in events if e.kind == "budget_ladder"]
+        assert ladder_events, f"expected budget_ladder event, got {[e.kind for e in events]}"
+        payload = ladder_events[0].payload
+        assert payload["retry_breaker"] == {"limit": 5, "source": "task"}
+        assert payload["worker_max_turns"]["limit"] == 100
+        assert payload["worker_max_turns"]["source"] == "task"
+        assert payload["goal_max_turns"]["enabled"] is True
+        assert payload["goal_max_turns"]["limit"] == 15
+        assert payload["goal_max_turns"]["source"] == "task"
+
+        # Helper itself is deterministic and matches the breaker.
+        task = kb.get_task(conn, tid)
+        assert kb.resolve_task_retry_budget(task, failure_limit=10) == {
+            "limit": 5, "source": "task"
+        }
+        assert kb.resolve_task_retry_budget(task, failure_limit=2) == {
+            "limit": 5, "source": "task"
+        }
+    finally:
+        conn.close()
+
+    out = run_slash(f"show {tid} --json")
+    data = json.loads(out)
+    bl = data["task"]["budget_ladder"]
+    assert bl["retry_breaker"] == {"limit": 5, "source": "task"}
+    assert bl["worker_max_turns"]["limit"] == 100
+    assert bl["goal_max_turns"]["limit"] == 15
+
+    plain = run_slash(f"show {tid}")
+    assert "  max-retries: 5 (task)" in plain
+    assert "  worker-max-turns: 100 (task)" in plain
+    assert "  goal-max-turns: 15 (task)" in plain
+
+
+def test_max_retries_config_authoritative_when_no_task_override(kanban_home):
+    """When no per-task ``max_retries`` is set, the displayed retry budget
+    falls through to ``kanban.failure_limit`` from the active config.
+    """
+    # Write a config that changes the dispatcher limit.
+    config_path = kanban_home / "config.yaml"
+    config_path.write_text("kanban:\n  failure_limit: 8\n", encoding="utf-8")
+
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(conn, title="config-budget", assignee="worker")
+        task = kb.get_task(conn, tid)
+        assert kb.resolve_task_retry_budget(task, failure_limit=8) == {
+            "limit": 8, "source": "dispatcher"
+        }
+    finally:
+        conn.close()
+
+    # No overrides: no budget_ladder event, but show still resolves correctly.
+    out = run_slash(f"show {tid} --json")
+    data = json.loads(out)
+    assert data["task"]["budget_ladder"]["retry_breaker"] == {
+        "limit": 8, "source": "dispatcher"
+    }
+
+    plain = run_slash(f"show {tid}")
+    assert "  max-retries: 8 (dispatcher)" in plain
+
+
 def test_workspace_resolution_failure_also_counts(kanban_home, all_assignees_spawnable):
     """`dir:` workspace with no path should fail workspace resolution AND
     count against the failure budget — not just crash the tick."""
@@ -4744,10 +4829,14 @@ def test_repeated_timeouts_trip_the_circuit_breaker(kanban_home, monkeypatch):
             kb.enforce_max_runtime(conn, signal_fn=_signal)
 
         final = kb.get_task(conn, tid)
-        # After 3 consecutive timeouts with failure_limit=3, task should
-        # be auto-blocked, not looping forever as ``ready``.
-        assert final.status == "blocked", \
-            f"expected blocked after 3 timeouts, got {final.status}"
+        # After 3 consecutive timeouts with failure_limit=3, the task
+        # must be terminal (``blocked`` or ``triage``), not looping as
+        # ``ready``. Because the auto-block path now routes through
+        # ``block_task``, repeated identical failures count toward the
+        # unblock-loop breaker; the third trip may escalate to ``triage``
+        # once ``block_recurrences`` reaches ``BLOCK_RECURRENCE_LIMIT``.
+        assert final.status in ("blocked", "triage"), \
+            f"expected terminal after 3 timeouts, got {final.status}"
         assert final.consecutive_failures >= 3
         # ``gave_up`` event emitted (plus 3 ``timed_out`` events).
         kinds = [
@@ -4903,6 +4992,56 @@ def test_detect_crashed_workers_protocol_violation_streak_trips_at_limit(kanban_
         # Side channel consumed by dispatch_once — read through the same
         # (current) module object the reaper ran in, see _drive_worker_exit.
         assert tid in _kb.detect_crashed_workers._last_auto_blocked
+    finally:
+        conn.close()
+
+
+def test_protocol_violation_repeated_unblock_escalates_to_triage(kanban_home):
+    """Protocol-violation auto-blocks now route through ``block_task``.
+
+    The first violation streak lands in ``blocked``; after a manual
+    unblock, a second identical streak hits ``BLOCK_RECURRENCE_LIMIT``
+    and routes to ``triage`` instead of silently looping.
+    """
+    import hermes_cli.kanban_db as _kb
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(conn, title="quiet repeater", assignee="worker")
+        limit = _kb._PROTOCOL_VIOLATION_FAILURE_LIMIT
+        # First streak: trip at the bound.
+        for i in range(limit - 1):
+            _drive_protocol_violation(conn, tid, 990000 + i)
+            assert kb.get_task(conn, tid).status == "ready", (
+                f"violation {i + 1}/{limit} should still retry"
+            )
+        _drive_protocol_violation(conn, tid, 990900)
+        task = kb.get_task(conn, tid)
+        assert task is not None
+        assert task.status == "blocked", (
+            f"first streak must block, got {task.status}"
+        )
+
+        # Unblock and repeat the same violation streak.
+        assert kb.unblock_task(conn, tid)
+        # The first post-unblock violation is enough to trip again: the
+        # violation-only streak from the previous closed runs persists,
+        # and the second trip routes through ``block_task`` with
+        # ``block_recurrences`` already at 1 → escalation to ``triage``.
+        _drive_protocol_violation(conn, tid, 991000)
+
+        task2 = kb.get_task(conn, tid)
+        assert task2 is not None
+        assert task2.status == "triage", (
+            f"second identical streak should escalate, got {task2.status}"
+        )
+        assert task2.block_recurrences == 2
+        loops = [
+            e for e in kb.list_events(conn, tid)
+            if e.kind == "block_loop_detected"
+        ]
+        assert len(loops) == 1
+        assert loops[0].payload is not None
+        assert loops[0].payload.get("kind") is None
     finally:
         conn.close()
 
