@@ -591,6 +591,159 @@ BLOCK_RECURRENCE_LIMIT = 2
 DEP_WAIT_REDISPATCH_CAP = 3
 VALID_WORKSPACE_KINDS = {"scratch", "worktree", "dir"}
 
+# Sentinel used to distinguish "field not supplied" from "field supplied as
+# None/empty" in workspace validation.  Public callers should not see this;
+# it is internal to ``_validate_workspace_fields``.
+_UNSET = object()
+
+
+def _validate_workspace_fields(
+    workspace_kind: object,
+    workspace_path: object,
+    branch_name: object,
+    *,
+    require_path: bool = True,
+    old_kind: str = "scratch",
+) -> tuple[object, object, object]:
+    """Shared validation/normalization for workspace kind/path/branch.
+
+    Accepts either concrete values or the internal ``_UNSET`` sentinel for
+    each field.  ``_UNSET`` means "caller did not supply this field", and the
+    validator leaves the corresponding result as ``_UNSET`` so the caller can
+    decide whether to apply a default or leave the existing value unchanged.
+
+    When ``require_path`` is True (used at task creation and when changing
+    ``workspace_kind``), ``dir`` and ``worktree`` kinds demand a non-empty,
+    absolute ``workspace_path`` and reject an explicit clear.  When False
+    (used for updates that keep the current kind), an explicit ``None`` for
+    ``workspace_path`` is allowed to clear the path only for ``scratch``.
+
+    Returns a tuple of ``(kind, path, branch)`` where each element is either
+    a concrete normalized value or ``_UNSET``.
+
+    Raises:
+        WorkspaceUpdateError: on invalid kind, missing/relative path,
+            branch/kind mismatch, or forbidden explicit null.
+    """
+    # workspace_kind
+    if workspace_kind is _UNSET:
+        kind_out: object = _UNSET
+    else:
+        kind = str(workspace_kind).strip()
+        if kind not in VALID_WORKSPACE_KINDS:
+            raise WorkspaceUpdateError(
+                f"workspace_kind must be one of {sorted(VALID_WORKSPACE_KINDS)}, "
+                f"got {kind!r}"
+            )
+        kind_out = kind
+
+    # workspace_path: normalize empty/whitespace to None
+    if workspace_path is _UNSET:
+        path_out: object = _UNSET
+    elif workspace_path is None:
+        path_out = None
+    else:
+        s = str(workspace_path).strip()
+        path_out = s or None
+
+    # branch_name: normalize empty/whitespace to None
+    if branch_name is _UNSET:
+        branch_out: object = _UNSET
+    elif branch_name is None:
+        branch_out = None
+    else:
+        s = str(branch_name).strip()
+        branch_out = s or None
+
+    effective_kind = kind_out if kind_out is not _UNSET else "scratch"
+
+    # branch/kind constraint.  When the kind is being changed, validate against
+    # the new kind; otherwise validate against the existing kind.  This allows
+    # a branch-only update on an existing worktree (kind unchanged) and rejects
+    # a branch for a task whose kind is not worktree.
+    if kind_out is _UNSET:
+        effective_kind = old_kind
+    else:
+        effective_kind = kind_out
+
+    # branch/kind constraint
+    if branch_out is not _UNSET and branch_out is not None and effective_kind != "worktree":
+        raise WorkspaceUpdateError("branch_name is only valid for worktree workspaces")
+
+    # path requirement / explicit null handling
+    if path_out is _UNSET:
+        # caller omitted path.  For creation or a kind change this is an
+        # error because dir/worktree require a path; for a same-kind update
+        # the caller simply leaves the existing value alone.
+        if require_path and effective_kind in {"dir", "worktree"}:
+            raise WorkspaceUpdateError(
+                f"workspace_path is required for workspace_kind={effective_kind!r}"
+            )
+    elif path_out is None:
+        if effective_kind in {"dir", "worktree"}:
+            # Changing the kind to dir/worktree without a path is always invalid.
+            # Keeping the kind as dir/worktree and sending null is also invalid
+            # (clear is forbidden); both cases surface as a required-path error
+            # so the response names the field that is missing.
+            raise WorkspaceUpdateError(
+                f"workspace_path is required for workspace_kind={effective_kind!r}"
+            )
+        # scratch with explicit None is valid (clears any legacy path)
+    else:
+        p = Path(str(path_out)).expanduser()
+        if not p.is_absolute():
+            raise WorkspaceUpdateError(
+                f"workspace_path must be absolute, got {path_out!r}"
+            )
+        path_out = str(p)
+
+    kind_result = kind_out if kind_out is _UNSET else str(kind_out)
+    return (
+        kind_result,  # type: ignore[return-value]
+        path_out if path_out is _UNSET or path_out is None else str(path_out),
+        branch_out if branch_out is _UNSET or branch_out is None else str(branch_out),
+    )
+
+
+def _normalize_workspace_update_inputs(
+    *,
+    workspace_kind: object,
+    workspace_path: object,
+    branch_name: object,
+    old_kind: str,
+) -> tuple[object, object, object, bool]:
+    """Prepare raw update inputs for :func:`_validate_workspace_fields`.
+
+    ``None`` in an input can mean either "field not sent" or "field sent as
+    JSON null", and this function tells them apart by using ``_UNSET`` for
+    the not-sent case.  It treats empty / whitespace strings as the explicit
+    null that their wire representation already implies.
+
+    Returns ``(kind, path, branch, require_path)`` where ``require_path`` is
+    True when the kind is being changed (the new combination must be valid on
+    its own), and False when the kind stays the same (so an explicit null path
+    can be validated as a clear attempt against the existing kind).
+    """
+    kind_in = _UNSET if workspace_kind is None else workspace_kind
+    path_in = _UNSET if workspace_path is None else workspace_path
+    branch_in = _UNSET if branch_name is None else branch_name
+
+    # An empty/whitespace-only string is not distinguishable from null on the
+    # wire, so normalize it to a real None rather than treating it as a path.
+    if path_in is not _UNSET and isinstance(path_in, str) and not path_in.strip():
+        path_in = None
+    if branch_in is not _UNSET and isinstance(branch_in, str) and not branch_in.strip():
+        branch_in = None
+    if kind_in is not _UNSET and isinstance(kind_in, str) and not kind_in.strip():
+        kind_in = None
+
+    # Determine whether the kind is actually changing.  When the caller did not
+    # send a kind, we look at the existing row's kind; the path requirement is
+    # then relaxed so an explicit null path can be validated as a clear.
+    effective_kind = old_kind if kind_in is _UNSET else kind_in
+    require_path = bool(kind_in is not _UNSET and kind_in != old_kind)
+    return kind_in, path_in, branch_in, require_path
+
 
 def normalize_reasoning_effort(effort: Optional[str]) -> Optional[str]:
     """Normalize a per-task reasoning effort into a storable level.
@@ -4053,17 +4206,17 @@ def create_task(
         raise ValueError(
             f"initial_status must be one of {sorted(VALID_INITIAL_STATUSES)}"
         )
-    if workspace_kind not in VALID_WORKSPACE_KINDS:
-        raise ValueError(
-            f"workspace_kind must be one of {sorted(VALID_WORKSPACE_KINDS)}, "
-            f"got {workspace_kind!r}"
-        )
-    if branch_name is not None:
-        branch_name = str(branch_name).strip() or None
-    if branch_name and workspace_kind != "worktree":
-        raise ValueError("branch_name is only valid for worktree workspaces")
-    if worker_max_turns is not None and int(worker_max_turns) < 1:
-        raise ValueError("worker_max_turns must be >= 1")
+
+    # Shared workspace validation: kind/path/branch rules and absolute-path
+    # requirement.  We run a first pass to catch malformed kind/branch/path
+    # inputs early with the same exception class as the update path.  A missing
+    # path for dir/worktree is allowed here if the caller did not provide one,
+    # because board-level default_workdir or a linked project may supply it
+    # below; we re-validate after that resolution.
+    _validate_workspace_fields(
+        workspace_kind, workspace_path, branch_name,
+        require_path=workspace_path is not None,
+    )
 
     # Inherit the board's scoped project when the caller didn't name one, so a
     # project-scoped board anchors every new task to that project's repo
@@ -4249,6 +4402,14 @@ def create_task(
         board_default = board_meta.get("default_workdir")
         if board_default:
             workspace_path = str(board_default)
+
+    # After default inheritance and project resolution, dir/worktree kinds
+    # must have a non-empty absolute path.  Use the shared validator for the
+    # final check so creation and update stay aligned.
+    if workspace_kind in {"dir", "worktree"}:
+        _validate_workspace_fields(
+            workspace_kind, workspace_path, branch_name, require_path=True
+        )
 
     # Retry once on the extremely unlikely id collision.
     for attempt in range(2):
@@ -9699,6 +9860,13 @@ def update_task_workspace(
       ``worktree`` and must be absolute.
     * ``branch_name`` is only permitted when ``workspace_kind`` is
       ``worktree``.
+    * Omitting a key leaves the existing value unchanged.  To clear
+      ``workspace_path`` or ``branch_name`` explicitly, pass an empty string
+      (``""``) which normalizes to ``None``.
+    * A normalized ``None`` for ``workspace_path`` clears it for ``scratch``
+      and is rejected for ``dir`` and ``worktree``.
+    * A normalized ``None`` for ``branch_name`` clears the branch when the
+      kind is ``worktree``.
 
     Guards:
 
@@ -9755,39 +9923,30 @@ def update_task_workspace(
         old_path = row["workspace_path"]
         old_branch = row["branch_name"]
 
-        new_kind = workspace_kind if workspace_kind is not None else old_kind
-        new_path = workspace_path if workspace_path is not None else old_path
-        new_branch = branch_name if branch_name is not None else old_branch
+        incoming_kind, incoming_path, incoming_branch, require_path = _normalize_workspace_update_inputs(
+            workspace_kind=workspace_kind,
+            workspace_path=workspace_path,
+            branch_name=branch_name,
+            old_kind=old_kind,
+        )
 
-        new_kind = str(new_kind).strip()
-        if new_kind not in VALID_WORKSPACE_KINDS:
-            raise WorkspaceUpdateError(
-                f"workspace_kind must be one of {sorted(VALID_WORKSPACE_KINDS)}, "
-                f"got {new_kind!r}"
-            )
+        new_kind, new_path, new_branch = _validate_workspace_fields(
+            incoming_kind,
+            incoming_path,
+            incoming_branch,
+            require_path=require_path,
+            old_kind=old_kind,
+        )
+        if new_kind is _UNSET:
+            new_kind = old_kind
+        if new_path is _UNSET:
+            new_path = old_path
+        if new_branch is _UNSET:
+            new_branch = old_branch
 
-        if new_path is not None:
-            new_path = str(new_path).strip() or None
-        if new_branch is not None:
-            new_branch = str(new_branch).strip() or None
-
-        if new_branch and new_kind != "worktree":
-            raise WorkspaceUpdateError(
-                "branch_name is only valid for worktree workspaces"
-            )
-
-        if new_kind in {"dir", "worktree"} and not new_path:
-            raise WorkspaceUpdateError(
-                f"workspace_path is required for workspace_kind={new_kind!r}"
-            )
-
-        if new_path is not None:
-            p = Path(new_path).expanduser()
-            if not p.is_absolute():
-                raise WorkspaceUpdateError(
-                    f"workspace_path must be absolute, got {new_path!r}"
-                )
-            new_path = str(p)
+        # If the kind changed but path was not supplied, the validator ran with
+        # require_path=True and already demanded a path; if it was supplied as
+        # None, it was rejected.  So at this point new_path must be set.
 
         conn.execute(
             """

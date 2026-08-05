@@ -500,8 +500,18 @@ def test_create_task_unknown_parent_errors(kanban_home):
 
 
 def test_workspace_kind_validation(kanban_home):
-    with kb.connect() as conn, pytest.raises(ValueError, match="workspace_kind"):
+    with kb.connect() as conn, pytest.raises(kb.WorkspaceUpdateError, match="workspace_kind"):
         kb.create_task(conn, title="bad ws", workspace_kind="cloud")
+
+
+def test_branch_name_requires_worktree_workspace(kanban_home):
+    with kb.connect() as conn, pytest.raises(kb.WorkspaceUpdateError, match="worktree"):
+        kb.create_task(
+            conn,
+            title="bad branch",
+            workspace_kind="scratch",
+            branch_name="wt/bad",
+        )
 
 
 def test_create_task_persists_worktree_branch_name(kanban_home, tmp_path):
@@ -523,14 +533,102 @@ def test_create_task_persists_worktree_branch_name(kanban_home, tmp_path):
     assert "Branch:   wt/t6-wire" in context
 
 
-def test_branch_name_requires_worktree_workspace(kanban_home):
-    with kb.connect() as conn, pytest.raises(ValueError, match="worktree"):
-        kb.create_task(
+def test_create_and_update_share_workspace_validation(kanban_home, tmp_path):
+    """Creation and update must raise the same exception class and message for
+    the same invalid workspace inputs.  This catches future divergence between
+    the two call paths.
+    """
+    cases = [
+        ("bad kind", {"workspace_kind": "cloud"}, "workspace_kind"),
+        ("branch on scratch", {"branch_name": "wt/bad"}, "worktree"),
+        ("relative path", {"workspace_kind": "dir", "workspace_path": "rel"}, "absolute"),
+        ("missing path for dir", {"workspace_kind": "dir"}, "workspace_path"),
+    ]
+
+    with kb.connect() as conn:
+        for label, kwargs, match in cases:
+            with pytest.raises(kb.WorkspaceUpdateError, match=match):
+                kb.create_task(conn, title=label, **kwargs)
+
+            tid = kb.create_task(conn, title=f"update victim {label}")
+            with pytest.raises(kb.WorkspaceUpdateError, match=match):
+                kb.update_task_workspace(conn, tid, **kwargs)
+            task = kb.get_task(conn, tid)
+            assert task.workspace_kind == "scratch"
+            assert task.workspace_path is None
+
+
+def test_update_task_workspace_explicit_null_rejects_dir_path_clear(kanban_home, tmp_path):
+    """An explicit clear (empty string / normalized null) for workspace_path on
+    a dir workspace is rejected, not silently dropped.
+    """
+    target = tmp_path / "my-dir"
+    target.mkdir()
+    with kb.connect() as conn:
+        tid = kb.create_task(
             conn,
-            title="bad branch",
-            workspace_kind="scratch",
-            branch_name="wt/bad",
+            title="dir task",
+            workspace_kind="dir",
+            workspace_path=str(target),
         )
+        with pytest.raises(kb.WorkspaceUpdateError, match="workspace_path"):
+            kb.update_task_workspace(conn, tid, workspace_path="")
+        task = kb.get_task(conn, tid)
+    assert task.workspace_path == str(target)
+
+
+def test_update_task_workspace_explicit_null_clears_scratch_path(kanban_home):
+    """An explicit clear (empty string) for workspace_path on a scratch task
+    actually clears the stored path and emits a workspace_changed event.
+    """
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="scratch with path", workspace_path="/tmp/legacy")
+        payload = kb.update_task_workspace(conn, tid, workspace_path="")
+        task = kb.get_task(conn, tid)
+        events = kb.list_events(conn, tid)
+    assert task.workspace_path is None
+    assert payload["new"]["workspace_path"] is None
+    change_event = next(e for e in events if e.kind == "workspace_changed")
+    assert change_event.payload["old"]["workspace_path"] == "/tmp/legacy"
+    assert change_event.payload["new"]["workspace_path"] is None
+
+
+def test_update_task_workspace_omitted_values_unchanged(kanban_home, tmp_path):
+    """Absent keys in an update must not touch the existing values."""
+    target = tmp_path / "my-dir"
+    target.mkdir()
+    with kb.connect() as conn:
+        tid = kb.create_task(
+            conn,
+            title="dir task",
+            workspace_kind="dir",
+            workspace_path=str(target),
+        )
+        # Send no workspace fields at all — everything should stay as-is.
+        payload = kb.update_task_workspace(conn, tid)
+        task = kb.get_task(conn, tid)
+    assert task.workspace_kind == "dir"
+    assert task.workspace_path == str(target)
+
+
+def test_update_task_workspace_empty_branch_clears_worktree_branch(kanban_home, tmp_path):
+    """An explicit clear (empty string) for branch_name on a worktree clears it."""
+    repo = tmp_path / "repo"
+    _init_git_repo(repo)
+    target = repo / ".worktrees" / "t-branchy"
+    with kb.connect() as conn:
+        tid = kb.create_task(
+            conn,
+            title="worktree",
+            workspace_kind="worktree",
+            workspace_path=str(target),
+            branch_name="wt/old",
+        )
+        payload = kb.update_task_workspace(conn, tid, branch_name="")
+        task = kb.get_task(conn, tid)
+    assert task.branch_name is None
+    assert payload["old"]["branch_name"] == "wt/old"
+    assert payload["new"]["branch_name"] is None
 
 
 def test_update_task_workspace_changes_kind_path_branch(kanban_home, tmp_path):

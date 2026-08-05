@@ -1112,6 +1112,9 @@ class UpdateTaskBody(BaseModel):
     clear_reasoning_effort: bool = False
     # Workspace repair fields. Changing where a worker writes is dangerous;
     # these are only accepted when the task is not running and not terminal.
+    # Optional[str]=None in a PATCH means "field not sent" (no change).  To
+    # clear one of these fields explicitly, send an empty string, which the
+    # shared validator normalizes to None.
     workspace_kind: Optional[str] = None
     workspace_path: Optional[str] = None
     branch_name: Optional[str] = None
