@@ -308,13 +308,17 @@ def create_intake_link(
     # So we pass workspace_path=None here, then patch it after.
     title = _make_title(url)
     
+    # Create as scratch first; the concrete durable path is derived from the
+    # task id below and applied atomically via ``set_workspace`` once known.
+    # ``create_task`` now rejects a ``dir`` kind without an absolute path,
+    # so we defer the kind/path commitment to ``_ensure_durable_workspace``.
     new_task_id = kb.create_task(
         conn,
         title=title,
         body=None,  # Will patch after we know workspace_path
         assignee=assignee,
         created_by=source,
-        workspace_kind="dir",
+        workspace_kind="scratch",
         workspace_path=None,
         tenant=None,
         priority=priority,

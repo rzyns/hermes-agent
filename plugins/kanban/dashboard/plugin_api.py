@@ -1314,23 +1314,25 @@ def update_task(task_id: str, payload: UpdateTaskBody, board: Optional[str] = Qu
                 )
 
         # --- workspace ----------------------------------------------------
-        if (
-            payload.workspace_kind is not None
-            or payload.workspace_path is not None
-            or payload.branch_name is not None
-        ):
-            supplied = {
-                field
-                for field in ("workspace_kind", "workspace_path", "branch_name")
-                if getattr(payload, field) is not None
-            }
+        supplied_workspace_fields = {
+            field
+            for field in ("workspace_kind", "workspace_path", "branch_name")
+            if field in payload.model_fields_set
+        }
+        if supplied_workspace_fields:
             try:
                 kanban_db.update_task_workspace(
                     conn,
                     task_id,
-                    workspace_kind=payload.workspace_kind,
-                    workspace_path=payload.workspace_path,
-                    branch_name=payload.branch_name,
+                    workspace_kind=payload.workspace_kind
+                    if "workspace_kind" in supplied_workspace_fields
+                    else kanban_db._UNSET,
+                    workspace_path=payload.workspace_path
+                    if "workspace_path" in supplied_workspace_fields
+                    else kanban_db._UNSET,
+                    branch_name=payload.branch_name
+                    if "branch_name" in supplied_workspace_fields
+                    else kanban_db._UNSET,
                 )
             except kanban_db.WorkspaceUpdateError as exc:
                 raise HTTPException(status_code=400, detail=str(exc))

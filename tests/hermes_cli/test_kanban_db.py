@@ -558,9 +558,51 @@ def test_create_and_update_share_workspace_validation(kanban_home, tmp_path):
             assert task.workspace_path is None
 
 
+def test_create_and_update_agree_on_explicit_null_path(kanban_home, tmp_path):
+    """Creation and update must both reject a workspace_path null/empty when
+    the resulting kind requires a path.  This pins the shared validator
+    against silent no-ops on both paths.
+    """
+    target = tmp_path / "my-dir"
+    target.mkdir()
+    with kb.connect() as conn:
+        # Creation: dir with explicit null/empty path is rejected.
+        for empty in (None, ""):
+            with pytest.raises(kb.WorkspaceUpdateError, match="workspace_path"):
+                kb.create_task(
+                    conn,
+                    title="dir null path create",
+                    workspace_kind="dir",
+                    workspace_path=empty,
+                )
+
+        # Update: changing to dir with explicit null/empty path is rejected.
+        tid = kb.create_task(conn, title="scratch to dir null path")
+        for empty in (None, ""):
+            with pytest.raises(kb.WorkspaceUpdateError, match="workspace_path"):
+                kb.update_task_workspace(
+                    conn, tid, workspace_kind="dir", workspace_path=empty
+                )
+        task = kb.get_task(conn, tid)
+        assert task.workspace_kind == "scratch"
+        assert task.workspace_path is None
+
+        # Update: clearing an existing dir path via null/empty is rejected.
+        tid_dir = kb.create_task(
+            conn,
+            title="dir task",
+            workspace_kind="dir",
+            workspace_path=str(target),
+        )
+        for empty in (None, ""):
+            with pytest.raises(kb.WorkspaceUpdateError, match="workspace_path"):
+                kb.update_task_workspace(conn, tid_dir, workspace_path=empty)
+        task = kb.get_task(conn, tid_dir)
+        assert task.workspace_path == str(target)
+
 def test_update_task_workspace_explicit_null_rejects_dir_path_clear(kanban_home, tmp_path):
-    """An explicit clear (empty string / normalized null) for workspace_path on
-    a dir workspace is rejected, not silently dropped.
+    """An explicit clear (JSON null / empty string) for workspace_path on a dir
+    workspace is rejected, not silently dropped.
     """
     target = tmp_path / "my-dir"
     target.mkdir()
@@ -571,19 +613,40 @@ def test_update_task_workspace_explicit_null_rejects_dir_path_clear(kanban_home,
             workspace_kind="dir",
             workspace_path=str(target),
         )
-        with pytest.raises(kb.WorkspaceUpdateError, match="workspace_path"):
-            kb.update_task_workspace(conn, tid, workspace_path="")
+        for clear_value in ("", None):
+            with pytest.raises(kb.WorkspaceUpdateError, match="workspace_path"):
+                kb.update_task_workspace(conn, tid, workspace_path=clear_value)
         task = kb.get_task(conn, tid)
     assert task.workspace_path == str(target)
 
 
-def test_update_task_workspace_explicit_null_clears_scratch_path(kanban_home):
-    """An explicit clear (empty string) for workspace_path on a scratch task
-    actually clears the stored path and emits a workspace_changed event.
-    """
+def test_update_task_workspace_json_null_clears_branch(kanban_home, tmp_path):
+    """JSON null for branch_name on a worktree clears it, just like an empty string."""
+    repo = tmp_path / "repo"
+    _init_git_repo(repo)
+    target = repo / ".worktrees" / "t-branchy"
+    with kb.connect() as conn:
+        tid = kb.create_task(
+            conn,
+            title="worktree",
+            workspace_kind="worktree",
+            workspace_path=str(target),
+            branch_name="wt/old",
+        )
+        for clear_value in ("", None):
+            payload = kb.update_task_workspace(conn, tid, branch_name=clear_value)
+            task = kb.get_task(conn, tid)
+            assert task.branch_name is None
+            assert payload["new"]["branch_name"] is None
+            # restore for next iteration
+            kb.update_task_workspace(conn, tid, branch_name="wt/old")
+
+
+def test_update_task_workspace_json_null_clears_scratch_path(kanban_home):
+    """JSON null for workspace_path on a scratch task clears the stored path."""
     with kb.connect() as conn:
         tid = kb.create_task(conn, title="scratch with path", workspace_path="/tmp/legacy")
-        payload = kb.update_task_workspace(conn, tid, workspace_path="")
+        payload = kb.update_task_workspace(conn, tid, workspace_path=None)
         task = kb.get_task(conn, tid)
         events = kb.list_events(conn, tid)
     assert task.workspace_path is None

@@ -676,6 +676,90 @@ def test_patch_rejects_unknown_fields_instead_of_silently_dropping_them(client):
     assert "block_fignerprint" in response.text
 
 
+def test_patch_workspace_explicit_null_rejected_or_applied(client, tmp_path):
+    """JSON null must not be silently dropped for workspace fields.
+
+    * workspace_path null on a dir/worktree must return 400.
+    * branch_name null on a worktree must clear the branch and return 200.
+    * omitted keys must leave values unchanged.
+    """
+    target = tmp_path / "repair-dir"
+    target.mkdir()
+
+    # dir task: explicit null path is rejected, not silently ignored.
+    dir_task = client.post(
+        "/api/plugins/kanban/tasks",
+        json={"title": "dir", "workspace_kind": "dir", "workspace_path": str(target)},
+    ).json()["task"]
+    response = client.patch(
+        f"/api/plugins/kanban/tasks/{dir_task['id']}",
+        json={"workspace_path": None},
+    )
+    assert response.status_code == 400
+    assert "workspace_path" in response.json()["detail"]
+    updated = client.get(f"/api/plugins/kanban/tasks/{dir_task['id']}").json()["task"]
+    assert updated["workspace_path"] == str(target)
+
+    # worktree task: explicit null branch clears it.
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    subprocess.run(["git", "init", "-b", "main", str(repo)], check=True, capture_output=True, text=True)
+    wt_target = repo / ".worktrees" / "t-wt"
+    wt_task = client.post(
+        "/api/plugins/kanban/tasks",
+        json={
+            "title": "wt",
+            "workspace_kind": "worktree",
+            "workspace_path": str(wt_target),
+            "branch_name": "wt/old",
+        },
+    ).json()["task"]
+    response = client.patch(
+        f"/api/plugins/kanban/tasks/{wt_task['id']}",
+        json={"branch_name": None},
+    )
+    assert response.status_code == 200, response.text
+    updated = response.json()["task"]
+    assert updated["branch_name"] is None
+
+    # omitted branch_name leaves an existing branch alone
+    response = client.patch(
+        f"/api/plugins/kanban/tasks/{wt_task['id']}",
+        json={"workspace_path": str(wt_target)},
+    )
+    assert response.status_code == 200, response.text
+    assert response.json()["task"]["branch_name"] is None
+
+
+def test_patch_workspace_omitted_fields_unchanged(client, tmp_path):
+    """Omitted workspace fields must leave existing values alone."""
+    target = tmp_path / "repair-dir"
+    target.mkdir()
+    task = client.post(
+        "/api/plugins/kanban/tasks",
+        json={"title": "dir", "workspace_kind": "dir", "workspace_path": str(target)},
+    ).json()["task"]
+
+    # Omitting workspace_path must not clear it.
+    response = client.patch(
+        f"/api/plugins/kanban/tasks/{task['id']}",
+        json={"workspace_kind": "dir"},
+    )
+    assert response.status_code == 200, response.text
+    updated = response.json()["task"]
+    assert updated["workspace_path"] == str(target)
+
+    # Omitting workspace_kind must not revert it to scratch.
+    response = client.patch(
+        f"/api/plugins/kanban/tasks/{task['id']}",
+        json={"workspace_path": str(target / "other")},
+    )
+    assert response.status_code == 200, response.text
+    updated = response.json()["task"]
+    assert updated["workspace_kind"] == "dir"
+    assert updated["workspace_path"] == str(target / "other")
+
+
 def test_patch_workspace_kind_and_path(client, tmp_path):
     target = tmp_path / "repair-dir"
     target.mkdir()

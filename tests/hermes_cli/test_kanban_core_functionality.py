@@ -2948,23 +2948,18 @@ def test_cli_show_clamps_negative_elapsed(kanban_home):
     assert "0s" in out_show or "0s" in out_runs
 
 
-def test_resolve_workspace_rejects_relative_dir_path(kanban_home):
-    """dir: workspace_path must be absolute. A relative path like
-    '../../../tmp/attacker' would be resolved against the dispatcher's
+def test_create_and_resolve_reject_relative_dir_path(kanban_home):
+    """dir: workspace_path must be absolute at creation time. A relative path
+    like '../../../tmp/attacker' would be resolved against the dispatcher's
     CWD — a confused-deputy escape vector."""
     conn = kb.connect()
     try:
-        tid = kb.create_task(
-            conn, title="path-trav", assignee="worker",
-            workspace_kind="dir",
-            workspace_path="../../../tmp/attacker",
-        )
-        task = kb.get_task(conn, tid)
-        # Storage is verbatim — that's fine.
-        assert task.workspace_path == "../../../tmp/attacker"
-        # But resolution must refuse.
-        with pytest.raises(ValueError, match=r"non-absolute"):
-            kb.resolve_workspace(task)
+        with pytest.raises(kb.WorkspaceUpdateError, match=r"absolute"):
+            kb.create_task(
+                conn, title="path-trav", assignee="worker",
+                workspace_kind="dir",
+                workspace_path="../../../tmp/attacker",
+            )
     finally:
         conn.close()
 
@@ -2987,17 +2982,16 @@ def test_resolve_workspace_accepts_absolute_dir_path(kanban_home, tmp_path):
         conn.close()
 
 
-def test_resolve_workspace_rejects_relative_worktree_path(kanban_home):
+def test_create_rejects_relative_worktree_path(kanban_home):
     """Worktree paths also must be absolute when explicitly set."""
     conn = kb.connect()
     try:
-        tid = kb.create_task(
-            conn, title="wt", assignee="worker",
-            workspace_kind="worktree",
-            workspace_path="../escape",
-        )
-        with pytest.raises(ValueError, match=r"non-absolute"):
-            kb.resolve_workspace(kb.get_task(conn, tid))
+        with pytest.raises(kb.WorkspaceUpdateError, match=r"absolute"):
+            kb.create_task(
+                conn, title="wt", assignee="worker",
+                workspace_kind="worktree",
+                workspace_path="../escape",
+            )
     finally:
         conn.close()
 

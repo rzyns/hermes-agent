@@ -84,6 +84,7 @@ import sqlite3
 import subprocess
 import sys
 import threading
+import typing
 import logging
 import time
 from contextvars import ContextVar, Token
@@ -714,19 +715,19 @@ def _normalize_workspace_update_inputs(
 ) -> tuple[object, object, object, bool]:
     """Prepare raw update inputs for :func:`_validate_workspace_fields`.
 
-    ``None`` in an input can mean either "field not sent" or "field sent as
-    JSON null", and this function tells them apart by using ``_UNSET`` for
-    the not-sent case.  It treats empty / whitespace strings as the explicit
-    null that their wire representation already implies.
+    ``None`` in an input means "field sent as JSON null / explicit clear",
+    and the internal ``_UNSET`` sentinel means "field not sent at all".
+    Empty / whitespace strings are normalized to ``None`` because their wire
+    representation is already indistinguishable from null.
 
     Returns ``(kind, path, branch, require_path)`` where ``require_path`` is
     True when the kind is being changed (the new combination must be valid on
     its own), and False when the kind stays the same (so an explicit null path
     can be validated as a clear attempt against the existing kind).
     """
-    kind_in = _UNSET if workspace_kind is None else workspace_kind
-    path_in = _UNSET if workspace_path is None else workspace_path
-    branch_in = _UNSET if branch_name is None else branch_name
+    kind_in = workspace_kind
+    path_in = workspace_path
+    branch_in = branch_name
 
     # An empty/whitespace-only string is not distinguishable from null on the
     # wire, so normalize it to a real None rather than treating it as a path.
@@ -740,7 +741,6 @@ def _normalize_workspace_update_inputs(
     # Determine whether the kind is actually changing.  When the caller did not
     # send a kind, we look at the existing row's kind; the path requirement is
     # then relaxed so an explicit null path can be validated as a clear.
-    effective_kind = old_kind if kind_in is _UNSET else kind_in
     require_path = bool(kind_in is not _UNSET and kind_in != old_kind)
     return kind_in, path_in, branch_in, require_path
 
@@ -4125,6 +4125,34 @@ def _canonical_assignee(assignee: Optional[str]) -> Optional[str]:
     return normalize_profile_name(assignee)
 
 
+def validate_workspace_for_mutation(
+    workspace_kind: object,
+    workspace_path: object,
+    branch_name: object,
+    *,
+    require_path: bool,
+    old_kind: str = "scratch",
+) -> tuple[object, object, object]:
+    """Single entry point for workspace validation used by creation and update.
+
+    Wraps :func:`_validate_workspace_fields` so every caller — ``create_task``
+    and ``update_task_workspace`` — shares the exact same normalization and
+    error classification.  Returns ``(kind, path, branch)`` where each element
+    is either a concrete normalized value or the internal ``_UNSET`` sentinel.
+
+    Parameters match the update path semantics: ``require_path`` is True when
+    a ``dir``/``worktree`` kind is being established and a path must be
+    present; old_kind is the existing kind for same-kind updates.
+    """
+    return _validate_workspace_fields(
+        workspace_kind,
+        workspace_path,
+        branch_name,
+        require_path=require_path,
+        old_kind=old_kind,
+    )
+
+
 def create_task(
     conn: sqlite3.Connection,
     *,
@@ -4213,10 +4241,33 @@ def create_task(
     # path for dir/worktree is allowed here if the caller did not provide one,
     # because board-level default_workdir or a linked project may supply it
     # below; we re-validate after that resolution.
-    _validate_workspace_fields(
-        workspace_kind, workspace_path, branch_name,
+    #
+    # At creation time, ``None`` for path/branch means "caller did not supply a
+    # value" (Python default), not JSON null, so we translate it to the internal
+    # _UNSET sentinel before the shared validator inspects it.
+    _wk, _wp, _wb = validate_workspace_for_mutation(
+        workspace_kind,
+        _UNSET if workspace_path is None else workspace_path,
+        _UNSET if branch_name is None else branch_name,
         require_path=workspace_path is not None,
+        old_kind=workspace_kind,
     )
+    workspace_kind = typing.cast(str, _wk)
+    workspace_path = typing.cast(Optional[str], _wp if _wp is not _UNSET else None)
+    branch_name = typing.cast(Optional[str], _wb if _wb is not _UNSET else None)
+
+    # After default inheritance and project resolution, dir/worktree kinds
+    # must have a non-empty absolute path when one was actually supplied or
+    # inherited.  If no path is available at all (no explicit path, no board
+    # default, no project repo), creation is still allowed; resolve_workspace
+    # will raise a clear runtime error about default_workdir rather than
+    # silently anchoring on the dispatcher's CWD.  This preserves the old
+    # no-default-workdir behavior while still sharing the validator for any
+    # concrete path that does exist.
+    if workspace_kind in {"dir", "worktree"} and workspace_path is not None:
+        validate_workspace_for_mutation(
+            workspace_kind, workspace_path, branch_name, require_path=True
+        )
 
     # Inherit the board's scoped project when the caller didn't name one, so a
     # project-scoped board anchors every new task to that project's repo
@@ -4392,6 +4443,7 @@ def create_task(
     # task would point cleanup at the user's source tree (#28818). The
     # containment guard in ``_cleanup_workspace`` is the safety rail, but
     # we also stop the bad state from being created in the first place.
+    board_default: Optional[str] = None
     if (
         workspace_path is None
         and project_repo is None
@@ -4403,11 +4455,24 @@ def create_task(
         if board_default:
             workspace_path = str(board_default)
 
-    # After default inheritance and project resolution, dir/worktree kinds
-    # must have a non-empty absolute path.  Use the shared validator for the
-    # final check so creation and update stay aligned.
-    if workspace_kind in {"dir", "worktree"}:
-        _validate_workspace_fields(
+    # After default inheritance and project resolution, dir kinds must have a
+    # non-empty absolute path.  worktree creation without a path is still
+    # allowed when no default/project is available; resolve_workspace fails
+    # loudly later so the error names the dispatcher CWD / default_workdir
+    # issue rather than a validation gap.  dir has no deferred resolution, so
+    # an unfulfilled dir path is rejected here with the same error the update
+    # path uses.
+    if workspace_kind == "dir":
+        if workspace_path is not None:
+            validate_workspace_for_mutation(
+                workspace_kind, workspace_path, branch_name, require_path=True
+            )
+        elif project_repo is None and not board_default:
+            raise WorkspaceUpdateError(
+                f"workspace_path is required for workspace_kind={workspace_kind!r}"
+            )
+    elif workspace_kind == "worktree" and workspace_path is not None:
+        validate_workspace_for_mutation(
             workspace_kind, workspace_path, branch_name, require_path=True
         )
 
@@ -9847,9 +9912,9 @@ def update_task_workspace(
     conn: sqlite3.Connection,
     task_id: str,
     *,
-    workspace_kind: Optional[str] = None,
-    workspace_path: Optional[str] = None,
-    branch_name: Optional[str] = None,
+    workspace_kind: object = _UNSET,
+    workspace_path: object = _UNSET,
+    branch_name: object = _UNSET,
 ) -> dict[str, Any]:
     """Update a task's workspace kind, path, and branch name.
 
@@ -9860,13 +9925,14 @@ def update_task_workspace(
       ``worktree`` and must be absolute.
     * ``branch_name`` is only permitted when ``workspace_kind`` is
       ``worktree``.
-    * Omitting a key leaves the existing value unchanged.  To clear
-      ``workspace_path`` or ``branch_name`` explicitly, pass an empty string
-      (``""``) which normalizes to ``None``.
-    * A normalized ``None`` for ``workspace_path`` clears it for ``scratch``
-      and is rejected for ``dir`` and ``worktree``.
-    * A normalized ``None`` for ``branch_name`` clears the branch when the
-      kind is ``worktree``.
+    * Omitting a key leaves the existing value unchanged.
+    * A key present with a non-null value validates and applies it.
+    * A key present as JSON ``null`` (or an empty/whitespace string) is an
+      explicit clear.  Clearing ``branch_name`` on a ``worktree`` is allowed;
+      clearing ``workspace_path`` is only allowed when the resulting kind is
+      ``scratch``.  Clearing ``workspace_kind`` itself is invalid.
+    * Validation is delegated to :func:`_validate_workspace_fields`, the same
+      validator used at task creation time.
 
     Guards:
 
@@ -9930,7 +9996,7 @@ def update_task_workspace(
             old_kind=old_kind,
         )
 
-        new_kind, new_path, new_branch = _validate_workspace_fields(
+        new_kind, new_path, new_branch = validate_workspace_for_mutation(
             incoming_kind,
             incoming_path,
             incoming_branch,
