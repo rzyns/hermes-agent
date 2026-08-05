@@ -67,10 +67,10 @@ def test_parse_branch_flag_rejects_empty_and_option_like():
     assert kc._parse_branch_flag(" wt/t6-wire ") == "wt/t6-wire"
     with pytest.raises(argparse.ArgumentTypeError):
         kc._parse_branch_flag("   ")
-    with pytest.raises(argparse.ArgumentTypeError):
-        kc._parse_branch_flag("-bad")
-    with pytest.raises(argparse.ArgumentTypeError):
-        kc._parse_branch_flag("bad branch")
+    # Internal whitespace / leading dash are now rejected by the shared
+    # kernel, not duplicated in the argparse type.
+    assert kc._parse_branch_flag("-bad") == "-bad"
+    assert kc._parse_branch_flag("bad branch") == "bad branch"
 
 
 def test_validate_create_workspace_routes_through_kernel():
@@ -84,6 +84,55 @@ def test_validate_create_workspace_routes_through_kernel():
         kc._validate_create_workspace("dir", "./relative", None)
     with pytest.raises(ValueError, match=r"branch_name is only valid for worktree"):
         kc._validate_create_workspace("dir", "/tmp/ws", "feature/x")
+
+
+def test_validate_create_workspace_deferred_worktree_path(kanban_home, tmp_path):
+    """CLI create-time validation must allow a missing worktree path so the
+    DB can derive it from a board default or project link."""
+    assert kc._validate_create_workspace(
+        "worktree", None, None, require_path_for=frozenset()
+    ) == ("worktree", None, None)
+
+
+def test_validate_create_workspace_deferred_dir_path(kanban_home, tmp_path):
+    """CLI create-time validation must allow a missing dir path so the DB can
+    inherit it from a board default_workdir."""
+    assert kc._validate_create_workspace(
+        "dir", None, None, require_path_for=frozenset()
+    ) == ("dir", None, None)
+
+
+def test_run_slash_create_worktree_no_path_with_board_default(kanban_home, tmp_path):
+    """``--workspace worktree`` with no path works when the board has a
+    default_workdir."""
+    import subprocess
+
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    subprocess.run(["git", "init", "-q", "-b", "main", str(repo)], check=True)
+    subprocess.run(["git", "-C", str(repo), "config", "user.email", "test@example.com"], check=True)
+    subprocess.run(["git", "-C", str(repo), "config", "user.name", "Test"], check=True)
+    (repo / "README.md").write_text("hello\n", encoding="utf-8")
+    subprocess.run(["git", "-C", str(repo), "add", "README.md"], check=True)
+    subprocess.run(["git", "-C", str(repo), "commit", "-m", "init"], check=True)
+    kb.create_board("wt-board", default_workdir=str(repo))
+    out = kc.run_slash(
+        "--board wt-board create 'ship worktree' --workspace worktree --branch wt/cli"
+    )
+    assert "Created" in out
+    import re
+
+    m = re.search(r"(t_[a-f0-9]+)", out)
+    assert m is not None
+    tid = m.group(1)
+    with kb.connect(board="wt-board") as conn:
+        task = kb.get_task(conn, tid)
+    assert task is not None
+    assert task.workspace_kind == "worktree"
+    assert task.workspace_path == str(repo)
+    ws = kb.resolve_workspace(task, board="wt-board")
+    assert ws == repo / ".worktrees" / tid
+    assert task.branch_name == "wt/cli"
 
 
 # ---------------------------------------------------------------------------

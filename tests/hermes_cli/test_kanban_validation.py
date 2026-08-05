@@ -130,8 +130,20 @@ class TestValidateWorkspaceSpec:
         with pytest.raises(ValueError, match=r"worktree.*requires.*workspace_path"):
             validate_workspace_spec("worktree", None)
 
+    def test_worktree_path_may_be_deferred(self):
+        spec = validate_workspace_spec(
+            "worktree", None, require_path_for=frozenset()
+        )
+        assert spec == WorkspaceSpec("worktree", None, None)
+
+    def test_dir_path_may_be_deferred(self):
+        spec = validate_workspace_spec(
+            "dir", None, require_path_for=frozenset()
+        )
+        assert spec == WorkspaceSpec("dir", None, None)
+
     def test_rejects_empty_path(self):
-        with pytest.raises(ValueError, match=r"non-empty workspace_path"):
+        with pytest.raises(ValueError, match=r"workspace_path must be non-empty"):
             validate_workspace_spec("dir", "  ")
 
     def test_rejects_relative_path(self):
@@ -155,6 +167,14 @@ class TestValidateWorkspaceSpec:
         spec = validate_workspace_spec("worktree", "/tmp/wt", "   ")
         assert spec.branch_name is None
 
+    def test_branch_internal_whitespace_rejected(self):
+        with pytest.raises(ValueError, match=r"branch has internal whitespace"):
+            validate_workspace_spec("worktree", "/tmp/wt", "bad branch")
+
+    def test_branch_leading_dash_rejected(self):
+        with pytest.raises(ValueError, match=r"branch_name must not start with"):
+            validate_workspace_spec("worktree", "/tmp/wt", "-bad")
+
     def test_kind_normalised_to_lowercase(self):
         spec = validate_workspace_spec("DIR", "/tmp/ws")
         assert spec.workspace_kind == "dir"
@@ -162,6 +182,18 @@ class TestValidateWorkspaceSpec:
     def test_undefined_path_treated_as_missing(self):
         with pytest.raises(ValueError, match=r"requires workspace_path"):
             validate_workspace_spec("dir", UNDEFINED)
+
+    def test_deferred_policy_undefined_worktree_path_allowed(self):
+        spec = validate_workspace_spec(
+            "worktree", UNDEFINED, require_path_for=frozenset()
+        )
+        assert spec == WorkspaceSpec("worktree", None, None)
+
+    def test_deferred_policy_undefined_dir_path_allowed(self):
+        spec = validate_workspace_spec(
+            "dir", UNDEFINED, require_path_for=frozenset()
+        )
+        assert spec == WorkspaceSpec("dir", None, None)
 
 
 class TestNormaliseBranchName:
@@ -211,17 +243,20 @@ def test_all_known_validation_sites_import_kernel():
     """Any module that validates workspace_kind/branch_name must import the kernel.
 
     This test scans the hermes_cli and plugins/kanban/dashboard trees for
-    string literals that are the old validation vocabulary.  If a future
-    change adds a second validation path that re-implements these checks, the
-    new file must either import from ``hermes_cli.kanban_validation`` or be
-    added to ``ALLOWED_EXCEPTIONS`` below with an explicit justification.
+    string literals that are validation vocabulary.  Presence alone is not
+    enough to convict a file: repair/mutation surfaces legitimately describe
+    the rules in docstrings or error messages.  A file that contains the
+    vocabulary is therefore allowed only if it also imports from or calls
+    ``hermes_cli.kanban_validation`` (i.e. it delegates), or it is listed in
+    ``ALLOWED_EXCEPTIONS`` below with an explicit justification.  This keeps
+    the consolidation tripwire from eroding every time a literal is reworded.
 
     The test does not prove correctness of the kernel itself; the unit tests
-    above do that.  It proves that there is only one validator in the
-    codebase, which is the property that keeps the three surfaces aligned.
+    above do that.  It proves that there is only one live validator in the
+    codebase, which is the property that keeps the three create surfaces
+    aligned.
     """
     import ast
-    import inspect
 
     repo = Path(__file__).resolve().parents[2]
     allowed_exceptions: set[str] = {
@@ -229,19 +264,47 @@ def test_all_known_validation_sites_import_kernel():
         str(Path("tests/hermes_cli/test_kanban_validation.py")),
         # The kernel itself defines the canonical messages; it is not a re-implementation.
         "hermes_cli/kanban_validation.py",
-        # hermes_cli/kanban_db.py is the canonical store: it defines the DB
-        # constants and calls validate_workspace_spec where appropriate.  Its
-        # own local checks for workspace_kind are expected to delegate to the
-        # kernel in follow-up work; until then, its literal set comparison is
-        # guarded by ``test_workspace_constants_match_kanban_db``.
+        # hermes_cli/kanban_db.py: the create path delegates correctly to the
+        # kernel at create_task (:4071-4076).  The remaining local
+        # workspace_kind checks are deferred mutation/repair surfaces:
+        #   * set_workspace() still performs a local kind check
+        #     (:10206-10233)
+        #   * resolve_workspace() / _resolve_worktree_workspace() retain
+        #     defensive dispatch-time guards for absolute paths and git anchors
+        # Those surfaces are intentionally out of scope for this card and belong
+        # to t_c6d77bec.  The literal set comparison is additionally guarded by
+        # ``test_workspace_constants_match_kanban_db``.
         "hermes_cli/kanban_db.py",
     }
 
+    # Vocabulary that indicates a file is talking about workspace/branch rules.
+    # Adding new literals here is fine; the predicate below also requires
+    # kernel delegation, so docstrings alone do not fail.
     marker_literals: frozenset[str] = frozenset({
+        "branch has internal whitespace",
         "branch_name is only valid",
-        "workspace_kind must be one of",
+        "branch_name must not start with",
         "workspace paths must be absolute",
+        "workspace_kind must be one of",
     })
+
+    def _imports_kernel(text: str) -> bool:
+        """Return True if the file imports from or calls the validation kernel."""
+        try:
+            tree = ast.parse(text)
+        except SyntaxError:
+            return False
+        for node in ast.walk(tree):
+            if isinstance(node, ast.ImportFrom):
+                if node.module == "hermes_cli.kanban_validation":
+                    return True
+            elif isinstance(node, ast.Call):
+                func = node.func
+                if isinstance(func, ast.Name) and func.id == "validate_workspace_spec":
+                    return True
+                if isinstance(func, ast.Attribute) and func.attr == "validate_workspace_spec":
+                    return True
+        return False
 
     offenders: list[str] = []
     roots = [repo / "hermes_cli", repo / "plugins" / "kanban" / "dashboard"]
@@ -252,11 +315,14 @@ def test_all_known_validation_sites_import_kernel():
                 continue
             text = path.read_text(encoding="utf-8")
             if any(marker in text for marker in marker_literals):
+                if _imports_kernel(text):
+                    continue
                 offenders.append(rel)
 
     assert not offenders, (
-        "Files that re-implement workspace/branch validation must import "
-        f"hermes_cli.kanban_validation or be added to allowed_exceptions: {offenders}"
+        "Files that contain workspace/branch validation vocabulary must "
+        "import/call hermes_cli.kanban_validation or be added to "
+        f"allowed_exceptions with a justification: {offenders}"
     )
 
 

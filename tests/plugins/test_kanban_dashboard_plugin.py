@@ -256,7 +256,6 @@ def test_create_task_branch_name_round_trips_on_worktree(client, tmp_path):
         json={
             "title": "worktree branch",
             "workspace_kind": "worktree",
-            "workspace_path": str(repo),
             "branch_name": "feature/wire",
         },
     )
@@ -264,6 +263,9 @@ def test_create_task_branch_name_round_trips_on_worktree(client, tmp_path):
     task = response.json()["task"]
     assert task["branch_name"] == "feature/wire"
     assert task["workspace_kind"] == "worktree"
+    # The stored path anchors on the board default_workdir; the DB derives it
+    # from the board default rather than requiring the client to supply one.
+    assert task["workspace_path"] == str(repo)
 
 
 def test_create_task_rejects_malformed_branch_name(client):

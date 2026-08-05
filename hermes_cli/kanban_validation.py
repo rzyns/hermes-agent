@@ -158,16 +158,22 @@ def validate_workspace_spec(
     Rules (chosen deliberately because the three legacy copies disagreed):
 
     1. ``workspace_kind`` must be one of ``scratch``, ``worktree``, ``dir``.
-    2. ``workspace_path`` is required for ``dir`` and ``worktree``.  A missing
-       path for those kinds is an error.  ``scratch`` always stores ``None``.
+    2. ``workspace_path`` is required for ``dir`` and ``worktree`` by default.
+       Callers that have a later bounded resolver (for example
+       ``kanban_db.create_task`` deriving ``<repo>/.worktrees/<task-id>`` from
+       a board ``default_workdir`` or project link) may pass
+       ``require_path_for=frozenset()`` to defer the path requirement.  A
+       supplied path is still validated (absolute, non-empty).  ``scratch``
+       normally stores ``None``; an explicit scratch path is validated as
+       absolute.
     3. Supplied paths must be absolute after ``~`` expansion.  Relative paths
        are rejected because they are ambiguous against the dispatcher's CWD
        and are a confused-deputy traversal risk.
     4. ``branch_name`` is permitted only when ``workspace_kind == "worktree"``.
-    5. Branch-name normalisation strips outer whitespace.  It cannot turn an
-       invalid name into an accepted one: empty-after-trim becomes ``None``,
-       and any internal whitespace or leading ``-`` remains present and must
-       be rejected by the caller's stricter checks if desired.
+    5. Branch-name normalisation strips outer whitespace.  A name that is
+       empty after trimming becomes ``None``.  Internal whitespace and a
+       leading ``-`` are rejected here so every surface shares the same
+       stricter branch syntax.
 
     Returns a :class:`WorkspaceSpec` with the normalised values.  The path is
     returned as the expanded string so CLI/REST callers and tests can compare
@@ -180,44 +186,63 @@ def validate_workspace_spec(
             f"got {workspace_kind!r}"
         )
 
+    normalised_path: Optional[str] = None
     if kind == "scratch":
-        if workspace_path is not None and str(workspace_path).strip():
-            # A scratch task with an explicit path is a legacy/degraded case:
-            # the DB accepts it, but resolve_workspace applies the same absolute
-            # guard as dir.  We do not reject it at validation time because some
-            # repair flows intentionally move a task to scratch while preserving
-            # a durable path reference.
-            pass
-        normalised_path: Optional[str] = None
-    else:
+        # Scratch normally stores no path (the dispatcher creates and cleans a
+        # per-board managed directory).  A supplied path is a legacy/degraded
+        # case that the DB still accepts; if given, it must be absolute so
+        # resolve_workspace can apply the same guard as dir.
+        if workspace_path is not None and not isinstance(workspace_path, Undefined):
+            if str(workspace_path).strip():
+                normalised_path = _validate_absolute_path(workspace_path)
+    elif kind == "dir":
         if workspace_path is None or isinstance(workspace_path, Undefined):
-            raise ValueError(f"workspace_kind={kind!r} requires workspace_path")
-        normalised_path = str(workspace_path).strip()
-        if not normalised_path:
-            raise ValueError(f"workspace_kind={kind!r} requires a non-empty workspace_path")
-        expanded = Path(normalised_path).expanduser()
-        if not expanded.is_absolute():
-            raise ValueError(
-                f"workspace_path {workspace_path!r} must be absolute "
-                f"(relative paths are ambiguous against the dispatcher's CWD)"
-            )
-        normalised_path = str(expanded)
+            if "dir" in require_path_for:
+                raise ValueError(f"workspace_kind={kind!r} requires workspace_path")
+            normalised_path = None
+        else:
+            normalised_path = _validate_absolute_path(workspace_path)
+    elif kind == "worktree":
+        if workspace_path is None or isinstance(workspace_path, Undefined):
+            if "worktree" in require_path_for:
+                raise ValueError(f"workspace_kind={kind!r} requires workspace_path")
+            normalised_path = None
+        else:
+            normalised_path = _validate_absolute_path(workspace_path)
+    else:  # pragma: no cover - guarded above
+        raise ValueError(
+            f"workspace_kind must be one of {sorted(VALID_WORKSPACE_KINDS)}, "
+            f"got {workspace_kind!r}"
+        )
 
     normalised_branch = _normalise_branch_name(branch_name)
-    if normalised_branch is not None and kind != "worktree":
-        raise ValueError("branch_name is only valid for worktree workspaces")
-
-    # Validate that the requested kind actually requires a path when the
-    # caller expects it (default: dir + worktree).  This is a no-op with the
-    # defaults but lets tests override the policy if needed.
-    if kind in require_path_for and (normalised_path is None or not normalised_path.strip()):
-        raise ValueError(f"workspace_kind={kind!r} requires workspace_path")
+    if normalised_branch is not None:
+        if kind != "worktree":
+            raise ValueError("branch_name is only valid for worktree workspaces")
+        if normalised_branch.startswith("-"):
+            raise ValueError("branch_name must not start with '-'")
+        if any(ch.isspace() for ch in normalised_branch):
+            raise ValueError("branch has internal whitespace")
 
     return WorkspaceSpec(
         workspace_kind=kind,  # type: ignore[arg-type]
         workspace_path=normalised_path,
         branch_name=normalised_branch,
     )
+
+
+def _validate_absolute_path(value: Any) -> str:
+    """Return ``value`` expanded and absolute, or raise a descriptive ValueError."""
+    normalised = str(value).strip()
+    if not normalised:
+        raise ValueError("workspace_path must be non-empty")
+    expanded = Path(normalised).expanduser()
+    if not expanded.is_absolute():
+        raise ValueError(
+            f"workspace_path {value!r} must be absolute "
+            f"(relative paths are ambiguous against the dispatcher's CWD)"
+        )
+    return str(expanded)
 
 
 # ---------------------------------------------------------------------------

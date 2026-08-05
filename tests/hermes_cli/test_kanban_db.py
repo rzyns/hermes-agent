@@ -21,6 +21,7 @@ import pytest
 import hermes_state
 from hermes_cli import kanban_db as kb
 from hermes_cli import kanban_dependencies as _kbd
+from hermes_cli import projects_db as _pdb
 
 
 
@@ -3621,6 +3622,42 @@ def test_worktree_no_path_anchors_on_board_default_workdir(kanban_home, tmp_path
     assert ws == expected
     assert ws.exists()
     assert ws != repo  # not the shared default verbatim
+
+
+def test_worktree_no_path_project_linked_anchors_on_project_repo(kanban_home, tmp_path):
+    """A project-linked worktree created with no explicit path derives its
+    anchor from the project's primary repo, producing a deterministic
+    ``<repo>/.worktrees/<id>`` path and a ``<project-slug>/<id>`` branch."""
+    repo = tmp_path / "repo"
+    _init_git_repo(repo)
+    kb.create_board("project-board")
+    with _pdb.connect() as pconn:
+        pid = _pdb.create_project(
+            pconn,
+            name="Hermes",
+            slug="hermes",
+            primary_path=str(repo),
+            board_slug="project-board",
+        )
+    kb.write_board_metadata("project-board", project_id=pid)
+
+    with kb.connect(board="project-board") as conn:
+        t = kb.create_task(
+            conn,
+            title="ship",
+            workspace_kind="worktree",
+            board="project-board",
+        )
+        task = kb.get_task(conn, t)
+        assert task is not None
+        assert task.project_id == pid
+        assert task.workspace_path == str(repo / ".worktrees" / t)
+        assert task.branch_name is not None
+        assert task.branch_name.startswith("hermes/")
+        ws = kb.resolve_workspace(task, board="project-board")
+
+    assert ws == repo / ".worktrees" / t
+    assert ws.exists()
 
 
 def test_worktree_no_path_no_board_default_raises(kanban_home, tmp_path, monkeypatch):

@@ -782,23 +782,31 @@ class CreateTaskBody(StrictPayloadBase):
 
     @model_validator(mode="after")
     def _workspace_branch(self) -> "CreateTaskBody":
-        """Route workspace/branch rules through the shared kernel."""
-        # We validate here (rather than in the endpoint) so FastAPI can report
-        # the error as a structured 422 naming the offending field.  The kernel
-        # raises plain ValueError for legacy callers; convert them to the typed
-        # PayloadValidationError so the REST surface names the key.
+        """Route workspace/branch rules through the shared kernel.
+
+        The kernel validates kind/path coupling and branch syntax.  We validate
+        here (rather than in the endpoint) so FastAPI can report the error as a
+        structured 422 naming the offending field.  The kernel raises plain
+        ValueError for legacy callers; convert them to the typed
+        PayloadValidationError so the REST surface names the key.
+
+        For task creation, a worktree path may be omitted because
+        ``kanban_db.create_task`` derives it from a board ``default_workdir``
+        or project link; ``dir`` still requires an explicit absolute path.
+        """
         try:
             validate_workspace_spec(
                 self.workspace_kind,
                 self.workspace_path,
                 self.branch_name,
+                require_path_for=frozenset(),
             )
         except ValueError as exc:
             key = "workspace_kind"
             msg = str(exc)
             if "workspace_path" in msg:
                 key = "workspace_path"
-            elif "branch_name" in msg:
+            elif "branch_name" in msg or "branch " in msg:
                 key = "branch_name"
             raise PayloadValidationError(msg, key=key) from exc
         return self
@@ -806,22 +814,18 @@ class CreateTaskBody(StrictPayloadBase):
     @field_validator("branch_name")
     @classmethod
     def _branch_name_not_empty(cls, v: Optional[str]) -> Optional[str]:
-        """Preserve the REST-specific malformed-name 422 messages.
+        """Preserve the REST-specific empty-branch 422 message.
 
-        The shared kernel only trims outer whitespace; it intentionally does
-        not turn an invalid name into a valid one.  For REST, we want a
-        structured 422 with the field named when the caller sends an empty or
-        whitespace-only branch, a leading dash, or internal whitespace.
+        The shared kernel normalises outer whitespace and maps an empty or
+        whitespace-only branch to ``None``.  For REST, we want a structured 422
+        with the field named when the caller sends an empty/whitespace branch.
+        Internal whitespace and leading dashes are rejected by the kernel.
         """
         if v is None:
             return None
         s = str(v).strip()
         if not s:
             raise ValueError("branch_name must not be empty")
-        if s.startswith("-"):
-            raise ValueError("branch_name must not start with '-'")
-        if any(ch.isspace() for ch in s):
-            raise ValueError("branch has internal whitespace")
         return s
 
 
