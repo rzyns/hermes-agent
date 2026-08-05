@@ -59,7 +59,7 @@ def _fmt_task_line(t: kb.Task) -> str:
     return f"{icon} {t.id}  {t.status:8s}  {assignee:20s}{tenant}  {t.title}"
 
 
-def _task_to_dict(t: kb.Task) -> dict[str, Any]:
+def _task_to_dict(t: kb.Task, failure_limit: Optional[int] = None) -> dict[str, Any]:
     return {
         "id": t.id,
         "title": t.title,
@@ -84,6 +84,7 @@ def _task_to_dict(t: kb.Task) -> dict[str, Any]:
         "session_id": t.session_id,
         "workflow_template_id": t.workflow_template_id,
         "current_step_key": t.current_step_key,
+        "budget_ladder": kb._budget_ladder_projection(t, failure_limit=failure_limit),
     }
 
 
@@ -407,13 +408,15 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
                                "rarely finishes.")
     p_create.add_argument("--goal-max-turns", type=int, default=None,
                           metavar="N", dest="goal_max_turns",
-                          help="Turn budget for --goal workers (default 20). "
-                               "Ignored without --goal.")
+                          help="Judge/goal-loop turn budget for --goal workers "
+                               "(default 20). Part of the four-layer budget "
+                               "ladder; ignored without --goal.")
     p_create.add_argument("--worker-max-turns", type=int, default=None,
                           metavar="N", dest="worker_max_turns",
                           help="Per-conversation API/tool iteration budget for "
-                               "the worker (minimum 1). Independent of "
-                               "--goal-max-turns; omit to use profile/config.")
+                               "the worker (minimum 1). Part of the four-layer "
+                               "budget ladder; independent of --goal-max-turns. "
+                               "Omit to use the assignee profile's agent.max_turns.")
     p_create.add_argument("--initial-status",
                           choices=sorted(kb.VALID_INITIAL_STATUSES),
                           default="running",
@@ -2044,9 +2047,18 @@ def _cmd_show(args: argparse.Namespace) -> int:
         # looking like a no-op when the worker actually did real work.
         latest_summary = kb.latest_summary(conn, args.task_id)
 
+    # Resolve dispatcher retry limit once for both JSON and plain paths.
+    try:
+        from hermes_cli.config import load_config
+        cfg = load_config()
+        cfg_limit = (cfg.get("kanban", {}) or {}).get("failure_limit")
+        cfg_limit = int(cfg_limit) if cfg_limit is not None else None
+    except Exception:
+        cfg_limit = None
+
     if getattr(args, "json", False):
         payload = {
-            "task": _task_to_dict(task),
+            "task": _task_to_dict(task, failure_limit=cfg_limit),
             "latest_summary": latest_summary,
             "parents": parents,
             "children": children,
@@ -2097,23 +2109,26 @@ def _cmd_show(args: argparse.Namespace) -> int:
     if task.model_override:
         _prov = f" (provider: {task.provider_override})" if task.provider_override else ""
         print(f"  model:     {task.model_override}{_prov}")
-    # Effective retry threshold. Show the per-task override if set,
-    # otherwise the dispatcher's resolved value from config (or the
-    # default if config doesn't set it either). Helps operators see
-    # why a task auto-blocked earlier/later than they expected.
-    if task.max_retries is not None:
-        print(f"  max-retries: {task.max_retries} (task)")
+    # Effective retry threshold. Resolve the same single source of truth
+    # the circuit breaker uses: task.max_retries > kanban.failure_limit >
+    # DEFAULT_FAILURE_LIMIT. Helps operators see why a task auto-blocked
+    # earlier/later than they expected, and avoids conflating retries with
+    # conversation/goal budgets.
+    retry = kb.resolve_task_retry_budget(task, failure_limit=cfg_limit)
+    print(f"  max-retries: {retry['limit']} ({retry['source']})")
+
+    # Conversation / goal budgets — shown separately so operators do not
+    # confuse retries (outer breaker) with the worker's per-turn API/tool
+    # loop or the judge/goal loop.
+    ladder = kb._budget_ladder_projection(task, failure_limit=cfg_limit)
+    if ladder["worker_max_turns"]["limit"] is not None:
+        print(f"  worker-max-turns: {ladder['worker_max_turns']['limit']} (task)")
     else:
-        try:
-            from hermes_cli.config import load_config
-            cfg = load_config()
-            cfg_val = (cfg.get("kanban", {}) or {}).get("failure_limit")
-        except Exception:
-            cfg_val = None
-        if cfg_val is not None and int(cfg_val) != kb.DEFAULT_FAILURE_LIMIT:
-            print(f"  max-retries: {int(cfg_val)} (config kanban.failure_limit)")
-        else:
-            print(f"  max-retries: {kb.DEFAULT_FAILURE_LIMIT} (default)")
+        print("  worker-max-turns: profile agent.max_turns at dispatch")
+    if ladder["goal_max_turns"]["enabled"]:
+        print(f"  goal-max-turns: {ladder['goal_max_turns']['limit']} ({ladder['goal_max_turns']['source']})")
+    else:
+        print("  goal-max-turns: n/a (goal loop disabled)")
     print(f"  created:   {_fmt_ts(task.created_at)} by {task.created_by or '-'}")
 
     # Diagnostics section — surface active distress signals at the top

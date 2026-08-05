@@ -4381,6 +4381,25 @@ def create_task(
                         "provider_override": provider_override,
                     },
                 )
+                # Informational budget-ladder projection. Emitted whenever the
+                # task carries an override that affects one of the four layers,
+                # so operators can see the effective limits from the event log
+                # without relying on the CLI config resolving them correctly.
+                if (
+                    max_retries is not None
+                    or worker_max_turns is not None
+                    or goal_max_turns is not None
+                    or goal_mode
+                ):
+                    _append_event(
+                        conn,
+                        task_id,
+                        "budget_ladder",
+                        _budget_ladder_projection(
+                            get_task(conn, task_id),
+                            failure_limit=None,
+                        ),
+                    )
                 if initial_status == "blocked":
                     # Initial blocked is an explicit operator gate. Record the
                     # same durable marker used by worker/operator blocks so
@@ -11732,6 +11751,104 @@ def detect_crashed_workers(
     # failure and are NOT crashes, so they stay out of the ``crashed`` return.
     detect_crashed_workers._last_rate_limited = rate_limited  # type: ignore[attr-defined]
     return crashed
+
+
+def resolve_task_retry_budget(
+    task: "Task",
+    *,
+    failure_limit: Optional[int] = None,
+) -> dict[str, Any]:
+    """Resolve the effective retry-breaker budget for a task and its source.
+
+    This is a **display/projection helper**: it computes the same
+    precedence the circuit breaker uses in ``_record_task_failure`` so
+    that CLI, dashboard, and emitted events can show operators what limit
+    will actually be enforced.
+
+    Resolution order (single source of truth, matching ``_record_task_failure``):
+
+      1. per-task ``task.max_retries`` (set via ``--max-retries`` on create)
+      2. caller-supplied ``failure_limit`` (the dispatcher passes the
+         ``kanban.failure_limit`` config value)
+      3. ``DEFAULT_FAILURE_LIMIT``
+
+    ``failure_limit`` may be ``None`` when the caller cannot supply the
+    dispatcher config (e.g. a dashboard read). In that case the source
+    falls back to ``default``.
+
+    Returns a dict::
+
+        {
+            "limit": <int>,
+            "source": "task" | "dispatcher" | "default",
+        }
+    """
+    if task.max_retries is not None:
+        return {"limit": int(task.max_retries), "source": "task"}
+    if failure_limit is not None:
+        return {"limit": int(failure_limit), "source": "dispatcher"}
+    return {"limit": int(DEFAULT_FAILURE_LIMIT), "source": "default"}
+
+
+def _budget_ladder_projection(
+    task: "Task",
+    *,
+    failure_limit: Optional[int] = None,
+) -> dict[str, Any]:
+    """Return a stable, serializable projection of the four-layer budget ladder.
+
+    This is the **single source of truth** for how the CLI, dashboard,
+    and events describe the limits that govern a kanban task. It is
+    informational only — enforcement happens in the dispatcher and the
+    worker, not here.
+
+    Four independent authority layers cap different things:
+
+    1. Retry breaker — ``task.max_retries`` / ``kanban.failure_limit`` /
+       ``DEFAULT_FAILURE_LIMIT``. Trips on consecutive non-success runs
+       (spawn_failed / timed_out / crashed). Single source of truth for
+       retries.
+    2. ``worker_max_turns`` — per-conversation API/tool iteration budget
+       for the worker CLI. Passed as ``--max-turns`` when set on the task;
+       otherwise the assignee profile's ``agent.max_turns`` applies.
+    3. ``goal_max_turns`` — judge/goal loop budget for ``goal_mode`` cards.
+       ``None`` falls through to ``goals.DEFAULT_MAX_TURNS`` (currently 20).
+    4. Profile ``agent.max_turns`` — hard ceiling on the active chat
+       session across CLI/TUI/messaging. Default 500; setup recommends 90
+       and some users lower it further.
+    """
+    retry = resolve_task_retry_budget(task, failure_limit=failure_limit)
+    worker = {"limit": task.worker_max_turns, "source": None}
+    if task.worker_max_turns is not None:
+        worker["source"] = "task"
+    else:
+        worker["source"] = "profile"
+        worker["note"] = "assignee profile's agent.max_turns at dispatch time"
+
+    goal = {"enabled": bool(task.goal_mode), "limit": task.goal_max_turns}
+    if task.goal_mode:
+        if task.goal_max_turns is not None:
+            goal["source"] = "task"
+        else:
+            from hermes_cli.goals import DEFAULT_MAX_TURNS as _DEFAULT_GOAL_TURNS
+            goal["limit"] = _DEFAULT_GOAL_TURNS
+            goal["source"] = "default"
+            goal["note"] = "goals.DEFAULT_MAX_TURNS"
+    else:
+        goal["source"] = "n/a"
+        goal["note"] = "goal loop disabled"
+
+    return {
+        "retry_breaker": retry,
+        "worker_max_turns": worker,
+        "goal_max_turns": goal,
+        "authority_order": [
+            "retry_breaker (task.max_retries > kanban.failure_limit > DEFAULT_FAILURE_LIMIT)",
+            "worker_max_turns (task override > profile agent.max_turns)",
+            "goal_max_turns (task override > goals.DEFAULT_MAX_TURNS, only when goal_mode)",
+            "agent.max_turns (profile/session hard ceiling)",
+        ],
+    }
 
 
 def _record_task_failure(
