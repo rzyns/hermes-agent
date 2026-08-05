@@ -46,7 +46,7 @@ from typing import Any, Optional
 
 from fastapi import APIRouter, File, Form, HTTPException, Query, UploadFile, WebSocket, WebSocketDisconnect, status as http_status
 from fastapi.responses import FileResponse
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from hermes_cli import kanban_db
 from hermes_cli import kanban_diagnostics as kd
@@ -758,6 +758,7 @@ class CreateTaskBody(BaseModel):
     priority: int = 0
     workspace_kind: str = "scratch"
     workspace_path: Optional[str] = None
+    branch_name: Optional[str] = None
     parents: list[str] = Field(default_factory=list)
     triage: bool = False
     idempotency_key: Optional[str] = None
@@ -774,6 +775,31 @@ class CreateTaskBody(BaseModel):
     # Explicit project link; when omitted, create_task inherits the board's
     # scoped project (if any) so a project-scoped board anchors every task.
     project_id: Optional[str] = None
+    # Initial card status. Only ``running`` (default) and ``blocked`` are
+    # accepted; ``blocked`` parks the card immediately for human ops review.
+    initial_status: str = "running"
+
+    @field_validator("branch_name")
+    @classmethod
+    def _branch_name_not_empty(cls, v: Optional[str]) -> Optional[str]:
+        if v is None:
+            return None
+        s = str(v).strip()
+        if not s:
+            raise ValueError("branch_name must not be empty")
+        if s.startswith("-"):
+            raise ValueError("branch_name must not start with '-'")
+        if any(ch.isspace() for ch in s):
+            raise ValueError("branch_name must not contain whitespace")
+        return s
+
+    @model_validator(mode="after")
+    def _branch_name_requires_worktree(self) -> "CreateTaskBody":
+        if self.branch_name is not None and self.workspace_kind != "worktree":
+            raise ValueError(
+                "branch_name is only valid when workspace_kind is 'worktree'"
+            )
+        return self
 
 
 @router.post("/tasks")
@@ -789,6 +815,7 @@ def create_task(payload: CreateTaskBody, board: Optional[str] = Query(None)):
             created_by="dashboard",
             workspace_kind=payload.workspace_kind,
             workspace_path=payload.workspace_path,
+            branch_name=payload.branch_name,
             tenant=payload.tenant,
             priority=payload.priority,
             parents=payload.parents,
@@ -803,6 +830,7 @@ def create_task(payload: CreateTaskBody, board: Optional[str] = Query(None)):
             provider_override=payload.provider_override,
             reasoning_effort=payload.reasoning_effort,
             project_id=payload.project_id,
+            initial_status=payload.initial_status,
             board=board,
         )
         task = kanban_db.get_task(conn, task_id)

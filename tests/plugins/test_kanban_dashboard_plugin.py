@@ -140,6 +140,79 @@ def test_create_task_rejects_non_positive_worker_max_turns(client):
     assert response.status_code == 422
 
 
+def test_create_task_initial_status_blocked_parks_card(client):
+    response = client.post(
+        "/api/plugins/kanban/tasks",
+        json={"title": "needs human review", "assignee": "reviewer", "initial_status": "blocked"},
+    )
+    assert response.status_code == 200, response.text
+    task = response.json()["task"]
+    assert task["status"] == "blocked"
+
+    # A blocked task must not be offered to the dispatcher as "ready".
+    board = client.get("/api/plugins/kanban/board").json()
+    ready = next(c for c in board["columns"] if c["name"] == "ready")
+    assert not any(t["id"] == task["id"] for t in ready["tasks"])
+    blocked = next(c for c in board["columns"] if c["name"] == "blocked")
+    assert any(t["id"] == task["id"] for t in blocked["tasks"])
+
+
+def test_create_task_rejects_invalid_initial_status(client):
+    response = client.post(
+        "/api/plugins/kanban/tasks",
+        json={"title": "bad status", "initial_status": "done"},
+    )
+    assert response.status_code == 400
+    detail = response.json()["detail"]
+    assert "initial_status" in detail
+
+
+def test_create_task_branch_name_requires_worktree(client):
+    response = client.post(
+        "/api/plugins/kanban/tasks",
+        json={"title": "bad branch", "workspace_kind": "scratch", "branch_name": "feature/foo"},
+    )
+    assert response.status_code == 422
+    errors = response.json()["detail"]
+    messages = " ".join(e.get("msg", "") for e in errors)
+    assert "branch_name" in messages.lower() and "worktree" in messages.lower()
+
+
+def test_create_task_branch_name_round_trips_on_worktree(client, tmp_path):
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    subprocess.run(["git", "init", "-q", str(repo)], check=True)
+    kb.write_board_metadata("default", default_workdir=str(repo))
+
+    response = client.post(
+        "/api/plugins/kanban/tasks",
+        json={
+            "title": "worktree branch",
+            "workspace_kind": "worktree",
+            "branch_name": "feature/wire",
+        },
+    )
+    assert response.status_code == 200, response.text
+    task = response.json()["task"]
+    assert task["branch_name"] == "feature/wire"
+    assert task["workspace_kind"] == "worktree"
+
+
+def test_create_task_rejects_malformed_branch_name(client):
+    response = client.post(
+        "/api/plugins/kanban/tasks",
+        json={
+            "title": "bad branch name",
+            "workspace_kind": "worktree",
+            "branch_name": "feature bad",
+        },
+    )
+    assert response.status_code == 422
+    errors = response.json()["detail"]
+    messages = " ".join(e.get("msg", "") for e in errors)
+    assert "branch_name" in messages.lower()
+
+
 def test_dashboard_create_and_details_surface_worker_max_turns():
     """The committed dashboard bundle must expose the backend budget knob."""
     bundle = (
