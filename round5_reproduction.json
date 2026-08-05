@@ -1,0 +1,26 @@
+{
+  "round5_reproduction_output": {
+    "same_size_restored_mtime_win32": {
+      "accepted": false,
+      "canonical_exists": false,
+      "canonical_matches_opened_stream": false,
+      "error": "ArtifactPreservationError: source artifact /tmp/hyg2-r4-win32-same-size-0d0w6tvg/source.bin changed during copy (content continuity check failed)",
+      "source_now_differs": true
+    },
+    "block_metadata": {
+      "persisted_keys": ["artifacts", "public"],
+      "private_staged_artifacts_leaked": false,
+      "private_value": null
+    },
+    "complete_metadata": {
+      "persisted_keys": ["artifacts", "public"],
+      "private_staged_artifacts_leaked": false,
+      "private_value": null
+    }
+  },
+  "verdict": "Both round-4 defects closed: Win32 same-size mutation now rejected via handle-bound content continuity (accepted=false, canonical_exists=false, zero residue); private _staged_artifacts key absent from both block and completion run metadata.",
+  "commit": "24359d461c",
+  "branch": "hyg-2/t_c84b38ee",
+  "main_verified": "54faaba33d",
+  "tests": "479 passed, 1 xfailed, 0 failed across 4 focused files"
+}

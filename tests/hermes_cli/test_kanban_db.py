@@ -4366,14 +4366,15 @@ def test_copy_file_with_hash_verification_rejects_source_mutation_mid_copy(
     original_sha256_file = kb._sha256_file
 
     def _mutating_sha256_file(path):
-        # Mutate the source on disk between the size check and the post-stream
-        # handle stat, so the second fstat detects a size/mtime change.
+        # Mutate the source on disk between the stream and the post-stream
+        # continuity check, so the handle-bound re-read detects different
+        # bytes than were streamed.
         with open(str(src), "wb") as mutation_handle:
             mutation_handle.write(b"mutated content is longer")
         return original_sha256_file(path)
 
     with unittest.mock.patch.object(kb, "_sha256_file", _mutating_sha256_file):
-        with pytest.raises(kb.ArtifactPreservationError, match="changed during copy"):
+        with pytest.raises(kb.ArtifactPreservationError, match="content continuity"):
             kb._copy_file_with_hash_verification(src, dest)
 
     assert not dest.exists()
@@ -4409,7 +4410,7 @@ def test_copy_file_rejects_source_replacement_after_open(kanban_home):
 
 
 def test_copy_file_rejects_same_size_mutation_with_restored_mtime(kanban_home):
-    """A same-size overwrite with restored mtime is still detected via ctime."""
+    """A same-size overwrite with restored mtime is detected by content continuity."""
     with kb.connect() as conn:
         t = kb.create_task(conn, title="same-size mutation target")
     src_dir = kanban_home / "srcs"
@@ -4428,11 +4429,94 @@ def test_copy_file_rejects_same_size_mutation_with_restored_mtime(kanban_home):
         return real_sha256_file(path)
 
     with unittest.mock.patch.object(kb, "_sha256_file", _mutate_then_hash):
-        with pytest.raises(kb.ArtifactPreservationError, match="mutated during copy"):
+        with pytest.raises(kb.ArtifactPreservationError, match="content continuity"):
             kb._copy_file_with_hash_verification(src, dest)
 
     assert not dest.exists()
     assert not list(kb.task_attachments_dir(t).glob("*.stage"))
+
+
+def test_copy_file_rejects_same_size_mutation_win32_branch(kanban_home):
+    """The Win32 platform branch (no ctime witness) still rejects same-size
+    overwrite with restored mtime via the handle-bound content-continuity
+    check. Closes the round-4 class defect: identity must not be established
+    against mutable path metadata alone on any platform."""
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="win32 same-size mutation target")
+    src_dir = kanban_home / "srcs"
+    src_dir.mkdir(parents=True, exist_ok=True)
+    src = src_dir / "source.bin"
+    original = b"A" * 4096
+    src.write_bytes(original)
+    dest = kb.task_attachments_dir(t) / "source.bin"
+
+    real_sha256_file = kb._sha256_file
+
+    def _mutate_then_hash(path):
+        before = src.stat()
+        src.write_bytes(b"B" * before.st_size)
+        os.utime(src, ns=(before.st_atime_ns, before.st_mtime_ns))
+        return real_sha256_file(path)
+
+    with unittest.mock.patch.object(kb.sys, "platform", "win32"), \
+         unittest.mock.patch.object(kb, "_sha256_file", _mutate_then_hash):
+        with pytest.raises(kb.ArtifactPreservationError, match="content continuity"):
+            kb._copy_file_with_hash_verification(src, dest)
+
+    assert not dest.exists()
+    assert not list(kb.task_attachments_dir(t).glob("*.stage"))
+
+
+def test_block_and_complete_do_not_leak_private_staged_key(kanban_home):
+    """The private _staged_artifacts transport key must not appear in durable
+    run metadata on either block or completion paths. Closes the round-4
+    regression introduced when explicit staged_paths bypassed the pop."""
+    import json
+
+    # --- Block path ---
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="metadata leak probe (block)")
+        task = kb.get_task(conn, t)
+        ws = kb.resolve_workspace(task)
+        kb.set_workspace_path(conn, t, ws)
+        report = ws / "report.md"
+        report.write_text("report", encoding="utf-8")
+        kb.claim_task(conn, t)
+        run_id = kb.get_task(conn, t).current_run_id
+        kb.block_task(
+            conn, t, reason="review",
+            metadata={"artifacts": [str(report)], "public": "ok"},
+            expected_run_id=run_id,
+        )
+        block_run = kb.latest_run(conn, t)
+        block_row = conn.execute(
+            "SELECT metadata FROM task_runs WHERE id = ?", (block_run.id,)
+        ).fetchone()
+        block_md = json.loads(block_row["metadata"]) if block_row and block_row["metadata"] else {}
+
+    # --- Completion path ---
+    with kb.connect() as conn:
+        t2 = kb.create_task(conn, title="metadata leak probe (complete)")
+        task2 = kb.get_task(conn, t2)
+        ws2 = kb.resolve_workspace(task2)
+        kb.set_workspace_path(conn, t2, ws2)
+        report2 = ws2 / "report.md"
+        report2.write_text("report", encoding="utf-8")
+        kb.claim_task(conn, t2)
+        run_id2 = kb.get_task(conn, t2).current_run_id
+        kb.complete_task(
+            conn, t2, summary="done",
+            metadata={"artifacts": [str(report2)], "public": "ok"},
+            expected_run_id=run_id2,
+        )
+        complete_run = kb.latest_run(conn, t2)
+        complete_row = conn.execute(
+            "SELECT metadata FROM task_runs WHERE id = ?", (complete_run.id,)
+        ).fetchone()
+        complete_md = json.loads(complete_row["metadata"]) if complete_row and complete_row["metadata"] else {}
+
+    assert "_staged_artifacts" not in block_md, f"block leaked: {sorted(block_md)}"
+    assert "_staged_artifacts" not in complete_md, f"complete leaked: {sorted(complete_md)}"
 
 
 def test_copy_file_rejects_unlink_after_open(kanban_home):

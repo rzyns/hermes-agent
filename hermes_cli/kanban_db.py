@@ -4774,10 +4774,15 @@ def _copy_file_with_hash_verification(
 
     The source is opened **once**; its digest is computed from the bytes
     actually streamed to the destination, eliminating the TOCTOU window
-    between a pre-copy hash and the real copy. A stable snapshot of the
-    source's identity (device, inode, size, mtime, and ctime on Unix) is
-    recorded before and after the stream; any change raises
-    :class:`ArtifactPreservationError`.
+    between a pre-copy hash and the real copy. After the stream the source
+    is re-read from the same opened handle and re-hashed; if the digest
+    differs, the bytes changed during the protected window and the copy is
+    rejected. This content-continuity witness is authoritative and
+    cross-platform — it catches a same-size overwrite with restored mtime
+    that no mutable stat field can detect on Windows. Metadata checks
+    (size, mtime, inode, ctime on Unix) remain as cheap fast paths for
+    replacement/unlink detection but are never the sole witness on any
+    platform. Any change raises :class:`ArtifactPreservationError`.
 
     The destination is written to a hidden same-directory staging file,
     verified, then published with a no-clobber hard link so a partial or
@@ -4853,7 +4858,35 @@ def _copy_file_with_hash_verification(
                     f"!= staging {staging_hash}"
                 )
 
-            # Detect source mutation that happened while the handle was open.
+            # Authoritative content-continuity witness, bound to the opened
+            # handle. Re-read the source from the same descriptor and re-hash
+            # it; if the digest differs from the one computed during the
+            # stream, the source bytes changed during the protected window.
+            # This is cross-platform and catches the sharp case a mutable
+            # stat field cannot: a same-size overwrite with restored mtime.
+            # Metadata checks below remain as cheap fast paths for
+            # replacement/unlink detection, but this is the witness that
+            # must pass on every platform.
+            try:
+                source_file.seek(0)
+            except OSError as exc:
+                raise ArtifactPreservationError(
+                    f"cannot re-seek opened source artifact {src} for continuity check: {exc}"
+                ) from exc
+            reread_hash = hashlib.sha256()
+            while chunk := source_file.read(1024 * 1024):
+                reread_hash.update(chunk)
+            if reread_hash.hexdigest() != stream_hash.hexdigest():
+                raise ArtifactPreservationError(
+                    f"source artifact {src} changed during copy "
+                    f"(content continuity check failed)"
+                )
+
+            # Metadata fast paths: replacement, unlink, and obvious mutation.
+            # These are not the sole witness on any platform — the
+            # content-continuity check above is authoritative — but they
+            # produce clearer diagnostics and catch unlink/replacement
+            # without reading bytes when the path itself is gone.
             try:
                 post_handle_stat = os.fstat(source_file.fileno())
             except OSError as exc:
@@ -4886,6 +4919,9 @@ def _copy_file_with_hash_verification(
                 raise ArtifactPreservationError(
                     f"source artifact {src} was replaced during copy (inode mismatch)"
                 )
+            # ctime is a Unix-only extra fast path; not relied upon for the
+            # same-size guarantee (handled by the content-continuity witness
+            # above). Kept for diagnostics on platforms that expose change time.
             if sys.platform != "win32":
                 if getattr(post_path_stat, "st_ctime_ns", post_path_stat.st_ctime) != getattr(
                     pre_handle_stat, "st_ctime_ns", pre_handle_stat.st_ctime
@@ -7143,9 +7179,6 @@ def _persist_scratch_lifecycle_artifacts(
 
     if changed:
         metadata["artifacts"] = persisted
-        metadata["_staged_artifacts"] = [
-            path for path in persisted if path.startswith(str(attachment_dir.resolve()))
-        ]
 
     return published_paths
 
@@ -7169,15 +7202,19 @@ def _record_lifecycle_staged_artifacts(
 
     Callers must run this after the task-state CAS UPDATE succeeds so we do
     not attach files to a failed transition. The staged list is taken from
-    the explicit ``staged_paths`` argument when provided; otherwise it is
-    popped from ``metadata["_staged_artifacts"]`` for backwards compatibility.
+    the explicit ``staged_paths`` argument, which the caller captures
+    directly from ``_persist_scratch_lifecycle_artifacts``'s return value.
+    The private ``_staged_artifacts`` metadata transport key is no longer
+    written or read; ownership is established from the explicit argument
+    alone so internal transport state can never leak into durable run
+    metadata.
 
     Returns the list of filesystem paths that were durably published and now
     belong to the task. Callers should keep this list in a local variable so
     they can compensate (unlink) these files on any later exception or commit
     failure, because SQLite cannot roll back filesystem writes.
     """
-    staged = staged_paths if staged_paths is not None else metadata.pop("_staged_artifacts", None)
+    staged = staged_paths
     recorded: list[Path] = []
     if not isinstance(staged, (list, tuple)):
         return recorded
