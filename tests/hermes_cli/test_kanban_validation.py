@@ -235,20 +235,11 @@ def test_all_known_validation_sites_import_kernel():
         # kernel in follow-up work; until then, its literal set comparison is
         # guarded by ``test_workspace_constants_match_kanban_db``.
         "hermes_cli/kanban_db.py",
-        # The CLI parser splits the --workspace flag before validation; the
-        # actual rules come from the kernel.  It contains the word "worktree"
-        # in help text and branch validation messages.
-        "hermes_cli/kanban.py",
-        # Dashboard plugin currently has its own CreateTaskBody; the adoption
-        # follow-up will replace that with the kernel.  Until then, we allow
-        # the file because the test suite tracks it explicitly.
-        "plugins/kanban/dashboard/plugin_api.py",
     }
 
     marker_literals: frozenset[str] = frozenset({
         "branch_name is only valid",
         "workspace_kind must be one of",
-        "branch must not contain whitespace",
         "workspace paths must be absolute",
     })
 

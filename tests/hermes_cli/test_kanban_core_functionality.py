@@ -3039,17 +3039,12 @@ def test_resolve_workspace_rejects_relative_dir_path(kanban_home):
     CWD — a confused-deputy escape vector."""
     conn = kb.connect()
     try:
-        tid = kb.create_task(
-            conn, title="path-trav", assignee="worker",
-            workspace_kind="dir",
-            workspace_path="../../../tmp/attacker",
-        )
-        task = kb.get_task(conn, tid)
-        # Storage is verbatim — that's fine.
-        assert task.workspace_path == "../../../tmp/attacker"
-        # But resolution must refuse.
-        with pytest.raises(ValueError, match=r"non-absolute"):
-            kb.resolve_workspace(task)
+        with pytest.raises(ValueError, match=r"must be absolute"):
+            kb.create_task(
+                conn, title="path-trav", assignee="worker",
+                workspace_kind="dir",
+                workspace_path="../../../tmp/attacker",
+            )
     finally:
         conn.close()
 
@@ -3076,13 +3071,12 @@ def test_resolve_workspace_rejects_relative_worktree_path(kanban_home):
     """Worktree paths also must be absolute when explicitly set."""
     conn = kb.connect()
     try:
-        tid = kb.create_task(
-            conn, title="wt", assignee="worker",
-            workspace_kind="worktree",
-            workspace_path="../escape",
-        )
-        with pytest.raises(ValueError, match=r"non-absolute"):
-            kb.resolve_workspace(kb.get_task(conn, tid))
+        with pytest.raises(ValueError, match=r"must be absolute"):
+            kb.create_task(
+                conn, title="wt", assignee="worker",
+                workspace_kind="worktree",
+                workspace_path="../escape",
+            )
     finally:
         conn.close()
 

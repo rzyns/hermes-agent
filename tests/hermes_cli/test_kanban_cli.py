@@ -73,6 +73,19 @@ def test_parse_branch_flag_rejects_empty_and_option_like():
         kc._parse_branch_flag("bad branch")
 
 
+def test_validate_create_workspace_routes_through_kernel():
+    assert kc._validate_create_workspace("scratch", None, None) == ("scratch", None, None)
+    assert kc._validate_create_workspace("worktree", "/tmp/wt", "  feature/x  ") == (
+        "worktree",
+        "/tmp/wt",
+        "feature/x",
+    )
+    with pytest.raises(ValueError, match=r"must be absolute"):
+        kc._validate_create_workspace("dir", "./relative", None)
+    with pytest.raises(ValueError, match=r"branch_name is only valid for worktree"):
+        kc._validate_create_workspace("dir", "/tmp/ws", "feature/x")
+
+
 # ---------------------------------------------------------------------------
 # run_slash smoke tests (end-to-end via the same entry both CLI and gateway use)
 # ---------------------------------------------------------------------------
@@ -109,7 +122,7 @@ def test_run_slash_create_worktree_path_and_branch(kanban_home, tmp_path):
 
 def test_run_slash_rejects_branch_without_worktree(kanban_home):
     out = kc.run_slash("create 'bad branch' --workspace scratch --branch wt/bad")
-    assert "--branch is only valid with --workspace worktree" in out
+    assert "branch_name is only valid for worktree" in out
 
 
 def test_run_slash_create_with_parent_and_cascade(kanban_home):
