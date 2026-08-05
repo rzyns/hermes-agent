@@ -4744,10 +4744,14 @@ def test_repeated_timeouts_trip_the_circuit_breaker(kanban_home, monkeypatch):
             kb.enforce_max_runtime(conn, signal_fn=_signal)
 
         final = kb.get_task(conn, tid)
-        # After 3 consecutive timeouts with failure_limit=3, task should
-        # be auto-blocked, not looping forever as ``ready``.
-        assert final.status == "blocked", \
-            f"expected blocked after 3 timeouts, got {final.status}"
+        # After 3 consecutive timeouts with failure_limit=3, the task
+        # must be terminal (``blocked`` or ``triage``), not looping as
+        # ``ready``. Because the auto-block path now routes through
+        # ``block_task``, repeated identical failures count toward the
+        # unblock-loop breaker; the third trip may escalate to ``triage``
+        # once ``block_recurrences`` reaches ``BLOCK_RECURRENCE_LIMIT``.
+        assert final.status in ("blocked", "triage"), \
+            f"expected terminal after 3 timeouts, got {final.status}"
         assert final.consecutive_failures >= 3
         # ``gave_up`` event emitted (plus 3 ``timed_out`` events).
         kinds = [
@@ -4903,6 +4907,56 @@ def test_detect_crashed_workers_protocol_violation_streak_trips_at_limit(kanban_
         # Side channel consumed by dispatch_once — read through the same
         # (current) module object the reaper ran in, see _drive_worker_exit.
         assert tid in _kb.detect_crashed_workers._last_auto_blocked
+    finally:
+        conn.close()
+
+
+def test_protocol_violation_repeated_unblock_escalates_to_triage(kanban_home):
+    """Protocol-violation auto-blocks now route through ``block_task``.
+
+    The first violation streak lands in ``blocked``; after a manual
+    unblock, a second identical streak hits ``BLOCK_RECURRENCE_LIMIT``
+    and routes to ``triage`` instead of silently looping.
+    """
+    import hermes_cli.kanban_db as _kb
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(conn, title="quiet repeater", assignee="worker")
+        limit = _kb._PROTOCOL_VIOLATION_FAILURE_LIMIT
+        # First streak: trip at the bound.
+        for i in range(limit - 1):
+            _drive_protocol_violation(conn, tid, 990000 + i)
+            assert kb.get_task(conn, tid).status == "ready", (
+                f"violation {i + 1}/{limit} should still retry"
+            )
+        _drive_protocol_violation(conn, tid, 990900)
+        task = kb.get_task(conn, tid)
+        assert task is not None
+        assert task.status == "blocked", (
+            f"first streak must block, got {task.status}"
+        )
+
+        # Unblock and repeat the same violation streak.
+        assert kb.unblock_task(conn, tid)
+        # The first post-unblock violation is enough to trip again: the
+        # violation-only streak from the previous closed runs persists,
+        # and the second trip routes through ``block_task`` with
+        # ``block_recurrences`` already at 1 → escalation to ``triage``.
+        _drive_protocol_violation(conn, tid, 991000)
+
+        task2 = kb.get_task(conn, tid)
+        assert task2 is not None
+        assert task2.status == "triage", (
+            f"second identical streak should escalate, got {task2.status}"
+        )
+        assert task2.block_recurrences == 2
+        loops = [
+            e for e in kb.list_events(conn, tid)
+            if e.kind == "block_loop_detected"
+        ]
+        assert len(loops) == 1
+        assert loops[0].payload is not None
+        assert loops[0].payload.get("kind") is None
     finally:
         conn.close()
 

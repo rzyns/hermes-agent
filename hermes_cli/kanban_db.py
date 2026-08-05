@@ -8503,6 +8503,8 @@ def block_task(
     contract: Optional[dict[str, Any]] = None,
     metadata: Optional[dict[str, Any]] = None,
     expected_run_id: Optional[int] = None,
+    close_run: bool = True,
+    _inside_write_txn: bool = False,
 ) -> bool:
     """Transition ``running``/``ready`` → ``blocked`` (or route elsewhere).
 
@@ -8535,15 +8537,12 @@ def block_task(
     worker-invoked blocks that pass ``metadata["artifacts"]``; crash and
     budget-exhaustion paths do not declare artifacts and are not recovered here.
 
-    Filesystem copies are performed **after** the state-transition CAS UPDATE
-    succeeds, inside the same ``BEGIN IMMEDIATE`` transaction. SQLite cannot
-    roll back filesystem writes, so any exception before a successful COMMIT
-    triggers explicit compensation that removes staged files. A stale
-    ``expected_run_id`` therefore reaches the ``rowcount != 1`` path before
-    any filesystem mutation, leaving no orphan attachment. Once COMMIT has
-    succeeded, filesystem state is treated as committed: a post-commit
-    exception (e.g. the file-length invariant check) does not delete the
-    files, because doing so would orphan durable attachment rows.
+    ``close_run`` (default ``True``) tells ``block_task`` to close the active
+    run with outcome ``blocked``. Callers that have already closed the run
+    themselves (e.g. the budget-exhaustion circuit breaker, which ends the run
+    as ``gave_up`` or preserves the caller's ``timed_out``) should pass
+    ``False`` so the run row is not overwritten. The state transition and
+    recurrence-counting logic still run normally.
 
     Returns True on any successful transition (to ``blocked``, ``todo``, or
     ``triage``), False when the task wasn't in a blockable state.
@@ -8609,7 +8608,11 @@ def block_task(
         return staged_paths
 
     try:
-        with write_txn(conn, on_committed=_mark_committed):
+        if not _inside_write_txn:
+            txn_cm = write_txn(conn, on_committed=_mark_committed)
+        else:
+            txn_cm = contextlib.nullcontext(conn)
+        with txn_cm:
             cur_row = conn.execute(
                 "SELECT status, block_kind, block_recurrences FROM tasks WHERE id = ?",
                 (task_id,),
@@ -8683,17 +8686,18 @@ def block_task(
 
                 # CAS succeeded: now it is safe to touch filesystem artifacts.
                 owned_files = _copy_declared_artifacts()
-                run_id = _end_run(
-                    conn, task_id,
-                    outcome="blocked", status="blocked",
-                    summary=reason,
-                    metadata=metadata if metadata else None,
-                )
-                if run_id is None and reason:
-                    run_id = _synthesize_ended_run(
-                        conn, task_id, outcome="blocked", summary=reason,
+                if close_run:
+                    run_id = _end_run(
+                        conn, task_id,
+                        outcome="blocked", status="blocked",
+                        summary=reason,
                         metadata=metadata if metadata else None,
                     )
+                    if run_id is None and reason:
+                        run_id = _synthesize_ended_run(
+                            conn, task_id, outcome="blocked", summary=reason,
+                            metadata=metadata if metadata else None,
+                        )
                 _emit_blocked_artifacts_event(conn, task_id, metadata, run_id=run_id)
                 _append_event(
                     conn, task_id, "dependency_wait",
@@ -8779,19 +8783,20 @@ def block_task(
                     return False
 
                 owned_files = _copy_declared_artifacts()
-                run_id = _end_run(
-                    conn, task_id,
-                    outcome="blocked", status="blocked",
-                    summary=reason,
-                    metadata=metadata if metadata else None,
-                )
-                if run_id is None and reason:
-                    run_id = _synthesize_ended_run(
+                if close_run:
+                    run_id = _end_run(
                         conn, task_id,
-                        outcome="blocked",
+                        outcome="blocked", status="blocked",
                         summary=reason,
                         metadata=metadata if metadata else None,
                     )
+                    if run_id is None and reason:
+                        run_id = _synthesize_ended_run(
+                            conn, task_id,
+                            outcome="blocked",
+                            summary=reason,
+                            metadata=metadata if metadata else None,
+                        )
                 _emit_blocked_artifacts_event(conn, task_id, metadata, run_id=run_id)
                 _append_event(
                     conn, task_id, "block_loop_detected",
@@ -8854,21 +8859,22 @@ def block_task(
                     return False
 
                 owned_files = _copy_declared_artifacts()
-                run_id = _end_run(
-                    conn, task_id,
-                    outcome="blocked", status="blocked",
-                    summary=reason,
-                    metadata=metadata if metadata else None,
-                )
-                # Synthesize a run when blocking a never-claimed task so the
-                # reason is preserved in attempt history.
-                if run_id is None and reason:
-                    run_id = _synthesize_ended_run(
+                if close_run:
+                    run_id = _end_run(
                         conn, task_id,
-                        outcome="blocked",
+                        outcome="blocked", status="blocked",
                         summary=reason,
                         metadata=metadata if metadata else None,
                     )
+                    # Synthesize a run when blocking a never-claimed task so the
+                    # reason is preserved in attempt history.
+                    if run_id is None and reason:
+                        run_id = _synthesize_ended_run(
+                            conn, task_id,
+                            outcome="blocked",
+                            summary=reason,
+                            metadata=metadata if metadata else None,
+                        )
                 _emit_blocked_artifacts_event(conn, task_id, metadata, run_id=run_id)
                 _append_event(
                     conn, task_id, "blocked",
@@ -8902,6 +8908,33 @@ def block_task(
         metadata=metadata if metadata else None,
     )
     return True
+
+
+# Helper used by the budget/protocol-violation circuit breaker to route
+# auto-blocks through ``block_task`` without duplicating its recurrence
+# logic. It exists only to keep ``block_task`` the single source of truth
+# for the unblock-loop counter.
+def _block_task_inside_failure(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    reason: str,
+    kind: Optional[str],
+    contract: dict[str, Any],
+    expected_run_id: Optional[int],
+) -> bool:
+    """Call ``block_task`` from within an already-open write transaction."""
+    return block_task(
+        conn, task_id,
+        reason=reason,
+        kind=kind,
+        contract=contract,
+        expected_run_id=expected_run_id,
+        close_run=False,
+        _inside_write_txn=True,
+    )
+
+
 def record_blocked_hold(
     conn: sqlite3.Connection,
     task_id: str,
@@ -11840,53 +11873,17 @@ def _record_task_failure(
             limit_source = "dispatcher"
 
         if force_trip or fingerprint_short_circuit or failures >= effective_limit:
-            # Trip the breaker.
-            if release_claim:
-                # Spawn path: still running, also clear claim state.
-                conn.execute(
-                    "UPDATE tasks SET status = 'blocked', claim_lock = NULL, "
-                    "claim_expires = NULL, worker_pid = NULL, "
-                    "consecutive_failures = ?, last_failure_error = ?, "
-                    "block_kind = ?, block_fingerprint = ?, "
-                    "block_deadline = ?, block_retry_after = ?, "
-                    "block_error_type = ? "
-                    "WHERE id = ? AND status IN ('running', 'ready')",
-                    (
-                        failures,
-                        error[:500],
-                        block_kind,
-                        fingerprint,
-                        block_deadline,
-                        contract_payload["retry_after"],
-                        contract_payload["error_type"],
-                        task_id,
-                    ),
-                )
-            else:
-                # Timeout/crash path: task is already at ``ready``
-                # with claim cleared; just flip to blocked + update
-                # counter fields.
-                conn.execute(
-                    "UPDATE tasks SET status = 'blocked', "
-                    "consecutive_failures = ?, last_failure_error = ?, "
-                    "block_kind = ?, block_fingerprint = ?, "
-                    "block_deadline = ?, block_retry_after = ?, "
-                    "block_error_type = ? "
-                    "WHERE id = ? AND status IN ('ready', 'running')",
-                    (
-                        failures,
-                        error[:500],
-                        block_kind,
-                        fingerprint,
-                        block_deadline,
-                        contract_payload["retry_after"],
-                        contract_payload["error_type"],
-                        task_id,
-                    ),
-                )
-            run_id = None
-            if end_run:
-                # Only the spawn path has an open run to close.
+            # Trip the breaker. Route the state transition through
+            # ``block_task`` so the unblock-loop counter
+            # (``block_recurrences``) and the ``triage`` escalation safety
+            # valve apply uniformly to budget and protocol-violation paths.
+            #
+            # The active run is already closed by the caller for
+            # timeout/crash paths, and we close it ourselves for the spawn
+            # path before invoking ``block_task`` so the run outcome is
+            # preserved (e.g. ``gave_up``) instead of overwritten with
+            # ``blocked``.
+            if end_run and row["current_run_id"] is not None:
                 run_id = _end_run(
                     conn, task_id,
                     outcome="gave_up", status="gave_up",
@@ -11900,6 +11897,52 @@ def _record_task_failure(
                         "contract": contract_payload,
                     },
                 )
+            else:
+                run_id = None
+
+            # Now perform the recurrence-aware block transition. We pass
+            # ``close_run=False`` because we either just closed the run
+            # (spawn path) or the caller already closed it
+            # (timeout/crash/protocol-violation paths). ``block_task``
+            # updates ``block_*`` fields and may route to ``triage`` when
+            # the same kind has been unblocked too many times.
+            #
+            # We do NOT pass ``expected_run_id`` here: after closing the run
+            # above, ``tasks.current_run_id`` is NULL, so a run-id CAS would
+            # fail. The enclosing write_txn already guarded the initial read
+            # (with the caller's expected_run_id when provided), so the row
+            # remains locked until commit.
+            blocked = block_task(
+                conn, task_id,
+                reason=error,
+                kind=block_kind,
+                contract=contract_payload,
+                expected_run_id=None,
+                close_run=False,
+                _inside_write_txn=True,
+            )
+            if not blocked:
+                # Could not apply the block transition (CAS mismatch after
+                # run closure). At least preserve the failure counter and
+                # error text so diagnostics aren't lost.
+                conn.execute(
+                    "UPDATE tasks SET consecutive_failures = ?, "
+                    "last_failure_error = ? WHERE id = ?",
+                    (failures, error[:500], task_id),
+                )
+                return False
+
+            # ``block_task`` succeeded; preserve the unified failure counter
+            # and any contract extras. The consecutive_failures value is
+            # already stored above in the below-threshold path; on the trip
+            # path it reflects the breaker-threshold count, so keep it.
+            if failures != row["consecutive_failures"] or error[:500] != (row["last_failure_error"] or ""):
+                conn.execute(
+                    "UPDATE tasks SET consecutive_failures = ?, "
+                    "last_failure_error = ? WHERE id = ?",
+                    (failures, error[:500], task_id),
+                )
+
             payload = {
                 "failures": failures,
                 "effective_limit": effective_limit,
@@ -11915,25 +11958,8 @@ def _record_task_failure(
             _append_event(
                 conn, task_id, "gave_up", payload, run_id=run_id,
             )
-            if fingerprint_short_circuit:
-                # Unlike an ordinary threshold trip, an identical second
-                # failure has already proved that another blind retry is not
-                # useful. Mark it as a sticky structured block so
-                # ``recompute_ready`` cannot immediately undo the short-circuit
-                # merely because the configured numeric retry limit is higher.
-                _append_event(
-                    conn,
-                    task_id,
-                    "blocked",
-                    {
-                        "reason": error[:500],
-                        "kind": block_kind,
-                        "contract": contract_payload,
-                        "fingerprint_short_circuit": True,
-                    },
-                    run_id=run_id,
-                )
             blocked = True
+            return True
         else:
             # Below threshold.
             if release_claim:
