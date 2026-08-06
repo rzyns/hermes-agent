@@ -483,7 +483,27 @@ def test_pending_response_records_kanban_timeout(monkeypatch):
         release_claim=True,
         end_run=True,
         expected_run_id=456,
-        event_payload_extra={"budget_used": 60, "budget_max": 60},
+        event_payload_extra={
+            "overhead_envelope": {
+                "api_call_count": 60,
+                "max_iterations": 60,
+                "budget_used": 60,
+                "budget_max": 60,
+                "tool_call_turns": 0,
+                "assistant_messages": 0,
+                "user_messages": 1,
+                "message_count": 1,
+                "input_tokens": 0,
+                "output_tokens": 0,
+                "total_tokens": 0,
+                "cache_read_tokens": 0,
+                "cache_write_tokens": 0,
+                "reasoning_tokens": 0,
+                "last_prompt_tokens": 0,
+                "last_turn_usage": {},
+                "exit_reason": "max_iterations_reached(60/60)",
+            }
+        },
     )
 
 
