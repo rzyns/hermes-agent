@@ -2160,6 +2160,8 @@ CREATE INDEX IF NOT EXISTS idx_attachments_task      ON task_attachments(task_id
 CREATE INDEX IF NOT EXISTS idx_notify_task           ON kanban_notify_subs(task_id);
 CREATE INDEX IF NOT EXISTS idx_review_candidate      ON review_requests(candidate_id, status);
 CREATE INDEX IF NOT EXISTS idx_review_reviewer      ON review_requests(reviewer_task_id, status);
+CREATE INDEX IF NOT EXISTS idx_inherit_child        ON task_inherit_sources(child_id);
+CREATE INDEX IF NOT EXISTS idx_inherit_source        ON task_inherit_sources(source_task_id);
 """
 
 
@@ -3627,6 +3629,10 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
             created_at     INTEGER NOT NULL
         )
         """
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_inherit_child "
+        "ON task_inherit_sources(child_id)"
     )
     conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_inherit_source "
