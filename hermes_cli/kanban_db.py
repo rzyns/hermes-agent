@@ -95,6 +95,10 @@ from typing import Any, Callable, Iterable, Mapping, Optional
 
 from hermes_cli.sqlite_util import add_column_if_missing as _add_column_if_missing
 from hermes_cli.kanban_validation import validate_workspace_spec
+from hermes_cli.observability.budget_telemetry import (
+    estimate_task_complexity,
+    merge_telemetry_into_payload,
+)
 from toolsets import get_toolset_names
 
 _log = logging.getLogger(__name__)
@@ -1639,7 +1643,7 @@ class Task:
     block_deadline: Optional[int] = None
     block_retry_after: Optional[int] = None
     block_error_type: Optional[str] = None
-    # Sticky dependency-wait fingerprint (DISP-1). Set when a worker blocks
+    # Sticky dependency-wait tracking (DISP-1). Set when a worker blocks
     # with kind=dependency; cleared when the blocking condition materially
     # changes. See ``_dependency_fingerprint`` / ``recompute_ready``.
     dep_wait_fingerprint: Optional[str] = None
@@ -1649,6 +1653,9 @@ class Task:
     # Durable dedup latch for the independent dependency-wait backstop.
     # Reset only by explicit operator unblock or terminal completion.
     dep_wait_backstop_tripped: bool = False
+    # Optional task-level diagnostics blob (JSON). Populated by create_task
+    # with the complexity proxy; read by failure telemetry. Keep small.
+    metadata: Optional[dict] = None
 
     @classmethod
     def from_row(cls, row: sqlite3.Row) -> "Task":
@@ -1662,6 +1669,15 @@ class Task:
                     skills_value = [str(s) for s in parsed if s]
             except Exception:
                 skills_value = None
+        # Parse optional task-level metadata blob if present
+        metadata_value: Optional[dict] = None
+        if "metadata" in keys and row["metadata"]:
+            try:
+                parsed_meta = json.loads(row["metadata"])
+                if isinstance(parsed_meta, dict):
+                    metadata_value = parsed_meta
+            except Exception:
+                metadata_value = None
         return cls(
             id=row["id"],
             title=row["title"],
@@ -1779,6 +1795,7 @@ class Task:
                 if "dep_wait_backstop_tripped" in keys
                 else False
             ),
+            metadata=metadata_value,
         )
 
 
@@ -2029,7 +2046,11 @@ CREATE TABLE IF NOT EXISTS tasks (
     dep_wait_count       INTEGER NOT NULL DEFAULT 0,
     -- Durable event/guard latch for that window. Reset only by explicit
     -- operator unblock or terminal completion.
-    dep_wait_backstop_tripped INTEGER NOT NULL DEFAULT 0
+    dep_wait_backstop_tripped INTEGER NOT NULL DEFAULT 0,
+    -- Optional JSON blob for durable task-level diagnostics (e.g. the
+    -- complexity proxy computed at creation). Kept small and additive so
+    -- later telemetry can read it without a schema change.
+    metadata             TEXT
 );
 
 CREATE TABLE IF NOT EXISTS task_links (
@@ -3444,6 +3465,12 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
             "dep_wait_backstop_tripped INTEGER NOT NULL DEFAULT 0",
         )
 
+    if "metadata" not in cols:
+        # Small JSON blob for task-level diagnostics such as the creation-time
+        # complexity proxy. NULL on legacy rows; populated by create_task going
+        # forward. Additive: no existing rows are backfilled.
+        _add_column_if_missing(conn, "tasks", "metadata", "metadata TEXT")
+
     # Independent review-gate relation (t_79a96299). Created additively so
     # legacy boards upgrade without losing data. The initial deployment used a
     # second-resolution UNIQUE key on (candidate_id, reviewer_task_id,
@@ -4354,6 +4381,18 @@ def create_task(
                         except Exception:
                             branch_name = None
 
+                # Compute a creation-time complexity proxy so budget telemetry
+                # can normalize ``iterations / complexity`` across runs of
+                # different sizes. Stored on the task row and echoed in the
+                # created event for observability.
+                complexity_proxy = estimate_task_complexity(
+                    title=title,
+                    body=body,
+                    parents=list(parents),
+                    children=[],  # no children exist yet at creation time
+                )
+                task_metadata = {"complexity_proxy": complexity_proxy}
+
                 conn.execute(
                     """
                     INSERT INTO tasks (
@@ -4364,8 +4403,9 @@ def create_task(
                         skills, max_retries, model_override, provider_override,
                         reasoning_effort,
                         goal_mode, goal_max_turns,
-                        worker_max_turns, session_id
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        worker_max_turns, session_id,
+                        metadata
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         task_id,
@@ -4392,6 +4432,7 @@ def create_task(
                         int(goal_max_turns) if goal_max_turns is not None else None,
                         int(worker_max_turns) if worker_max_turns is not None else None,
                         session_id,
+                        json.dumps(task_metadata, ensure_ascii=False),
                     ),
                 )
                 for pid in parents:
@@ -4416,6 +4457,7 @@ def create_task(
                         "goal_mode": bool(goal_mode) or None,
                         "model_override": model_override,
                         "provider_override": provider_override,
+                        "complexity_proxy": complexity_proxy,
                     },
                 )
                 # Informational budget-ladder projection. Emitted whenever the
@@ -12327,6 +12369,14 @@ def _record_task_failure(
     )
     fingerprint = contract_payload["fingerprint"]
     blocked = False
+    # Telemetry enrichment: complexity proxy is recomputed/stored at task
+    # creation and survives for normalized regression analysis.
+    task_for_telemetry = get_task(conn, task_id)
+    complexity_proxy = (
+        (task_for_telemetry.metadata or {}).get("complexity_proxy")
+        if task_for_telemetry is not None
+        else None
+    )
     with write_txn(conn):
         if expected_run_id is None:
             row = conn.execute(
@@ -12380,18 +12430,25 @@ def _record_task_failure(
             # preserved (e.g. ``gave_up``) instead of overwritten with
             # ``blocked``.
             if end_run and row["current_run_id"] is not None:
+                run_metadata = {
+                    "failures": failures,
+                    "trigger_outcome": outcome,
+                    "effective_limit": effective_limit,
+                    "limit_source": limit_source,
+                    "fingerprint_short_circuit": fingerprint_short_circuit,
+                    "contract": contract_payload,
+                }
+                overhead_envelope = (event_payload_extra or {}).get("overhead_envelope")
+                merge_telemetry_into_payload(
+                    run_metadata,
+                    complexity_proxy=complexity_proxy,
+                    overhead_envelope=overhead_envelope,
+                )
                 run_id = _end_run(
                     conn, task_id,
                     outcome="gave_up", status="gave_up",
                     error=error[:500],
-                    metadata={
-                        "failures": failures,
-                        "trigger_outcome": outcome,
-                        "effective_limit": effective_limit,
-                        "limit_source": limit_source,
-                        "fingerprint_short_circuit": fingerprint_short_circuit,
-                        "contract": contract_payload,
-                    },
+                    metadata=run_metadata,
                 )
             else:
                 run_id = None
@@ -12448,6 +12505,7 @@ def _record_task_failure(
                 "kind": block_kind,
                 "contract": contract_payload,
                 "fingerprint_short_circuit": fingerprint_short_circuit,
+                "complexity_proxy": complexity_proxy,
             }
             if event_payload_extra:
                 payload.update(event_payload_extra)

@@ -28,6 +28,10 @@ from typing import Any
 from agent.delegation_context import child_env_lookup, is_delegated_child_context
 from agent.codex_responses_adapter import _summarize_user_message_for_log
 from agent.message_content import flatten_message_text
+from hermes_cli.observability.budget_telemetry import (
+    build_overhead_envelope,
+    merge_telemetry_into_payload,
+)
 
 
 def _is_pure_tool_call_tail(msg: dict) -> bool:
@@ -226,6 +230,15 @@ def finalize_turn(
                     _kanban_run_id = int(child_env_lookup("HERMES_KANBAN_RUN_ID") or "")
                 except (TypeError, ValueError):
                     pass
+                _overhead_envelope = build_overhead_envelope(
+                    agent,
+                    api_call_count,
+                    messages=messages,
+                    turn_exit_reason=_turn_exit_reason,
+                )
+                _event_payload_extra = {
+                    "overhead_envelope": _overhead_envelope,
+                }
                 _conn = _kb.connect()
                 try:
                     _kb._record_task_failure(
@@ -241,10 +254,7 @@ def finalize_turn(
                         release_claim=True,
                         end_run=True,
                         expected_run_id=_kanban_run_id,
-                        event_payload_extra={
-                            "budget_used": api_call_count,
-                            "budget_max": agent.max_iterations,
-                        },
+                        event_payload_extra=_event_payload_extra,
                     )
 
                     logger.info(
