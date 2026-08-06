@@ -825,6 +825,26 @@ class TestSessionJsonSnapshotOptIn:
             "Opt-in writer must produce session_{sid}.json under logs_dir"
         )
 
+    def test_save_session_log_writes_session_cwd(self, agent, tmp_path):
+        from agent import runtime_cwd
+
+        project = tmp_path / "project"
+        project.mkdir()
+        logs_dir = tmp_path / "sessions"
+        logs_dir.mkdir()
+        agent._session_json_enabled = True
+        agent.logs_dir = logs_dir
+
+        token = runtime_cwd.set_session_cwd(str(project))
+        try:
+            agent._save_session_log([{"role": "user", "content": "hello"}])
+        finally:
+            runtime_cwd._SESSION_CWD.reset(token)
+
+        snapshot_path = logs_dir / f"session_{agent.session_id}.json"
+        snapshot = json.loads(snapshot_path.read_text(encoding="utf-8"))
+        assert snapshot["cwd"] == str(project)
+
     def test_logs_dir_retained_for_request_dumps(self, agent):
         # logs_dir is kept unconditionally because
         # agent_runtime_helpers.dump_api_request_debug still writes

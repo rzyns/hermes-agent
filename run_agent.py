@@ -154,6 +154,7 @@ from agent.error_classifier import FailoverReason
 from agent.redact import redact_sensitive_text
 from agent.message_content import flatten_message_text
 from agent.session_activity import ActivityProvenance
+from agent.runtime_cwd import resolve_agent_cwd
 from agent.model_metadata import (
     estimate_request_tokens_rough,  # noqa: F401  # re-exported for tests that mock.patch("run_agent.estimate_request_tokens_rough")
     is_local_endpoint,
@@ -2998,6 +2999,7 @@ class AIAgent:
                 "model": self.model,
                 "base_url": self.base_url,
                 "platform": self.platform,
+                "cwd": str(resolve_agent_cwd()),
                 "session_start": self.session_start.isoformat(),
                 "last_updated": datetime.now().isoformat(),
                 "system_prompt": redact_sensitive_text(self._cached_system_prompt or ""),
