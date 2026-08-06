@@ -10229,14 +10229,69 @@ def resolve_workspace(task: Task, *, board: Optional[str] = None) -> Path:
     raise ValueError(f"unknown workspace_kind: {kind}")
 
 
-def set_workspace_path(
+def _set_workspace_path(
     conn: sqlite3.Connection, task_id: str, path: Path | str
 ) -> None:
+    """Internal legacy helper: unconditionally write workspace_path."""
     with write_txn(conn):
         conn.execute(
             "UPDATE tasks SET workspace_path = ? WHERE id = ?",
             (str(path), task_id),
         )
+
+
+def set_workspace_path(
+    conn: sqlite3.Connection, task_id: str, path: Path | str
+) -> None:
+    import warnings
+
+    warnings.warn(
+        "set_workspace_path is deprecated; use set_workspace or _set_workspace",
+        DeprecationWarning,
+        stacklevel=2,
+    )
+    with write_txn(conn):
+        row = conn.execute(
+            "SELECT workspace_kind, branch_name FROM tasks WHERE id = ?",
+            (task_id,),
+        ).fetchone()
+    if row is None:
+        raise WorkspaceUpdateError(f"task {task_id} not found")
+    kind = row["workspace_kind"]
+    branch = row["branch_name"]
+    _set_workspace(
+        conn,
+        task_id,
+        workspace_kind=kind,
+        workspace_path=str(path),
+        branch_name=branch if kind == "worktree" else None,
+    )
+
+
+def set_branch_name(
+    conn: sqlite3.Connection, task_id: str, branch_name: str
+) -> None:
+    import warnings
+
+    warnings.warn(
+        "set_branch_name is deprecated; use set_workspace or _set_workspace",
+        DeprecationWarning,
+        stacklevel=2,
+    )
+    with write_txn(conn):
+        row = conn.execute(
+            "SELECT workspace_kind, workspace_path FROM tasks WHERE id = ?",
+            (task_id,),
+        ).fetchone()
+    if row is None:
+        raise WorkspaceUpdateError(f"task {task_id} not found")
+    _set_workspace(
+        conn,
+        task_id,
+        workspace_kind=row["workspace_kind"],
+        workspace_path=row["workspace_path"],
+        branch_name=str(branch_name),
+    )
 
 
 class WorkspaceUpdateError(ValueError):
@@ -10249,6 +10304,76 @@ class TaskIsLiveError(RuntimeError):
 
 class WorkspaceUpdateBlockedError(RuntimeError):
     """Raised when a workspace update is refused on a terminal-status task."""
+
+
+def _set_workspace(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    workspace_kind: str,
+    workspace_path: Optional[str],
+    branch_name: Optional[str] = None,
+) -> None:
+    """Internal validated, atomic workspace update for resolution paths.
+
+    Reads the old workspace triple, validates the resolved triple through
+    ``validate_workspace_spec`` with a concrete path required, updates all
+    three columns in one write transaction, and emits a single
+    ``workspace_changed`` event with old and new values.  This is the only
+    path that should touch workspace fields on a claimed/running task.
+
+    Raises :class:`WorkspaceUpdateError` when validation fails or the task is
+    not found.
+    """
+    try:
+        spec = validate_workspace_spec(
+            workspace_kind,
+            workspace_path,
+            branch_name,
+            require_path_for=frozenset({"dir", "worktree"}),
+        )
+    except ValueError as exc:
+        raise WorkspaceUpdateError(str(exc)) from exc
+
+    with write_txn(conn):
+        row = conn.execute(
+            "SELECT workspace_kind, workspace_path, branch_name "
+            "FROM tasks WHERE id = ?",
+            (task_id,),
+        ).fetchone()
+        if row is None:
+            raise WorkspaceUpdateError(f"task {task_id} not found")
+
+        old_kind = row["workspace_kind"]
+        old_path = row["workspace_path"]
+        old_branch = row["branch_name"]
+        # Preserve an existing branch only when the resolved kind stays a
+        # worktree.  For non-worktree, branch must be cleared.
+        new_branch = spec.branch_name if spec.workspace_kind == "worktree" else None
+
+        conn.execute(
+            "UPDATE tasks SET workspace_kind = ?, workspace_path = ?, "
+            "branch_name = ? WHERE id = ?",
+            (spec.workspace_kind, spec.workspace_path, new_branch, task_id),
+        )
+
+        _append_event(
+            conn,
+            task_id,
+            "workspace_changed",
+            {
+                "old": {
+                    "workspace_kind": old_kind,
+                    "workspace_path": old_path,
+                    "branch_name": old_branch,
+                },
+                "new": {
+                    "workspace_kind": spec.workspace_kind,
+                    "workspace_path": spec.workspace_path,
+                    "branch_name": new_branch,
+                },
+            },
+        )
 
 
 def set_workspace(
@@ -10496,9 +10621,10 @@ def update_task_body(
         )
 
 
-def set_branch_name(
+def _set_branch_name(
     conn: sqlite3.Connection, task_id: str, branch_name: str
 ) -> None:
+    """Internal legacy helper: unconditionally write branch_name."""
     with write_txn(conn):
         conn.execute(
             "UPDATE tasks SET branch_name = ? WHERE id = ?",
@@ -13016,10 +13142,19 @@ def _dispatch_once_locked(
             if auto:
                 result.auto_blocked.append(claimed.id)
             continue
-        # Persist the resolved workspace path so the worker can cd there.
-        set_workspace_path(conn, claimed.id, str(workspace))
-        if claimed.workspace_kind == "worktree":
-            set_branch_name(conn, claimed.id, resolved_branch_name or (claimed.branch_name or "").strip() or f"wt/{claimed.id}")
+        # Persist the resolved workspace back to the task row so the worker can
+        # cd there, and record the resolved branch for worktrees. Both fields
+        # are written atomically with a single workspace_changed event.
+        _set_workspace(
+            conn, claimed.id,
+            workspace_kind=claimed.workspace_kind,
+            workspace_path=str(workspace),
+            branch_name=(
+                resolved_branch_name or (claimed.branch_name or "").strip() or f"wt/{claimed.id}"
+                if claimed.workspace_kind == "worktree"
+                else None
+            ),
+        )
         _maybe_emit_scratch_tip(conn, claimed.id, claimed.workspace_kind)
         _spawn = spawn_fn if spawn_fn is not None else _default_spawn
         try:

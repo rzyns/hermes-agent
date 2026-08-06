@@ -1794,9 +1794,6 @@ def _cmd_create(args: argparse.Namespace) -> int:
     except (argparse.ArgumentTypeError, ValueError) as exc:
         print(f"kanban: {exc}", file=sys.stderr)
         return 2
-    if branch_name and ws_kind != "worktree":
-        print("kanban: --branch is only valid with --workspace worktree", file=sys.stderr)
-        return 2
     try:
         max_runtime = _parse_duration(getattr(args, "max_runtime", None))
     except ValueError as exc:
@@ -2654,8 +2651,22 @@ def _cmd_claim(args: argparse.Namespace) -> int:
                 file=sys.stderr,
             )
             return 1
-        workspace = kb.resolve_workspace(task)
-        kb.set_workspace_path(conn, task.id, str(workspace))
+        workspace: str
+        resolved_branch_name: Optional[str] = None
+        if task.workspace_kind == "worktree":
+            workspace, resolved_branch_name = kb._resolve_worktree_workspace(task)
+        else:
+            workspace = kb.resolve_workspace(task)
+        kb._set_workspace(
+            conn, task.id,
+            workspace_kind=task.workspace_kind or "scratch",
+            workspace_path=str(workspace),
+            branch_name=(
+                resolved_branch_name or (task.branch_name or "").strip() or f"wt/{task.id}"
+                if task.workspace_kind == "worktree"
+                else None
+            ),
+        )
     print(f"Claimed {task.id}")
     print(f"Workspace: {workspace}")
     return 0

@@ -834,6 +834,87 @@ def test_update_task_workspace_partial_invalid_does_not_apply(kanban_home, tmp_p
     assert not any(e.kind == "workspace_changed" for e in events)
 
 
+def test_set_workspace_validates_resolved_triple_and_emits_one_event(kanban_home, tmp_path):
+    """_set_workspace (resolution-time path) validates kind/path/branch and
+    records exactly one workspace_changed event carrying the old/new triple.
+    """
+    target = tmp_path / "my-dir"
+    target.mkdir()
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="resolution target")
+        kb._set_workspace(
+            conn, tid,
+            workspace_kind="dir",
+            workspace_path=str(target),
+        )
+        task = kb.get_task(conn, tid)
+        assert task is not None
+        events = [
+            e for e in kb.list_events(conn, tid)
+            if e.kind == "workspace_changed"
+        ]
+    assert task.workspace_kind == "dir"
+    assert task.workspace_path == str(target)
+    assert task.branch_name is None
+    assert len(events) == 1
+    assert events[0].payload["old"]["workspace_kind"] == "scratch"
+    assert events[0].payload["new"]["workspace_kind"] == "dir"
+    assert events[0].payload["new"]["workspace_path"] == str(target)
+
+
+def test_set_workspace_rejects_invalid_resolved_values(kanban_home):
+    """_set_workspace refuses invalid resolved workspace values instead of
+    silently persisting them.
+    """
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="invalid resolution target")
+        for kwargs in [
+            {"workspace_kind": "dir", "workspace_path": "relative/path"},
+            {"workspace_kind": "worktree", "workspace_path": "/tmp/wt", "branch_name": "bad branch"},
+            {"workspace_kind": "dir", "workspace_path": None},
+        ]:
+            with pytest.raises(kb.WorkspaceUpdateError):
+                kb._set_workspace(conn, tid, **kwargs)
+        task = kb.get_task(conn, tid)
+        assert task is not None
+    assert task.workspace_kind == "scratch"
+    assert task.workspace_path is None
+    assert task.branch_name is None
+
+
+def test_set_workspace_branch_cleared_for_non_worktree(kanban_home, tmp_path):
+    """When _set_workspace resolves to a non-worktree kind, any pre-existing
+    branch is cleared so the row stays internally consistent.
+    """
+    repo = tmp_path / "repo"
+    _init_git_repo(repo)
+    wt_target = repo / ".worktrees" / "t-branchy"
+    with kb.connect() as conn:
+        tid = kb.create_task(
+            conn,
+            title="worktree task",
+            workspace_kind="worktree",
+            workspace_path=str(wt_target),
+            branch_name="wt/old",
+        )
+        kb._set_workspace(
+            conn, tid,
+            workspace_kind="dir",
+            workspace_path=str(tmp_path / "my-dir"),
+        )
+        task = kb.get_task(conn, tid)
+        assert task is not None
+        events = [
+            e for e in kb.list_events(conn, tid)
+            if e.kind == "workspace_changed"
+        ]
+    assert task.workspace_kind == "dir"
+    assert task.workspace_path == str(tmp_path / "my-dir")
+    assert task.branch_name is None
+    assert events[-1].payload["old"]["branch_name"] == "wt/old"
+    assert events[-1].payload["new"]["branch_name"] is None
+
+
 # ---------------------------------------------------------------------------
 # Links + dependency resolution
 # ---------------------------------------------------------------------------
@@ -4018,6 +4099,47 @@ def test_worktree_workspace_explicit_target_materializes_linked_worktree(kanban_
     ).stdout
     assert f"worktree {target}" in listed
     assert f"branch refs/heads/{branch}" in listed
+
+
+def test_dispatch_worktree_task_emits_single_workspace_changed_event(kanban_home, tmp_path, monkeypatch):
+    """dispatch_once must record exactly one workspace_changed event when it
+    materializes and persists a worktree workspace and branch.
+    """
+    repo = tmp_path / "repo"
+    _init_git_repo(repo)
+    kb.create_board("worktree-event-board", default_workdir=str(repo))
+    import hermes_cli.profiles as profiles
+    monkeypatch.setattr(profiles, "profile_exists", lambda _name: True)
+
+    def fake_spawn(task, workspace, board=None):
+        return None
+
+    with kb.connect(board="worktree-event-board") as conn:
+        tid = kb.create_task(
+            conn,
+            title="ship",
+            assignee="sentinel",
+            workspace_kind="worktree",
+            board="worktree-event-board",
+        )
+        kb.dispatch_once(conn, spawn_fn=fake_spawn, board="worktree-event-board")
+        task = kb.get_task(conn, tid)
+        assert task is not None
+        events = [
+            e for e in kb.list_events(conn, tid)
+            if e.kind == "workspace_changed"
+        ]
+
+    expected = repo / ".worktrees" / tid
+    assert task is not None
+    assert task.workspace_path == str(expected)
+    assert task.branch_name == f"wt/{tid}"
+    assert len(events) == 1
+    payload = events[0].payload
+    assert payload["old"]["workspace_kind"] == "worktree"
+    assert payload["new"]["workspace_kind"] == "worktree"
+    assert payload["new"]["workspace_path"] == str(expected)
+    assert payload["new"]["branch_name"] == f"wt/{tid}"
 
 
 def test_dispatch_worktree_task_persists_materialized_workspace_and_branch(kanban_home, tmp_path, monkeypatch):

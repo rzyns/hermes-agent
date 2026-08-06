@@ -365,10 +365,6 @@ def test_all_known_validation_sites_import_kernel():
         str(Path("tests/hermes_cli/test_kanban_validation.py")),
         # The kernel itself defines the canonical messages; it is not a re-implementation.
         "hermes_cli/kanban_validation.py",
-        # resolve_workspace() / _resolve_worktree_workspace() retain dispatch-time
-        # guards for absolute paths and git anchors; these are runtime defensive
-        # checks, not the validation grammar shared with creation/PATCH.
-        "hermes_cli/kanban_db.py",
     }
 
     # Vocabulary that indicates a file is talking about workspace/branch rules.
