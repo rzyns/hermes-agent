@@ -241,27 +241,30 @@ def test_workspace_constants_match_kanban_db():
 
 
 def test_imports_kernel_predicate_boundaries():
-    """The scan accepts direct imports and attribute calls, rejects bare locals."""
+    """The scan accepts any kernel import or any ``validate_workspace_spec`` call."""
 
     def _scan(text: str) -> bool:
+        """Mirror the predicate used by ``test_all_known_validation_sites_import_kernel``."""
         import ast
 
         try:
             tree = ast.parse(text)
         except SyntaxError:
             return False
-        for node in ast.walk(tree):
-            if isinstance(node, ast.ImportFrom):
-                if node.module == "hermes_cli.kanban_validation":
-                    return True
-        for node in ast.walk(tree):
-            if isinstance(node, ast.Call):
-                func = node.func
-                if isinstance(func, ast.Name) and func.id == "validate_workspace_spec":
-                    return False
-                if isinstance(func, ast.Attribute) and func.attr == "validate_workspace_spec":
-                    return True
-        return False
+
+        imports_kernel = any(
+            isinstance(node, ast.ImportFrom) and node.module == "hermes_cli.kanban_validation"
+            for node in ast.walk(tree)
+        )
+        calls_validator = any(
+            isinstance(node, ast.Call)
+            and (
+                (isinstance(node.func, ast.Name) and node.func.id == "validate_workspace_spec")
+                or (isinstance(node.func, ast.Attribute) and node.func.attr == "validate_workspace_spec")
+            )
+            for node in ast.walk(tree)
+        )
+        return imports_kernel or calls_validator
 
     direct_import = textwrap.dedent(
         """\
@@ -273,6 +276,12 @@ def test_imports_kernel_predicate_boundaries():
         """\
         from hermes_cli.kanban_validation import validate_workspace_spec as vws
         vws("scratch")
+        """
+    )
+    other_kernel_symbol = textwrap.dedent(
+        """\
+        from hermes_cli.kanban_validation import StrictPayloadBase
+        StrictPayloadBase()
         """
     )
     bare_local = textwrap.dedent(
@@ -290,11 +299,36 @@ def test_imports_kernel_predicate_boundaries():
         LocalValidator().validate_workspace_spec("scratch")
         """
     )
+    bare_then_attr = textwrap.dedent(
+        """\
+        def validate_workspace_spec(kind, path=None):
+            return kind, path
+        validate_workspace_spec("scratch")
+        class LocalValidator:
+            def validate_workspace_spec(self, kind, path=None):
+                return kind, path
+        LocalValidator().validate_workspace_spec("scratch")
+        """
+    )
+    attr_then_bare = textwrap.dedent(
+        """\
+        class LocalValidator:
+            def validate_workspace_spec(self, kind, path=None):
+                return kind, path
+        LocalValidator().validate_workspace_spec("scratch")
+        def validate_workspace_spec(kind, path=None):
+            return kind, path
+        validate_workspace_spec("scratch")
+        """
+    )
 
     assert _scan(direct_import)
     assert _scan(alias_import)
-    assert not _scan(bare_local)
+    assert _scan(other_kernel_symbol)
+    assert _scan(bare_local)
     assert _scan(attribute_on_local)
+    assert _scan(bare_then_attr)
+    assert _scan(attr_then_bare)
 
 
 def test_all_known_validation_sites_import_kernel():
@@ -350,40 +384,25 @@ def test_all_known_validation_sites_import_kernel():
     })
 
     def _imports_kernel(text: str) -> bool:
-        """Return True if the file imports from or invokes the validation kernel.
-
-        A bare module-level ``def validate_workspace_spec(...)`` that is never
-        imported from the kernel is rejected.  An attribute call named
-        ``validate_workspace_spec`` on any object is accepted by this predicate,
-        regardless of whether that object is an alias imported from the kernel;
-        callers that need a stronger uniqueness guarantee must add an explicit
-        import check.
-        """
+        """Return True when the file imports anything from ``hermes_cli.kanban_validation`` or calls ``validate_workspace_spec`` in any form."""
         try:
             tree = ast.parse(text)
         except SyntaxError:
             return False
 
-        kernel_import_alias: str | None = None
-        for node in ast.walk(tree):
-            if isinstance(node, ast.ImportFrom):
-                if node.module == "hermes_cli.kanban_validation":
-                    # Record the alias used for the imported name, if any.
-                    for alias in node.names:
-                        if alias.name == "validate_workspace_spec":
-                            kernel_import_alias = alias.asname or alias.name
-                            break
-        if kernel_import_alias is not None:
-            return True
-
-        for node in ast.walk(tree):
-            if isinstance(node, ast.Call):
-                func = node.func
-                if isinstance(func, ast.Name) and func.id == "validate_workspace_spec":
-                    return False  # local function, not the kernel import
-                if isinstance(func, ast.Attribute) and func.attr == "validate_workspace_spec":
-                    return True
-        return False
+        imports_kernel = any(
+            isinstance(node, ast.ImportFrom) and node.module == "hermes_cli.kanban_validation"
+            for node in ast.walk(tree)
+        )
+        calls_validator = any(
+            isinstance(node, ast.Call)
+            and (
+                (isinstance(node.func, ast.Name) and node.func.id == "validate_workspace_spec")
+                or (isinstance(node.func, ast.Attribute) and node.func.attr == "validate_workspace_spec")
+            )
+            for node in ast.walk(tree)
+        )
+        return imports_kernel or calls_validator
 
     offenders: list[str] = []
     roots = [repo / "hermes_cli", repo / "plugins" / "kanban" / "dashboard"]
