@@ -17,6 +17,7 @@ reimplemented the rules".
 
 from __future__ import annotations
 
+import textwrap
 from pathlib import Path
 from typing import Any
 
@@ -239,6 +240,63 @@ def test_workspace_constants_match_kanban_db():
     assert kernel_kinds == kb.VALID_WORKSPACE_KINDS
 
 
+def test_imports_kernel_predicate_boundaries():
+    """The scan accepts direct imports and attribute calls, rejects bare locals."""
+
+    def _scan(text: str) -> bool:
+        import ast
+
+        try:
+            tree = ast.parse(text)
+        except SyntaxError:
+            return False
+        for node in ast.walk(tree):
+            if isinstance(node, ast.ImportFrom):
+                if node.module == "hermes_cli.kanban_validation":
+                    return True
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Call):
+                func = node.func
+                if isinstance(func, ast.Name) and func.id == "validate_workspace_spec":
+                    return False
+                if isinstance(func, ast.Attribute) and func.attr == "validate_workspace_spec":
+                    return True
+        return False
+
+    direct_import = textwrap.dedent(
+        """\
+        from hermes_cli.kanban_validation import validate_workspace_spec
+        validate_workspace_spec("scratch")
+        """
+    )
+    alias_import = textwrap.dedent(
+        """\
+        from hermes_cli.kanban_validation import validate_workspace_spec as vws
+        vws("scratch")
+        """
+    )
+    bare_local = textwrap.dedent(
+        """\
+        def validate_workspace_spec(kind, path=None):
+            return kind, path
+        validate_workspace_spec("scratch")
+        """
+    )
+    attribute_on_local = textwrap.dedent(
+        """\
+        class LocalValidator:
+            def validate_workspace_spec(self, kind, path=None):
+                return kind, path
+        LocalValidator().validate_workspace_spec("scratch")
+        """
+    )
+
+    assert _scan(direct_import)
+    assert _scan(alias_import)
+    assert not _scan(bare_local)
+    assert _scan(attribute_on_local)
+
+
 def test_all_known_validation_sites_import_kernel():
     """Any module that validates workspace_kind/branch_name must import the kernel.
 
@@ -253,10 +311,11 @@ def test_all_known_validation_sites_import_kernel():
 
     The test does not prove correctness of the kernel itself; the unit tests
     above do that.  The scan guarantees only that a non-excepted file containing
-    one of the marker literals also contains a recognized kernel import or a
-    call to ``validate_workspace_spec`` imported from the kernel; it does not
-    prove that the file has no private validator or that marker-free
-    reimplementations are absent.
+    one of the marker literals also contains either (a) a direct import from
+    ``hermes_cli.kanban_validation`` or (b) an attribute call named
+    ``validate_workspace_spec``.  An attribute call on a same-named local helper
+    is accepted by design; the scan does not prove uniqueness of the validator
+    or absence of marker-free reimplementations.
     """
     import ast
 
@@ -291,11 +350,14 @@ def test_all_known_validation_sites_import_kernel():
     })
 
     def _imports_kernel(text: str) -> bool:
-        """Return True if the file imports from or calls the validation kernel.
+        """Return True if the file imports from or invokes the validation kernel.
 
-        A same-named local helper (for example a module-level
-        ``def validate_workspace_spec(...)`` that never imports the kernel)
-        does not satisfy this predicate.
+        A bare module-level ``def validate_workspace_spec(...)`` that is never
+        imported from the kernel is rejected.  An attribute call named
+        ``validate_workspace_spec`` on any object is accepted by this predicate,
+        regardless of whether that object is an alias imported from the kernel;
+        callers that need a stronger uniqueness guarantee must add an explicit
+        import check.
         """
         try:
             tree = ast.parse(text)

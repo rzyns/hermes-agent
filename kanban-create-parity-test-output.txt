@@ -2,22 +2,24 @@
   (TZ=UTC LANG=C.UTF-8 PYTHONHASHSEED=0; clean env)
 ▶ pre-compiling bytecode cache
 ▶ launching test runner
-Discovered 4 test files (~516 tests) under ['tests/hermes_cli/test_kanban_validation.py', 'tests/hermes_cli/test_kanban_cli.py', 'tests/hermes_cli/test_kanban_db.py', 'tests/plugins/test_kanban_dashboard_plugin.py']; running with -j 40
-[  7.6% |    39/~516 | ✓39 | ✗ 0] ✓ tests/hermes_cli/test_kanban_validation.py (39✓, 1.8s)
-[ 15.7% |    81/~516 | ✓90 | ✗ 0] ✓ tests/hermes_cli/test_kanban_cli.py (51✓, 8.8s)
-[ 72.1% |   372/~516 | ✓380 | ✗  0] ✓ tests/hermes_cli/test_kanban_db.py (290✓ 1xf, 31.7s)
-[100.0% |   516/~516 | ✓527 | ✗  0] ✓ tests/plugins/test_kanban_dashboard_plugin.py (147✓, 35.9s)
+Discovered 5 test files (~546 tests) under ['tests/hermes_cli/test_kanban_validation.py', 'tests/hermes_cli/test_kanban_cli.py', 'tests/hermes_cli/test_kanban_db.py', 'tests/plugins/test_kanban_dashboard_plugin.py', 'tests/hermes_cli/test_kanban_intake_link.py']; running with -j 40
+[  7.3% |    40/~546 | ✓40 | ✗ 0] ✓ tests/hermes_cli/test_kanban_validation.py (40✓, 2.1s)
+[ 11.5% |    63/~546 | ✓63 | ✗ 0] ✓ tests/hermes_cli/test_kanban_intake_link.py (23✓, 4.5s)
+[ 19.6% |   107/~546 | ✓116 | ✗  0] ✓ tests/hermes_cli/test_kanban_cli.py (53✓, 8.5s)
+[ 73.3% |   400/~546 | ✓408 | ✗  0] ✓ tests/hermes_cli/test_kanban_db.py (292✓ 1xf, 40.9s)
+[100.0% |   546/~546 | ✓557 | ✗  0] ✓ tests/plugins/test_kanban_dashboard_plugin.py (149✓, 45.5s)
 
-=== Summary: 4 files, 527 tests passed, 0 failed (100% complete) in 35.9s (40 workers) ===
-  Durations cached to test_durations.json (4 files)
+=== Summary: 5 files, 557 tests passed, 0 failed (100% complete) in 45.5s (40 workers) ===
+  Durations cached to test_durations.json (5 files)
 
 === Per-file subprocess time distribution ===
-  Files:   4
-  Total subprocess CPU-wall: 78.2s  (runner wall: 35.9s, parallelism: 40x)
-  P50: 31.72s  P90: 35.88s  P95: 35.88s  P99: 35.88s  Max: 35.88s
-  <1s: 0 files (0%)  <2s: 1 files (25%)
+  Files:   5
+  Total subprocess CPU-wall: 101.5s  (runner wall: 45.5s, parallelism: 40x)
+  P50: 8.45s  P90: 45.53s  P95: 45.53s  P99: 45.53s  Max: 45.53s
+  <1s: 0 files (0%)  <2s: 0 files (0%)
   Top 10 slowest:
-     35.88s  tests/plugins/test_kanban_dashboard_plugin.py
-     31.72s  tests/hermes_cli/test_kanban_db.py
-      8.81s  tests/hermes_cli/test_kanban_cli.py
-      1.78s  tests/hermes_cli/test_kanban_validation.py
+     45.53s  tests/plugins/test_kanban_dashboard_plugin.py
+     40.93s  tests/hermes_cli/test_kanban_db.py
+      8.45s  tests/hermes_cli/test_kanban_cli.py
+      4.49s  tests/hermes_cli/test_kanban_intake_link.py
+      2.07s  tests/hermes_cli/test_kanban_validation.py
