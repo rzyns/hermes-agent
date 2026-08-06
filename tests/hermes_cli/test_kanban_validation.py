@@ -240,31 +240,37 @@ def test_workspace_constants_match_kanban_db():
     assert kernel_kinds == kb.VALID_WORKSPACE_KINDS
 
 
+def _imports_kernel(text: str) -> bool:
+    """Return True when ``text`` imports from ``hermes_cli.kanban_validation`` or calls ``validate_workspace_spec`` in any form.
+
+    This predicate is the single definition used by both the boundary tests and
+    the consolidation scan.  Keeping it at module scope guarantees the boundary
+    tests exercise the exact same logic that detects kernel delegation.
+    """
+    import ast
+
+    try:
+        tree = ast.parse(text)
+    except SyntaxError:
+        return False
+
+    imports_kernel = any(
+        isinstance(node, ast.ImportFrom) and node.module == "hermes_cli.kanban_validation"
+        for node in ast.walk(tree)
+    )
+    calls_validator = any(
+        isinstance(node, ast.Call)
+        and (
+            (isinstance(node.func, ast.Name) and node.func.id == "validate_workspace_spec")
+            or (isinstance(node.func, ast.Attribute) and node.func.attr == "validate_workspace_spec")
+        )
+        for node in ast.walk(tree)
+    )
+    return imports_kernel or calls_validator
+
+
 def test_imports_kernel_predicate_boundaries():
     """The scan accepts any kernel import or any ``validate_workspace_spec`` call."""
-
-    def _scan(text: str) -> bool:
-        """Mirror the predicate used by ``test_all_known_validation_sites_import_kernel``."""
-        import ast
-
-        try:
-            tree = ast.parse(text)
-        except SyntaxError:
-            return False
-
-        imports_kernel = any(
-            isinstance(node, ast.ImportFrom) and node.module == "hermes_cli.kanban_validation"
-            for node in ast.walk(tree)
-        )
-        calls_validator = any(
-            isinstance(node, ast.Call)
-            and (
-                (isinstance(node.func, ast.Name) and node.func.id == "validate_workspace_spec")
-                or (isinstance(node.func, ast.Attribute) and node.func.attr == "validate_workspace_spec")
-            )
-            for node in ast.walk(tree)
-        )
-        return imports_kernel or calls_validator
 
     direct_import = textwrap.dedent(
         """\
@@ -322,13 +328,13 @@ def test_imports_kernel_predicate_boundaries():
         """
     )
 
-    assert _scan(direct_import)
-    assert _scan(alias_import)
-    assert _scan(other_kernel_symbol)
-    assert _scan(bare_local)
-    assert _scan(attribute_on_local)
-    assert _scan(bare_then_attr)
-    assert _scan(attr_then_bare)
+    assert _imports_kernel(direct_import)
+    assert _imports_kernel(alias_import)
+    assert _imports_kernel(other_kernel_symbol)
+    assert _imports_kernel(bare_local)
+    assert _imports_kernel(attribute_on_local)
+    assert _imports_kernel(bare_then_attr)
+    assert _imports_kernel(attr_then_bare)
 
 
 def test_all_known_validation_sites_import_kernel():
@@ -382,27 +388,6 @@ def test_all_known_validation_sites_import_kernel():
         "workspace paths must be absolute",
         "workspace_kind must be one of",
     })
-
-    def _imports_kernel(text: str) -> bool:
-        """Return True when the file imports anything from ``hermes_cli.kanban_validation`` or calls ``validate_workspace_spec`` in any form."""
-        try:
-            tree = ast.parse(text)
-        except SyntaxError:
-            return False
-
-        imports_kernel = any(
-            isinstance(node, ast.ImportFrom) and node.module == "hermes_cli.kanban_validation"
-            for node in ast.walk(tree)
-        )
-        calls_validator = any(
-            isinstance(node, ast.Call)
-            and (
-                (isinstance(node.func, ast.Name) and node.func.id == "validate_workspace_spec")
-                or (isinstance(node.func, ast.Attribute) and node.func.attr == "validate_workspace_spec")
-            )
-            for node in ast.walk(tree)
-        )
-        return imports_kernel or calls_validator
 
     offenders: list[str] = []
     roots = [repo / "hermes_cli", repo / "plugins" / "kanban" / "dashboard"]
