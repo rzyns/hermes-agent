@@ -9925,6 +9925,10 @@ def delete_archived_task(conn: sqlite3.Connection, task_id: str) -> bool:
             "DELETE FROM task_links WHERE parent_id = ? OR child_id = ?",
             (task_id, task_id),
         )
+        conn.execute(
+            "DELETE FROM task_inherit_sources WHERE child_id = ? OR source_task_id = ?",
+            (task_id, task_id),
+        )
         conn.execute("DELETE FROM task_comments WHERE task_id = ?", (task_id,))
         conn.execute("DELETE FROM task_events WHERE task_id = ?", (task_id,))
         conn.execute("DELETE FROM task_runs WHERE task_id = ?", (task_id,))
@@ -9948,6 +9952,10 @@ def delete_task(conn: sqlite3.Connection, task_id: str) -> bool:
         if cur.rowcount != 1:
             return False
         conn.execute("DELETE FROM task_links WHERE parent_id = ? OR child_id = ?", (task_id, task_id))
+        conn.execute(
+            "DELETE FROM task_inherit_sources WHERE child_id = ? OR source_task_id = ?",
+            (task_id, task_id),
+        )
         conn.execute("DELETE FROM task_comments WHERE task_id = ?", (task_id,))
         conn.execute("DELETE FROM task_events WHERE task_id = ?", (task_id,))
         conn.execute("DELETE FROM task_runs WHERE task_id = ?", (task_id,))
