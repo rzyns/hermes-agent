@@ -4062,17 +4062,27 @@ def create_task(
         raise ValueError(
             f"initial_status must be one of {sorted(VALID_INITIAL_STATUSES)}"
         )
-    if workspace_kind not in VALID_WORKSPACE_KINDS:
-        raise ValueError(
-            f"workspace_kind must be one of {sorted(VALID_WORKSPACE_KINDS)}, "
-            f"got {workspace_kind!r}"
-        )
-    if branch_name is not None:
-        branch_name = str(branch_name).strip() or None
-    if branch_name and workspace_kind != "worktree":
-        raise ValueError("branch_name is only valid for worktree workspaces")
+    # Workspace/branch validation is handled below via validate_workspace_spec.
     if worker_max_turns is not None and int(worker_max_turns) < 1:
         raise ValueError("worker_max_turns must be >= 1")
+
+    # Validate/normalise workspace and branch through the shared kernel so
+    # REST, CLI, and DB enforce the same rules.  For the create path, only
+    # ``worktree`` may omit its path, because ``create_task`` derives it from a
+    # board ``default_workdir`` or a project link.  ``dir`` still requires an
+    # explicit absolute path.  A supplied path is still validated (absolute,
+    # non-empty).
+    from hermes_cli.kanban_validation import validate_workspace_spec
+
+    ws_spec = validate_workspace_spec(
+        workspace_kind,
+        workspace_path,
+        branch_name,
+        require_path_for=frozenset({"dir"}),
+    )
+    workspace_kind = ws_spec.workspace_kind
+    workspace_path = ws_spec.workspace_path
+    branch_name = ws_spec.branch_name
 
     # Inherit the board's scoped project when the caller didn't name one, so a
     # project-scoped board anchors every new task to that project's repo

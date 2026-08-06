@@ -124,17 +124,50 @@ def _parse_workspace_flag(value: str) -> tuple[str, Optional[str]]:
 
 
 def _parse_branch_flag(value: Optional[str]) -> Optional[str]:
-    """Normalize an optional branch name from ``kanban create --branch``."""
+    """Pre-normalise an optional branch name from ``kanban create --branch``.
+
+    Performs only light parsing: strips outer whitespace and maps an empty
+    or whitespace-only value to ``None``.  The canonical branch syntax checks
+    (internal whitespace, leading dash) live in the shared kernel so that
+    REST, CLI, and DB share one copy.
+    """
     if value is None:
         return None
     branch = value.strip()
     if not branch:
         raise argparse.ArgumentTypeError("--branch requires a non-empty name")
-    if branch.startswith("-"):
-        raise argparse.ArgumentTypeError("--branch must not start with '-'")
-    if any(ch.isspace() for ch in branch):
-        raise argparse.ArgumentTypeError("--branch must not contain whitespace")
     return branch
+
+
+def _validate_create_workspace(
+    workspace_kind: str,
+    workspace_path: Optional[str],
+    branch_name: Optional[str],
+    *,
+    require_path_for: frozenset[str] = frozenset({"dir", "worktree"}),
+) -> tuple[str, Optional[str], Optional[str]]:
+    """Route workspace/branch validation through the shared kernel.
+
+    The CLI already parses ``--workspace`` into a kind/path pair and
+    normalises the branch name, but the final canonical guard (absolute path,
+    kind/path coupling, branch-only-for-worktree, branch syntax) lives in
+    ``kanban_validation.validate_workspace_spec`` so REST, CLI, and DB share
+    one copy.
+
+    For task creation, ``require_path_for`` defaults to the strict policy
+    but ``_cmd_create`` passes a deferred policy that keeps ``dir`` strict
+    while allowing ``create_task`` to derive a missing worktree path from a
+    board default or project link.
+    """
+    from hermes_cli.kanban_validation import validate_workspace_spec
+
+    spec = validate_workspace_spec(
+        workspace_kind,
+        workspace_path,
+        branch_name,
+        require_path_for=require_path_for,
+    )
+    return (spec.workspace_kind, spec.workspace_path, spec.branch_name)
 
 
 def _check_dispatcher_presence(
@@ -1754,7 +1787,11 @@ def _cmd_create(args: argparse.Namespace) -> int:
     try:
         ws_kind, ws_path = _parse_workspace_flag(args.workspace)
         branch_name = _parse_branch_flag(getattr(args, "branch", None))
-    except argparse.ArgumentTypeError as exc:
+        ws_kind, ws_path, branch_name = _validate_create_workspace(
+            ws_kind, ws_path, branch_name,
+            require_path_for=frozenset({"dir"}),
+        )
+    except (argparse.ArgumentTypeError, ValueError) as exc:
         print(f"kanban: {exc}", file=sys.stderr)
         return 2
     if branch_name and ws_kind != "worktree":

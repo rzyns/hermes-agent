@@ -21,6 +21,7 @@ import pytest
 import hermes_state
 from hermes_cli import kanban_db as kb
 from hermes_cli import kanban_dependencies as _kbd
+from hermes_cli import projects_db as _pdb
 
 
 
@@ -3623,6 +3624,42 @@ def test_worktree_no_path_anchors_on_board_default_workdir(kanban_home, tmp_path
     assert ws != repo  # not the shared default verbatim
 
 
+def test_worktree_no_path_project_linked_anchors_on_project_repo(kanban_home, tmp_path):
+    """A project-linked worktree created with no explicit path derives its
+    anchor from the project's primary repo, producing a deterministic
+    ``<repo>/.worktrees/<id>`` path and a ``<project-slug>/<id>`` branch."""
+    repo = tmp_path / "repo"
+    _init_git_repo(repo)
+    kb.create_board("project-board")
+    with _pdb.connect() as pconn:
+        pid = _pdb.create_project(
+            pconn,
+            name="Hermes",
+            slug="hermes",
+            primary_path=str(repo),
+            board_slug="project-board",
+        )
+    kb.write_board_metadata("project-board", project_id=pid)
+
+    with kb.connect(board="project-board") as conn:
+        t = kb.create_task(
+            conn,
+            title="ship",
+            workspace_kind="worktree",
+            board="project-board",
+        )
+        task = kb.get_task(conn, t)
+        assert task is not None
+        assert task.project_id == pid
+        assert task.workspace_path == str(repo / ".worktrees" / t)
+        assert task.branch_name is not None
+        assert task.branch_name.startswith("hermes/")
+        ws = kb.resolve_workspace(task, board="project-board")
+
+    assert ws == repo / ".worktrees" / t
+    assert ws.exists()
+
+
 def test_worktree_no_path_no_board_default_raises(kanban_home, tmp_path, monkeypatch):
     """With neither an explicit workspace_path nor a board default_workdir,
     resolution fails loudly pointing at default_workdir / worktree:<path> —
@@ -6225,6 +6262,38 @@ def test_task_dict_survives_corrupt_created_at(tmp_path, monkeypatch):
 # ---------------------------------------------------------------------------
 
 
+def test_create_task_rejects_dir_without_path_even_with_board_default(kanban_home):
+    """Pathless ``dir`` must be rejected at DB level regardless of default_workdir."""
+    default_wd = "/home/user/project"
+    kb.create_board("work-proj-dir", default_workdir=default_wd)
+
+    with pytest.raises(ValueError, match=r"dir.*requires.*workspace_path"):
+        with kb.connect(board="work-proj-dir") as conn:
+            kb.create_task(
+                conn,
+                title="pathless dir",
+                workspace_kind="dir",
+                board="work-proj-dir",
+            )
+
+
+def test_create_task_worktree_without_path_inherits_board_default_workdir(kanban_home, monkeypatch):
+    """Pathless worktree keeps inheriting board.default_workdir."""
+    default_wd = "/home/user/project"
+    kb.create_board("work-proj-wt", default_workdir=default_wd)
+
+    with kb.connect(board="work-proj-wt") as conn:
+        tid = kb.create_task(
+            conn,
+            title="inherited worktree",
+            workspace_kind="worktree",
+            board="work-proj-wt",
+        )
+        t = kb.get_task(conn, tid)
+    assert t is not None
+    assert t.workspace_path == default_wd
+
+
 def test_create_task_scratch_without_workspace_ignores_board_default_workdir(kanban_home, monkeypatch):
     """Scratch tasks must NOT inherit board.default_workdir — would point auto-cleanup
     at the user's source tree on completion (#28818)."""
@@ -6239,21 +6308,21 @@ def test_create_task_scratch_without_workspace_ignores_board_default_workdir(kan
     assert t.workspace_path is None
 
 
-def test_create_task_dir_without_workspace_inherits_board_default_workdir(kanban_home, monkeypatch):
-    """Board default_workdir is for persistent dir/worktree workspaces, not scratch."""
+def test_create_task_dir_without_workspace_requires_explicit_path(kanban_home, monkeypatch):
+    """``dir`` no longer silently inherits board.default_workdir; it requires an
+    explicit absolute path from the caller.
+    """
     default_wd = "/home/user/project"
     kb.create_board("work-proj-dir", default_workdir=default_wd)
 
-    with kb.connect(board="work-proj-dir") as conn:
-        tid = kb.create_task(
-            conn,
-            title="inherited",
-            workspace_kind="dir",
-            board="work-proj-dir",
-        )
-        t = kb.get_task(conn, tid)
-    assert t is not None
-    assert t.workspace_path == default_wd
+    with pytest.raises(ValueError, match=r"dir.*requires.*workspace_path"):
+        with kb.connect(board="work-proj-dir") as conn:
+            kb.create_task(
+                conn,
+                title="inherited",
+                workspace_kind="dir",
+                board="work-proj-dir",
+            )
 
 
 def test_create_task_without_workspace_no_default_stays_none(kanban_home):

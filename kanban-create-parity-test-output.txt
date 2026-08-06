@@ -1,0 +1,25 @@
+▶ running per-file parallel test suite via run_tests_parallel.py
+  (TZ=UTC LANG=C.UTF-8 PYTHONHASHSEED=0; clean env)
+▶ pre-compiling bytecode cache
+▶ launching test runner
+Discovered 5 test files (~546 tests) under ['tests/hermes_cli/test_kanban_validation.py', 'tests/hermes_cli/test_kanban_cli.py', 'tests/hermes_cli/test_kanban_db.py', 'tests/plugins/test_kanban_dashboard_plugin.py', 'tests/hermes_cli/test_kanban_intake_link.py']; running with -j 40
+[  7.3% |    40/~546 | ✓40 | ✗ 0] ✓ tests/hermes_cli/test_kanban_validation.py (40✓, 2.1s)
+[ 11.5% |    63/~546 | ✓63 | ✗ 0] ✓ tests/hermes_cli/test_kanban_intake_link.py (23✓, 4.5s)
+[ 19.6% |   107/~546 | ✓116 | ✗  0] ✓ tests/hermes_cli/test_kanban_cli.py (53✓, 8.5s)
+[ 73.3% |   400/~546 | ✓408 | ✗  0] ✓ tests/hermes_cli/test_kanban_db.py (292✓ 1xf, 40.9s)
+[100.0% |   546/~546 | ✓557 | ✗  0] ✓ tests/plugins/test_kanban_dashboard_plugin.py (149✓, 45.5s)
+
+=== Summary: 5 files, 557 tests passed, 0 failed (100% complete) in 45.5s (40 workers) ===
+  Durations cached to test_durations.json (5 files)
+
+=== Per-file subprocess time distribution ===
+  Files:   5
+  Total subprocess CPU-wall: 101.5s  (runner wall: 45.5s, parallelism: 40x)
+  P50: 8.45s  P90: 45.53s  P95: 45.53s  P99: 45.53s  Max: 45.53s
+  <1s: 0 files (0%)  <2s: 0 files (0%)
+  Top 10 slowest:
+     45.53s  tests/plugins/test_kanban_dashboard_plugin.py
+     40.93s  tests/hermes_cli/test_kanban_db.py
+      8.45s  tests/hermes_cli/test_kanban_cli.py
+      4.49s  tests/hermes_cli/test_kanban_intake_link.py
+      2.07s  tests/hermes_cli/test_kanban_validation.py

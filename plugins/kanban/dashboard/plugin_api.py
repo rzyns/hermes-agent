@@ -46,10 +46,11 @@ from typing import Any, Optional
 
 from fastapi import APIRouter, File, Form, HTTPException, Query, UploadFile, WebSocket, WebSocketDisconnect, status as http_status
 from fastapi.responses import FileResponse
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from hermes_cli import kanban_db
 from hermes_cli import kanban_diagnostics as kd
+from hermes_cli.kanban_validation import StrictPayloadBase, UNDEFINED, PayloadValidationError, validate_workspace_spec
 from hermes_constants import get_default_hermes_root
 
 # Soft import of the cross-board deps plugin so the kanban dashboard can
@@ -750,7 +751,7 @@ def get_task(
 # POST /tasks
 # ---------------------------------------------------------------------------
 
-class CreateTaskBody(BaseModel):
+class CreateTaskBody(StrictPayloadBase):
     title: str
     body: Optional[str] = None
     assignee: Optional[str] = None
@@ -758,6 +759,7 @@ class CreateTaskBody(BaseModel):
     priority: int = 0
     workspace_kind: str = "scratch"
     workspace_path: Optional[str] = None
+    branch_name: Optional[str] = None
     parents: list[str] = Field(default_factory=list)
     triage: bool = False
     idempotency_key: Optional[str] = None
@@ -773,7 +775,86 @@ class CreateTaskBody(BaseModel):
     reasoning_effort: Optional[str] = None
     # Explicit project link; when omitted, create_task inherits the board's
     # scoped project (if any) so a project-scoped board anchors every task.
-    project_id: Optional[str] = None
+    project_id: Optional[str] = UNDEFINED
+    # Initial card status. Only ``running`` (default) and ``blocked`` are
+    # accepted; ``blocked`` parks the card immediately for human ops review.
+    initial_status: str = "running"
+
+    @model_validator(mode="after")
+    def _workspace_branch(self) -> "CreateTaskBody":
+        """Route workspace/branch rules through the shared kernel.
+
+        The kernel validates kind/path coupling and branch syntax.  We validate
+        here (rather than in the endpoint) so FastAPI can report the error as a
+        structured 422 naming the offending field.  The kernel raises plain
+        ValueError for legacy callers; convert them to the typed
+        PayloadValidationError so the REST surface names the key.
+
+        For task creation, only ``worktree`` may omit its path because
+        ``kanban_db.create_task`` derives it from a board ``default_workdir``
+        or project link; ``dir`` still requires an explicit absolute path.
+        """
+        try:
+            validate_workspace_spec(
+                self.workspace_kind,
+                self.workspace_path,
+                self.branch_name,
+                require_path_for=frozenset({"dir"}),
+            )
+        except ValueError as exc:
+            key = "workspace_kind"
+            msg = str(exc)
+            if "workspace_path" in msg:
+                key = "workspace_path"
+            elif "branch_name" in msg or "branch " in msg:
+                key = "branch_name"
+            raise PayloadValidationError(msg, key=key) from exc
+        return self
+
+    @field_validator("branch_name")
+    @classmethod
+    def _branch_name_not_empty(cls, v: Optional[str]) -> Optional[str]:
+        """Preserve the REST-specific empty-branch 422 message.
+
+        The shared kernel normalises outer whitespace and maps an empty or
+        whitespace-only branch to ``None``.  For REST, we want a structured 422
+        with the field named when the caller sends an empty/whitespace branch.
+        Internal whitespace and leading dashes are rejected by the kernel.
+        """
+        if v is None:
+            return None
+        s = str(v).strip()
+        if not s:
+            raise ValueError("branch_name must not be empty")
+        return s
+
+
+class _CreateTaskProjectResolver:
+    """Resolve an explicit project_id; fail loudly when it cannot be resolved."""
+
+    def __init__(self, board: Optional[str]):
+        self.board = board
+
+    def resolve(self, project_id: Any) -> Optional[str]:
+        """Return the canonical project id, or None when the caller omitted it.
+
+        The create endpoint distinguishes "absent" (``UNDEFINED``) from
+        "present but unresolvable".  An omitted project_id lets the board's
+        scoped project inherit as before; an explicit unresolvable id is a 422.
+        """
+        from hermes_cli import projects_db as _pdb
+
+        try:
+            with _pdb.connect_closing() as _pconn:
+                project_obj = _pdb.get_project(_pconn, project_id)
+        except Exception:
+            project_obj = None
+        if project_obj is None:
+            raise PayloadValidationError(
+                f"project_id {project_id!r} does not resolve to a project",
+                key="project_id",
+            )
+        return project_obj.id
 
 
 @router.post("/tasks")
@@ -781,6 +862,16 @@ def create_task(payload: CreateTaskBody, board: Optional[str] = Query(None)):
     board = _resolve_board(board)
     conn = _conn(board=board)
     try:
+        # Distinguish "project_id was supplied" from "project_id was omitted".
+        # An omitted value lets create_task inherit the board's scoped project;
+        # a supplied value must resolve or the request fails closed.
+        project_id: Optional[str]
+        if payload.is_supplied("project_id"):
+            resolver = _CreateTaskProjectResolver(board=board)
+            project_id = resolver.resolve(payload.project_id)
+        else:
+            project_id = None
+
         task_id = kanban_db.create_task(
             conn,
             title=payload.title,
@@ -789,6 +880,7 @@ def create_task(payload: CreateTaskBody, board: Optional[str] = Query(None)):
             created_by="dashboard",
             workspace_kind=payload.workspace_kind,
             workspace_path=payload.workspace_path,
+            branch_name=payload.branch_name,
             tenant=payload.tenant,
             priority=payload.priority,
             parents=payload.parents,
@@ -802,7 +894,8 @@ def create_task(payload: CreateTaskBody, board: Optional[str] = Query(None)):
             model_override=payload.model_override,
             provider_override=payload.provider_override,
             reasoning_effort=payload.reasoning_effort,
-            project_id=payload.project_id,
+            project_id=project_id,
+            initial_status=payload.initial_status,
             board=board,
         )
         task = kanban_db.get_task(conn, task_id)
@@ -830,6 +923,11 @@ def create_task(payload: CreateTaskBody, board: Optional[str] = Query(None)):
                 # Probe failure must never block the create itself.
                 pass
         return body
+    except PayloadValidationError as exc:
+        raise HTTPException(
+            status_code=422,
+            detail=[{"loc": [exc.key or "body"], "msg": exc.message, "type": "value_error"}],
+        )
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
     finally:

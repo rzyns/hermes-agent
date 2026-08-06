@@ -140,6 +140,191 @@ def test_create_task_rejects_non_positive_worker_max_turns(client):
     assert response.status_code == 422
 
 
+def test_create_task_rejects_unknown_fields(client):
+    response = client.post(
+        "/api/plugins/kanban/tasks",
+        json={"title": "unknown extras", "max_retries": 9, "definitely_unknown": "x"},
+    )
+    assert response.status_code == 422
+    detail = response.json()["detail"]
+    if isinstance(detail, list):
+        locs = [".".join(str(p) for p in e.get("loc", [])) for e in detail]
+    else:
+        locs = [str(detail)]
+    assert any(name in " ".join(locs) for name in ("max_retries", "definitely_unknown"))
+
+
+def test_create_task_rejects_unresolvable_project_id(client):
+    response = client.post(
+        "/api/plugins/kanban/tasks",
+        json={"title": "orphan project", "project_id": "missing-project"},
+    )
+    assert response.status_code == 422
+    detail = response.json()["detail"]
+    if isinstance(detail, list):
+        messages = " ".join(e.get("msg", "") for e in detail)
+    else:
+        messages = str(detail)
+    assert "project_id" in messages.lower()
+
+
+def test_create_task_initial_status_blocked_parks_card(client, kanban_home, monkeypatch):
+    # Create a blocked card and a ready control in the same board.
+    blocked_resp = client.post(
+        "/api/plugins/kanban/tasks",
+        json={"title": "needs human review", "assignee": "reviewer", "initial_status": "blocked"},
+    )
+    assert blocked_resp.status_code == 200, blocked_resp.text
+    blocked_task = blocked_resp.json()["task"]
+    assert blocked_task["status"] == "blocked"
+
+    ready_resp = client.post(
+        "/api/plugins/kanban/tasks",
+        json={"title": "control ready", "assignee": "reviewer"},
+    )
+    assert ready_resp.status_code == 200, ready_resp.text
+    ready_task = ready_resp.json()["task"]
+    assert ready_task["status"] == "ready"
+
+    # Run a real dispatcher tick with a spawn stub.  The control must be
+    # claimed/spawned; the blocked card must stay blocked with no claimed or
+    # spawned event.
+    spawned_ids: list[str] = []
+
+    def fake_spawn(task, workspace, board=None):
+        spawned_ids.append(task.id)
+        return 12345
+
+    # The dispatcher checks profile_exists. Stub it so the test assignee is
+    # considered spawnable without a real Hermes profile.
+    monkeypatch.setattr(
+        "hermes_cli.profiles.profile_exists", lambda name: name == "reviewer"
+    )
+
+    with kb.connect_closing(board="default") as conn:
+        result = kb.dispatch_once(conn, spawn_fn=fake_spawn, board="default")
+
+    assert ready_task["id"] in [tid for tid, _, _ in result.spawned]
+    assert blocked_task["id"] not in spawned_ids
+
+    with kb.connect_closing(board="default") as conn:
+        blocked_events = {e.kind for e in kb.list_events(conn, blocked_task["id"])}
+        ready_events = {e.kind for e in kb.list_events(conn, ready_task["id"])}
+
+    assert "claimed" not in blocked_events
+    assert "spawned" not in blocked_events
+    assert "claimed" in ready_events
+    assert "spawned" in ready_events
+
+    # Column assertions remain as a sanity check on the REST view.
+    board = client.get("/api/plugins/kanban/board").json()
+    ready = next(c for c in board["columns"] if c["name"] == "ready")
+    assert not any(t["id"] == blocked_task["id"] for t in ready["tasks"])
+    blocked = next(c for c in board["columns"] if c["name"] == "blocked")
+    assert any(t["id"] == blocked_task["id"] for t in blocked["tasks"])
+
+
+def test_create_task_rejects_invalid_initial_status(client):
+    response = client.post(
+        "/api/plugins/kanban/tasks",
+        json={"title": "bad status", "initial_status": "done"},
+    )
+    assert response.status_code == 400
+    detail = response.json()["detail"]
+    assert "initial_status" in detail
+
+
+def test_create_task_rejects_dir_without_path_even_with_board_default(client, tmp_path):
+    """Pathless ``dir`` must be rejected at REST even when a board default exists.
+
+    Only ``worktree`` is allowed to inherit the board default; ``dir`` requires
+    an explicit absolute path from the client.
+    """
+    work_dir = tmp_path / "workdir"
+    work_dir.mkdir()
+    kb.write_board_metadata("default", default_workdir=str(work_dir))
+
+    response = client.post(
+        "/api/plugins/kanban/tasks",
+        json={"title": "pathless dir", "workspace_kind": "dir"},
+    )
+    assert response.status_code == 422
+    detail = response.json()["detail"]
+    if isinstance(detail, list):
+        messages = " ".join(e.get("msg", "") for e in detail)
+    else:
+        messages = str(detail)
+    assert "workspace_path" in messages.lower()
+    assert "dir" in messages.lower()
+
+
+def test_create_task_worktree_no_path_round_trips_with_board_default(client, tmp_path):
+    """The existing worktree-deferral path keeps working after narrowing."""
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    subprocess.run(["git", "init", "-q", str(repo)], check=True)
+    kb.write_board_metadata("default", default_workdir=str(repo))
+
+    response = client.post(
+        "/api/plugins/kanban/tasks",
+        json={"title": "pathless worktree", "workspace_kind": "worktree"},
+    )
+    assert response.status_code == 200, response.text
+    task = response.json()["task"]
+    assert task["workspace_kind"] == "worktree"
+    assert task["workspace_path"] == str(repo)
+
+
+def test_create_task_branch_name_requires_worktree(client):
+    response = client.post(
+        "/api/plugins/kanban/tasks",
+        json={"title": "bad branch", "workspace_kind": "scratch", "branch_name": "feature/foo"},
+    )
+    assert response.status_code == 422
+    errors = response.json()["detail"]
+    messages = " ".join(e.get("msg", "") for e in errors)
+    assert "branch_name" in messages.lower() and "worktree" in messages.lower()
+
+
+def test_create_task_branch_name_round_trips_on_worktree(client, tmp_path):
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    subprocess.run(["git", "init", "-q", str(repo)], check=True)
+    kb.write_board_metadata("default", default_workdir=str(repo))
+
+    response = client.post(
+        "/api/plugins/kanban/tasks",
+        json={
+            "title": "worktree branch",
+            "workspace_kind": "worktree",
+            "branch_name": "feature/wire",
+        },
+    )
+    assert response.status_code == 200, response.text
+    task = response.json()["task"]
+    assert task["branch_name"] == "feature/wire"
+    assert task["workspace_kind"] == "worktree"
+    # The stored path anchors on the board default_workdir; the DB derives it
+    # from the board default rather than requiring the client to supply one.
+    assert task["workspace_path"] == str(repo)
+
+
+def test_create_task_rejects_malformed_branch_name(client):
+    response = client.post(
+        "/api/plugins/kanban/tasks",
+        json={
+            "title": "bad branch name",
+            "workspace_kind": "worktree",
+            "branch_name": "feature bad",
+        },
+    )
+    assert response.status_code == 422
+    errors = response.json()["detail"]
+    messages = " ".join(e.get("msg", "") for e in errors)
+    assert "branch" in messages.lower() or "branch_name" in messages.lower()
+    assert "whitespace" in messages.lower() or "space" in messages.lower()
+
+
 def test_dashboard_create_and_details_surface_worker_max_turns():
     """The committed dashboard bundle must expose the backend budget knob."""
     bundle = (
