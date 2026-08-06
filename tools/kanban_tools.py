@@ -1559,6 +1559,14 @@ def _handle_create(args: dict, **kw) -> str:
     works as usual. ``review_of`` creates a reviewer task for an existing
     candidate task. The reviewer task is NOT a dependency of the candidate;
     instead, an independent review request binds candidate to reviewer.
+
+    ``inherit_from_current_task`` (default true) makes a worker-created task
+    inherit gateway notification subscriptions, project_id, and board
+    default_workdir from ``HERMES_KANBAN_TASK`` without creating a dependency
+    edge. Use explicit ``parents`` when you need a gated fan-in; use the
+    default when you want routing context only. Set to ``false`` to create
+    an isolated child that inherits none of the current task's routing
+    context.
     """
     delegated_err = _reject_delegated_child_mutation("kanban_create")
     if delegated_err:
@@ -1608,7 +1616,19 @@ def _handle_create(args: dict, **kw) -> str:
     workspace_path = args.get("workspace_path")
     project_id = args.get("project") or args.get("project_id")
     project_source_task_id = None
-    _inherit_project = workspace_kind is None and workspace_path is None
+    # Parse the routing-inheritance opt-out early; it gates both the typed
+    # ``inherit_from`` source and per-task project_id inheritance from the
+    # current worker task. Board-level defaults (``default_workdir``,
+    # ``project_id`` on ``board.json``) are not suppressed; they are shared
+    # board context, not current-task lineage.
+    _inherit_current, _inherit_err = _parse_bool_arg(
+        args, "inherit_from_current_task", default=True
+    )
+    if _inherit_err:
+        return tool_error(_inherit_err)
+    _inherit_project = (
+        workspace_kind is None and workspace_path is None and _inherit_current
+    )
     if workspace_kind is None:
         workspace_kind = "scratch"
     triage, bool_error = _parse_bool_arg(args, "triage")
@@ -1640,7 +1660,7 @@ def _handle_create(args: dict, **kw) -> str:
         return tool_error(
             f"parents must be a list of task ids, got {type(parents).__name__}"
         )
-    board = args.get("board")
+    board = args.get("board") or kw.get("board")
     try:
         kb, conn = _connect(board=board)
         try:
@@ -1654,6 +1674,18 @@ def _handle_create(args: dict, **kw) -> str:
                     if _self_task is not None and _self_task.project_id:
                         project_id = _self_task.project_id
                         project_source_task_id = _self_task.id
+            # Typed routing inheritance from the current worker task. This is
+            # independent of dependency parent links; it only copies routing
+            # context (notify subscriptions) so spawned children receive
+            # delivery metadata without becoming gated on the parent's
+            # completion.
+            inherit_from: Optional[str] = None
+            if not parents and _inherit_current:
+                _self_tid = os.environ.get("HERMES_KANBAN_TASK")
+                if _self_tid:
+                    _self_task = kb.get_task(conn, _self_tid)
+                    if _self_task is not None:
+                        inherit_from = _self_task.id
             new_tid = kb.create_task(
                 conn,
                 title=str(title).strip(),
@@ -1666,6 +1698,7 @@ def _handle_create(args: dict, **kw) -> str:
                 workspace_path=workspace_path,
                 project_id=project_id,
                 project_source_task_id=project_source_task_id,
+                inherit_from=inherit_from,
                 triage=triage,
                 idempotency_key=idempotency_key,
                 max_runtime_seconds=(
@@ -1685,6 +1718,7 @@ def _handle_create(args: dict, **kw) -> str:
                 initial_status=str(initial_status),
                 created_by=os.environ.get("HERMES_PROFILE") or "worker",
                 session_id=session_id,
+                board=board,
             )
             if review_of:
                 # Bind the newly created reviewer task to the candidate. Use
@@ -1702,6 +1736,8 @@ def _handle_create(args: dict, **kw) -> str:
                 )
             new_task = kb.get_task(conn, new_tid)
             subscribed = _maybe_auto_subscribe(conn, new_tid)
+            # Surface whether routing inheritance happened so callers and tests
+            # can distinguish a pure dependency child from an inherited one.
             return _ok(
                 task_id=new_tid,
                 status=new_task.status if new_task else None,
@@ -1709,6 +1745,7 @@ def _handle_create(args: dict, **kw) -> str:
                 workspace_path=new_task.workspace_path if new_task else None,
                 project_id=new_task.project_id if new_task else None,
                 subscribed=subscribed,
+                inherit_from=inherit_from,
             )
         finally:
             conn.close()
@@ -2608,12 +2645,14 @@ KANBAN_ATTACHMENTS_SCHEMA = {
 KANBAN_CREATE_SCHEMA = {
     "name": "kanban_create",
     "description": (
-        "Create a new kanban task, optionally as a child of the current "
-        "one (pass the current task id in ``parents``). Used by "
-        "orchestrator workers to fan out — decompose work into child "
-        "tasks with specific assignees, link them into a pipeline, "
-        "then complete your own task. The dispatcher picks up the new "
-        "tasks on its next tick and spawns the assigned profiles."
+        "Create a new kanban task. Used by orchestrator workers to fan out "
+        "— decompose work into child tasks with specific assignees, link them "
+        "into a pipeline, then complete your own task. The dispatcher picks "
+        "up the new tasks on its next tick and spawns the assigned profiles. "
+        "``parents`` creates dependency-gated child links; "
+        "``inherit_from_current_task`` lets a worker-created task copy routing "
+        "context (gateway notification subscriptions and project_id) from the "
+        "current HERMES_KANBAN_TASK without adding a dependency edge."
     ),
     "parameters": {
         "type": "object",
@@ -2647,7 +2686,9 @@ KANBAN_CREATE_SCHEMA = {
                     "until every parent reaches 'done'; then it "
                     "auto-promotes to 'ready'. Typical fan-in: list "
                     "all the researcher task ids when creating a "
-                    "synthesizer task."
+                    "synthesizer task. Use ``inherit_from_current_task`` "
+                    "instead when you want to pass routing context without "
+                    "a dependency gate."
                 ),
             },
             "review_of": {
@@ -2660,6 +2701,18 @@ KANBAN_CREATE_SCHEMA = {
                     "is already in 'review' status (e.g. adding another "
                     "reviewer), or combine with completing the candidate "
                     "using ``review_pending`` to hand off for review."
+                ),
+            },
+            "inherit_from_current_task": {
+                "type": "boolean",
+                "default": True,
+                "description": (
+                    "When true and the caller is a dispatcher-spawned worker "
+                    "(HERMES_KANBAN_TASK is set), inherit gateway notification "
+                    "subscriptions and the current task's project_id without "
+                    "creating a dependency edge. Default true. Set to false "
+                    "to create a fully isolated child task. Ignored when "
+                    "explicit ``parents`` are provided."
                 ),
             },
             "tenant": {
