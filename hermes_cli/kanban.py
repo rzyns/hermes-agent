@@ -155,8 +155,9 @@ def _validate_create_workspace(
     one copy.
 
     For task creation, ``require_path_for`` defaults to the strict policy
-    but ``_cmd_create`` passes a deferred policy because ``create_task`` can
-    derive a missing worktree path from a board default or project link.
+    but ``_cmd_create`` passes a deferred policy that keeps ``dir`` strict
+    while allowing ``create_task`` to derive a missing worktree path from a
+    board default or project link.
     """
     from hermes_cli.kanban_validation import validate_workspace_spec
 
@@ -1788,7 +1789,7 @@ def _cmd_create(args: argparse.Namespace) -> int:
         branch_name = _parse_branch_flag(getattr(args, "branch", None))
         ws_kind, ws_path, branch_name = _validate_create_workspace(
             ws_kind, ws_path, branch_name,
-            require_path_for=frozenset(),
+            require_path_for=frozenset({"dir"}),
         )
     except (argparse.ArgumentTypeError, ValueError) as exc:
         print(f"kanban: {exc}", file=sys.stderr)

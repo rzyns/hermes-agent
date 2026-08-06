@@ -4067,18 +4067,18 @@ def create_task(
         raise ValueError("worker_max_turns must be >= 1")
 
     # Validate/normalise workspace and branch through the shared kernel so
-    # REST, CLI, and DB enforce the same rules.  For the create path, both
-    # ``dir`` and ``worktree`` paths may be omitted because ``create_task``
-    # itself derives them from a board ``default_workdir`` or a project-linked
-    # repo before the row is inserted.  A supplied path is still validated
-    # (absolute, non-empty).
+    # REST, CLI, and DB enforce the same rules.  For the create path, only
+    # ``worktree`` may omit its path, because ``create_task`` derives it from a
+    # board ``default_workdir`` or a project link.  ``dir`` still requires an
+    # explicit absolute path.  A supplied path is still validated (absolute,
+    # non-empty).
     from hermes_cli.kanban_validation import validate_workspace_spec
 
     ws_spec = validate_workspace_spec(
         workspace_kind,
         workspace_path,
         branch_name,
-        require_path_for=frozenset(),
+        require_path_for=frozenset({"dir"}),
     )
     workspace_kind = ws_spec.workspace_kind
     workspace_path = ws_spec.workspace_path

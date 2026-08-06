@@ -314,7 +314,7 @@ def create_intake_link(
         body=None,  # Will patch after we know workspace_path
         assignee=assignee,
         created_by=source,
-        workspace_kind="dir",
+        workspace_kind="scratch",
         workspace_path=None,
         tenant=None,
         priority=priority,
@@ -329,8 +329,9 @@ def create_intake_link(
     # If this was an idempotency hit, create_task returned the existing id
     # and we must NOT overwrite the body or workspace_path.
     existing = kb.get_task(conn, new_task_id)
-    # Robustly detect a truly-fresh row, even when the board has a
-    # default_workdir that auto-fills workspace_path.  An idempotency-hit
+    # Robustly detect a truly-fresh row.  We create with ``workspace_kind=scratch``
+    # to avoid the create-time ``dir`` path requirement, then patch to ``dir`` with
+    # the resolved artifact path once ``new_task_id`` is known.  An idempotency hit
     # will already carry our contract body; anything else needs patching.
     expected_ws_path = str(_task_artifact_dir(new_task_id))
     needs_patch = existing and (

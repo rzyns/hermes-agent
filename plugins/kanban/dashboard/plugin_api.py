@@ -790,7 +790,7 @@ class CreateTaskBody(StrictPayloadBase):
         ValueError for legacy callers; convert them to the typed
         PayloadValidationError so the REST surface names the key.
 
-        For task creation, a worktree path may be omitted because
+        For task creation, only ``worktree`` may omit its path because
         ``kanban_db.create_task`` derives it from a board ``default_workdir``
         or project link; ``dir`` still requires an explicit absolute path.
         """
@@ -799,7 +799,7 @@ class CreateTaskBody(StrictPayloadBase):
                 self.workspace_kind,
                 self.workspace_path,
                 self.branch_name,
-                require_path_for=frozenset(),
+                require_path_for=frozenset({"dir"}),
             )
         except ValueError as exc:
             key = "workspace_kind"

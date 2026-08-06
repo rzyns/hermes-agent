@@ -90,16 +90,17 @@ def test_validate_create_workspace_deferred_worktree_path(kanban_home, tmp_path)
     """CLI create-time validation must allow a missing worktree path so the
     DB can derive it from a board default or project link."""
     assert kc._validate_create_workspace(
-        "worktree", None, None, require_path_for=frozenset()
+        "worktree", None, None, require_path_for=frozenset({"dir"})
     ) == ("worktree", None, None)
 
 
 def test_validate_create_workspace_deferred_dir_path(kanban_home, tmp_path):
-    """CLI create-time validation must allow a missing dir path so the DB can
-    inherit it from a board default_workdir."""
-    assert kc._validate_create_workspace(
-        "dir", None, None, require_path_for=frozenset()
-    ) == ("dir", None, None)
+    """CLI create-time validation keeps ``dir`` strict; only worktree may defer
+    its path to ``create_task``."""
+    with pytest.raises(ValueError, match=r"dir.*requires.*workspace_path"):
+        kc._validate_create_workspace(
+            "dir", None, None, require_path_for=frozenset({"dir"})
+        )
 
 
 def test_run_slash_create_worktree_no_path_with_board_default(kanban_home, tmp_path):
@@ -133,6 +134,34 @@ def test_run_slash_create_worktree_no_path_with_board_default(kanban_home, tmp_p
     ws = kb.resolve_workspace(task, board="wt-board")
     assert ws == repo / ".worktrees" / tid
     assert task.branch_name == "wt/cli"
+
+
+def test_run_slash_create_dir_requires_explicit_path(kanban_home, tmp_path):
+    """``--workspace dir`` with no path is rejected before it can create a row."""
+    out = kc.run_slash("create 'ship dir' --workspace dir")
+    assert (
+        "workspace_path" in out.lower()
+        or "requires" in out.lower()
+        or "dir:<path>" in out.lower()
+    )
+
+
+def test_run_slash_create_dir_with_explicit_path_round_trips(kanban_home, tmp_path):
+    """``--workspace dir:/abs/path`` stores the explicit path."""
+    target = tmp_path / "workdir"
+    target.mkdir()
+    out = kc.run_slash(f"create 'ship dir' --workspace dir:{target.as_posix()}")
+    assert "Created" in out
+    import re
+
+    m = re.search(r"(t_[a-f0-9]+)", out)
+    assert m is not None
+    tid = m.group(1)
+    with kb.connect() as conn:
+        task = kb.get_task(conn, tid)
+    assert task is not None
+    assert task.workspace_kind == "dir"
+    assert task.workspace_path == str(target)
 
 
 # ---------------------------------------------------------------------------

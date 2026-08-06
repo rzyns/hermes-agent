@@ -162,10 +162,10 @@ def validate_workspace_spec(
        Callers that have a later bounded resolver (for example
        ``kanban_db.create_task`` deriving ``<repo>/.worktrees/<task-id>`` from
        a board ``default_workdir`` or project link) may pass
-       ``require_path_for=frozenset()`` to defer the path requirement.  A
-       supplied path is still validated (absolute, non-empty).  ``scratch``
-       normally stores ``None``; an explicit scratch path is validated as
-       absolute.
+       ``require_path_for=frozenset({"dir"})`` to defer only the worktree path
+       requirement.  A supplied path is still validated (absolute, non-empty).
+       ``scratch`` normally stores ``None``; an explicit scratch path is
+       validated as absolute.
     3. Supplied paths must be absolute after ``~`` expansion.  Relative paths
        are rejected because they are ambiguous against the dispatcher's CWD
        and are a confused-deputy traversal risk.

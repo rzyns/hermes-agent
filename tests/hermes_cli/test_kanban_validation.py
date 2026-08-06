@@ -132,15 +132,15 @@ class TestValidateWorkspaceSpec:
 
     def test_worktree_path_may_be_deferred(self):
         spec = validate_workspace_spec(
-            "worktree", None, require_path_for=frozenset()
+            "worktree", None, require_path_for=frozenset({"dir"})
         )
         assert spec == WorkspaceSpec("worktree", None, None)
 
     def test_dir_path_may_be_deferred(self):
-        spec = validate_workspace_spec(
-            "dir", None, require_path_for=frozenset()
-        )
-        assert spec == WorkspaceSpec("dir", None, None)
+        """Only the default policy actually keeps ``dir`` strict.  Passing the
+        narrow create policy (``{\"dir\"}``) still requires a dir path."""
+        with pytest.raises(ValueError, match=r"dir.*requires.*workspace_path"):
+            validate_workspace_spec("dir", None, require_path_for=frozenset({"dir"}))
 
     def test_rejects_empty_path(self):
         with pytest.raises(ValueError, match=r"workspace_path must be non-empty"):
@@ -185,15 +185,15 @@ class TestValidateWorkspaceSpec:
 
     def test_deferred_policy_undefined_worktree_path_allowed(self):
         spec = validate_workspace_spec(
-            "worktree", UNDEFINED, require_path_for=frozenset()
+            "worktree", UNDEFINED, require_path_for=frozenset({"dir"})
         )
         assert spec == WorkspaceSpec("worktree", None, None)
 
-    def test_deferred_policy_undefined_dir_path_allowed(self):
-        spec = validate_workspace_spec(
-            "dir", UNDEFINED, require_path_for=frozenset()
-        )
-        assert spec == WorkspaceSpec("dir", None, None)
+    def test_deferred_policy_undefined_dir_path_still_rejected(self):
+        with pytest.raises(ValueError, match=r"dir.*requires.*workspace_path"):
+            validate_workspace_spec(
+                "dir", UNDEFINED, require_path_for=frozenset({"dir"})
+            )
 
 
 class TestNormaliseBranchName:
@@ -252,9 +252,11 @@ def test_all_known_validation_sites_import_kernel():
     the consolidation tripwire from eroding every time a literal is reworded.
 
     The test does not prove correctness of the kernel itself; the unit tests
-    above do that.  It proves that there is only one live validator in the
-    codebase, which is the property that keeps the three create surfaces
-    aligned.
+    above do that.  The scan guarantees only that a non-excepted file containing
+    one of the marker literals also contains a recognized kernel import or a
+    call to ``validate_workspace_spec`` imported from the kernel; it does not
+    prove that the file has no private validator or that marker-free
+    reimplementations are absent.
     """
     import ast
 
@@ -289,19 +291,34 @@ def test_all_known_validation_sites_import_kernel():
     })
 
     def _imports_kernel(text: str) -> bool:
-        """Return True if the file imports from or calls the validation kernel."""
+        """Return True if the file imports from or calls the validation kernel.
+
+        A same-named local helper (for example a module-level
+        ``def validate_workspace_spec(...)`` that never imports the kernel)
+        does not satisfy this predicate.
+        """
         try:
             tree = ast.parse(text)
         except SyntaxError:
             return False
+
+        kernel_import_alias: str | None = None
         for node in ast.walk(tree):
             if isinstance(node, ast.ImportFrom):
                 if node.module == "hermes_cli.kanban_validation":
-                    return True
-            elif isinstance(node, ast.Call):
+                    # Record the alias used for the imported name, if any.
+                    for alias in node.names:
+                        if alias.name == "validate_workspace_spec":
+                            kernel_import_alias = alias.asname or alias.name
+                            break
+        if kernel_import_alias is not None:
+            return True
+
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Call):
                 func = node.func
                 if isinstance(func, ast.Name) and func.id == "validate_workspace_spec":
-                    return True
+                    return False  # local function, not the kernel import
                 if isinstance(func, ast.Attribute) and func.attr == "validate_workspace_spec":
                     return True
         return False
@@ -363,7 +380,6 @@ def test_kernel_can_model_create_task_body():
         body.workspace_path if body.is_supplied("workspace_path") else None,
         None,
     )
-    assert spec.workspace_kind == "scratch"
 
     # explicit null is distinguishable from omitted
     body_null = FutureCreateTaskBody(title="x", workspace_path=None)

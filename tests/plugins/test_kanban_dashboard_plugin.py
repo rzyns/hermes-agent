@@ -234,6 +234,47 @@ def test_create_task_rejects_invalid_initial_status(client):
     assert "initial_status" in detail
 
 
+def test_create_task_rejects_dir_without_path_even_with_board_default(client, tmp_path):
+    """Pathless ``dir`` must be rejected at REST even when a board default exists.
+
+    Only ``worktree`` is allowed to inherit the board default; ``dir`` requires
+    an explicit absolute path from the client.
+    """
+    work_dir = tmp_path / "workdir"
+    work_dir.mkdir()
+    kb.write_board_metadata("default", default_workdir=str(work_dir))
+
+    response = client.post(
+        "/api/plugins/kanban/tasks",
+        json={"title": "pathless dir", "workspace_kind": "dir"},
+    )
+    assert response.status_code == 422
+    detail = response.json()["detail"]
+    if isinstance(detail, list):
+        messages = " ".join(e.get("msg", "") for e in detail)
+    else:
+        messages = str(detail)
+    assert "workspace_path" in messages.lower()
+    assert "dir" in messages.lower()
+
+
+def test_create_task_worktree_no_path_round_trips_with_board_default(client, tmp_path):
+    """The existing worktree-deferral path keeps working after narrowing."""
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    subprocess.run(["git", "init", "-q", str(repo)], check=True)
+    kb.write_board_metadata("default", default_workdir=str(repo))
+
+    response = client.post(
+        "/api/plugins/kanban/tasks",
+        json={"title": "pathless worktree", "workspace_kind": "worktree"},
+    )
+    assert response.status_code == 200, response.text
+    task = response.json()["task"]
+    assert task["workspace_kind"] == "worktree"
+    assert task["workspace_path"] == str(repo)
+
+
 def test_create_task_branch_name_requires_worktree(client):
     response = client.post(
         "/api/plugins/kanban/tasks",
