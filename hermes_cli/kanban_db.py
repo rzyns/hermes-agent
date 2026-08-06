@@ -4560,12 +4560,16 @@ def _inherit_notify_subs(
     ).fetchone()
     cursor = int(row["cursor"] if row is not None else 0)
     placeholders = ",".join("?" * len(parent_ids))
+    # Copy the full routing tuple so inherited subscriptions keep their
+    # chat_type and delivery_metadata. The creation-time cursor is pinned to
+    # the child's current max event id; we do not replay pre-inheritance events.
     conn.execute(
         f"""
         INSERT OR IGNORE INTO kanban_notify_subs
-            (task_id, platform, chat_id, thread_id, user_id,
-             notifier_profile, created_at, last_event_id)
-        SELECT ?, platform, chat_id, thread_id, user_id, notifier_profile, ?, ?
+            (task_id, platform, chat_id, chat_type, thread_id, user_id,
+             notifier_profile, delivery_metadata, created_at, last_event_id)
+        SELECT ?, platform, chat_id, chat_type, thread_id, user_id,
+               notifier_profile, delivery_metadata, ?, ?
           FROM kanban_notify_subs
          WHERE task_id IN ({placeholders})
         """,
@@ -9904,6 +9908,15 @@ def archive_task(conn: sqlite3.Connection, task_id: str) -> bool:
             conn, task_id,
             outcome="reclaimed", status="reclaimed",
             summary="task archived with run still active",
+        )
+        # Routing-inheritance provenance is a run-time routing aid, not
+        # long-term lineage. Drop it on archive so archived sources/children
+        # behave the same way as links and subscriptions (both removed at
+        # archive-purge), and so the relation table never points at a task
+        # whose routing context is frozen.
+        conn.execute(
+            "DELETE FROM task_inherit_sources WHERE child_id = ? OR source_task_id = ?",
+            (task_id, task_id),
         )
         _append_event(conn, task_id, "archived", None, run_id=run_id)
     # ``archived`` parents only unblock children when the dependency predicate

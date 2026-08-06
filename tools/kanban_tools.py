@@ -1626,9 +1626,10 @@ def _handle_create(args: dict, **kw) -> str:
     )
     if _inherit_err:
         return tool_error(_inherit_err)
-    _inherit_project = (
-        workspace_kind is None and workspace_path is None and _inherit_current
-    )
+    # The closed inheritable set includes project_id. An explicit workspace
+    # choice is not an opt-out of project identity; only an explicit project
+    # argument or ``inherit_from_current_task=false`` suppresses it.
+    _inherit_project = _inherit_current and project_id is None
     if workspace_kind is None:
         workspace_kind = "scratch"
     triage, bool_error = _parse_bool_arg(args, "triage")

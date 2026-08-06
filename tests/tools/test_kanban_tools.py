@@ -1786,6 +1786,7 @@ def test_worker_spawn_inherits_notify_subscriptions(worker_env, monkeypatch):
             task_id=worker_env,
             platform="telegram",
             chat_id="chat-42",
+            chat_type="private",
             thread_id="20197",
             user_id="user-9",
             notifier_profile="notifier",
@@ -1806,9 +1807,23 @@ def test_worker_spawn_inherits_notify_subscriptions(worker_env, monkeypatch):
     s = subs[0]
     assert s["platform"] == "telegram"
     assert s["chat_id"] == "chat-42"
+    assert s["chat_type"] == "private"
     assert s["thread_id"] == "20197"
     assert s["user_id"] == "user-9"
     assert s["notifier_profile"] == "notifier"
+    assert s["delivery_metadata"] == {"reply_to": "msg-11"}
+
+    # The inherited subscription's cursor is pinned to the child's creation-time
+    # max event id, so pre-inheritance events are not replayed.
+    conn = kb.connect()
+    try:
+        max_event = conn.execute(
+            "SELECT COALESCE(MAX(id), 0) AS n FROM task_events WHERE task_id = ?",
+            (child_id,),
+        ).fetchone()["n"]
+        assert s["last_event_id"] == max_event
+    finally:
+        conn.close()
 
     assert _inherit_sources_for(child_id) == [worker_env]
     assert worker_env not in _task_links_for(child_id)
@@ -1838,18 +1853,23 @@ def test_worker_spawned_child_runnable_while_creator_open(worker_env):
 def test_worker_spawn_inherits_board_default_workdir(worker_env, tmp_path):
     """When a worker explicitly asks for a persistent workspace kind without a
     path, the board's ``default_workdir`` is inherited like any other task on
-    that board."""
+    that board, and project_id still inherits from the current task."""
     from hermes_cli import kanban_db as kb
+    from hermes_cli import projects_db as pdb
     from tools import kanban_tools as kt
 
     repo = tmp_path / "repo"
     repo.mkdir()
+    with pdb.connect_closing() as pconn:
+        project_id = pdb.create_project(pconn, name="Default Project", folders=[str(repo)])
+
     kb.create_board("wt-board", default_workdir=str(repo))
 
     conn = kb.connect(board="wt-board")
     try:
         parent_id = kb.create_task(
-            conn, title="parent", assignee="worker", board="wt-board"
+            conn, title="parent", assignee="worker", board="wt-board",
+            project_id=project_id,
         )
         kb.claim_task(conn, parent_id)
     finally:
@@ -1872,7 +1892,58 @@ def test_worker_spawn_inherits_board_default_workdir(worker_env, tmp_path):
     d = json.loads(out)
     assert d["ok"] is True, d
     assert d["workspace_kind"] == "worktree"
-    assert d["workspace_path"] == str(repo)
+    assert d["workspace_path"].startswith(str(repo))
+    assert d["project_id"] == project_id
+
+
+def test_explicit_workspace_path_keeps_project_inheritance(worker_env, tmp_path):
+    """An explicit workspace_path is not an opt-out of project_id inheritance.
+    The closed inheritable set still copies project_id while keeping the
+    caller's literal workspace path."""
+    from hermes_cli import kanban_db as kb
+    from hermes_cli import projects_db as pdb
+    from tools import kanban_tools as kt
+
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    with pdb.connect_closing() as pconn:
+        project_id = pdb.create_project(pconn, name="Path Project", folders=[str(repo)])
+
+    conn = kb.connect()
+    try:
+        kb.add_notify_sub(conn, task_id=worker_env, platform="slack", chat_id="path-chat")
+        conn.execute(
+            "UPDATE tasks SET project_id = ? WHERE id = ?", (project_id, worker_env)
+        )
+    finally:
+        conn.close()
+
+    explicit_path = tmp_path / "explicit-dir"
+    explicit_path.mkdir()
+    out = kt._handle_create(
+        {
+            "title": "path child",
+            "assignee": "peer",
+            "workspace_kind": "dir",
+            "workspace_path": str(explicit_path),
+        }
+    )
+    d = json.loads(out)
+    assert d["ok"] is True, d
+    assert d["workspace_kind"] == "dir"
+    assert d["workspace_path"] == str(explicit_path)
+    assert d["project_id"] == project_id
+    assert d["inherit_from"] == worker_env
+
+    conn = kb.connect()
+    try:
+        child = kb.get_task(conn, d["task_id"])
+        assert child is not None
+        assert child.project_id == project_id
+        assert child.workspace_path == str(explicit_path)
+        assert len(_sub_index(_list_subs_for_task(d["task_id"]))) == 1
+    finally:
+        conn.close()
 
 
 def test_explicit_override_takes_precedence(worker_env, tmp_path):
@@ -2040,7 +2111,8 @@ def test_non_inheritable_fields_do_not_leak(worker_env):
     """``model``, ``provider``, ``skills``, ``max_retries``,
     ``goal_max_turns``, ``worker_max_turns``, ``priority``, and ``tenant`` are
     outside the closed inheritable set and must not leak to a worker-created
-    child."""
+    child.  Likewise run/claim identity and the literal workspace path stay
+    behind."""
     from hermes_cli import kanban_db as kb
     from tools import kanban_tools as kt
 
@@ -2049,7 +2121,8 @@ def test_non_inheritable_fields_do_not_leak(worker_env):
         kb.set_model_override(conn, worker_env, "fancy-model", provider="fancy-provider")
         conn.execute(
             "UPDATE tasks SET skills = ?, max_retries = ?, goal_max_turns = ?, "
-            "worker_max_turns = ?, priority = ?, tenant = ? WHERE id = ?",
+            "worker_max_turns = ?, priority = ?, tenant = ?, "
+            "current_run_id = ?, claim_lock = ?, workspace_path = ? WHERE id = ?",
             (
                 json.dumps(["github-code-review"]),
                 7,
@@ -2057,6 +2130,9 @@ def test_non_inheritable_fields_do_not_leak(worker_env):
                 21,
                 99,
                 "secret-tenant",
+                42,
+                "claim-me",
+                "/should/not/copy",
                 worker_env,
             ),
         )
@@ -2070,6 +2146,7 @@ def test_non_inheritable_fields_do_not_leak(worker_env):
     conn = kb.connect()
     try:
         child = kb.get_task(conn, d["task_id"])
+        assert child is not None
         assert child.model_override is None
         assert child.provider_override is None
         assert child.skills is None
@@ -2078,6 +2155,9 @@ def test_non_inheritable_fields_do_not_leak(worker_env):
         assert child.worker_max_turns is None
         assert child.priority == 0
         assert child.tenant is None
+        assert child.current_run_id is None
+        assert child.claim_lock is None
+        assert child.workspace_path != "/should/not/copy"
     finally:
         conn.close()
 
@@ -2110,6 +2190,39 @@ def test_explicit_parents_suppress_typed_routing_inheritance(worker_env):
     assert worker_env in _task_links_for(d["task_id"])
     assert _inherit_sources_for(d["task_id"]) == []
     assert len(_sub_index(_list_subs_for_task(d["task_id"]))) == 1
+
+
+def test_inheritance_relation_cascades_on_archive_and_delete(worker_env):
+    """task_inherit_sources rows are removed when either side of the relation
+    is archived or hard-deleted, matching task_links and subscriptions."""
+    from hermes_cli import kanban_db as kb
+    from tools import kanban_tools as kt
+
+    # Archive a source removes its inheritance rows.
+    out = kt._handle_create({"title": "archive-source child", "assignee": "peer"})
+    d = json.loads(out)
+    assert d["ok"] is True
+    assert _inherit_sources_for(d["task_id"]) == [worker_env]
+
+    conn = kb.connect()
+    try:
+        assert kb.archive_task(conn, worker_env)
+        assert _inherit_sources_for(d["task_id"]) == []
+    finally:
+        conn.close()
+
+    # Hard-delete a source removes its inheritance rows.
+    out2 = kt._handle_create({"title": "delete-source child", "assignee": "peer"})
+    d2 = json.loads(out2)
+    assert d2["ok"] is True
+    assert _inherit_sources_for(d2["task_id"]) == [worker_env]
+
+    conn = kb.connect()
+    try:
+        assert kb.delete_task(conn, worker_env)
+        assert _inherit_sources_for(d2["task_id"]) == []
+    finally:
+        conn.close()
 
 
 def test_create_no_worker_task_stays_scratch(monkeypatch, worker_env):
