@@ -176,8 +176,14 @@ def test_create_intake_link_basic(conn):
     assert "needs_assessment" in task.body
     assert task.workspace_kind == "dir"
     assert task.workspace_path is not None
-    assert task.workspace_path == str(Path(os.environ["HERMES_HOME"]) / "artifacts" / "attention-intake" / tid)
+    expected_path = str(
+        Path(os.environ["HERMES_HOME"]) / "artifacts" / "attention-intake" / tid
+    )
+    assert task.workspace_path == expected_path
     assert Path(task.workspace_path).exists()
+    # Internally we create as scratch to avoid the create-time ``dir`` path
+    # requirement, then patch to ``dir`` once the task id is known.  The caller
+    # still sees a ``dir`` row.
     assert task.assignee == "link-analyst"
     assert task.status == "triage"
     assert task.idempotency_key == kil.canonical_url_hash("https://example.com/foo")

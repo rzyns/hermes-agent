@@ -333,9 +333,18 @@ def create_intake_link(
     # If this was an idempotency hit, create_task returned the existing id
     # and we must NOT overwrite the body or workspace_path.
     existing = kb.get_task(conn, new_task_id)
-    # Robustly detect a truly-fresh row, even when the board has a
-    # default_workdir that auto-fills workspace_path.  An idempotency-hit
+    # Robustly detect a truly-fresh row.  We create with ``workspace_kind=scratch``
+    # to avoid the create-time ``dir`` path requirement, then patch to ``dir`` with
+    # the resolved artifact path once ``new_task_id`` is known.  An idempotency hit
     # will already carry our contract body; anything else needs patching.
+    #
+    # AUDIT-EVENT NOTE: Because the row is created as ``workspace_kind=scratch`` and
+    # only later patched via ``set_workspace(kind=\"dir\", ...)``, the immutable
+    # ``created`` event records ``workspace_kind=\"scratch\"`` and ``workspace_path=null``.
+    # The final row state is correct (dir + resolved path), but the event stream
+    # currently misreports the workspace until ``t_c6d77bec`` adds a
+    # ``workspace_changed`` transition event on the ``set_workspace`` path.  Do not
+    # synthesise an event here; the durable fix belongs in that follow-up card.
     expected_ws_path = str(_task_artifact_dir(new_task_id))
     needs_patch = existing and (
         existing.body is None

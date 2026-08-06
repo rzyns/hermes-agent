@@ -89,15 +89,18 @@ import logging
 import time
 from contextvars import ContextVar, Token
 from dataclasses import dataclass, field
+from functools import partial
 from pathlib import Path
 from typing import Any, Callable, Iterable, Mapping, Optional
 
 from hermes_cli.sqlite_util import add_column_if_missing as _add_column_if_missing
+from hermes_cli.kanban_validation import validate_workspace_spec
 from toolsets import get_toolset_names
 
 _log = logging.getLogger(__name__)
 
 
+# ---------------------------------------------------------------------------
 # Test-only hook for deterministic interleave verification.  Called inside
 # the heartbeat_claim_with_event write_txn, between the CAS UPDATE and the
 # heartbeat event write, while the SQLite writer lock is still held.
@@ -593,156 +596,10 @@ DEP_WAIT_REDISPATCH_CAP = 3
 VALID_WORKSPACE_KINDS = {"scratch", "worktree", "dir"}
 
 # Sentinel used to distinguish "field not supplied" from "field supplied as
-# None/empty" in workspace validation.  Public callers should not see this;
-# it is internal to ``_validate_workspace_fields``.
+# None/empty" in workspace validation.  Public callers (e.g. the dashboard
+# plugin) pass this sentinel to ``update_task_workspace``; the function then
+# maps it onto the shared kernel's ``UNDEFINED`` sentinel internally.
 _UNSET = object()
-
-
-def _validate_workspace_fields(
-    workspace_kind: object,
-    workspace_path: object,
-    branch_name: object,
-    *,
-    require_path: bool = True,
-    old_kind: str = "scratch",
-) -> tuple[object, object, object]:
-    """Shared validation/normalization for workspace kind/path/branch.
-
-    Accepts either concrete values or the internal ``_UNSET`` sentinel for
-    each field.  ``_UNSET`` means "caller did not supply this field", and the
-    validator leaves the corresponding result as ``_UNSET`` so the caller can
-    decide whether to apply a default or leave the existing value unchanged.
-
-    When ``require_path`` is True (used at task creation and when changing
-    ``workspace_kind``), ``dir`` and ``worktree`` kinds demand a non-empty,
-    absolute ``workspace_path`` and reject an explicit clear.  When False
-    (used for updates that keep the current kind), an explicit ``None`` for
-    ``workspace_path`` is allowed to clear the path only for ``scratch``.
-
-    Returns a tuple of ``(kind, path, branch)`` where each element is either
-    a concrete normalized value or ``_UNSET``.
-
-    Raises:
-        WorkspaceUpdateError: on invalid kind, missing/relative path,
-            branch/kind mismatch, or forbidden explicit null.
-    """
-    # workspace_kind
-    if workspace_kind is _UNSET:
-        kind_out: object = _UNSET
-    else:
-        kind = str(workspace_kind).strip()
-        if kind not in VALID_WORKSPACE_KINDS:
-            raise WorkspaceUpdateError(
-                f"workspace_kind must be one of {sorted(VALID_WORKSPACE_KINDS)}, "
-                f"got {kind!r}"
-            )
-        kind_out = kind
-
-    # workspace_path: normalize empty/whitespace to None
-    if workspace_path is _UNSET:
-        path_out: object = _UNSET
-    elif workspace_path is None:
-        path_out = None
-    else:
-        s = str(workspace_path).strip()
-        path_out = s or None
-
-    # branch_name: normalize empty/whitespace to None
-    if branch_name is _UNSET:
-        branch_out: object = _UNSET
-    elif branch_name is None:
-        branch_out = None
-    else:
-        s = str(branch_name).strip()
-        branch_out = s or None
-
-    effective_kind = kind_out if kind_out is not _UNSET else "scratch"
-
-    # branch/kind constraint.  When the kind is being changed, validate against
-    # the new kind; otherwise validate against the existing kind.  This allows
-    # a branch-only update on an existing worktree (kind unchanged) and rejects
-    # a branch for a task whose kind is not worktree.
-    if kind_out is _UNSET:
-        effective_kind = old_kind
-    else:
-        effective_kind = kind_out
-
-    # branch/kind constraint
-    if branch_out is not _UNSET and branch_out is not None and effective_kind != "worktree":
-        raise WorkspaceUpdateError("branch_name is only valid for worktree workspaces")
-
-    # path requirement / explicit null handling
-    if path_out is _UNSET:
-        # caller omitted path.  For creation or a kind change this is an
-        # error because dir/worktree require a path; for a same-kind update
-        # the caller simply leaves the existing value alone.
-        if require_path and effective_kind in {"dir", "worktree"}:
-            raise WorkspaceUpdateError(
-                f"workspace_path is required for workspace_kind={effective_kind!r}"
-            )
-    elif path_out is None:
-        if effective_kind in {"dir", "worktree"}:
-            # Changing the kind to dir/worktree without a path is always invalid.
-            # Keeping the kind as dir/worktree and sending null is also invalid
-            # (clear is forbidden); both cases surface as a required-path error
-            # so the response names the field that is missing.
-            raise WorkspaceUpdateError(
-                f"workspace_path is required for workspace_kind={effective_kind!r}"
-            )
-        # scratch with explicit None is valid (clears any legacy path)
-    else:
-        p = Path(str(path_out)).expanduser()
-        if not p.is_absolute():
-            raise WorkspaceUpdateError(
-                f"workspace_path must be absolute, got {path_out!r}"
-            )
-        path_out = str(p)
-
-    kind_result = kind_out if kind_out is _UNSET else str(kind_out)
-    return (
-        kind_result,  # type: ignore[return-value]
-        path_out if path_out is _UNSET or path_out is None else str(path_out),
-        branch_out if branch_out is _UNSET or branch_out is None else str(branch_out),
-    )
-
-
-def _normalize_workspace_update_inputs(
-    *,
-    workspace_kind: object,
-    workspace_path: object,
-    branch_name: object,
-    old_kind: str,
-) -> tuple[object, object, object, bool]:
-    """Prepare raw update inputs for :func:`_validate_workspace_fields`.
-
-    ``None`` in an input means "field sent as JSON null / explicit clear",
-    and the internal ``_UNSET`` sentinel means "field not sent at all".
-    Empty / whitespace strings are normalized to ``None`` because their wire
-    representation is already indistinguishable from null.
-
-    Returns ``(kind, path, branch, require_path)`` where ``require_path`` is
-    True when the kind is being changed (the new combination must be valid on
-    its own), and False when the kind stays the same (so an explicit null path
-    can be validated as a clear attempt against the existing kind).
-    """
-    kind_in = workspace_kind
-    path_in = workspace_path
-    branch_in = branch_name
-
-    # An empty/whitespace-only string is not distinguishable from null on the
-    # wire, so normalize it to a real None rather than treating it as a path.
-    if path_in is not _UNSET and isinstance(path_in, str) and not path_in.strip():
-        path_in = None
-    if branch_in is not _UNSET and isinstance(branch_in, str) and not branch_in.strip():
-        branch_in = None
-    if kind_in is not _UNSET and isinstance(kind_in, str) and not kind_in.strip():
-        kind_in = None
-
-    # Determine whether the kind is actually changing.  When the caller did not
-    # send a kind, we look at the existing row's kind; the path requirement is
-    # then relaxed so an explicit null path can be validated as a clear.
-    require_path = bool(kind_in is not _UNSET and kind_in != old_kind)
-    return kind_in, path_in, branch_in, require_path
 
 
 def normalize_reasoning_effort(effort: Optional[str]) -> Optional[str]:
@@ -4043,12 +3900,17 @@ def _execute_boundary_with_retry(conn: sqlite3.Connection, sql: str) -> None:
 
 
 @contextlib.contextmanager
-def write_txn(conn: sqlite3.Connection):
+def write_txn(conn: sqlite3.Connection, *, on_committed: Optional[Callable[[], None]] = None):
     """Context manager for an IMMEDIATE write transaction.
 
     Use for any multi-statement write (creating a task + link, claiming a
     task + recording an event, etc.).  A claim CAS inside this context is
     atomic -- at most one concurrent writer can succeed.
+
+    The optional ``on_committed`` callback is invoked after ``COMMIT`` has
+    succeeded and before the post-commit invariant checks. Callers can use
+    it to mark filesystem state as committed, so post-commit failures are
+    not mistaken for rollback cases.
 
     The explicit ROLLBACK on exception is wrapped in try/except so that
     a SQLite auto-rollback (which leaves no active transaction) does not
@@ -4066,7 +3928,7 @@ def write_txn(conn: sqlite3.Connection):
         except sqlite3.OperationalError:
             # SQLite has already auto-rolled-back the transaction (typical
             # under EIO, lock contention, or corruption). Nothing to undo;
-            # do not let this secondary failure shadow the real one.
+            # do not let this secondary failure shadow the real exception.
             pass
         raise
     else:
@@ -4080,6 +3942,8 @@ def write_txn(conn: sqlite3.Connection):
             except sqlite3.OperationalError:
                 pass
             raise
+        if on_committed is not None:
+            on_committed()
         # Post-commit file-length check: header page_count must match actual file pages.
         # A discrepancy means a torn-extend — raise now rather than silently corrupt.
         _check_file_length_invariant(conn)
@@ -4123,34 +3987,6 @@ def _canonical_assignee(assignee: Optional[str]) -> Optional[str]:
     from hermes_cli.profiles import normalize_profile_name
 
     return normalize_profile_name(assignee)
-
-
-def validate_workspace_for_mutation(
-    workspace_kind: object,
-    workspace_path: object,
-    branch_name: object,
-    *,
-    require_path: bool,
-    old_kind: str = "scratch",
-) -> tuple[object, object, object]:
-    """Single entry point for workspace validation used by creation and update.
-
-    Wraps :func:`_validate_workspace_fields` so every caller — ``create_task``
-    and ``update_task_workspace`` — shares the exact same normalization and
-    error classification.  Returns ``(kind, path, branch)`` where each element
-    is either a concrete normalized value or the internal ``_UNSET`` sentinel.
-
-    Parameters match the update path semantics: ``require_path`` is True when
-    a ``dir``/``worktree`` kind is being established and a path must be
-    present; old_kind is the existing kind for same-kind updates.
-    """
-    return _validate_workspace_fields(
-        workspace_kind,
-        workspace_path,
-        branch_name,
-        require_path=require_path,
-        old_kind=old_kind,
-    )
 
 
 def create_task(
@@ -4234,40 +4070,27 @@ def create_task(
         raise ValueError(
             f"initial_status must be one of {sorted(VALID_INITIAL_STATUSES)}"
         )
+    if worker_max_turns is not None and int(worker_max_turns) < 1:
+        raise ValueError("worker_max_turns must be >= 1")
 
-    # Shared workspace validation: kind/path/branch rules and absolute-path
-    # requirement.  We run a first pass to catch malformed kind/branch/path
-    # inputs early with the same exception class as the update path.  A missing
-    # path for dir/worktree is allowed here if the caller did not provide one,
-    # because board-level default_workdir or a linked project may supply it
-    # below; we re-validate after that resolution.
-    #
-    # At creation time, ``None`` for path/branch means "caller did not supply a
-    # value" (Python default), not JSON null, so we translate it to the internal
-    # _UNSET sentinel before the shared validator inspects it.
-    _wk, _wp, _wb = validate_workspace_for_mutation(
-        workspace_kind,
-        _UNSET if workspace_path is None else workspace_path,
-        _UNSET if branch_name is None else branch_name,
-        require_path=workspace_path is not None,
-        old_kind=workspace_kind,
-    )
-    workspace_kind = typing.cast(str, _wk)
-    workspace_path = typing.cast(Optional[str], _wp if _wp is not _UNSET else None)
-    branch_name = typing.cast(Optional[str], _wb if _wb is not _UNSET else None)
-
-    # After default inheritance and project resolution, dir/worktree kinds
-    # must have a non-empty absolute path when one was actually supplied or
-    # inherited.  If no path is available at all (no explicit path, no board
-    # default, no project repo), creation is still allowed; resolve_workspace
-    # will raise a clear runtime error about default_workdir rather than
-    # silently anchoring on the dispatcher's CWD.  This preserves the old
-    # no-default-workdir behavior while still sharing the validator for any
-    # concrete path that does exist.
-    if workspace_kind in {"dir", "worktree"} and workspace_path is not None:
-        validate_workspace_for_mutation(
-            workspace_kind, workspace_path, branch_name, require_path=True
+    # Validate/normalise workspace and branch through the shared kernel so
+    # REST, CLI, and DB enforce the same rules.  For the create path, only
+    # ``worktree`` may omit its path, because ``create_task`` derives it from a
+    # board ``default_workdir`` or a project link.  ``dir`` still requires an
+    # explicit absolute path.  A supplied path is still validated (absolute,
+    # non-empty).
+    try:
+        ws_spec = validate_workspace_spec(
+            workspace_kind,
+            workspace_path,
+            branch_name,
+            require_path_for=frozenset({"dir"}),
         )
+    except ValueError as exc:
+        raise WorkspaceUpdateError(str(exc)) from exc
+    workspace_kind = ws_spec.workspace_kind
+    workspace_path = ws_spec.workspace_path
+    branch_name = ws_spec.branch_name
 
     # Inherit the board's scoped project when the caller didn't name one, so a
     # project-scoped board anchors every new task to that project's repo
@@ -4455,25 +4278,22 @@ def create_task(
         if board_default:
             workspace_path = str(board_default)
 
-    # After default inheritance and project resolution, dir kinds must have a
-    # non-empty absolute path.  worktree creation without a path is still
-    # allowed when no default/project is available; resolve_workspace fails
-    # loudly later so the error names the dispatcher CWD / default_workdir
-    # issue rather than a validation gap.  dir has no deferred resolution, so
-    # an unfulfilled dir path is rejected here with the same error the update
-    # path uses.
-    if workspace_kind == "dir":
-        if workspace_path is not None:
-            validate_workspace_for_mutation(
-                workspace_kind, workspace_path, branch_name, require_path=True
+    # After default inheritance and project resolution, any concrete path
+    # must still be absolute.  dir has no deferred resolver, so an unfulfilled
+    # dir path is rejected here with the same error the update path uses.
+    if workspace_path is not None:
+        try:
+            validate_workspace_spec(
+                workspace_kind,
+                workspace_path,
+                branch_name,
+                require_path_for=frozenset({"dir", "worktree"}),
             )
-        elif project_repo is None and not board_default:
-            raise WorkspaceUpdateError(
-                f"workspace_path is required for workspace_kind={workspace_kind!r}"
-            )
-    elif workspace_kind == "worktree" and workspace_path is not None:
-        validate_workspace_for_mutation(
-            workspace_kind, workspace_path, branch_name, require_path=True
+        except ValueError as exc:
+            raise WorkspaceUpdateError(str(exc)) from exc
+    elif workspace_kind == "dir" and project_repo is None and not board_default:
+        raise WorkspaceUpdateError(
+            f"workspace_path is required for workspace_kind={workspace_kind!r}"
         )
 
     # Retry once on the extremely unlikely id collision.
@@ -4598,6 +4418,25 @@ def create_task(
                         "provider_override": provider_override,
                     },
                 )
+                # Informational budget-ladder projection. Emitted whenever the
+                # task carries an override that affects one of the four layers,
+                # so operators can see the effective limits from the event log
+                # without relying on the CLI config resolving them correctly.
+                if (
+                    max_retries is not None
+                    or worker_max_turns is not None
+                    or goal_max_turns is not None
+                    or goal_mode
+                ):
+                    _append_event(
+                        conn,
+                        task_id,
+                        "budget_ladder",
+                        _budget_ladder_projection(
+                            get_task(conn, task_id),
+                            failure_limit=None,
+                        ),
+                    )
                 if initial_status == "blocked":
                     # Initial blocked is an explicit operator gate. Record the
                     # same durable marker used by worker/operator blocks so
@@ -5104,6 +4943,299 @@ def _collision_free_path(dest_dir: Path, safe_name: str) -> Path:
     return dest_dir / candidate
 
 
+def _sha256_bytes(data: bytes) -> str:
+    """Return the SHA-256 hex digest of ``data``."""
+    return hashlib.sha256(data).hexdigest()
+
+
+def _sha256_file(path: Path) -> str:
+    """Return the SHA-256 hex digest of the file at ``path``."""
+    h = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+class AttachmentNameCollisionError(ValueError):
+    """Raised when an attachment filename collides with an existing row.
+
+    A duplicate name means either an overwrite intent or a bug; both
+    deserve a loud error rather than a silently renamed file.
+    """
+
+
+def _attachment_path_for_name(
+    dest_dir: Path, safe_name: str, *, collision_mode: str = "rename"
+) -> Path:
+    """Resolve a destination path for ``safe_name`` under ``dest_dir``.
+
+    ``collision_mode``:
+      * ``rename`` (default) — append ``(1)``, ``(2)`` … as needed, the
+        historical behavior used by the dashboard and older agent tools.
+      * ``error`` — raise :class:`AttachmentNameCollisionError` if a file
+        with that name already exists under ``dest_dir``. Use this for
+        agent-driven scratch-to-durable copies where a duplicate name
+        signals a bug or overwrite intent that should not be hidden.
+    """
+    candidate = dest_dir / safe_name
+    if not candidate.exists():
+        return candidate
+    if collision_mode == "error":
+        raise AttachmentNameCollisionError(
+            f"attachment filename already exists: {safe_name}"
+        )
+    return _collision_free_path(dest_dir, safe_name)
+
+
+def _stage_file_path(dest_dir: Path, safe_name: str) -> Path:
+    """Return a unique, hidden staging path next to the intended final name.
+
+    The staging file lives in the same directory as the final attachment so
+    publishing can use a same-filesystem hard link and never crosses a mount
+    boundary.  Dot-prefix keeps the transient file out of casual directory
+    listings.
+    """
+    token = secrets.token_hex(8)
+    return dest_dir / f".{token}.{safe_name}.stage"
+
+
+def _remove_file_silent(path: Path) -> None:
+    """Best-effort remove; never raise.
+
+    Used for transient staging files and for rollback compensation. A real
+    permission or I/O failure here is recorded by the surrounding context,
+    not swallowed silently; this helper is intentionally narrow so that
+    cleanup failures do not get promoted to a misleading claim of
+    unconditional removal.
+    """
+    try:
+        path.unlink(missing_ok=True)
+    except OSError:
+        pass
+
+
+def _publish_staged_file(
+    staging_path: Path,
+    final_path: Path,
+    safe_name: str,
+) -> None:
+    """Atomically publish a verified staging file as ``final_path``.
+
+    Uses a same-filesystem hard link: the operation either succeeds with
+    both names pointing at the same inode, or fails with ``EEXIST`` if the
+    final name is already occupied.  The staging file is always removed on
+    return, success or failure, best-effort.  No plain ``os.replace`` is
+    used, so an existing final file can never be silently overwritten.
+
+    Raises :class:`AttachmentNameCollisionError` when ``final_path``
+    already exists, or :class:`ArtifactPreservationError` for unexpected
+    publish failures.
+    """
+    try:
+        os.link(str(staging_path), str(final_path))
+    except FileExistsError as exc:
+        _remove_file_silent(staging_path)
+        raise AttachmentNameCollisionError(
+            f"attachment filename already exists: {safe_name}"
+        ) from exc
+    except OSError as exc:
+        _remove_file_silent(staging_path)
+        raise ArtifactPreservationError(
+            f"could not publish staged attachment to {final_path}: {exc}"
+        ) from exc
+    # Hard link succeeded; drop the extra link so only the final name remains.
+    _remove_file_silent(staging_path)
+
+
+def _copy_file_with_hash_verification(
+    src: Path,
+    dest: Path,
+    *,
+    max_bytes: Optional[int] = None,
+) -> Path:
+    """Copy ``src`` to ``dest`` atomically with byte-exact SHA-256 verification.
+
+    The source is opened **once**; its digest is computed from the bytes
+    actually streamed to the destination, eliminating the TOCTOU window
+    between a pre-copy hash and the real copy. After the stream the source
+    is re-read from the same opened handle and re-hashed; if the digest
+    differs, the bytes changed during the protected window and the copy is
+    rejected. This content-continuity witness is authoritative and
+    cross-platform — it catches a same-size overwrite with restored mtime
+    that no mutable stat field can detect on Windows. Metadata checks
+    (size, mtime, inode, ctime on Unix) remain as cheap fast paths for
+    replacement/unlink detection but are never the sole witness on any
+    platform. Any change raises :class:`ArtifactPreservationError`.
+
+    The destination is written to a hidden same-directory staging file,
+    verified, then published with a no-clobber hard link so a partial or
+    failed copy can never leave a truncated file at ``dest``. Returns the
+    final ``dest`` path.
+
+    ``max_bytes`` caps the total bytes copied; an overrun raises
+    :class:`ArtifactPreservationError`.
+    """
+    if max_bytes is None:
+        max_bytes = KANBAN_ATTACHMENT_MAX_BYTES
+
+    # Pre-check: stat once and remember stable identity for the mutation check.
+    try:
+        pre_stat = src.stat()
+    except OSError as exc:
+        raise ArtifactPreservationError(f"cannot stat source artifact {src}: {exc}") from exc
+    src_size = pre_stat.st_size
+    if src_size > max_bytes:
+        raise ArtifactPreservationError(
+            f"artifact exceeds the {max_bytes}-byte limit: {src}"
+        )
+
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    staging_path = _stage_file_path(dest.parent, dest.name)
+    stream_hash = hashlib.sha256()
+    published_final: Optional[Path] = None
+
+    try:
+        with src.open("rb") as source_file:
+            # Bind verification to the single opened handle so the identity
+            # (size, mtime) and the streamed bytes are guaranteed to come from
+            # the same file incarnation. This closes the TOCTOU window between a
+            # pre-copy hash and the real copy.
+            try:
+                pre_handle_stat = os.fstat(source_file.fileno())
+            except OSError as exc:
+                raise ArtifactPreservationError(
+                    f"cannot stat opened source artifact {src}: {exc}"
+                ) from exc
+            handle_size = pre_handle_stat.st_size
+            if handle_size > max_bytes:
+                raise ArtifactPreservationError(
+                    f"artifact exceeds the {max_bytes}-byte limit: {src}"
+                )
+
+            copied = 0
+            with staging_path.open("xb") as destination_file:
+                while chunk := source_file.read(1024 * 1024):
+                    copied += len(chunk)
+                    if copied > max_bytes:
+                        raise ArtifactPreservationError(
+                            f"artifact grew beyond the {max_bytes}-byte limit: {src}"
+                        )
+                    destination_file.write(chunk)
+                    stream_hash.update(chunk)
+                destination_file.flush()
+                os.fsync(destination_file.fileno())
+
+            if copied != handle_size:
+                raise ArtifactPreservationError(
+                    f"size mismatch copying {src}: expected {handle_size}, wrote {copied}"
+                )
+
+            # Verify the bytes that landed on disk match the bytes that left the
+            # source, using the same opened handle's view of the world. Re-reading
+            # the staging file is part of the protected region so a failure here
+            # also removes the staging file.
+            staging_hash = _sha256_file(staging_path)
+            if staging_hash != stream_hash.hexdigest():
+                raise ArtifactPreservationError(
+                    f"hash mismatch writing {src}: streamed {stream_hash.hexdigest()} "
+                    f"!= staging {staging_hash}"
+                )
+
+            # Authoritative content-continuity witness, bound to the opened
+            # handle. Re-read the source from the same descriptor and re-hash
+            # it; if the digest differs from the one computed during the
+            # stream, the source bytes changed during the protected window.
+            # This is cross-platform and catches the sharp case a mutable
+            # stat field cannot: a same-size overwrite with restored mtime.
+            # Metadata checks below remain as cheap fast paths for
+            # replacement/unlink detection, but this is the witness that
+            # must pass on every platform.
+            try:
+                source_file.seek(0)
+            except OSError as exc:
+                raise ArtifactPreservationError(
+                    f"cannot re-seek opened source artifact {src} for continuity check: {exc}"
+                ) from exc
+            reread_hash = hashlib.sha256()
+            while chunk := source_file.read(1024 * 1024):
+                reread_hash.update(chunk)
+            if reread_hash.hexdigest() != stream_hash.hexdigest():
+                raise ArtifactPreservationError(
+                    f"source artifact {src} changed during copy "
+                    f"(content continuity check failed)"
+                )
+
+            # Metadata fast paths: replacement, unlink, and obvious mutation.
+            # These are not the sole witness on any platform — the
+            # content-continuity check above is authoritative — but they
+            # produce clearer diagnostics and catch unlink/replacement
+            # without reading bytes when the path itself is gone.
+            try:
+                post_handle_stat = os.fstat(source_file.fileno())
+            except OSError as exc:
+                raise ArtifactPreservationError(
+                    f"cannot re-stat opened source artifact {src} after copy: {exc}"
+                ) from exc
+            if (
+                post_handle_stat.st_size != pre_handle_stat.st_size
+                or getattr(post_handle_stat, "st_mtime_ns", post_handle_stat.st_mtime)
+                != getattr(pre_handle_stat, "st_mtime_ns", pre_handle_stat.st_mtime)
+            ):
+                raise ArtifactPreservationError(
+                    f"source artifact {src} changed during copy"
+                )
+
+            # Detect path-level replacement or unlink after the handle was opened.
+            # The opened inode and the path must still name the same object; a
+            # different inode means the path was replaced, and a missing path means
+            # the source was unlinked.
+            try:
+                post_path_stat = os.stat(src)
+            except OSError as exc:
+                raise ArtifactPreservationError(
+                    f"source artifact {src} disappeared or became inaccessible after copy: {exc}"
+                ) from exc
+            if (
+                post_path_stat.st_dev != pre_handle_stat.st_dev
+                or post_path_stat.st_ino != pre_handle_stat.st_ino
+            ):
+                raise ArtifactPreservationError(
+                    f"source artifact {src} was replaced during copy (inode mismatch)"
+                )
+            # ctime is a Unix-only extra fast path; not relied upon for the
+            # same-size guarantee (handled by the content-continuity witness
+            # above). Kept for diagnostics on platforms that expose change time.
+            if sys.platform != "win32":
+                if getattr(post_path_stat, "st_ctime_ns", post_path_stat.st_ctime) != getattr(
+                    pre_handle_stat, "st_ctime_ns", pre_handle_stat.st_ctime
+                ):
+                    raise ArtifactPreservationError(
+                        f"source artifact {src} was mutated during copy (ctime changed)"
+                    )
+
+        # Publish atomically: hard link to final name, then drop staging link.
+        _publish_staged_file(staging_path, dest, dest.name)
+        published_final = dest
+        return dest
+    except ArtifactPreservationError:
+        _remove_file_silent(staging_path)
+        if published_final is not None:
+            _remove_file_silent(published_final)
+        raise
+    except Exception as exc:
+        _remove_file_silent(staging_path)
+        if published_final is not None:
+            _remove_file_silent(published_final)
+        raise ArtifactPreservationError(
+            f"could not copy artifact {src} to staging: {exc}"
+        ) from exc
+    finally:
+        # Always remove the staging file; if publish succeeded the extra hard
+        # link is already gone, and on failure we never want a hidden partial.
+        _remove_file_silent(staging_path)
+
+
 def store_attachment_bytes(
     conn: sqlite3.Connection,
     task_id: str,
@@ -5114,6 +5246,8 @@ def store_attachment_bytes(
     uploaded_by: Optional[str] = None,
     board: Optional[str] = None,
     max_bytes: Optional[int] = None,
+    collision_mode: str = "rename",
+    verify_hash: bool = True,
 ) -> int:
     """Validate, size-check, persist a blob, and record its metadata row.
 
@@ -5123,14 +5257,27 @@ def store_attachment_bytes(
     collision-resolution all behave identically everywhere.
 
     Steps: enforce ``max_bytes``, sanitise ``filename`` to a safe basename,
-    write the bytes under :func:`task_attachments_dir` with a
-    collision-free name, then insert the ``task_attachments`` row via
-    :func:`add_attachment`. Returns the new attachment id.
+    stage the bytes under :func:`task_attachments_dir`, verify the hash,
+    publish with an atomic no-clobber hard link, then insert the
+    ``task_attachments`` row via :func:`add_attachment`. Returns the new
+    attachment id.
 
     Raises :class:`AttachmentTooLarge` when ``data`` exceeds ``max_bytes``,
     or :class:`ValueError` for a bad filename / unknown task. On any failure
-    after the blob is written (e.g. the task disappeared) the orphaned blob
-    is removed before re-raising.
+    no partial file is left at the canonical final path, and the staging
+    file is removed.
+
+    ``collision_mode``:
+      * ``rename`` (default) — append ``(1)``, ``(2)`` … as needed, the
+        historical behavior used by the dashboard and older agent tools.
+      * ``error`` — raise :class:`AttachmentNameCollisionError` if a file
+        with that name already exists under ``dest_dir``. Use this for
+        agent-driven scratch-to-durable copies where a duplicate name
+        signals a bug or overwrite intent that should not be hidden.
+
+    ``verify_hash`` — when True, compute a SHA-256 digest before/after the
+    write and raise :class:`ArtifactPreservationError` on mismatch, ensuring
+    the bytes that land on disk are the bytes the caller passed.
     """
     if max_bytes is None:
         max_bytes = KANBAN_ATTACHMENT_MAX_BYTES
@@ -5142,9 +5289,31 @@ def store_attachment_bytes(
     dest_dir = task_attachments_dir(task_id, board=board)
     _assert_mutation_isolation_permits(dest_dir)
     dest_dir.mkdir(parents=True, exist_ok=True)
-    dest_path = _collision_free_path(dest_dir, safe_name)
-    dest_path.write_bytes(data)
+    dest_path = _attachment_path_for_name(
+        dest_dir, safe_name, collision_mode=collision_mode
+    )
+
+    source_hash = _sha256_bytes(data) if verify_hash else None
+    staging_path = _stage_file_path(dest_dir, safe_name)
+    published_final: Optional[Path] = None
+
     try:
+        with staging_path.open("xb") as handle:
+            handle.write(data)
+            handle.flush()
+            os.fsync(handle.fileno())
+
+        if verify_hash and source_hash is not None:
+            staging_hash = _sha256_file(staging_path)
+            if staging_hash != source_hash:
+                raise ArtifactPreservationError(
+                    f"hash mismatch writing {dest_path}: "
+                    f"expected {source_hash}, got {staging_hash}"
+                )
+
+        _publish_staged_file(staging_path, dest_path, safe_name)
+        published_final = dest_path
+
         return add_attachment(
             conn,
             task_id,
@@ -5154,13 +5323,17 @@ def store_attachment_bytes(
             size=len(data),
             uploaded_by=uploaded_by,
         )
+    except ArtifactPreservationError:
+        _remove_file_silent(staging_path)
+        if published_final is not None:
+            _remove_file_silent(published_final)
+        raise
     except Exception:
         # Don't leave an orphan blob if the metadata insert fails (most
-        # commonly: the task id doesn't exist).
-        try:
-            dest_path.unlink(missing_ok=True)
-        except OSError:
-            pass
+        # commonly: the task id doesn't exist), and never leave a staging file.
+        _remove_file_silent(staging_path)
+        if published_final is not None:
+            _remove_file_silent(published_final)
         raise
 
 
@@ -7005,17 +7178,11 @@ def complete_task(
                 return False
             accepted_budget_run_id = int(budget_run["id"])
         if isinstance(metadata, dict):
-            _persist_scratch_completion_artifacts(conn, task_id, metadata)
-            for stored_path in metadata.pop("_staged_artifacts", []):
-                path = Path(stored_path)
-                _insert_completion_attachment(
-                    conn,
-                    task_id,
-                    filename=path.name,
-                    stored_path=str(path),
-                    size=path.stat().st_size,
-                    created_at=now,
-                )
+            staged_paths = _persist_scratch_completion_artifacts(conn, task_id, metadata)
+            _record_lifecycle_staged_artifacts(
+                conn, task_id, metadata, created_at=now,
+                uploaded_by="kanban_complete", staged_paths=staged_paths,
+            )
         run_metadata = metadata
         if accepted_budget_run_id is not None:
             run_metadata = dict(metadata) if isinstance(metadata, dict) else {}
@@ -7062,14 +7229,9 @@ def complete_task(
         # ``kanban_complete(artifacts=[...])`` which stashes the list in
         # ``metadata["artifacts"]`` — we promote it onto the event so
         # consumers don't have to fetch the run row to find it.
-        if isinstance(metadata, dict):
-            md_artifacts = metadata.get("artifacts")
-            if isinstance(md_artifacts, (list, tuple)):
-                cleaned_artifacts = [
-                    str(p).strip() for p in md_artifacts if isinstance(p, str) and str(p).strip()
-                ]
-                if cleaned_artifacts:
-                    completed_payload["artifacts"] = cleaned_artifacts
+        cleaned_artifacts = _artifact_list_from_metadata(metadata)
+        if cleaned_artifacts:
+            completed_payload["artifacts"] = cleaned_artifacts
         _append_event(
             conn, task_id, terminal_outcome,
             completed_payload,
@@ -7652,6 +7814,39 @@ def has_pending_review(
 # ---------------------------------------------------------------------------
 
 
+def _artifact_list_from_metadata(metadata: Optional[dict]) -> list[str]:
+    """Return the non-empty artifact paths stored in metadata, if any."""
+    if not isinstance(metadata, dict):
+        return []
+    raw = metadata.get("artifacts")
+    if not isinstance(raw, (list, tuple)):
+        return []
+    return [
+        str(p).strip()
+        for p in raw
+        if isinstance(p, str) and str(p).strip()
+    ]
+
+
+def _emit_blocked_artifacts_event(
+    conn: sqlite3.Connection,
+    task_id: str,
+    metadata: dict,
+    *,
+    run_id: Optional[int],
+) -> None:
+    """Emit a ``blocked_artifacts`` event when declared artifacts are present."""
+    artifacts = _artifact_list_from_metadata(metadata)
+    if artifacts:
+        _append_event(
+            conn,
+            task_id,
+            "blocked_artifacts",
+            {"artifacts": artifacts},
+            run_id=run_id,
+        )
+
+
 def _merge_completion_prose_artifacts(
     conn: sqlite3.Connection,
     task_id: str,
@@ -7699,37 +7894,52 @@ def _merge_completion_prose_artifacts(
     return updated
 
 
-def _persist_scratch_completion_artifacts(
+def _persist_scratch_lifecycle_artifacts(
     conn: sqlite3.Connection,
     task_id: str,
     metadata: dict,
-) -> None:
-    """Copy scratch-workspace completion artifacts before cleanup removes them."""
+    *,
+    uploaded_by: str,
+) -> list[Path]:
+    """Copy scratch-workspace artifacts to durable attachments before loss.
+
+    Used by both terminal completion and by ``block_task`` so that a
+    worker asking for human input can still hand over deliverables safely.
+    Only managed scratch workspaces are touched; ``dir``/``worktree`` and
+    out-of-scratch paths are left alone so we never silently relocate a
+    user's source tree.
+
+    Returns the list of durable filesystem paths that were published. The
+    caller owns these files until the containing transaction commits; on
+    any later failure the caller must compensate by unlinking them, because
+    SQLite cannot roll back filesystem writes.
+    """
     raw_artifacts = metadata.get("artifacts")
     if not isinstance(raw_artifacts, (list, tuple)):
-        return
+        return []
 
     row = conn.execute(
         "SELECT workspace_kind, workspace_path FROM tasks WHERE id = ?",
         (task_id,),
     ).fetchone()
     if not row or row["workspace_kind"] != "scratch" or not row["workspace_path"]:
-        return
+        return []
 
     workspace = Path(row["workspace_path"]).expanduser()
     is_managed, board = _managed_scratch_path_info(workspace)
     if not is_managed:
-        return
+        return []
 
     try:
         workspace_root = workspace.resolve()
     except OSError:
-        return
+        return []
 
     attachment_dir = task_attachments_dir(task_id, board=board)
     persisted: list[str] = []
     used_destinations: set[Path] = set()
     changed = False
+    published_paths: list[Path] = []
 
     def _discard_copies() -> None:
         for copied in used_destinations:
@@ -7771,44 +7981,86 @@ def _persist_scratch_completion_artifacts(
                 f"{KANBAN_ATTACHMENT_MAX_BYTES}-byte limit: {artifact}"
             )
 
-        dest: Optional[Path] = None
+        attachment_dir.mkdir(parents=True, exist_ok=True)
+        dest = _unique_attachment_path(attachment_dir, resolved_src.name, used_destinations)
         try:
-            attachment_dir.mkdir(parents=True, exist_ok=True)
-            dest = _unique_attachment_path(attachment_dir, resolved_src.name, used_destinations)
-            with resolved_src.open("rb") as source_file, dest.open("xb") as destination_file:
-                copied = 0
-                while chunk := source_file.read(1024 * 1024):
-                    copied += len(chunk)
-                    if copied > KANBAN_ATTACHMENT_MAX_BYTES:
-                        raise ArtifactPreservationError(
-                            f"declared scratch artifact grew beyond the size limit: {artifact}"
-                        )
-                    destination_file.write(chunk)
-        except Exception as exc:
-            if dest is not None:
-                try:
-                    dest.unlink(missing_ok=True)
-                except OSError:
-                    pass
+            _copy_file_with_hash_verification(
+                resolved_src,
+                dest,
+                max_bytes=KANBAN_ATTACHMENT_MAX_BYTES,
+            )
+        except ArtifactPreservationError:
             _discard_copies()
-            if isinstance(exc, ArtifactPreservationError):
-                raise
+            raise
+        except Exception as exc:
+            _discard_copies()
             raise ArtifactPreservationError(
                 f"could not preserve declared scratch artifact {artifact}: {exc}"
             ) from exc
 
         used_destinations.add(dest)
         persisted.append(str(dest.resolve()))
+        published_paths.append(dest)
         changed = True
 
     if changed:
         metadata["artifacts"] = persisted
-        metadata["_staged_artifacts"] = [
-            path for path in persisted if path.startswith(str(attachment_dir.resolve()))
-        ]
+
+    return published_paths
+
+# Backward-compatible alias used by complete_task.
+_persist_scratch_completion_artifacts = partial(
+    _persist_scratch_lifecycle_artifacts,
+    uploaded_by="kanban_complete",
+)
 
 
-def _insert_completion_attachment(
+def _record_lifecycle_staged_artifacts(
+    conn: sqlite3.Connection,
+    task_id: str,
+    metadata: dict,
+    *,
+    created_at: int,
+    uploaded_by: str,
+    staged_paths: Optional[list[Path]] = None,
+) -> list[Path]:
+    """Record staged lifecycle-preserved attachments.
+
+    Callers must run this after the task-state CAS UPDATE succeeds so we do
+    not attach files to a failed transition. The staged list is taken from
+    the explicit ``staged_paths`` argument, which the caller captures
+    directly from ``_persist_scratch_lifecycle_artifacts``'s return value.
+    The private ``_staged_artifacts`` metadata transport key is no longer
+    written or read; ownership is established from the explicit argument
+    alone so internal transport state can never leak into durable run
+    metadata.
+
+    Returns the list of filesystem paths that were durably published and now
+    belong to the task. Callers should keep this list in a local variable so
+    they can compensate (unlink) these files on any later exception or commit
+    failure, because SQLite cannot roll back filesystem writes.
+    """
+    staged = staged_paths
+    recorded: list[Path] = []
+    if not isinstance(staged, (list, tuple)):
+        return recorded
+    for stored_path in staged:
+        path = Path(stored_path)
+        _insert_lifecycle_attachment(
+            conn,
+            task_id,
+            filename=path.name,
+            stored_path=str(path),
+            size=path.stat().st_size,
+            created_at=created_at,
+            uploaded_by=uploaded_by,
+        )
+        recorded.append(path)
+    return recorded
+
+
+
+def _insert_lifecycle_attachment(
     conn: sqlite3.Connection,
     task_id: str,
     *,
@@ -7816,20 +8068,22 @@ def _insert_completion_attachment(
     stored_path: str,
     size: int,
     created_at: int,
+    uploaded_by: str,
 ) -> None:
-    """Record a worker-produced artifact in the existing attachment table."""
+    """Record a lifecycle-preserved artifact in the existing attachment table."""
     conn.execute(
         "INSERT INTO task_attachments "
         "(task_id, filename, stored_path, content_type, size, uploaded_by, created_at) "
-        "VALUES (?, ?, ?, NULL, ?, 'kanban_complete', ?)",
-        (task_id, filename, stored_path, size, created_at),
+        "VALUES (?, ?, ?, NULL, ?, ?, ?)",
+        (task_id, filename, stored_path, size, uploaded_by, created_at),
     )
     _append_event(
         conn,
         task_id,
         "attached",
-        {"filename": filename, "size": size, "by": "kanban_complete"},
+        {"filename": filename, "size": size, "by": uploaded_by},
     )
+
 
 
 def _unique_attachment_path(directory: Path, filename: str, used: set[Path]) -> Path:
@@ -8303,7 +8557,10 @@ def block_task(
     reason: Optional[str] = None,
     kind: Optional[str] = None,
     contract: Optional[dict[str, Any]] = None,
+    metadata: Optional[dict[str, Any]] = None,
     expected_run_id: Optional[int] = None,
+    close_run: bool = True,
+    _inside_write_txn: bool = False,
 ) -> bool:
     """Transition ``running``/``ready`` → ``blocked`` (or route elsewhere).
 
@@ -8329,6 +8586,20 @@ def block_task(
       can use it to signal "this might clear on its own"; it still participates
       in the loop breaker so a forever-flaky task eventually escalates.
 
+    ``metadata`` is a free-form dict of structured handoff facts (changed_files,
+    tests_run, findings, etc.) Just like :func:`complete_task`, declared
+    artifact paths inside a managed scratch workspace are copied to durable
+    task attachments before the workspace can be lost. This only covers orderly
+    worker-invoked blocks that pass ``metadata["artifacts"]``; crash and
+    budget-exhaustion paths do not declare artifacts and are not recovered here.
+
+    ``close_run`` (default ``True``) tells ``block_task`` to close the active
+    run with outcome ``blocked``. Callers that have already closed the run
+    themselves (e.g. the budget-exhaustion circuit breaker, which ends the run
+    as ``gave_up`` or preserves the caller's ``timed_out``) should pass
+    ``False`` so the run row is not overwritten. The state transition and
+    recurrence-counting logic still run normally.
+
     Returns True on any successful transition (to ``blocked``, ``todo``, or
     ``triage``), False when the task wasn't in a blockable state.
     """
@@ -8346,267 +8617,343 @@ def block_task(
         contract_payload["error_type"],
     )
     recurrences = 0
-    with write_txn(conn):
-        cur_row = conn.execute(
-            "SELECT status, block_kind, block_recurrences FROM tasks WHERE id = ?",
-            (task_id,),
-        ).fetchone()
-        if cur_row is None:
-            return False
-        prev_kind = cur_row["block_kind"] if "block_kind" in cur_row.keys() else None
-        prev_recurrences = (
-            int(cur_row["block_recurrences"])
-            if "block_recurrences" in cur_row.keys()
-            and cur_row["block_recurrences"] is not None
-            else 0
-        )
 
-        # Dependency blocks never enter the human ``blocked`` bucket — they
-        # wait in ``todo`` and let ``recompute_ready`` gate on parents. Routing
-        # here (rather than ``blocked``) is what keeps a cron from ever seeing
-        # a dependency-wait as something to "unblock".
-        if kind == "dependency":
-            # Compute the dependency fingerprint BEFORE the UPDATE so
-            # recompute_ready can detect "same blocking condition" and
-            # refuse to re-promote (DISP-1: 2026-07-27 incident, 122 wasted
-            # runs in a dependency_wait → promote → spawn → dependency_wait
-            # loop). The worker already told us it can't proceed; we must
-            # not re-dispatch until the dependency materially changes.
-            dep_fp = _dependency_fingerprint(conn, task_id)
-            # Read the current dep_wait_count so we can increment it. On
-            # the first dependency block for this task it's 0 → 1.
-            dep_count_row = conn.execute(
-                "SELECT dep_wait_count FROM tasks WHERE id = ?",
+    metadata = dict(metadata) if isinstance(metadata, dict) else {}
+    now = int(time.time())
+    run_id: Optional[int] = None
+    _blocked_task: Optional[Any] = None
+
+    def _compensate_staged_files(paths: Iterable[Path]) -> None:
+        """Remove any durable files staged during a failed block transition."""
+        for path in paths:
+            try:
+                path.unlink(missing_ok=True)
+            except OSError:
+                pass
+
+    # Filesystem paths that this block attempt has published into the durable
+    # attachment directory. SQLite cannot roll back filesystem writes, so this
+    # local list must be assigned immediately after publication and before any
+    # metadata/row/event recording can fail. It is independent of metadata.
+    owned_files: list[Path] = []
+
+    # True only after write_txn's COMMIT has succeeded. Post-commit exceptions
+    # (e.g. the file-length invariant check) must not compensate, because the
+    # database transition is already durable and deleting the files would
+    # orphan committed attachment rows.
+    txn_committed = False
+
+    def _mark_committed() -> None:
+        nonlocal txn_committed
+        txn_committed = True
+
+    def _copy_declared_artifacts() -> list[Path]:
+        """Copy declared scratch artifacts and record their attachment rows."""
+        if not metadata:
+            return []
+        staged_paths = _persist_scratch_lifecycle_artifacts(
+            conn, task_id, metadata, uploaded_by="kanban_block"
+        )
+        # Ownership is captured *before* row/event recording so a failure in
+        # the recorder can still be compensated.
+        owned_files.extend(staged_paths)
+        _record_lifecycle_staged_artifacts(
+            conn, task_id, metadata, created_at=now,
+            uploaded_by="kanban_block", staged_paths=staged_paths,
+        )
+        return staged_paths
+
+    try:
+        if not _inside_write_txn:
+            txn_cm = write_txn(conn, on_committed=_mark_committed)
+        else:
+            txn_cm = contextlib.nullcontext(conn)
+        with txn_cm:
+            cur_row = conn.execute(
+                "SELECT status, block_kind, block_recurrences FROM tasks WHERE id = ?",
                 (task_id,),
             ).fetchone()
-            prev_dep_count = (
-                int(dep_count_row["dep_wait_count"])
-                if dep_count_row
-                and dep_count_row["dep_wait_count"] is not None
+            if cur_row is None:
+                return False
+
+            prev_kind = cur_row["block_kind"] if "block_kind" in cur_row.keys() else None
+            prev_recurrences = (
+                int(cur_row["block_recurrences"])
+                if "block_recurrences" in cur_row.keys()
+                and cur_row["block_recurrences"] is not None
                 else 0
             )
-            # Independent wait-window counter: unlike the sticky fingerprint,
-            # this deliberately survives dependency changes and promotion.
-            # Only explicit operator unblock (or completion) starts a new
-            # window, so a flickering dependency cannot evade the cap.
-            new_dep_count = prev_dep_count + 1
-            cur = conn.execute(
-                """
-                UPDATE tasks
-                   SET status        = 'todo',
-                       claim_lock    = NULL,
-                       claim_expires = NULL,
-                       worker_pid    = NULL,
-                       block_kind    = ?,
-                       block_fingerprint = ?,
-                       block_deadline = ?,
-                       block_retry_after = ?,
-                       block_error_type = ?,
-                       dep_wait_fingerprint = ?,
-                       dep_wait_count = ?
-                 WHERE id = ?
-                   AND status IN ('running', 'ready')
-                """ + ("" if expected_run_id is None else " AND current_run_id = ?"),
-                (kind, *block_values, dep_fp, new_dep_count, task_id)
-                if expected_run_id is None
-                else (
-                    kind, *block_values, dep_fp, new_dep_count, task_id,
-                    int(expected_run_id),
-                ),
-            )
-            if cur.rowcount != 1:
-                return False
-            run_id = _end_run(
-                conn, task_id,
-                outcome="blocked", status="blocked",
-                summary=reason,
-            )
-            if run_id is None and reason:
-                run_id = _synthesize_ended_run(
-                    conn, task_id, outcome="blocked", summary=reason,
-                )
-            _append_event(
-                conn, task_id, "dependency_wait",
-                {
-                    "reason": reason,
-                    "kind": kind,
-                    "contract": contract_payload,
-                    "dep_wait_fingerprint": dep_fp,
-                    "dep_wait_count": new_dep_count,
-                },
-                run_id=run_id,
-            )
-            if new_dep_count >= DEP_WAIT_REDISPATCH_CAP:
-                _maybe_emit_dep_wait_backstop(
-                    conn, task_id, new_dep_count, dep_fp
-                )
-            _blocked_task = get_task(conn, task_id)
-            _fire_kanban_lifecycle_hook(
-                "kanban_task_blocked",
-                task_id,
-                board=get_current_board(),
-                assignee=_blocked_task.assignee if _blocked_task else None,
-                run_id=run_id,
-                reason=reason,
-            )
-            return True
 
-        # Truly-blocked kinds. Increment the unblock-loop counter when this is a
-        # re-block for the SAME reason after a prior unblock. block_task only
-        # fires from running/ready (i.e. AFTER an unblock returned the task to
-        # the work pool), so a stored block_kind that matches the incoming kind
-        # means: blocked → unblocked → about-to-re-block for the same cause.
-        # An un-typed (None) block compares as "same" to a prior un-typed block.
-        same_cause = prev_kind == kind
-        if kind == "transient":
-            # The retry sweep owns this counter. Keeping block_task neutral
-            # avoids counting a requeue and its following re-block as two
-            # separate retry cycles.
-            recurrences = prev_recurrences if same_cause else 0
-            base_retry_after = contract_payload["retry_after"]
-            if base_retry_after is None:
-                base_retry_after = _BLOCK_DEFAULT_DEADLINE_SECONDS["transient"]
-            retry_after = min(
-                int(base_retry_after) * (2 ** min(recurrences, 14)),
-                _TRANSIENT_RETRY_MAX_SECONDS,
-            )
-            contract_payload["retry_after"] = retry_after
-            block_deadline = int(time.time()) + retry_after
-            block_values = (
-                contract_payload["fingerprint"],
-                block_deadline,
-                retry_after,
-                contract_payload["error_type"],
-            )
-        else:
-            recurrences = prev_recurrences + 1 if same_cause else 1
-
-        if recurrences >= BLOCK_RECURRENCE_LIMIT:
-            # Loop detected — stop letting the unblocker spin this task. Route
-            # to triage for a human-in-the-loop decision instead of blocked.
-            block_deadline = (
-                int(time.time()) + _BLOCK_DEFAULT_DEADLINE_SECONDS["triage"]
-            )
-            block_values = (
-                contract_payload["fingerprint"],
-                block_deadline,
-                contract_payload["retry_after"],
-                contract_payload["error_type"],
-            )
-            cur = conn.execute(
-                """
-                UPDATE tasks
-                   SET status        = 'triage',
-                       claim_lock    = NULL,
-                       claim_expires = NULL,
-                       worker_pid    = NULL,
-                       block_kind    = ?,
-                       block_recurrences = ?,
-                       block_fingerprint = ?,
-                       block_deadline = ?,
-                       block_retry_after = ?,
-                       block_error_type = ?
-                 WHERE id = ?
-                   AND status IN ('running', 'ready')
-                """ + ("" if expected_run_id is None else " AND current_run_id = ?"),
-                (kind, recurrences, *block_values, task_id)
-                if expected_run_id is None
-                else (kind, recurrences, *block_values, task_id, int(expected_run_id)),
-            )
-            if cur.rowcount != 1:
-                return False
-            run_id = _end_run(
-                conn, task_id,
-                outcome="blocked", status="blocked",
-                summary=reason,
-            )
-            if run_id is None and reason:
-                run_id = _synthesize_ended_run(
-                    conn, task_id, outcome="blocked", summary=reason,
+            # Dependency blocks never enter the human ``blocked`` bucket — they
+            # wait in ``todo`` and let ``recompute_ready`` gate on parents. Routing
+            # here (rather than ``blocked``) is what keeps a cron from ever seeing
+            # a dependency-wait as something to "unblock".
+            if kind == "dependency":
+                # Compute the dependency fingerprint BEFORE the UPDATE so
+                # recompute_ready can detect "same blocking condition" and
+                # refuse to re-promote (DISP-1: 2026-07-27 incident, 122 wasted
+                # runs in a dependency_wait → promote → spawn → dependency_wait
+                # loop). The worker already told us it can't proceed; we must
+                # not re-dispatch until the dependency materially changes.
+                dep_fp = _dependency_fingerprint(conn, task_id)
+                # Read the current dep_wait_count so we can increment it. On
+                # the first dependency block for this task it's 0 → 1.
+                dep_count_row = conn.execute(
+                    "SELECT dep_wait_count FROM tasks WHERE id = ?",
+                    (task_id,),
+                ).fetchone()
+                prev_dep_count = (
+                    int(dep_count_row["dep_wait_count"])
+                    if dep_count_row
+                    and dep_count_row["dep_wait_count"] is not None
+                    else 0
                 )
-            _append_event(
-                conn, task_id, "block_loop_detected",
-                {
-                    "reason": reason,
-                    "kind": kind,
-                    "recurrences": recurrences,
-                    "limit": BLOCK_RECURRENCE_LIMIT,
-                    "contract": contract_payload,
-                },
-                run_id=run_id,
-            )
-        else:
-            if expected_run_id is None:
+                # Independent wait-window counter: unlike the sticky fingerprint,
+                # this deliberately survives dependency changes and promotion.
+                # Only explicit operator unblock (or completion) starts a new
+                # window, so a flickering dependency cannot evade the cap.
+                new_dep_count = prev_dep_count + 1
                 cur = conn.execute(
                     """
                     UPDATE tasks
-                       SET status        = 'blocked',
+                       SET status        = 'todo',
                            claim_lock    = NULL,
                            claim_expires = NULL,
                            worker_pid    = NULL,
                            block_kind    = ?,
-                           block_recurrences = ?,
                            block_fingerprint = ?,
                            block_deadline = ?,
                            block_retry_after = ?,
-                           block_error_type = ?
+                           block_error_type = ?,
+                           dep_wait_fingerprint = ?,
+                           dep_wait_count = ?
                      WHERE id = ?
                        AND status IN ('running', 'ready')
-                    """,
-                    (kind, recurrences, *block_values, task_id),
-                )
-            else:
-                cur = conn.execute(
-                    """
-                    UPDATE tasks
-                       SET status        = 'blocked',
-                           claim_lock    = NULL,
-                           claim_expires = NULL,
-                           worker_pid    = NULL,
-                           block_kind    = ?,
-                           block_recurrences = ?,
-                           block_fingerprint = ?,
-                           block_deadline = ?,
-                           block_retry_after = ?,
-                           block_error_type = ?
-                     WHERE id = ?
-                       AND status IN ('running', 'ready')
-                       AND current_run_id = ?
-                    """,
-                    (
-                        kind,
-                        recurrences,
-                        *block_values,
-                        task_id,
+                    """ + ("" if expected_run_id is None else " AND current_run_id = ?"),
+                    (kind, *block_values, dep_fp, new_dep_count, task_id)
+                    if expected_run_id is None
+                    else (
+                        kind, *block_values, dep_fp, new_dep_count, task_id,
                         int(expected_run_id),
                     ),
                 )
-            if cur.rowcount != 1:
-                return False
-            run_id = _end_run(
-                conn, task_id,
-                outcome="blocked", status="blocked",
-                summary=reason,
-            )
-            # Synthesize a run when blocking a never-claimed task so the
-            # reason is preserved in attempt history.
-            if run_id is None and reason:
-                run_id = _synthesize_ended_run(
-                    conn, task_id,
-                    outcome="blocked",
-                    summary=reason,
+                if cur.rowcount != 1:
+                    return False
+
+                # CAS succeeded: now it is safe to touch filesystem artifacts.
+                owned_files = _copy_declared_artifacts()
+                if close_run:
+                    run_id = _end_run(
+                        conn, task_id,
+                        outcome="blocked", status="blocked",
+                        summary=reason,
+                        metadata=metadata if metadata else None,
+                    )
+                    if run_id is None and reason:
+                        run_id = _synthesize_ended_run(
+                            conn, task_id, outcome="blocked", summary=reason,
+                            metadata=metadata if metadata else None,
+                        )
+                _emit_blocked_artifacts_event(conn, task_id, metadata, run_id=run_id)
+                _append_event(
+                    conn, task_id, "dependency_wait",
+                    {
+                        "reason": reason,
+                        "kind": kind,
+                        "contract": contract_payload,
+                        "dep_wait_fingerprint": dep_fp,
+                        "dep_wait_count": new_dep_count,
+                    },
+                    run_id=run_id,
                 )
-            _append_event(
-                conn, task_id, "blocked",
-                {
-                    "reason": reason,
-                    "kind": kind,
-                    "recurrences": recurrences,
-                    "contract": contract_payload,
-                },
-                run_id=run_id,
-            )
-        _blocked_task = get_task(conn, task_id)
+                if new_dep_count >= DEP_WAIT_REDISPATCH_CAP:
+                    _maybe_emit_dep_wait_backstop(
+                        conn, task_id, new_dep_count, dep_fp
+                    )
+                _blocked_task = get_task(conn, task_id)
+                return True
+
+            # Truly-blocked kinds. Increment the unblock-loop counter when this is a
+            # re-block for the SAME reason after a prior unblock. block_task only
+            # fires from running/ready (i.e. AFTER an unblock returned the task to
+            # the work pool), so a stored block_kind that matches the incoming kind
+            # means: blocked → unblocked → about-to-re-block for the same cause.
+            # An un-typed (None) block compares as "same" to a prior un-typed block.
+            same_cause = prev_kind == kind
+            if kind == "transient":
+                # The retry sweep owns this counter. Keeping block_task neutral
+                # avoids counting a requeue and its following re-block as two
+                # separate retry cycles.
+                recurrences = prev_recurrences if same_cause else 0
+                base_retry_after = contract_payload["retry_after"]
+                if base_retry_after is None:
+                    base_retry_after = _BLOCK_DEFAULT_DEADLINE_SECONDS["transient"]
+                retry_after = min(
+                    int(base_retry_after) * (2 ** min(recurrences, 14)),
+                    _TRANSIENT_RETRY_MAX_SECONDS,
+                )
+                contract_payload["retry_after"] = retry_after
+                block_deadline = int(time.time()) + retry_after
+                block_values = (
+                    contract_payload["fingerprint"],
+                    block_deadline,
+                    retry_after,
+                    contract_payload["error_type"],
+                )
+            else:
+                recurrences = prev_recurrences + 1 if same_cause else 1
+
+            if recurrences >= BLOCK_RECURRENCE_LIMIT:
+                # Loop detected — stop letting the unblocker spin this task. Route
+                # to triage for a human-in-the-loop decision instead of blocked.
+                block_deadline = (
+                    int(time.time()) + _BLOCK_DEFAULT_DEADLINE_SECONDS["triage"]
+                )
+                block_values = (
+                    contract_payload["fingerprint"],
+                    block_deadline,
+                    contract_payload["retry_after"],
+                    contract_payload["error_type"],
+                )
+                cur = conn.execute(
+                    """
+                    UPDATE tasks
+                       SET status        = 'triage',
+                           claim_lock    = NULL,
+                           claim_expires = NULL,
+                           worker_pid    = NULL,
+                           block_kind    = ?,
+                           block_recurrences = ?,
+                           block_fingerprint = ?,
+                           block_deadline = ?,
+                           block_retry_after = ?,
+                           block_error_type = ?
+                     WHERE id = ?
+                       AND status IN ('running', 'ready')
+                    """ + ("" if expected_run_id is None else " AND current_run_id = ?"),
+                    (kind, recurrences, *block_values, task_id)
+                    if expected_run_id is None
+                    else (kind, recurrences, *block_values, task_id, int(expected_run_id)),
+                )
+                if cur.rowcount != 1:
+                    return False
+
+                owned_files = _copy_declared_artifacts()
+                if close_run:
+                    run_id = _end_run(
+                        conn, task_id,
+                        outcome="blocked", status="blocked",
+                        summary=reason,
+                        metadata=metadata if metadata else None,
+                    )
+                    if run_id is None and reason:
+                        run_id = _synthesize_ended_run(
+                            conn, task_id,
+                            outcome="blocked",
+                            summary=reason,
+                            metadata=metadata if metadata else None,
+                        )
+                _emit_blocked_artifacts_event(conn, task_id, metadata, run_id=run_id)
+                _append_event(
+                    conn, task_id, "block_loop_detected",
+                    {
+                        "reason": reason,
+                        "kind": kind,
+                        "recurrences": recurrences,
+                        "limit": BLOCK_RECURRENCE_LIMIT,
+                        "contract": contract_payload,
+                    },
+                    run_id=run_id,
+                )
+            else:
+                if expected_run_id is None:
+                    cur = conn.execute(
+                        """
+                        UPDATE tasks
+                           SET status        = 'blocked',
+                               claim_lock    = NULL,
+                               claim_expires = NULL,
+                               worker_pid    = NULL,
+                               block_kind    = ?,
+                               block_recurrences = ?,
+                               block_fingerprint = ?,
+                               block_deadline = ?,
+                               block_retry_after = ?,
+                               block_error_type = ?
+                         WHERE id = ?
+                           AND status IN ('running', 'ready')
+                        """,
+                        (kind, recurrences, *block_values, task_id),
+                    )
+                else:
+                    cur = conn.execute(
+                        """
+                        UPDATE tasks
+                           SET status        = 'blocked',
+                               claim_lock    = NULL,
+                               claim_expires = NULL,
+                               worker_pid    = NULL,
+                               block_kind    = ?,
+                               block_recurrences = ?,
+                               block_fingerprint = ?,
+                               block_deadline = ?,
+                               block_retry_after = ?,
+                               block_error_type = ?
+                         WHERE id = ?
+                           AND status IN ('running', 'ready')
+                           AND current_run_id = ?
+                        """,
+                        (
+                            kind,
+                            recurrences,
+                            *block_values,
+                            task_id,
+                            int(expected_run_id),
+                        ),
+                    )
+                if cur.rowcount != 1:
+                    return False
+
+                owned_files = _copy_declared_artifacts()
+                if close_run:
+                    run_id = _end_run(
+                        conn, task_id,
+                        outcome="blocked", status="blocked",
+                        summary=reason,
+                        metadata=metadata if metadata else None,
+                    )
+                    # Synthesize a run when blocking a never-claimed task so the
+                    # reason is preserved in attempt history.
+                    if run_id is None and reason:
+                        run_id = _synthesize_ended_run(
+                            conn, task_id,
+                            outcome="blocked",
+                            summary=reason,
+                            metadata=metadata if metadata else None,
+                        )
+                _emit_blocked_artifacts_event(conn, task_id, metadata, run_id=run_id)
+                _append_event(
+                    conn, task_id, "blocked",
+                    {
+                        "reason": reason,
+                        "kind": kind,
+                        "recurrences": recurrences,
+                        "contract": contract_payload,
+                    },
+                    run_id=run_id,
+                )
+            _blocked_task = get_task(conn, task_id)
+    except Exception:
+        # SQLite cannot roll back filesystem writes. If a copy succeeded but a
+        # later event / run / commit failed, remove any staged durable files so
+        # the next attempt does not see filename churn from orphan attachments.
+        # Do NOT compensate if the transaction already committed; at that point
+        # the attachment rows and events are durable and deleting the files
+        # would leave the database pointing at non-existent blobs.
+        if not txn_committed:
+            _compensate_staged_files(owned_files)
+        raise
+
     _fire_kanban_lifecycle_hook(
         "kanban_task_blocked",
         task_id,
@@ -8614,8 +8961,34 @@ def block_task(
         assignee=_blocked_task.assignee if _blocked_task else None,
         run_id=run_id,
         reason=reason,
+        metadata=metadata if metadata else None,
     )
     return True
+
+
+# Helper used by the budget/protocol-violation circuit breaker to route
+# auto-blocks through ``block_task`` without duplicating its recurrence
+# logic. It exists only to keep ``block_task`` the single source of truth
+# for the unblock-loop counter.
+def _block_task_inside_failure(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    reason: str,
+    kind: Optional[str],
+    contract: dict[str, Any],
+    expected_run_id: Optional[int],
+) -> bool:
+    """Call ``block_task`` from within an already-open write transaction."""
+    return block_task(
+        conn, task_id,
+        reason=reason,
+        kind=kind,
+        contract=contract,
+        expected_run_id=expected_run_id,
+        close_run=False,
+        _inside_write_txn=True,
+    )
 
 
 def record_blocked_hold(
@@ -9891,20 +10264,57 @@ def set_workspace(
     scratch workspace to a durable directory.  Updating ``workspace_path``
     alone leaves split-brain cleanup semantics: the row points at a durable
     directory but still claims to be disposable scratch.
+
+    Validation is delegated to the shared kernel.  A ``workspace_changed``
+    event recording old and new values is emitted on the same transaction
+    boundary as the write.
     """
-    if workspace_kind not in VALID_WORKSPACE_KINDS:
-        raise ValueError(
-            f"workspace_kind must be one of {sorted(VALID_WORKSPACE_KINDS)}, "
-            f"got {workspace_kind!r}"
+    try:
+        spec = validate_workspace_spec(
+            workspace_kind,
+            workspace_path,
+            None,
+            require_path_for=frozenset({"dir", "worktree"}),
         )
+    except ValueError as exc:
+        raise WorkspaceUpdateError(str(exc)) from exc
+
     with write_txn(conn):
+        row = conn.execute(
+            "SELECT workspace_kind, workspace_path, branch_name "
+            "FROM tasks WHERE id = ?",
+            (task_id,),
+        ).fetchone()
+        if row is None:
+            raise WorkspaceUpdateError(f"task {task_id} not found")
+
+        old_kind = row["workspace_kind"]
+        old_path = row["workspace_path"]
+        old_branch = row["branch_name"]
+        new_branch = old_branch if spec.workspace_kind == "worktree" else None
+
         conn.execute(
-            "UPDATE tasks SET workspace_kind = ?, workspace_path = ? WHERE id = ?",
-            (
-                workspace_kind,
-                str(workspace_path) if workspace_path is not None else None,
-                task_id,
-            ),
+            "UPDATE tasks SET workspace_kind = ?, workspace_path = ?, "
+            "branch_name = ? WHERE id = ?",
+            (spec.workspace_kind, spec.workspace_path, new_branch, task_id),
+        )
+
+        _append_event(
+            conn,
+            task_id,
+            "workspace_changed",
+            {
+                "old": {
+                    "workspace_kind": old_kind,
+                    "workspace_path": old_path,
+                    "branch_name": old_branch,
+                },
+                "new": {
+                    "workspace_kind": spec.workspace_kind,
+                    "workspace_path": spec.workspace_path,
+                    "branch_name": new_branch,
+                },
+            },
         )
 
 
@@ -9931,8 +10341,8 @@ def update_task_workspace(
       explicit clear.  Clearing ``branch_name`` on a ``worktree`` is allowed;
       clearing ``workspace_path`` is only allowed when the resulting kind is
       ``scratch``.  Clearing ``workspace_kind`` itself is invalid.
-    * Validation is delegated to :func:`_validate_workspace_fields`, the same
-      validator used at task creation time.
+    Validation is delegated to :func:`validate_workspace_spec`, the shared
+    kernel used at task creation time.
 
     Guards:
 
@@ -9989,30 +10399,63 @@ def update_task_workspace(
         old_path = row["workspace_path"]
         old_branch = row["branch_name"]
 
-        incoming_kind, incoming_path, incoming_branch, require_path = _normalize_workspace_update_inputs(
-            workspace_kind=workspace_kind,
-            workspace_path=workspace_path,
-            branch_name=branch_name,
-            old_kind=old_kind,
-        )
+        # Determine which fields the caller actually supplied.  ``_UNSET``
+        # means "not sent"; ``None`` means "explicit JSON null / clear".
+        kind_supplied = workspace_kind is not _UNSET
+        path_supplied = workspace_path is not _UNSET
+        branch_supplied = branch_name is not _UNSET
 
-        new_kind, new_path, new_branch = validate_workspace_for_mutation(
-            incoming_kind,
-            incoming_path,
-            incoming_branch,
-            require_path=require_path,
-            old_kind=old_kind,
-        )
-        if new_kind is _UNSET:
-            new_kind = old_kind
-        if new_path is _UNSET:
-            new_path = old_path
-        if new_branch is _UNSET:
-            new_branch = old_branch
+        # Normalise empty/whitespace strings to None the same way the wire does.
+        kind_in = workspace_kind
+        if kind_supplied and isinstance(workspace_kind, str) and not workspace_kind.strip():
+            kind_in = None
+        path_in = workspace_path
+        if path_supplied and isinstance(workspace_path, str) and not workspace_path.strip():
+            path_in = None
+        branch_in = branch_name
+        if branch_supplied and isinstance(branch_name, str) and not branch_name.strip():
+            branch_in = None
 
-        # If the kind changed but path was not supplied, the validator ran with
-        # require_path=True and already demanded a path; if it was supplied as
-        # None, it was rejected.  So at this point new_path must be set.
+        # Reject a null/empty workspace_kind explicitly; the kernel would just
+        # report an unknown kind.
+        if kind_supplied and kind_in is None:
+            raise WorkspaceUpdateError(
+                f"workspace_kind must be one of {sorted(VALID_WORKSPACE_KINDS)}, "
+                f"got {workspace_kind!r}"
+            )
+
+        effective_kind = kind_in if kind_supplied else old_kind
+        kind_changing = kind_supplied and kind_in != old_kind
+
+        # Build the candidate values.  For supplied fields we use the caller's
+        # value (possibly None for an explicit clear).  For omitted fields we
+        # keep the existing value, except when the kind changes away from
+        # worktree: a branch can only live on a worktree, so it is cleared.
+        new_kind = effective_kind
+        new_path = path_in if path_supplied else old_path
+        new_branch = branch_in if branch_supplied else (old_branch if effective_kind == "worktree" else None)
+
+        # Decide when a missing/None path is an error.  When the kind is
+        # changing to a path-requiring kind, the new combination must stand
+        # on its own.  When the kind stays the same, an explicit null path
+        # is only allowed for scratch; dir/worktree reject it.
+        require_path_for: frozenset[str]
+        if kind_changing:
+            require_path_for = frozenset({"dir", "worktree"})
+        elif effective_kind in {"dir", "worktree"}:
+            require_path_for = frozenset({effective_kind})
+        else:
+            require_path_for = frozenset()
+
+        try:
+            spec = validate_workspace_spec(
+                new_kind,
+                new_path,
+                new_branch,
+                require_path_for=require_path_for,
+            )
+        except ValueError as exc:
+            raise WorkspaceUpdateError(str(exc)) from exc
 
         conn.execute(
             """
@@ -10022,7 +10465,7 @@ def update_task_workspace(
                    branch_name = ?
              WHERE id = ?
             """,
-            (new_kind, new_path, new_branch, task_id),
+            (spec.workspace_kind, spec.workspace_path, spec.branch_name, task_id),
         )
 
         payload = {
@@ -10032,9 +10475,9 @@ def update_task_workspace(
                 "branch_name": old_branch,
             },
             "new": {
-                "workspace_kind": new_kind,
-                "workspace_path": new_path,
-                "branch_name": new_branch,
+                "workspace_kind": spec.workspace_kind,
+                "workspace_path": spec.workspace_path,
+                "branch_name": spec.branch_name,
             },
         }
         _append_event(conn, task_id, "workspace_changed", payload)
@@ -11596,6 +12039,104 @@ def detect_crashed_workers(
     return crashed
 
 
+def resolve_task_retry_budget(
+    task: "Task",
+    *,
+    failure_limit: Optional[int] = None,
+) -> dict[str, Any]:
+    """Resolve the effective retry-breaker budget for a task and its source.
+
+    This is a **display/projection helper**: it computes the same
+    precedence the circuit breaker uses in ``_record_task_failure`` so
+    that CLI, dashboard, and emitted events can show operators what limit
+    will actually be enforced.
+
+    Resolution order (single source of truth, matching ``_record_task_failure``):
+
+      1. per-task ``task.max_retries`` (set via ``--max-retries`` on create)
+      2. caller-supplied ``failure_limit`` (the dispatcher passes the
+         ``kanban.failure_limit`` config value)
+      3. ``DEFAULT_FAILURE_LIMIT``
+
+    ``failure_limit`` may be ``None`` when the caller cannot supply the
+    dispatcher config (e.g. a dashboard read). In that case the source
+    falls back to ``default``.
+
+    Returns a dict::
+
+        {
+            "limit": <int>,
+            "source": "task" | "dispatcher" | "default",
+        }
+    """
+    if task.max_retries is not None:
+        return {"limit": int(task.max_retries), "source": "task"}
+    if failure_limit is not None:
+        return {"limit": int(failure_limit), "source": "dispatcher"}
+    return {"limit": int(DEFAULT_FAILURE_LIMIT), "source": "default"}
+
+
+def _budget_ladder_projection(
+    task: "Task",
+    *,
+    failure_limit: Optional[int] = None,
+) -> dict[str, Any]:
+    """Return a stable, serializable projection of the four-layer budget ladder.
+
+    This is the **single source of truth** for how the CLI, dashboard,
+    and events describe the limits that govern a kanban task. It is
+    informational only — enforcement happens in the dispatcher and the
+    worker, not here.
+
+    Four independent authority layers cap different things:
+
+    1. Retry breaker — ``task.max_retries`` / ``kanban.failure_limit`` /
+       ``DEFAULT_FAILURE_LIMIT``. Trips on consecutive non-success runs
+       (spawn_failed / timed_out / crashed). Single source of truth for
+       retries.
+    2. ``worker_max_turns`` — per-conversation API/tool iteration budget
+       for the worker CLI. Passed as ``--max-turns`` when set on the task;
+       otherwise the assignee profile's ``agent.max_turns`` applies.
+    3. ``goal_max_turns`` — judge/goal loop budget for ``goal_mode`` cards.
+       ``None`` falls through to ``goals.DEFAULT_MAX_TURNS`` (currently 20).
+    4. Profile ``agent.max_turns`` — hard ceiling on the active chat
+       session across CLI/TUI/messaging. Default 500; setup recommends 90
+       and some users lower it further.
+    """
+    retry = resolve_task_retry_budget(task, failure_limit=failure_limit)
+    worker = {"limit": task.worker_max_turns, "source": None}
+    if task.worker_max_turns is not None:
+        worker["source"] = "task"
+    else:
+        worker["source"] = "profile"
+        worker["note"] = "assignee profile's agent.max_turns at dispatch time"
+
+    goal = {"enabled": bool(task.goal_mode), "limit": task.goal_max_turns}
+    if task.goal_mode:
+        if task.goal_max_turns is not None:
+            goal["source"] = "task"
+        else:
+            from hermes_cli.goals import DEFAULT_MAX_TURNS as _DEFAULT_GOAL_TURNS
+            goal["limit"] = _DEFAULT_GOAL_TURNS
+            goal["source"] = "default"
+            goal["note"] = "goals.DEFAULT_MAX_TURNS"
+    else:
+        goal["source"] = "n/a"
+        goal["note"] = "goal loop disabled"
+
+    return {
+        "retry_breaker": retry,
+        "worker_max_turns": worker,
+        "goal_max_turns": goal,
+        "authority_order": [
+            "retry_breaker (task.max_retries > kanban.failure_limit > DEFAULT_FAILURE_LIMIT)",
+            "worker_max_turns (task override > profile agent.max_turns)",
+            "goal_max_turns (task override > goals.DEFAULT_MAX_TURNS, only when goal_mode)",
+            "agent.max_turns (profile/session hard ceiling)",
+        ],
+    }
+
+
 def _record_task_failure(
     conn: sqlite3.Connection,
     task_id: str,
@@ -11702,53 +12243,17 @@ def _record_task_failure(
             limit_source = "dispatcher"
 
         if force_trip or fingerprint_short_circuit or failures >= effective_limit:
-            # Trip the breaker.
-            if release_claim:
-                # Spawn path: still running, also clear claim state.
-                conn.execute(
-                    "UPDATE tasks SET status = 'blocked', claim_lock = NULL, "
-                    "claim_expires = NULL, worker_pid = NULL, "
-                    "consecutive_failures = ?, last_failure_error = ?, "
-                    "block_kind = ?, block_fingerprint = ?, "
-                    "block_deadline = ?, block_retry_after = ?, "
-                    "block_error_type = ? "
-                    "WHERE id = ? AND status IN ('running', 'ready')",
-                    (
-                        failures,
-                        error[:500],
-                        block_kind,
-                        fingerprint,
-                        block_deadline,
-                        contract_payload["retry_after"],
-                        contract_payload["error_type"],
-                        task_id,
-                    ),
-                )
-            else:
-                # Timeout/crash path: task is already at ``ready``
-                # with claim cleared; just flip to blocked + update
-                # counter fields.
-                conn.execute(
-                    "UPDATE tasks SET status = 'blocked', "
-                    "consecutive_failures = ?, last_failure_error = ?, "
-                    "block_kind = ?, block_fingerprint = ?, "
-                    "block_deadline = ?, block_retry_after = ?, "
-                    "block_error_type = ? "
-                    "WHERE id = ? AND status IN ('ready', 'running')",
-                    (
-                        failures,
-                        error[:500],
-                        block_kind,
-                        fingerprint,
-                        block_deadline,
-                        contract_payload["retry_after"],
-                        contract_payload["error_type"],
-                        task_id,
-                    ),
-                )
-            run_id = None
-            if end_run:
-                # Only the spawn path has an open run to close.
+            # Trip the breaker. Route the state transition through
+            # ``block_task`` so the unblock-loop counter
+            # (``block_recurrences``) and the ``triage`` escalation safety
+            # valve apply uniformly to budget and protocol-violation paths.
+            #
+            # The active run is already closed by the caller for
+            # timeout/crash paths, and we close it ourselves for the spawn
+            # path before invoking ``block_task`` so the run outcome is
+            # preserved (e.g. ``gave_up``) instead of overwritten with
+            # ``blocked``.
+            if end_run and row["current_run_id"] is not None:
                 run_id = _end_run(
                     conn, task_id,
                     outcome="gave_up", status="gave_up",
@@ -11762,6 +12267,52 @@ def _record_task_failure(
                         "contract": contract_payload,
                     },
                 )
+            else:
+                run_id = None
+
+            # Now perform the recurrence-aware block transition. We pass
+            # ``close_run=False`` because we either just closed the run
+            # (spawn path) or the caller already closed it
+            # (timeout/crash/protocol-violation paths). ``block_task``
+            # updates ``block_*`` fields and may route to ``triage`` when
+            # the same kind has been unblocked too many times.
+            #
+            # We do NOT pass ``expected_run_id`` here: after closing the run
+            # above, ``tasks.current_run_id`` is NULL, so a run-id CAS would
+            # fail. The enclosing write_txn already guarded the initial read
+            # (with the caller's expected_run_id when provided), so the row
+            # remains locked until commit.
+            blocked = block_task(
+                conn, task_id,
+                reason=error,
+                kind=block_kind,
+                contract=contract_payload,
+                expected_run_id=None,
+                close_run=False,
+                _inside_write_txn=True,
+            )
+            if not blocked:
+                # Could not apply the block transition (CAS mismatch after
+                # run closure). At least preserve the failure counter and
+                # error text so diagnostics aren't lost.
+                conn.execute(
+                    "UPDATE tasks SET consecutive_failures = ?, "
+                    "last_failure_error = ? WHERE id = ?",
+                    (failures, error[:500], task_id),
+                )
+                return False
+
+            # ``block_task`` succeeded; preserve the unified failure counter
+            # and any contract extras. The consecutive_failures value is
+            # already stored above in the below-threshold path; on the trip
+            # path it reflects the breaker-threshold count, so keep it.
+            if failures != row["consecutive_failures"] or error[:500] != (row["last_failure_error"] or ""):
+                conn.execute(
+                    "UPDATE tasks SET consecutive_failures = ?, "
+                    "last_failure_error = ? WHERE id = ?",
+                    (failures, error[:500], task_id),
+                )
+
             payload = {
                 "failures": failures,
                 "effective_limit": effective_limit,
@@ -11777,25 +12328,8 @@ def _record_task_failure(
             _append_event(
                 conn, task_id, "gave_up", payload, run_id=run_id,
             )
-            if fingerprint_short_circuit:
-                # Unlike an ordinary threshold trip, an identical second
-                # failure has already proved that another blind retry is not
-                # useful. Mark it as a sticky structured block so
-                # ``recompute_ready`` cannot immediately undo the short-circuit
-                # merely because the configured numeric retry limit is higher.
-                _append_event(
-                    conn,
-                    task_id,
-                    "blocked",
-                    {
-                        "reason": error[:500],
-                        "kind": block_kind,
-                        "contract": contract_payload,
-                        "fingerprint_short_circuit": True,
-                    },
-                    run_id=run_id,
-                )
             blocked = True
+            return True
         else:
             # Below threshold.
             if release_claim:

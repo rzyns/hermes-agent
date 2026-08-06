@@ -337,3 +337,66 @@ def test_bare_reason_is_recorded_as_judgment_contract(kanban_home: Path) -> None
             "needs_authority": False,
             "detail": "legacy judgment",
         }
+
+
+def test_budget_auto_block_uses_block_task_recurrence_counter(kanban_home: Path) -> None:
+    """Budget-exhaustion auto-blocks route through ``block_task`` and its
+    unblock-loop counter, so repeated identical budget failures escalate to
+    ``triage`` instead of silently re-blocking forever."""
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(conn, title="budget loop", assignee="worker")
+        kb.claim_task(conn, tid)
+        run1 = kb.latest_run(conn, tid)
+        assert run1 is not None
+
+        tripped = kb._record_task_failure(
+            conn,
+            tid,
+            error="Iteration budget exhausted (4/4)",
+            outcome="timed_out",
+            release_claim=True,
+            end_run=True,
+            expected_run_id=run1.id,
+            failure_limit=1,
+        )
+        assert tripped, "first budget failure should trip the breaker"
+        task = kb.get_task(conn, tid)
+        assert task is not None
+        assert task.status == "blocked"
+        assert task.block_kind == "budget"
+        assert task.block_error_type == "budget_exhausted"
+        assert task.block_recurrences == 1
+
+        # Unblock and re-run the same budget failure.
+        assert kb.unblock_task(conn, tid)
+        kb.claim_task(conn, tid)
+        run2 = kb.latest_run(conn, tid)
+        assert run2 is not None
+        tripped2 = kb._record_task_failure(
+            conn,
+            tid,
+            error="Iteration budget exhausted (4/4)",
+            outcome="timed_out",
+            release_claim=True,
+            end_run=True,
+            expected_run_id=run2.id,
+            failure_limit=1,
+        )
+        assert tripped2, "second budget failure should trip the breaker again"
+        task2 = kb.get_task(conn, tid)
+        assert task2 is not None
+        assert task2.status == "triage", (
+            f"same-cause re-block should escalate, got {task2.status}"
+        )
+        assert task2.block_kind == "budget"
+        assert task2.block_recurrences == 2
+
+        gave_up = [e for e in kb.list_events(conn, tid) if e.kind == "gave_up"]
+        assert len(gave_up) == 2
+        loops = [e for e in kb.list_events(conn, tid) if e.kind == "block_loop_detected"]
+        assert len(loops) == 1
+        assert loops[0].payload is not None
+        assert loops[0].payload.get("kind") == "budget"
+    finally:
+        conn.close()
