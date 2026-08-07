@@ -675,6 +675,68 @@ def test_complete_retry_with_corrected_created_cards_succeeds(worker_env):
     assert ok.get("ok") is True
 
 
+def test_complete_idempotent_tool_call_returns_ok_without_duplicating_events(
+    worker_env,
+):
+    """An exact retry of kanban_complete is idempotent at the tool layer."""
+    from hermes_cli import kanban_db as kb
+    from tools import kanban_tools as kt
+
+    first = json.loads(kt._handle_complete({"summary": "first handoff"}))
+    assert first.get("ok") is True
+
+    with kb.connect() as conn:
+        before = len(kb.list_events(conn, worker_env))
+
+    second = json.loads(kt._handle_complete({"summary": "first handoff"}))
+    assert second.get("ok") is True
+    assert second.get("task_id") == worker_env
+
+    with kb.connect() as conn:
+        assert kb.get_task(conn, worker_env).status == "done"
+        after = len(kb.list_events(conn, worker_env))
+    assert after == before, "idempotent retry must not append duplicate events"
+
+
+def test_complete_digest_conflict_returns_structured_tool_error(
+    worker_env, monkeypatch,
+):
+    """A second kanban_complete with a different handoff for the same run is
+    refused with a structured error instead of a generic ValueError."""
+    from hermes_cli import kanban_db as kb
+    from tools import kanban_tools as kt
+
+    with kb.connect() as conn:
+        run_id = kb.latest_run(conn, worker_env).id
+    monkeypatch.setenv("HERMES_KANBAN_RUN_ID", str(run_id))
+
+    assert json.loads(kt._handle_complete({"summary": "original"})).get("ok")
+    err = json.loads(kt._handle_complete({"summary": "changed"}))
+    assert err.get("ok") is not True
+    assert "error" in err
+    assert "different digest" in err["error"]
+    assert "already exists" in err["error"]
+
+
+def test_complete_already_terminal_duplicate_run_reports_status(worker_env):
+    """If the task is already terminal and a later run is attempted, the tool
+    reports the terminal status instead of a generic failure."""
+    from hermes_cli import kanban_db as kb
+    from tools import kanban_tools as kt
+
+    assert json.loads(kt._handle_complete({"summary": "done"})).get("ok")
+
+    # Force a new run id so the worker attempts to complete a different run
+    # of an already-terminal task.
+    with kb.connect() as conn:
+        kb.claim_task(conn, worker_env)
+
+    out = json.loads(kt._handle_complete({"summary": "done"}))
+    assert out.get("ok") is True
+    assert out.get("already_terminal") is True
+    assert out.get("terminal_status") == "done"
+
+
 def test_complete_goal_mode_rejected_by_judge(monkeypatch, tmp_path):
     """Goal-mode tasks must pass the auxiliary judge before completion.
     Regression for #38367: workers bypassing the judge via early kanban_complete."""

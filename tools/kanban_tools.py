@@ -913,6 +913,20 @@ def _handle_complete(args: dict, **kw) -> str:
                     expected_run_id=_worker_run_id(tid),
                     review_pending=_normalize_review_pending(args.get("review_pending")),
                 )
+            except kb.CompletionDigestConflictError as conflict_err:
+                # A retry with a materially different handoff for the same run
+                # is ambiguous. Return a structured refusal so the worker can
+                # see it is not a duplicate, and cannot silently overwrite.
+                return tool_error(
+                    f"kanban_complete blocked: a completion result for "
+                    f"{conflict_err.task_id} run {conflict_err.run_id} already "
+                    f"exists with a different digest. "
+                    f"You may retry with the exact same summary/result/metadata "
+                    f"(idempotent), or call kanban_block/kanban_create for a "
+                    f"new continuation. Conflicting digest: "
+                    f"stored={conflict_err.stored_digest[:16]}... "
+                    f"attempted={conflict_err.attempted_digest[:16]}..."
+                )
             except kb.ArtifactPreservationError as artifact_err:
                 return tool_error(
                     f"kanban_complete could not preserve the declared artifacts: "
@@ -941,6 +955,19 @@ def _handle_complete(args: dict, **kw) -> str:
                     f"created_cards=[] to skip the card-claim check entirely."
                 )
             if not ok:
+                # Distinguish an already-terminal task from a generic failure.
+                # If the task is already done/review/archived, complete_task
+                # returns False and a duplicate tool call should not look like
+                # an error to the worker.
+                task = kb.get_task(conn, tid)
+                if task and task.status in {"done", "review", "archived"}:
+                    latest = kb.latest_run(conn, tid)
+                    return _ok(
+                        task_id=tid,
+                        run_id=latest.id if latest else None,
+                        already_terminal=True,
+                        terminal_status=task.status,
+                    )
                 return tool_error(
                     f"could not complete {tid} (unknown id or already terminal)"
                 )

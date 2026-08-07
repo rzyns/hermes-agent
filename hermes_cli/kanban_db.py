@@ -2178,6 +2178,40 @@ CREATE INDEX IF NOT EXISTS idx_events_task           ON task_events(task_id, cre
 CREATE INDEX IF NOT EXISTS idx_runs_task             ON task_runs(task_id, started_at);
 CREATE INDEX IF NOT EXISTS idx_runs_status           ON task_runs(status);
 CREATE INDEX IF NOT EXISTS idx_attachments_task      ON task_attachments(task_id, created_at);
+
+-- Durable completion-result ledger used to make `kanban_complete` idempotent
+-- and crash-safe. Each terminal completion for a given (task_id, run_id) is
+-- recorded with a canonical digest of its semantic inputs. A retry carrying the
+-- same digest can return the original result without mutating task state again;
+-- a retry with a different digest for the same (task_id, run_id) is rejected as
+-- an ambiguous/conflicting retry. The `published_artifacts_json` field stores
+-- the absolute paths of artifacts that were staged for this completion, so a
+-- later retry can finalize any attachment rows/events that were not recorded
+-- before a crash.
+CREATE TABLE IF NOT EXISTS task_completion_results (
+    task_id                TEXT NOT NULL,
+    run_id                 INTEGER NOT NULL,
+    digest                 TEXT NOT NULL,
+    status                 TEXT NOT NULL DEFAULT 'committed',
+    terminal_status        TEXT NOT NULL,
+    outcome                TEXT NOT NULL,
+    summary                TEXT,
+    result                 TEXT,
+    metadata_json          TEXT,
+    created_cards_json     TEXT,
+    review_pending_json    TEXT,
+    published_artifacts_json TEXT,
+    terminal_event_id      INTEGER,
+    completed_at           INTEGER NOT NULL,
+    finalized_at           INTEGER,
+    PRIMARY KEY (task_id, run_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_completion_results_task_run
+    ON task_completion_results(task_id, run_id);
+CREATE INDEX IF NOT EXISTS idx_completion_results_digest
+    ON task_completion_results(digest);
+
 CREATE INDEX IF NOT EXISTS idx_notify_task           ON kanban_notify_subs(task_id);
 CREATE INDEX IF NOT EXISTS idx_review_candidate      ON review_requests(candidate_id, status);
 CREATE INDEX IF NOT EXISTS idx_review_reviewer      ON review_requests(reviewer_task_id, status);
@@ -5621,6 +5655,15 @@ def _append_event(
     )
 
 
+def _last_event_id(conn: sqlite3.Connection, task_id: str) -> Optional[int]:
+    """Return the most recent event id for ``task_id``, or None."""
+    row = conn.execute(
+        "SELECT id FROM task_events WHERE task_id = ? ORDER BY id DESC LIMIT 1",
+        (task_id,),
+    ).fetchone()
+    return int(row["id"]) if row else None
+
+
 def _end_run(
     conn: sqlite3.Connection,
     task_id: str,
@@ -6975,6 +7018,39 @@ class CompletionResultRequiredError(ValueError):
         )
 
 
+class CompletionDigestConflictError(ValueError):
+    """Raised by ``complete_task`` when the same (task_id, run_id) already
+    completed with a different digest.
+
+    A retry of ``kanban_complete`` must carry exactly the same semantic
+    inputs as the first successful completion. Changing the summary,
+    result, metadata, created_cards, or review_pending set after the
+    task is already terminal is treated as a conflicting retry, not a
+    silent overwrite, so workers cannot accidentally mutate a published
+    handoff.
+
+    The original task id, run id, and stored digest are attached as
+    ``.task_id``, ``.run_id``, and ``.stored_digest``.
+    """
+
+    def __init__(
+        self,
+        task_id: str,
+        run_id: int,
+        stored_digest: str,
+        attempted_digest: str,
+    ):
+        self.task_id = task_id
+        self.run_id = int(run_id)
+        self.stored_digest = stored_digest
+        self.attempted_digest = attempted_digest
+        super().__init__(
+            f"completion blocked: task {task_id} run {run_id} already "
+            f"completed with a different digest "
+            f"(stored={stored_digest[:16]}..., attempted={attempted_digest[:16]}...)"
+        )
+
+
 def _terminal_completion_grace_seconds() -> int:
     """Return the default-off budget-bench completion grace window."""
     try:
@@ -6986,6 +7062,137 @@ def _terminal_completion_grace_seconds() -> int:
         return max(0, int(raw or 0))
     except Exception:  # pragma: no cover - config loading must fail closed
         return 0
+
+
+def _canonical_completion_digest(
+    *,
+    task_id: str,
+    run_id: Optional[int],
+    summary: Optional[str],
+    result: Optional[str],
+    metadata: Optional[dict],
+    created_cards: Optional[list[str]],
+    review_pending: Optional[list[str]],
+) -> str:
+    """Return a deterministic SHA-256 digest of the semantic completion inputs.
+
+    The digest covers everything that changes the meaning of a completion:
+    task identity, run identity, the effective handoff summary, structured
+    metadata, the set of claimed created cards, and the set of pending reviewers.
+    It intentionally does NOT cover timestamps, post-commit side effects, or
+    database row ids, so an honest retry of the same completion is recognized.
+
+    Collection-valued fields are normalized (sorted, deduplicated) so order and
+    representation quirks do not affect equality. The effective summary is the
+    # handoff text: ``summary`` falling back to ``result``.
+    """
+    effective_summary = (summary or result or "").strip()
+
+    def _sorted_unique(items: Optional[Iterable[str]]) -> list[str]:
+        if not items:
+            return []
+        seen: set[str] = set()
+        ordered: list[str] = []
+        for item in items:
+            key = str(item).strip()
+            if key and key not in seen:
+                seen.add(key)
+                ordered.append(key)
+        return sorted(ordered)
+
+    # Canonicalize metadata by keeping only stable semantic keys and ignoring
+    # internal transport keys that should not affect idempotency.
+    canonical_metadata: Optional[dict]
+    if isinstance(metadata, dict):
+        stable = {
+            key: value
+            for key, value in metadata.items()
+            if not key.startswith("_") and key not in {"worker_session_id"}
+        }
+        canonical_metadata = dict(sorted(stable.items()))
+    else:
+        canonical_metadata = None
+
+    payload = {
+        "task_id": task_id,
+        "run_id": run_id,
+        # For digest purposes the effective handoff text is what matters.
+        # ``summary`` and ``result`` are equivalent when they produce the same
+        # effective text; we collapse them to the effective value and treat the
+        # explicitly-empty counterpart as blank so order of precedence does not
+        # affect idempotency.
+        "effective": effective_summary,
+        "metadata": canonical_metadata,
+        "created_cards": _sorted_unique(created_cards),
+        "review_pending": _sorted_unique(review_pending),
+    }
+    canonical_json = json.dumps(
+        payload,
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=False,
+    )
+    return hashlib.sha256(canonical_json.encode("utf-8")).hexdigest()
+
+
+def _finalize_completion_artifacts(
+    conn: sqlite3.Connection,
+    task_id: str,
+    staged_paths: list[Path],
+    *,
+    now: int,
+    uploaded_by: str = "kanban_complete",
+) -> list[Path]:
+    """Record attachment rows and events for already-published artifact files.
+
+    Used during idempotent retries: the original completion already copied the
+    scratch files into durable attachment storage, so we only need to ensure the
+    matching ``task_attachments`` rows and ``attached`` events exist. Existing
+    rows for the same stored_path are skipped so the retry is idempotent.
+    """
+    recorded: list[Path] = []
+    if not staged_paths:
+        return recorded
+    existing_paths = {
+        str(r["stored_path"])
+        for r in conn.execute(
+            "SELECT stored_path FROM task_attachments WHERE task_id = ?",
+            (task_id,),
+        ).fetchall()
+    }
+    for path in staged_paths:
+        stored = str(path)
+        if stored in existing_paths:
+            continue
+        try:
+            size = path.stat().st_size
+        except OSError:
+            continue
+        _insert_lifecycle_attachment(
+            conn, task_id,
+            filename=path.name,
+            stored_path=stored,
+            size=size,
+            created_at=now,
+            uploaded_by=uploaded_by,
+        )
+        recorded.append(path)
+    return recorded
+
+
+def _load_completion_result(
+    conn: sqlite3.Connection,
+    task_id: str,
+    run_id: int,
+) -> Optional[sqlite3.Row]:
+    """Return an existing durable completion result row, if any."""
+    return conn.execute(
+        """
+        SELECT * FROM task_completion_results
+         WHERE task_id = ? AND run_id = ?
+        """,
+        (task_id, int(run_id)),
+    ).fetchone()
 
 
 def _eligible_budget_bench_run(
@@ -7089,6 +7296,14 @@ def complete_task(
     principal-only decision gate. Completion therefore remains fail-closed,
     but a structured ``stale_block_completion_wedge`` event is emitted so an
     operator can distinguish this state from an unknown-id/terminal rejection.
+
+    This function is **idempotent and crash-safe**. A durable completion
+    result keyed by ``(task_id, run_id)`` and a canonical digest of the
+    semantic inputs is persisted before post-commit side effects run. A retry
+    with the same digest for the same run returns the original result without
+    mutating task state, events, attachments, or review requests again. A
+    retry with a different digest for the same run raises
+    ``CompletionDigestConflictError``.
     """
     now = int(time.time())
     review_pending_ids = tuple(r for r in (review_pending or ()) if r)
@@ -7129,13 +7344,66 @@ def complete_task(
     else:
         verified_cards = []
 
+    # Promote any absolute scratch paths mentioned in summary/result into
+    # ``metadata["artifacts"]`` so they are preserved before workspace cleanup.
+    # We keep a separate *input* copy of metadata for digest canonicalization
+    # because artifact paths are rewritten to durable attachment paths below.
+    input_metadata = metadata
     metadata = _merge_completion_prose_artifacts(
-        conn, task_id, metadata, summary=summary, result=result,
+        conn, task_id, input_metadata, summary=summary, result=result,
     )
-    accepted_budget_run_id: Optional[int] = None
     terminal_status = "review" if review_pending_ids else "done"
     terminal_outcome = "review_pending" if review_pending_ids else "completed"
-    with write_txn(conn):
+
+    # Resolve the run id that will anchor the durable completion result. If the
+    # caller passed ``expected_run_id`` we use that; otherwise use the task's
+    # active run. When the task has already completed and the run is closed, we
+    # look up the existing completion result for idempotent matching.
+    resolved_run_id: Optional[int] = expected_run_id
+    if resolved_run_id is None:
+        resolved_run_id = _current_run_id(conn, task_id)
+
+    # Compute the canonical digest from the *semantic* inputs, before any
+    # artifact paths are rewritten to durable attachment paths.
+    canonical_digest = _canonical_completion_digest(
+        task_id=task_id,
+        run_id=resolved_run_id,
+        summary=summary,
+        result=result,
+        metadata=input_metadata,
+        created_cards=verified_cards if verified_cards else None,
+        review_pending=review_pending_ids if review_pending_ids else None,
+    )
+
+    # If a durable completion result already exists for this run, check digest.
+    if resolved_run_id is not None:
+        existing = _load_completion_result(conn, task_id, resolved_run_id)
+        if existing is not None:
+            if existing["digest"] == canonical_digest:
+                # Idempotent retry: finalize any orphan staged artifacts from
+                # a previous crash, then return success without mutating task
+                # state or appending duplicate events.
+                published_artifact_json = existing["published_artifacts_json"] or "[]"
+                staged_paths = [Path(p) for p in json.loads(published_artifact_json) if p]
+                if staged_paths:
+                    with write_txn(conn):
+                        _finalize_completion_artifacts(
+                            conn, task_id, staged_paths, now=now,
+                            uploaded_by="kanban_complete",
+                        )
+                return True
+            raise CompletionDigestConflictError(
+                task_id=task_id,
+                run_id=resolved_run_id,
+                stored_digest=existing["digest"],
+                attempted_digest=canonical_digest,
+            )
+
+    accepted_budget_run_id: Optional[int] = None
+    terminal_event_id: Optional[int] = None
+    staged_paths: list[Path] = []
+
+    with write_txn(conn, on_committed=lambda: None):
         # Verify reviewer task ids exist, are distinct from the candidate, and
         # are not terminal before we commit the candidate to a review handoff.
         for reviewer_id in review_pending_ids:
@@ -7154,6 +7422,35 @@ def complete_task(
                     f"reviewer task {reviewer_id!r} is already terminal "
                     f"({reviewer['status']})"
                 )
+
+        # Re-check durable result under the write lock to close the race with
+        # another finalizer/completer. If it appeared with the same digest we
+        # skip mutation; if it appeared with a different digest we conflict.
+        if resolved_run_id is not None:
+            existing = _load_completion_result(conn, task_id, resolved_run_id)
+            if existing is not None:
+                if existing["digest"] != canonical_digest:
+                    raise CompletionDigestConflictError(
+                        task_id=task_id,
+                        run_id=resolved_run_id,
+                        stored_digest=existing["digest"],
+                        attempted_digest=canonical_digest,
+                    )
+                # Same digest already committed while we were waiting for the
+                # write lock. Do not repeat the mutation.
+                terminal_event_id = existing["terminal_event_id"]
+                run_id = resolved_run_id
+                # Ensure any orphan staged artifacts are finalized.
+                published_artifact_json = existing["published_artifacts_json"] or "[]"
+                staged_paths = [Path(p) for p in json.loads(published_artifact_json) if p]
+                if staged_paths:
+                    _finalize_completion_artifacts(
+                        conn, task_id, staged_paths, now=now,
+                        uploaded_by="kanban_complete",
+                    )
+                # Skip the normal state transition entirely.
+                return True
+
         if expected_run_id is None:
             cur = conn.execute(
                 """
@@ -7286,6 +7583,7 @@ def complete_task(
             if cur.rowcount != 1:
                 return False
             accepted_budget_run_id = int(budget_run["id"])
+
         if isinstance(metadata, dict):
             staged_paths = _persist_scratch_completion_artifacts(conn, task_id, metadata)
             _record_lifecycle_staged_artifacts(
@@ -7348,6 +7646,9 @@ def complete_task(
         )
         # Record independent review requests inside the same txn so the
         # candidate status and the review relation are atomically consistent.
+        # The terminal event id is captured after the event is appended so the
+        # durable completion ledger can point back to it.
+        terminal_event_id = _last_event_id(conn, task_id)
         if review_pending_ids:
             now = int(time.time())
             for reviewer_id in review_pending_ids:
@@ -7355,6 +7656,36 @@ def complete_task(
                     conn, task_id, reviewer_id, run_id,
                     now=now, reason=effective_result,
                 )
+
+        # Persist durable completion result keyed by (task_id, run_id).
+        # ``run_id`` is non-None here because either an active run was closed
+        # or a synthetic zero-duration run was inserted above.
+        assert run_id is not None
+        conn.execute(
+            """
+            INSERT INTO task_completion_results (
+                task_id, run_id, digest, status, terminal_status, outcome,
+                summary, result, metadata_json, created_cards_json,
+                review_pending_json, published_artifacts_json,
+                terminal_event_id, completed_at, finalized_at
+            ) VALUES (?, ?, ?, 'committed', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL)
+            """,
+            (
+                task_id,
+                int(run_id),
+                canonical_digest,
+                terminal_status,
+                terminal_outcome,
+                summary if summary else None,
+                result if result else None,
+                json.dumps(metadata if isinstance(metadata, dict) else {}, ensure_ascii=False),
+                json.dumps(verified_cards, ensure_ascii=False),
+                json.dumps(list(review_pending_ids), ensure_ascii=False),
+                json.dumps([str(p) for p in staged_paths], ensure_ascii=False),
+                terminal_event_id,
+                now,
+            ),
+        )
     # Prose-scan the summary + result for task-id references. Advisory — does
     # not block the completion. Runs in its own txn so the completion itself is
     # already durable by the time we emit any warning.
@@ -7406,6 +7737,19 @@ def complete_task(
     # a rejection can be repaired in place.
     if not review_pending_ids:
         _cleanup_workspace(conn, task_id)
+    # Mark completion result finalized once post-commit side effects have run.
+    # This also acts as a guard so lifecycle hooks do not fire twice.
+    with write_txn(conn):
+        conn.execute(
+            """
+            UPDATE task_completion_results
+               SET status = 'finalized',
+                   finalized_at = ?,
+                   terminal_event_id = ?
+             WHERE task_id = ? AND run_id = ? AND status != 'finalized'
+            """,
+            (now, terminal_event_id, task_id, int(run_id)),
+        )
     _done_task = get_task(conn, task_id)
     _fire_kanban_lifecycle_hook(
         "kanban_task_completed",
@@ -7416,6 +7760,8 @@ def complete_task(
         summary=effective_result,
     )
     return True
+
+
 # ---------------------------------------------------------------------------
 # Review gate (independent of blocking / dependency edges)
 # ---------------------------------------------------------------------------
@@ -7974,21 +8320,37 @@ def _merge_completion_prose_artifacts(
         "SELECT workspace_kind, workspace_path FROM tasks WHERE id = ?",
         (task_id,),
     ).fetchone()
-    if not row or row["workspace_kind"] != "scratch" or not row["workspace_path"]:
+    if not row or row["workspace_kind"] != "scratch":
         return metadata
-    workspace = Path(row["workspace_path"]).expanduser()
-    if not _is_managed_scratch_path(workspace):
-        return metadata
+
+    # Gather candidate absolute paths from summary/result prose that look like
+    # they sit inside a Hermes-managed scratch workspace. We intentionally do
+    # not require ``workspace_path`` to be populated: the production spawn path
+    # persists it, but tests and some CLI flows call ``resolve_workspace`` without
+    # writing it back. Inferring managed storage from the path itself keeps the
+    # prose-artifact discovery robust.
+    workspace_hint: Optional[Path] = None
+    if row["workspace_path"]:
+        workspace_hint = Path(row["workspace_path"]).expanduser()
+        if not _is_managed_scratch_path(workspace_hint):
+            return metadata
     text = "\n".join(part for part in (summary, result) if part)
     if not text:
         return metadata
-    prefix = re.escape(str(workspace))
+    prefix = re.escape(str(workspace_hint)) if workspace_hint else r"(?:[A-Za-z0-9_/:.-]+?/kanban(?:/boards/[^/\s]+)?/workspaces/[^\s`\"'<>]+)"
     discovered: list[str] = []
     for match in re.finditer(prefix + r"(?:[/\\][^\s`\"'<>]+)", text):
         raw = match.group(0).rstrip(".,;:!?)]}")
         candidate = Path(raw)
-        if candidate.is_file():
-            discovered.append(str(candidate))
+        if not candidate.is_file():
+            continue
+        resolved_candidate = candidate.resolve()
+        if workspace_hint is not None:
+            if not resolved_candidate.is_relative_to(workspace_hint):
+                continue
+        elif not _is_managed_scratch_path(resolved_candidate):
+            continue
+        discovered.append(str(candidate))
     if not discovered:
         return metadata
     updated = dict(metadata) if isinstance(metadata, dict) else {}
@@ -8027,24 +8389,8 @@ def _persist_scratch_lifecycle_artifacts(
     if not isinstance(raw_artifacts, (list, tuple)):
         return []
 
-    row = conn.execute(
-        "SELECT workspace_kind, workspace_path FROM tasks WHERE id = ?",
-        (task_id,),
-    ).fetchone()
-    if not row or row["workspace_kind"] != "scratch" or not row["workspace_path"]:
-        return []
-
-    workspace = Path(row["workspace_path"]).expanduser()
-    is_managed, board = _managed_scratch_path_info(workspace)
-    if not is_managed:
-        return []
-
-    try:
-        workspace_root = workspace.resolve()
-    except OSError:
-        return []
-
-    attachment_dir = task_attachments_dir(task_id, board=board)
+    attachment_dir: Optional[Path] = None
+    board_for_dir: Optional[str] = None
     persisted: list[str] = []
     used_destinations: set[Path] = set()
     changed = False
@@ -8056,10 +8402,11 @@ def _persist_scratch_lifecycle_artifacts(
                 copied.unlink(missing_ok=True)
             except OSError:
                 pass
-        try:
-            attachment_dir.rmdir()
-        except OSError:
-            pass
+        if attachment_dir is not None:
+            try:
+                attachment_dir.rmdir()
+            except OSError:
+                pass
 
     for item in raw_artifacts:
         artifact = str(item).strip() if isinstance(item, str) else ""
@@ -8072,7 +8419,8 @@ def _persist_scratch_lifecycle_artifacts(
             persisted.append(artifact)
             continue
 
-        if not resolved_src.is_relative_to(workspace_root):
+        is_managed, board = _managed_scratch_path_info(resolved_src)
+        if not is_managed:
             persisted.append(artifact)
             continue
 
@@ -8090,6 +8438,10 @@ def _persist_scratch_lifecycle_artifacts(
                 f"{KANBAN_ATTACHMENT_MAX_BYTES}-byte limit: {artifact}"
             )
 
+        if attachment_dir is None or board != board_for_dir:
+            attachment_dir = task_attachments_dir(task_id, board=board)
+            board_for_dir = board
+            used_destinations.clear()
         attachment_dir.mkdir(parents=True, exist_ok=True)
         dest = _unique_attachment_path(attachment_dir, resolved_src.name, used_destinations)
         try:
