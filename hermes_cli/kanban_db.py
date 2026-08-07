@@ -5694,6 +5694,20 @@ def _last_event_id(conn: sqlite3.Connection, task_id: str) -> Optional[int]:
     return int(row["id"]) if row else None
 
 
+def _event_exists(
+    conn: sqlite3.Connection,
+    task_id: str,
+    run_id: int,
+    kind: str,
+) -> bool:
+    """Return True if ``task_events`` already contains ``kind`` for this run."""
+    row = conn.execute(
+        "SELECT 1 FROM task_events WHERE task_id = ? AND run_id = ? AND kind = ? LIMIT 1",
+        (task_id, int(run_id), kind),
+    ).fetchone()
+    return row is not None
+
+
 def _end_run(
     conn: sqlite3.Connection,
     task_id: str,
@@ -7365,20 +7379,42 @@ def _canonical_completion_digest(
     effective_summary = (summary or result or "").strip()
 
     # Canonicalize metadata by keeping only stable semantic keys and ignoring
-    # internal transport keys that should not affect idempotency.
+    # internal transport keys that should not affect idempotency. Artifact
+    # identity is covered separately by the content-bound manifest below, so
+    # drop the transport ``artifacts`` list from the metadata digest.
     canonical_metadata: Optional[dict]
     if isinstance(metadata, dict):
         stable = {
             key: _canonical_json_value(value)
             for key, value in metadata.items()
-            if not key.startswith("_") and key not in {"worker_session_id"}
+            if not key.startswith("_")
+            and key not in {"worker_session_id", "artifacts", "_staged_artifacts"}
         }
         canonical_metadata = dict(sorted(stable.items())) if stable else None
     else:
         canonical_metadata = None
 
-    # Bind artifact identity by content hash, not by path.
-    artifact_manifest = _artifact_manifest_from_metadata(metadata)
+    # Bind artifact identity by content hash and logical name, not by path.
+    # The same bytes under different staging directories must produce the same
+    # digest; different bytes under the same name must differ.
+    full_manifest = _artifact_manifest_from_metadata(metadata)
+    seen_identities: set[tuple[str, str, int]] = set()
+    artifact_identity: list[dict[str, Any]] = []
+    for entry in sorted(
+        full_manifest,
+        key=lambda m: (m["logical_name"], m["content_hash"], m["size"]),
+    ):
+        key = (entry["logical_name"], entry["content_hash"], entry["size"])
+        if key in seen_identities:
+            continue
+        seen_identities.add(key)
+        artifact_identity.append(
+            {
+                "logical_name": entry["logical_name"],
+                "size": entry["size"],
+                "content_hash": entry["content_hash"],
+            }
+        )
 
     payload = {
         "v": _COMPLETION_DIGEST_VERSION,
@@ -7388,7 +7424,7 @@ def _canonical_completion_digest(
         "metadata": canonical_metadata,
         "created_cards": _sorted_unique_strings(created_cards),
         "review_pending": _sorted_unique_strings(review_pending),
-        "artifacts": artifact_manifest,
+        "artifacts": artifact_identity,
     }
     canonical_json = json.dumps(
         payload,
@@ -7744,10 +7780,12 @@ def _finalize_completion_result(
 ) -> CompletionResult:
     """Idempotent post-commit finalizer for a committed completion row.
 
-    Publishes declared artifacts, records their attachment rows, clears the
-    failure counter, recomputes dependent readiness, cleans the scratch
-    workspace, fires the lifecycle hook once, and transitions the ledger row to
-    ``finalized``. A row that is already finalized is a no-op.
+    Publishes declared artifacts, records their attachment rows, rewrites
+    durable references, clears the failure counter, recomputes dependent
+    readiness, cleans the scratch workspace, fires the lifecycle hook once,
+    and only then transitions the ledger row to ``finalized``. A row that is
+    already finalized is a no-op. Every step before the terminal marker is
+    idempotent so a retry can resume safely from any committed row.
     """
     now = int(time.time())
     row = _load_completion_result(conn, task_id, run_id)
@@ -7806,15 +7844,51 @@ def _finalize_completion_result(
                         stored = entry.get("stored_path")
                         if src and stored:
                             source_to_stored[src] = stored
+
+            # Rewrite durable references so consumers read attachment paths
+            # instead of scratch workspace paths that are about to be cleaned up.
+            if source_to_stored:
+                _rewrite_completed_event_artifact_paths(
+                    conn, task_id, run_id, source_to_stored
+                )
+                _rewrite_run_metadata_artifacts(
+                    conn, task_id, run_id, source_to_stored
+                )
+
+            scan_text = " ".join(filter(None, [summary, result]))
+            if scan_text:
+                ref_issues = _scan_prose_for_task_reference_issues(conn, scan_text)
+                verified_set: set[str] = set()
+                try:
+                    verified_cards_json = row["created_cards_json"]
+                    verified_cards = json.loads(verified_cards_json) if verified_cards_json else []
+                    verified_set = set(str(c) for c in verified_cards)
+                except Exception:
+                    pass
+                phantom_refs = [
+                    p for p in ref_issues.get("phantom_refs", [])
+                    if str(p).split("/")[-1].split(":")[-1] not in verified_set
+                ]
+                if phantom_refs:
+                    _append_event(
+                        conn, task_id, "suspected_hallucinated_references",
+                        {
+                            "phantom_refs": phantom_refs,
+                            "source": "completion_summary",
+                        },
+                        run_id=run_id,
+                    )
+                cross_board_refs = ref_issues.get("unqualified_cross_board_refs") or []
+                if cross_board_refs:
+                    _append_event(
+                        conn, task_id, "unqualified_cross_board_references",
+                        {"refs": cross_board_refs, "source": "completion_summary"},
+                        run_id=run_id,
+                    )
+
             conn.execute(
-                """
-                UPDATE task_completion_results
-                   SET status = 'finalized',
-                       finalized_at = ?,
-                       terminal_event_id = ?
-                 WHERE task_id = ? AND run_id = ? AND status != 'finalized'
-                """,
-                (now, terminal_event_id, task_id, run_id),
+                "UPDATE tasks SET consecutive_failures = 0, last_failure_error = NULL WHERE id = ?",
+                (task_id,),
             )
 
     if finalized_in_txn:
@@ -7830,72 +7904,46 @@ def _finalize_completion_result(
             already_terminal=True,
         )
 
-    # Rewrite durable references so consumers read attachment paths instead of
-    # scratch workspace paths that are about to be cleaned up.
-    if source_to_stored:
-        with _transaction_or_current(conn):
-            _rewrite_completed_event_artifact_paths(
-                conn, task_id, run_id, source_to_stored
-            )
-            _rewrite_run_metadata_artifacts(
-                conn, task_id, run_id, source_to_stored
-            )
-
-    with _transaction_or_current(conn):
-        scan_text = " ".join(filter(None, [summary, result]))
-        if scan_text:
-            ref_issues = _scan_prose_for_task_reference_issues(conn, scan_text)
-            verified_set: set[str] = set()
-            try:
-                verified_cards_json = row["created_cards_json"]
-                verified_cards = json.loads(verified_cards_json) if verified_cards_json else []
-                verified_set = set(str(c) for c in verified_cards)
-            except Exception:
-                pass
-            phantom_refs = [
-                p for p in ref_issues.get("phantom_refs", [])
-                if str(p).split("/")[-1].split(":")[-1] not in verified_set
-            ]
-            if phantom_refs:
-                _append_event(
-                    conn, task_id, "suspected_hallucinated_references",
-                    {
-                        "phantom_refs": phantom_refs,
-                        "source": "completion_summary",
-                    },
-                    run_id=run_id,
-                )
-            cross_board_refs = ref_issues.get("unqualified_cross_board_refs") or []
-            if cross_board_refs:
-                _append_event(
-                    conn, task_id, "unqualified_cross_board_references",
-                    {"refs": cross_board_refs, "source": "completion_summary"},
-                    run_id=run_id,
-                )
-
-        conn.execute(
-            "UPDATE tasks SET consecutive_failures = 0, last_failure_error = NULL WHERE id = ?",
-            (task_id,),
-        )
-
-    # Dependent readiness, workspace cleanup, and lifecycle hook run after the
-    # completion transaction is durably finalized.
+    # Dependent readiness, workspace cleanup, and lifecycle hook run BEFORE
+    # the terminal finalized marker is written. Each step is idempotent so a
+    # retry can resume safely after a crash at any point in this sequence.
     recompute_ready(conn)
     if not review_pending_ids:
         _cleanup_workspace(conn, task_id)
 
     _done_task = get_task(conn, task_id)
-    try:
-        _fire_kanban_lifecycle_hook(
-            "kanban_task_completed",
-            task_id,
-            board=get_current_board(),
-            assignee=_done_task.assignee if _done_task else None,
-            run_id=run_id,
-            summary=(summary or result or ""),
+    if not _event_exists(conn, task_id, run_id, "completed_hook_fired"):
+        try:
+            _fire_kanban_lifecycle_hook(
+                "kanban_task_completed",
+                task_id,
+                board=get_current_board(),
+                assignee=_done_task.assignee if _done_task else None,
+                run_id=run_id,
+                summary=(summary or result or ""),
+            )
+            _append_event(
+                conn,
+                task_id,
+                "completed_hook_fired",
+                {"run_id": run_id},
+                run_id=run_id,
+            )
+        except Exception:
+            _log.exception("kanban_task_completed lifecycle hook failed")
+
+    # Mark finalized only after all finalizer obligations are durably complete.
+    with _transaction_or_current(conn):
+        conn.execute(
+            """
+            UPDATE task_completion_results
+               SET status = 'finalized',
+                   finalized_at = ?,
+                   terminal_event_id = ?
+             WHERE task_id = ? AND run_id = ? AND status != 'finalized'
+            """,
+            (now, terminal_event_id, task_id, run_id),
         )
-    except Exception:
-        _log.exception("kanban_task_completed lifecycle hook failed")
 
     row = _load_completion_result(conn, task_id, run_id)
     return CompletionResult(
@@ -8093,6 +8141,8 @@ def complete_task(
                         result=existing["result"],
                         already_terminal=True,
                     )
+                # Same digest but not yet finalized; finalize idempotently outside
+                # the caller's transaction.
                 return _finalize_completion_result(
                     conn,
                     task_id,
@@ -8112,6 +8162,11 @@ def complete_task(
     accepted_budget_run_id: Optional[int] = None
     terminal_event_id: Optional[int] = None
     run_id: Optional[int] = None
+    # If the write transaction discovers an already-existing completion row, we
+    # finalize idempotently *after* the transaction commits. The ledger row's
+    # digest matches, so the caller's intent is durable; we only need to resume
+    # post-commit obligations (artifact publication, recompute, cleanup, hook).
+    finalize_after_txn: Optional[tuple[int, Optional[int], bool]] = None
 
     with write_txn(conn, on_committed=lambda: None):
         for reviewer_id in review_pending_ids:
@@ -8146,155 +8201,146 @@ def complete_task(
                         latest_run_id=latest_terminal_run,
                     )
                 if existing["digest"] == canonical_digest:
-                    if existing["status"] == "finalized":
-                        return CompletionResult(
-                            ok=True,
-                            task_id=task_id,
-                            run_id=resolved_run_id,
-                            terminal_status=existing["terminal_status"],
-                            outcome=existing["outcome"],
-                            summary=existing["summary"],
-                            result=existing["result"],
-                            already_terminal=True,
-                        )
-                    return _finalize_completion_result(
-                        conn,
-                        task_id,
+                    # Identical durable intent is already recorded. We will
+                    # finalize idempotently after the write transaction commits,
+                    # but we first need to stage any new metadata so the ledger
+                    # is consistent with the current call's artifact set.
+                    finalize_after_txn = (
                         resolved_run_id,
                         existing["terminal_event_id"],
-                        review_pending_ids=review_pending_ids,
-                        summary=summary,
-                        result=result,
+                        existing["status"] == "finalized",
                     )
-                raise CompletionDigestConflictError(
-                    task_id=task_id,
-                    run_id=resolved_run_id,
-                    stored_digest=existing["digest"],
-                    attempted_digest=canonical_digest,
-                )
+                else:
+                    raise CompletionDigestConflictError(
+                        task_id=task_id,
+                        run_id=resolved_run_id,
+                        stored_digest=existing["digest"],
+                        attempted_digest=canonical_digest,
+                    )
 
-        # CAS update the task row to terminal status.
-        if expected_run_id is None:
-            cur = conn.execute(
-                """
-                UPDATE tasks
-                   SET status       = ?,
-                       result       = ?,
-                       completed_at = ?,
-                       claim_lock   = NULL,
-                       claim_expires= NULL,
-                       worker_pid   = NULL,
-                       block_kind   = NULL,
-                       block_recurrences = 0,
-                       block_fingerprint = NULL,
-                       block_deadline = NULL,
-                       block_retry_after = NULL,
-                       block_error_type = NULL,
-                       dep_wait_fingerprint = NULL,
-                       dep_wait_count = 0,
-                       dep_wait_backstop_tripped = 0
-                 WHERE id = ?
-                   AND status IN ('running', 'ready', 'blocked')
-                """,
-                (terminal_status, effective_result, now if terminal_status == "done" else None, task_id),
-            )
-        else:
-            cur = conn.execute(
-                """
-                UPDATE tasks
-                   SET status       = ?,
-                       result       = ?,
-                       completed_at = ?,
-                       claim_lock   = NULL,
-                       claim_expires= NULL,
-                       worker_pid   = NULL,
-                       block_kind   = NULL,
-                       block_recurrences = 0,
-                       block_fingerprint = NULL,
-                       block_deadline = NULL,
-                       block_retry_after = NULL,
-                       block_error_type = NULL,
-                       dep_wait_fingerprint = NULL,
-                       dep_wait_count = 0,
-                       dep_wait_backstop_tripped = 0
-                 WHERE id = ?
-                   AND status IN ('running', 'ready', 'blocked')
-                   AND current_run_id = ?
-                """,
-                (terminal_status, effective_result, now if terminal_status == "done" else None, task_id, int(expected_run_id)),
-            )
-        if cur.rowcount != 1:
+        if finalize_after_txn is None:
+            # CAS update the task row to terminal status.
             if expected_run_id is None:
-                return CompletionResult(ok=False, task_id=task_id)
-            budget_run = _eligible_budget_bench_run(
-                conn, task_id, int(expected_run_id), now=now
-            )
-            if budget_run is None:
-                if expected_run_id is not None:
-                    blocked = conn.execute(
-                        "SELECT status, block_kind, block_recurrences, current_run_id "
-                        "FROM tasks WHERE id = ?",
-                        (task_id,),
-                    ).fetchone()
-                    ended_run = conn.execute(
-                        "SELECT outcome, ended_at FROM task_runs "
-                        "WHERE id = ? AND task_id = ?",
-                        (int(expected_run_id), task_id),
-                    ).fetchone()
-                    if (
-                        blocked is not None
-                        and blocked["status"] == "blocked"
-                        and blocked["block_kind"] == "needs_input"
-                        and blocked["current_run_id"] is None
-                        and ended_run is not None
-                        and ended_run["outcome"] == "blocked"
-                        and ended_run["ended_at"] is not None
-                    ):
-                        _append_event(
-                            conn,
-                            task_id,
-                            "stale_block_completion_wedge",
-                            {
-                                "attempted_run_id": int(expected_run_id),
-                                "block_kind": blocked["block_kind"],
-                                "block_recurrences": int(
-                                    blocked["block_recurrences"] or 0
-                                ),
-                                "current_run_id": None,
-                                "reason": (
-                                    "ended_run_attempted_completion_while_blocked"
-                                ),
-                            },
-                            run_id=int(expected_run_id),
-                        )
-                return CompletionResult(ok=False, task_id=task_id)
-            cur = conn.execute(
-                """
-                UPDATE tasks
-                   SET status       = ?,
-                       result       = ?,
-                       completed_at = ?,
-                       claim_lock   = NULL,
-                       claim_expires= NULL,
-                       worker_pid   = NULL,
-                       block_kind   = NULL,
-                       block_recurrences = 0,
-                       block_fingerprint = NULL,
-                       block_deadline = NULL,
-                       block_retry_after = NULL,
-                       block_error_type = NULL,
-                       dep_wait_fingerprint = NULL,
-                       dep_wait_count = 0,
-                       dep_wait_backstop_tripped = 0
-                 WHERE id = ?
-                   AND status IN ('ready', 'blocked')
-                   AND current_run_id IS NULL
-                """,
-                (terminal_status, effective_result, now if terminal_status == "done" else None, task_id),
-            )
+                cur = conn.execute(
+                    """
+                    UPDATE tasks
+                       SET status       = ?,
+                           result       = ?,
+                           completed_at = ?,
+                           claim_lock   = NULL,
+                           claim_expires= NULL,
+                           worker_pid   = NULL,
+                           block_kind   = NULL,
+                           block_recurrences = 0,
+                           block_fingerprint = NULL,
+                           block_deadline = NULL,
+                           block_retry_after = NULL,
+                           block_error_type = NULL,
+                           dep_wait_fingerprint = NULL,
+                           dep_wait_count = 0,
+                           dep_wait_backstop_tripped = 0
+                     WHERE id = ?
+                       AND status IN ('running', 'ready', 'blocked')
+                    """,
+                    (terminal_status, effective_result, now if terminal_status == "done" else None, task_id),
+                )
+            else:
+                cur = conn.execute(
+                    """
+                    UPDATE tasks
+                       SET status       = ?,
+                           result       = ?,
+                           completed_at = ?,
+                           claim_lock   = NULL,
+                           claim_expires= NULL,
+                           worker_pid   = NULL,
+                           block_kind   = NULL,
+                           block_recurrences = 0,
+                           block_fingerprint = NULL,
+                           block_deadline = NULL,
+                           block_retry_after = NULL,
+                           block_error_type = NULL,
+                           dep_wait_fingerprint = NULL,
+                           dep_wait_count = 0,
+                           dep_wait_backstop_tripped = 0
+                     WHERE id = ?
+                       AND status IN ('running', 'ready', 'blocked')
+                       AND current_run_id = ?
+                    """,
+                    (terminal_status, effective_result, now if terminal_status == "done" else None, task_id, int(expected_run_id)),
+                )
             if cur.rowcount != 1:
-                return CompletionResult(ok=False, task_id=task_id)
-            accepted_budget_run_id = int(budget_run["id"])
+                if expected_run_id is None:
+                    return CompletionResult(ok=False, task_id=task_id)
+                budget_run = _eligible_budget_bench_run(
+                    conn, task_id, int(expected_run_id), now=now
+                )
+                if budget_run is None:
+                    if expected_run_id is not None:
+                        blocked = conn.execute(
+                            "SELECT status, block_kind, block_recurrences, current_run_id "
+                            "FROM tasks WHERE id = ?",
+                            (task_id,),
+                        ).fetchone()
+                        ended_run = conn.execute(
+                            "SELECT outcome, ended_at FROM task_runs "
+                            "WHERE id = ? AND task_id = ?",
+                            (int(expected_run_id), task_id),
+                        ).fetchone()
+                        if (
+                            blocked is not None
+                            and blocked["status"] == "blocked"
+                            and blocked["block_kind"] == "needs_input"
+                            and blocked["current_run_id"] is None
+                            and ended_run is not None
+                            and ended_run["outcome"] == "blocked"
+                            and ended_run["ended_at"] is not None
+                        ):
+                            _append_event(
+                                conn,
+                                task_id,
+                                "stale_block_completion_wedge",
+                                {
+                                    "attempted_run_id": int(expected_run_id),
+                                    "block_kind": blocked["block_kind"],
+                                    "block_recurrences": int(
+                                        blocked["block_recurrences"] or 0
+                                    ),
+                                    "current_run_id": None,
+                                    "reason": (
+                                        "ended_run_attempted_completion_while_blocked"
+                                    ),
+                                },
+                                run_id=int(expected_run_id),
+                            )
+                    return CompletionResult(ok=False, task_id=task_id)
+                cur = conn.execute(
+                    """
+                    UPDATE tasks
+                       SET status       = ?,
+                           result       = ?,
+                           completed_at = ?,
+                           claim_lock   = NULL,
+                           claim_expires= NULL,
+                           worker_pid   = NULL,
+                           block_kind   = NULL,
+                           block_recurrences = 0,
+                           block_fingerprint = NULL,
+                           block_deadline = NULL,
+                           block_retry_after = NULL,
+                           block_error_type = NULL,
+                           dep_wait_fingerprint = NULL,
+                           dep_wait_count = 0,
+                           dep_wait_backstop_tripped = 0
+                     WHERE id = ?
+                       AND status IN ('ready', 'blocked')
+                       AND current_run_id IS NULL
+                    """,
+                    (terminal_status, effective_result, now if terminal_status == "done" else None, task_id),
+                )
+                if cur.rowcount != 1:
+                    return CompletionResult(ok=False, task_id=task_id)
+                accepted_budget_run_id = int(budget_run["id"])
 
         # Filesystem publication happens *after* commit via the idempotent
         # finalizer, so staged intent is durable before any file is copied.
@@ -8374,10 +8420,34 @@ def complete_task(
             ),
         )
 
+    if finalize_after_txn is not None:
+        final_run_id, final_terminal_event_id, already_terminal = finalize_after_txn
+        if already_terminal:
+            row = _load_completion_result(conn, task_id, final_run_id)
+            return CompletionResult(
+                ok=True,
+                task_id=task_id,
+                run_id=final_run_id,
+                terminal_status=row["terminal_status"] if row else None,
+                outcome=row["outcome"] if row else None,
+                summary=row["summary"] if row else None,
+                result=row["result"] if row else None,
+                already_terminal=True,
+            )
+        return _finalize_completion_result(
+            conn,
+            task_id,
+            final_run_id,
+            final_terminal_event_id,
+            review_pending_ids=review_pending_ids,
+            summary=summary,
+            result=result,
+        )
+
     if run_id is None:
         return CompletionResult(ok=False, task_id=task_id)
 
-    result = _finalize_completion_result(
+    completion_result = _finalize_completion_result(
         conn,
         task_id,
         run_id,
@@ -8387,9 +8457,9 @@ def complete_task(
         result=result,
     )
     if accepted_budget_run_id is not None:
-        result.budget_run_id = accepted_budget_run_id
-        result.accepted_terminal_after_budget_bench = True
-    return result
+        completion_result.budget_run_id = accepted_budget_run_id
+        completion_result.accepted_terminal_after_budget_bench = True
+    return completion_result
 
 REVIEW_RESOLUTIONS = {"clear", "reject"}
 
