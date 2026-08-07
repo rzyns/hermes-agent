@@ -91,7 +91,7 @@ from contextvars import ContextVar, Token
 from dataclasses import dataclass, field
 from functools import partial
 from pathlib import Path
-from typing import Any, Callable, Iterable, Mapping, Optional
+from typing import Any, Callable, Dict, Iterable, Mapping, Optional
 
 from hermes_cli.sqlite_util import add_column_if_missing as _add_column_if_missing
 from hermes_cli.kanban_validation import validate_workspace_spec
@@ -5621,6 +5621,57 @@ def _append_event(
     )
 
 
+def _stage_run_telemetry(
+    conn: sqlite3.Connection,
+    task_id: str,
+    overhead_envelope: Optional[Dict[str, Any]] = None,
+) -> None:
+    """Merge terminal telemetry into the currently-active run's metadata.
+
+    The agent finalizer calls this before the run ends so that later
+    ``complete_task`` / ``_record_task_failure`` calls (which may run in a
+    different code path or even a fresh process) inherit the overhead
+    envelope without needing access to the agent object.  Complexity proxy
+    is pulled from the task row if present.  Callers must already hold a
+    write transaction if atomicity is required; this helper executes a
+    single UPDATE and leaves transaction management to the caller.
+    """
+    row = conn.execute(
+        "SELECT current_run_id, metadata FROM tasks WHERE id = ?", (task_id,)
+    ).fetchone()
+    if not row or not row["current_run_id"]:
+        return
+    run_id = int(row["current_run_id"])
+    task_metadata = row["metadata"]
+    complexity_proxy = None
+    if task_metadata:
+        try:
+            complexity_proxy = json.loads(task_metadata).get("complexity_proxy")
+        except Exception:
+            pass
+
+    existing_metadata = {}
+    run_row = conn.execute(
+        "SELECT metadata FROM task_runs WHERE id = ?", (run_id,)
+    ).fetchone()
+    if run_row and run_row["metadata"]:
+        try:
+            existing_metadata = json.loads(run_row["metadata"]) or {}
+        except Exception:
+            existing_metadata = {}
+
+    payload = dict(existing_metadata)
+    merge_telemetry_into_payload(
+        payload,
+        complexity_proxy=complexity_proxy,
+        overhead_envelope=overhead_envelope,
+    )
+    conn.execute(
+        "UPDATE task_runs SET metadata = ? WHERE id = ?",
+        (json.dumps(payload, ensure_ascii=False), run_id),
+    )
+
+
 def _end_run(
     conn: sqlite3.Connection,
     task_id: str,
@@ -5639,6 +5690,10 @@ def _end_run(
     explicitly). Returns the closed run_id or ``None`` if no active run
     existed (e.g. a CLI user calling ``hermes kanban complete`` on a
     task that was never claimed).
+
+    If the run row already carries telemetry staged by the agent finalizer,
+    it is merged with the caller-supplied metadata so terminal runs do not
+    overwrite the overhead envelope.
     """
     now = int(time.time())
     row = conn.execute(
@@ -5647,6 +5702,21 @@ def _end_run(
     if not row or not row["current_run_id"]:
         return None
     run_id = int(row["current_run_id"])
+
+    # Merge with any telemetry already staged on the run row.
+    existing_row = conn.execute(
+        "SELECT metadata FROM task_runs WHERE id = ?", (run_id,)
+    ).fetchone()
+    existing_metadata: Dict[str, Any] = {}
+    if existing_row and existing_row["metadata"]:
+        try:
+            existing_metadata = json.loads(existing_row["metadata"]) or {}
+        except Exception:
+            existing_metadata = {}
+    merged_metadata = existing_metadata
+    if metadata:
+        merged_metadata = {**existing_metadata, **metadata}
+
     conn.execute(
         """
         UPDATE task_runs
@@ -5667,13 +5737,13 @@ def _end_run(
             outcome,
             summary,
             error,
-            json.dumps(metadata, ensure_ascii=False) if metadata else None,
+            json.dumps(merged_metadata, ensure_ascii=False) if merged_metadata else None,
             now,
             run_id,
         ),
     )
     conn.execute(
-        "UPDATE tasks SET current_run_id = NULL WHERE id = ?", (task_id,),
+        "UPDATE tasks SET current_run_id = NULL WHERE id = ?", (task_id,)
     )
     return run_id
 
@@ -7341,6 +7411,17 @@ def complete_task(
         cleaned_artifacts = _artifact_list_from_metadata(metadata)
         if cleaned_artifacts:
             completed_payload["artifacts"] = cleaned_artifacts
+        # Surface terminal telemetry on the completion event so consumers can
+        # see the overhead envelope without a second SQL round-trip.  The run
+        # metadata already carries anything staged by the agent finalizer.
+        if run_id is not None:
+            closed_run = get_run(conn, run_id)
+            if closed_run and closed_run.metadata:
+                merge_telemetry_into_payload(
+                    completed_payload,
+                    complexity_proxy=closed_run.metadata.get("complexity_proxy"),
+                    overhead_envelope=closed_run.metadata.get("overhead_envelope"),
+                )
         _append_event(
             conn, task_id, terminal_outcome,
             completed_payload,
@@ -12614,15 +12695,50 @@ def _record_task_failure(
                 )
             if end_run:
                 # Spawn path: close the open run with outcome.
+                run_metadata = {"failures": failures}
+                run_payload = {"error": error[:500], "failures": failures}
+                overhead_envelope = (event_payload_extra or {}).get("overhead_envelope")
+                # If the caller did not pass an envelope, inherit one already
+                # staged on the active run row by the agent finalizer.
+                if overhead_envelope is None:
+                    _run_id_for_staged = _current_run_id(conn, task_id)
+                    if _run_id_for_staged is not None:
+                        _staged_row = conn.execute(
+                            "SELECT metadata FROM task_runs WHERE id = ?",
+                            (_run_id_for_staged,),
+                        ).fetchone()
+                        if _staged_row and _staged_row["metadata"]:
+                            try:
+                                overhead_envelope = (
+                                    json.loads(_staged_row["metadata"] or "{}").get(
+                                        "overhead_envelope"
+                                    )
+                                )
+                            except Exception:
+                                overhead_envelope = None
+                merge_telemetry_into_payload(
+                    run_metadata,
+                    complexity_proxy=complexity_proxy,
+                    overhead_envelope=overhead_envelope,
+                )
+                merge_telemetry_into_payload(
+                    run_payload,
+                    complexity_proxy=complexity_proxy,
+                    overhead_envelope=overhead_envelope,
+                )
+                # Preserve any other caller-supplied event extras (e.g. pid,
+                # sigkill) without clobbering the telemetry keys.
+                if event_payload_extra:
+                    run_payload = {**event_payload_extra, **run_payload}
                 run_id = _end_run(
                     conn, task_id,
                     outcome=outcome, status=outcome,
                     error=error[:500],
-                    metadata={"failures": failures},
+                    metadata=run_metadata,
                 )
                 _append_event(
                     conn, task_id, outcome,
-                    {"error": error[:500], "failures": failures},
+                    run_payload,
                     run_id=run_id,
                 )
             # Timeout/crash path's caller already emitted its own event.

@@ -205,6 +205,43 @@ def finalize_turn(
         final_response = agent._handle_max_iterations(messages, api_call_count)
         iteration_limit_fallback = True
 
+    # If running as a non-delegated Kanban worker, stage terminal telemetry
+    # on the active run so that every terminal transition (completed,
+    # timed_out, gave_up) carries an overhead envelope.  This is done
+    # regardless of whether the turn hit the iteration limit so that normal
+    # completions also durably record telemetry.
+    _kanban_task = child_env_lookup("HERMES_KANBAN_TASK")
+    _kanban_run_id = None
+    _overhead_envelope = None
+    if _kanban_task and not is_delegated_child_context():
+        try:
+            _kanban_run_id = int(child_env_lookup("HERMES_KANBAN_RUN_ID") or "")
+        except (TypeError, ValueError):
+            pass
+        _overhead_envelope = build_overhead_envelope(
+            agent,
+            api_call_count,
+            messages=messages,
+            turn_exit_reason=_turn_exit_reason,
+        )
+        try:
+            from hermes_cli import kanban_db as _kb
+            _conn = _kb.connect()
+            try:
+                with _kb.write_txn(_conn):
+                    _kb._stage_run_telemetry(_conn, _kanban_task, _overhead_envelope)
+            finally:
+                try:
+                    _conn.close()
+                except Exception:
+                    pass
+        except Exception:
+            logger.warning(
+                "Failed to stage Kanban telemetry for task %s",
+                _kanban_task,
+                exc_info=True,
+            )
+
     if iteration_limit_fallback:
         # If running as a kanban worker, signal the dispatcher that the
         # worker could not complete (rather than treating it as a
@@ -221,21 +258,9 @@ def finalize_turn(
         # We route through ``_record_task_failure(outcome="timed_out")``
         # rather than ``kanban_block`` so this counts toward the dispatcher's
         # consecutive-failure circuit breaker (#29747 gap 2).
-        _kanban_task = child_env_lookup("HERMES_KANBAN_TASK")
         if _kanban_task and not is_delegated_child_context():
             try:
                 from hermes_cli import kanban_db as _kb
-                _kanban_run_id = None
-                try:
-                    _kanban_run_id = int(child_env_lookup("HERMES_KANBAN_RUN_ID") or "")
-                except (TypeError, ValueError):
-                    pass
-                _overhead_envelope = build_overhead_envelope(
-                    agent,
-                    api_call_count,
-                    messages=messages,
-                    turn_exit_reason=_turn_exit_reason,
-                )
                 _event_payload_extra = {
                     "overhead_envelope": _overhead_envelope,
                 }
