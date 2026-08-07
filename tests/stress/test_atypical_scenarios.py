@@ -801,10 +801,10 @@ def _(home, kb):
         assert claimed is None, "done task should not be claimable"
         # Try to complete it again
         ok = kb.complete_task(conn, tid, summary="oops twice")
-        assert ok is False, "completing an already-done task should refuse"
+        assert not ok, "completing an already-done task should refuse"
         # Try to block it
         ok = kb.block_task(conn, tid, reason="trying")
-        assert ok is False, "blocking a done task should refuse"
+        assert not ok, "blocking a done task should refuse"
         print("  done task correctly resists re-claim/complete/block")
     finally:
         conn.close()
@@ -831,7 +831,7 @@ def _(home, kb):
         # Archived can be un-archived via direct status? No API for that intentionally
         # (archive is meant to be terminal). Verify this.
         # complete/block/unblock on archived should all refuse.
-        assert kb.complete_task(conn, tid, result="nope") is False
+        assert kb.complete_task(conn, tid, result="nope").ok is False
         assert kb.block_task(conn, tid, reason="no") is False
         assert kb.unblock_task(conn, tid) is False
         print("  archived task cannot be resurrected via normal APIs")

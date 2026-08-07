@@ -66,7 +66,7 @@ def test_complete_with_review_pending_moves_to_review_not_done(kanban_home):
             summary="finished; needs review",
             review_pending=[reviewer],
         )
-        assert ok is True
+        assert ok
         task = kb.get_task(conn, candidate)
         assert task.status == "review"
         assert task.completed_at is None
@@ -175,7 +175,7 @@ def test_resolve_review_requires_run_and_operator_clear_review_works(kanban_home
             "cli:test-operator",
             reviewer_task_id=reviewer,
         )
-        assert ok is True
+        assert ok
         assert kb.get_task(conn, candidate).status == "done"
         event = conn.execute(
             "SELECT payload FROM task_events WHERE task_id = ? AND kind = 'review_cleared'",
@@ -378,7 +378,7 @@ def test_bound_reviewer_can_clear_review(kanban_home):
             resolving_run_id=reviewer_run_id,
             reviewer_task_id=reviewer,
         )
-        assert ok is True
+        assert ok
         task = kb.get_task(conn, candidate)
         assert task.status == "done"
         assert task.completed_at is not None
@@ -406,7 +406,7 @@ def test_reject_review_returns_candidate_to_ready(kanban_home):
             reviewer_task_id=reviewer,
             reason="needs more tests",
         )
-        assert ok is True
+        assert ok
         task = kb.get_task(conn, candidate)
         assert task.status == "ready"
         assert task.current_run_id is None
@@ -443,7 +443,7 @@ def test_reject_review_returns_candidate_to_todo_when_parents_unfinished(kanban_
             resolving_run_id=reviewer_run_id,
             reviewer_task_id=reviewer,
         )
-        assert ok is True
+        assert ok
         task = kb.get_task(conn, candidate)
         assert task.status == "todo"
 

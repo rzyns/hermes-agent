@@ -336,7 +336,7 @@ def test_expected_run_id_still_enforced_for_unknown_run(populated_db):
         conn, tid,
         summary="done",
         expected_run_id=999999,
-    ) is False
+    ).ok is False
 
 
 def test_budget_bench_grace_path_still_works(kanban_home, monkeypatch):

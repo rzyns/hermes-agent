@@ -729,7 +729,7 @@ def test_notify_sub_crud(kanban_home):
         ok = kb.remove_notify_sub(
             conn, task_id=tid, platform="telegram", chat_id="123",
         )
-        assert ok is True
+        assert ok
         assert len(kb.list_notify_subs(conn, tid)) == 1
     finally:
         conn.close()
@@ -1325,7 +1325,7 @@ def test_heartbeat_on_running_task(kanban_home):
         tid = kb.create_task(conn, title="x", assignee="worker")
         kb.claim_task(conn, tid)
         ok = kb.heartbeat_worker(conn, tid, note="step 3/10")
-        assert ok is True
+        assert ok
         task = kb.get_task(conn, tid)
         assert task.last_heartbeat_at is not None
         events = kb.list_events(conn, tid)
@@ -1341,7 +1341,7 @@ def test_heartbeat_refused_when_not_running(kanban_home):
     try:
         tid = kb.create_task(conn, title="x")   # lands in ready, not running
         ok = kb.heartbeat_worker(conn, tid)
-        assert ok is False
+        assert not ok
         task = kb.get_task(conn, tid)
         assert task.last_heartbeat_at is None
     finally:
@@ -1631,7 +1631,7 @@ def test_run_closed_on_complete_with_summary(kanban_home):
             summary="implemented rate limiter, tests pass",
             metadata={"changed_files": ["limiter.py"], "tests_run": 12},
         )
-        assert ok is True
+        assert ok
 
         task = kb.get_task(conn, tid)
         assert task is not None
@@ -2551,7 +2551,7 @@ def test_complete_never_claimed_task_synthesizes_run(kanban_home):
             summary="did it manually",
             metadata={"reason": "human intervention"},
         )
-        assert ok is True
+        assert ok
 
         runs = kb.list_runs(conn, tid)
         assert len(runs) == 1, f"expected 1 synthetic run, got {len(runs)}"
@@ -2578,7 +2578,7 @@ def test_block_never_claimed_task_synthesizes_run(kanban_home):
     try:
         tid = kb.create_task(conn, title="drop this", assignee="worker")
         ok = kb.block_task(conn, tid, reason="deprioritized")
-        assert ok is True
+        assert ok
 
         runs = kb.list_runs(conn, tid)
         assert len(runs) == 1
@@ -4313,7 +4313,7 @@ def test_complete_with_created_cards_all_verified_records_manifest(kanban_home):
             summary="done, created c1+c2",
             created_cards=[c1, c2],
         )
-        assert ok is True
+        assert ok
         evs = list(conn.execute(
             "SELECT kind, payload FROM task_events WHERE task_id=? ORDER BY id",
             (parent,),
@@ -4409,7 +4409,7 @@ def test_complete_accepts_cross_worker_card_when_linked_as_child(kanban_home):
             summary="completed with linked child",
             created_cards=[other],
         )
-        assert ok is True
+        assert ok
         # The card should appear in the completed event's verified_cards list.
         import json as _json
         row = conn.execute(
@@ -4457,7 +4457,7 @@ def test_complete_can_retry_after_phantom_rejection(kanban_home):
             summary="retry without claims",
             created_cards=[],
         )
-        assert ok is True
+        assert ok
         assert kb.get_task(conn, parent_a).status == "done"
 
         # Same flow on parent_b, but recover via a corrected list rather
@@ -4475,7 +4475,7 @@ def test_complete_can_retry_after_phantom_rejection(kanban_home):
             summary="retry with corrected list",
             created_cards=[real],
         )
-        assert ok is True
+        assert ok
         assert kb.get_task(conn, parent_b).status == "done"
 
         # Both audit events landed; the eventual completion event is
@@ -4504,7 +4504,7 @@ def test_complete_prose_scan_flags_nonexistent_ids(kanban_home):
             conn, parent,
             summary="also saw t_abcd1234ffff failing in CI",
         )
-        assert ok is True
+        assert ok
         kinds_and_payloads = list(conn.execute(
             "SELECT kind, payload FROM task_events WHERE task_id=? ORDER BY id",
             (parent,),
@@ -4532,7 +4532,7 @@ def test_complete_prose_scan_ignores_existing_ids(kanban_home):
             conn, parent,
             summary=f"depended on {other}, now done",
         )
-        assert ok is True
+        assert ok
         kinds = [
             r["kind"] for r in conn.execute(
                 "SELECT kind FROM task_events WHERE task_id=? ORDER BY id",

@@ -2384,7 +2384,7 @@ def test_heartbeat_claim_with_event_no_event_on_stale_run_id(kanban_home):
             claimer=lock,
             expected_run_id=run1_id,
         )
-        assert ok is False
+        assert not ok
         assert reason == "stale_run_id"
 
         # No heartbeat event was appended.
@@ -2454,7 +2454,7 @@ def test_heartbeat_claim_with_event_no_event_on_rotated_lock(kanban_home):
             claimer=lock_a,
             expected_run_id=run_a_id,
         )
-        assert ok is False
+        assert not ok
         assert reason == "rotated_lock"
 
         # No heartbeat event written.
@@ -2563,7 +2563,7 @@ def test_heartbeat_claim_with_event_atomic_reclaim_race(kanban_home, monkeypatch
         monkeypatch.setattr(_kb, "_test_interleave_hook", None)
 
     assert thread_b.is_alive() is False, "actor B did not finish"
-    assert ok is True, f"heartbeat should succeed atomically; got reason={reason!r}"
+    assert ok, f"heartbeat should succeed atomically; got reason={reason!r}"
     assert b_status["value"] == "busy", (
         "actor B must observe SQLite lock contention while actor A holds "
         f"the write_txn; got {b_status['value']!r}"
@@ -2684,7 +2684,7 @@ def test_heartbeat_claim_with_event_split_mutant_orphan_xfail(
 
     assert thread_b.is_alive() is False
     # The CAS phase succeeds; the event phase is what the mutant gets wrong.
-    assert ok is True, f"split mutant CAS phase should succeed; got reason={reason!r}"
+    assert ok, f"split mutant CAS phase should succeed; got reason={reason!r}"
 
     with kb.connect() as conn:
         task = kb.get_task(conn, t)
@@ -2728,7 +2728,7 @@ def test_heartbeat_claim_with_event_legitimate_owner_succeeds(kanban_home):
             claimer=lock,
             expected_run_id=run_id,
         )
-        assert ok is True
+        assert ok
         assert reason == ""
 
         # Lease was extended (compare vs old value of 0, don't assume a specific TTL).
@@ -2762,7 +2762,7 @@ def test_heartbeat_claim_with_event_not_running_returns_false(kanban_home):
             expected_run_id=None,
         )
         # Task exists but status is 'todo', not 'running' → "not_running".
-        assert ok is False
+        assert not ok
         assert reason == "not_running"
 
 

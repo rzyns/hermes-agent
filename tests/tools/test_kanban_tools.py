@@ -718,23 +718,35 @@ def test_complete_digest_conflict_returns_structured_tool_error(
     assert "already exists" in err["error"]
 
 
-def test_complete_already_terminal_duplicate_run_reports_status(worker_env):
-    """If the task is already terminal and a later run is attempted, the tool
-    reports the terminal status instead of a generic failure."""
+def test_complete_already_terminal_different_run_returns_refusal(worker_env):
+    """If the task is already terminal after a later run, completing an older
+    run returns a structured refusal rather than generic success."""
     from hermes_cli import kanban_db as kb
     from tools import kanban_tools as kt
 
     assert json.loads(kt._handle_complete({"summary": "done"})).get("ok")
 
-    # Force a new run id so the worker attempts to complete a different run
-    # of an already-terminal task.
+    # Reopen the task and complete it through a second run so the board's
+    # terminal identity is bound to run 2.
     with kb.connect() as conn:
+        conn.execute(
+            "UPDATE tasks SET status='ready', current_run_id=NULL, result=NULL, "
+            "completed_at=NULL WHERE id=?",
+            (worker_env,),
+        )
+        conn.commit()
         kb.claim_task(conn, worker_env)
+        latest = kb.latest_run(conn, worker_env)
+        assert latest is not None
+        run2 = latest.id
+        assert kb.complete_task(conn, worker_env, summary="done two").ok
 
+    # Now attempt to complete the original run id; this is structurally stale.
+    os.environ["HERMES_KANBAN_RUN_ID"] = "1"
     out = json.loads(kt._handle_complete({"summary": "done"}))
-    assert out.get("ok") is True
-    assert out.get("already_terminal") is True
-    assert out.get("terminal_status") == "done"
+    assert out.get("ok") is not True
+    assert "error" in out
+    assert "stale" in out["error"].lower() or "already terminal" in out["error"].lower()
 
 
 def test_complete_goal_mode_rejected_by_judge(monkeypatch, tmp_path):

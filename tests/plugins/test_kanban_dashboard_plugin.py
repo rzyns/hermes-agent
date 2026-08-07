@@ -2629,7 +2629,7 @@ def test_board_warnings_cleared_after_clean_completion(client):
             summary="retry without phantom",
             created_cards=[real],
         )
-        assert ok is True
+        assert ok
     finally:
         conn.close()
 

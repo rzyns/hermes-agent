@@ -906,12 +906,21 @@ def _handle_complete(args: dict, **kw) -> str:
                     )
 
             try:
-                ok = kb.complete_task(
+                completion_result = kb.complete_task(
                     conn, tid,
                     result=result, summary=summary, metadata=metadata,
                     created_cards=created_cards,
                     expected_run_id=_worker_run_id(tid),
                     review_pending=_normalize_review_pending(args.get("review_pending")),
+                )
+                ok = bool(completion_result)
+            except kb.StaleCompletionRunError as stale_err:
+                return tool_error(
+                    f"kanban_complete blocked: task {stale_err.task_id} "
+                    f"run {stale_err.attempted_run_id} is stale. "
+                    f"The task is already terminal after run "
+                    f"{stale_err.latest_run_id}; inspect the latest run instead "
+                    f"of retrying this one."
                 )
             except kb.CompletionDigestConflictError as conflict_err:
                 # A retry with a materially different handoff for the same run
@@ -955,31 +964,18 @@ def _handle_complete(args: dict, **kw) -> str:
                     f"created_cards=[] to skip the card-claim check entirely."
                 )
             if not ok:
-                # Distinguish an already-terminal task from a generic failure.
-                # If the task is already done/review/archived, complete_task
-                # returns False and a duplicate tool call should not look like
-                # an error to the worker.
-                task = kb.get_task(conn, tid)
-                if task and task.status in {"done", "review", "archived"}:
-                    latest = kb.latest_run(conn, tid)
-                    return _ok(
-                        task_id=tid,
-                        run_id=latest.id if latest else None,
-                        already_terminal=True,
-                        terminal_status=task.status,
-                    )
                 return tool_error(
-                    f"could not complete {tid} (unknown id or already terminal)"
+                    f"could not complete {tid} (unknown id or not in running/ready)"
                 )
-            run = kb.latest_run(conn, tid)
-            accepted_budget_run_id = None
-            if run and isinstance(run.metadata, dict):
-                accepted_budget_run_id = run.metadata.get(
-                    "accepted_after_budget_run_id"
-                )
+            # Use the canonical run_id carried by the completion result.
+            run_id = completion_result.run_id
+            accepted_budget_run_id = completion_result.budget_run_id
             return _ok(
+                ok=True,
                 task_id=tid,
-                run_id=run.id if run else None,
+                run_id=run_id,
+                already_terminal=completion_result.already_terminal or False,
+                terminal_status=completion_result.terminal_status,
                 accepted_terminal_after_budget_bench=(
                     accepted_budget_run_id is not None
                 ),
