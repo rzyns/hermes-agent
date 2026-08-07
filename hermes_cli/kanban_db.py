@@ -95,6 +95,7 @@ from pathlib import Path
 from typing import Any, Callable, Iterable, Mapping, Optional
 
 from hermes_cli.sqlite_util import add_column_if_missing as _add_column_if_missing
+from hermes_cli.sqlite_util import create_unique_index_if_missing as _create_unique_index_if_missing
 from hermes_cli.kanban_validation import validate_workspace_spec
 from hermes_cli.observability.budget_telemetry import (
     estimate_task_complexity,
@@ -2212,6 +2213,8 @@ CREATE INDEX IF NOT EXISTS idx_completion_results_task_run
     ON task_completion_results(task_id, run_id);
 CREATE INDEX IF NOT EXISTS idx_completion_results_digest
     ON task_completion_results(digest);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_completion_results_task_digest
+    ON task_completion_results(task_id, digest);
 
 CREATE INDEX IF NOT EXISTS idx_notify_task           ON kanban_notify_subs(task_id);
 CREATE INDEX IF NOT EXISTS idx_review_candidate      ON review_requests(candidate_id, status);
@@ -3818,8 +3821,45 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
                 "finalized_at",
                 "finalized_at INTEGER",
             )
+        # Enforce exactly one committed/finalized completion intent per task per
+        # digest. The digest includes the run id, so a different legitimate run
+        # gets a different digest and is allowed; a racing duplicate call for
+        # the same run+digest is rejected at the schema level. Existing duplicate
+        # rows produced by the pre-fix race are repaired by keeping the earliest
+        # run id per (task_id, digest).
+        _dedupe_completion_results(conn)
+        _create_unique_index_if_missing(
+            conn,
+            "idx_completion_results_task_digest",
+            "task_completion_results",
+            "task_id, digest",
+        )
 
     _rebuild_drifted_tables(conn)
+
+
+def _dedupe_completion_results(conn: sqlite3.Connection) -> None:
+    """Remove duplicate completion-result rows sharing the same (task_id, digest).
+
+    Keeps the row with the lowest run id (and, as a tie-breaker, lowest rowid)
+    so the earliest terminal record survives. This is a one-time repair pass for
+    boards that experienced the pre-fix concurrent-completion race.
+    """
+    conn.execute(
+        """
+        DELETE FROM task_completion_results
+        WHERE rowid IN (
+            SELECT rowid FROM (
+                SELECT rowid,
+                       ROW_NUMBER() OVER (
+                           PARTITION BY task_id, digest
+                           ORDER BY run_id ASC, rowid ASC
+                       ) AS rn
+                  FROM task_completion_results
+            ) WHERE rn > 1
+        )
+        """
+    )
 
 
 # Legacy DBs defined these tables with a ``TEXT PRIMARY KEY`` id (or, for
@@ -8342,83 +8382,83 @@ def complete_task(
                     return CompletionResult(ok=False, task_id=task_id)
                 accepted_budget_run_id = int(budget_run["id"])
 
-        # Filesystem publication happens *after* commit via the idempotent
-        # finalizer, so staged intent is durable before any file is copied.
-        run_metadata = metadata
-        if accepted_budget_run_id is not None:
-            run_metadata = dict(metadata) if isinstance(metadata, dict) else {}
-            run_metadata["accepted_after_budget_run_id"] = accepted_budget_run_id
-        run_id = _end_run(
-            conn, task_id,
-            outcome=terminal_outcome, status=terminal_status,
-            summary=effective_result,
-            metadata=run_metadata,
-        )
-        if run_id is None and (effective_result or metadata):
-            run_id = _synthesize_ended_run(
+            # Filesystem publication happens *after* commit via the idempotent
+            # finalizer, so staged intent is durable before any file is copied.
+            run_metadata = metadata
+            if accepted_budget_run_id is not None:
+                run_metadata = dict(metadata) if isinstance(metadata, dict) else {}
+                run_metadata["accepted_after_budget_run_id"] = accepted_budget_run_id
+            run_id = _end_run(
                 conn, task_id,
-                outcome=terminal_outcome,
+                outcome=terminal_outcome, status=terminal_status,
                 summary=effective_result,
                 metadata=run_metadata,
             )
-        if accepted_budget_run_id is not None:
+            if run_id is None and (effective_result or metadata):
+                run_id = _synthesize_ended_run(
+                    conn, task_id,
+                    outcome=terminal_outcome,
+                    summary=effective_result,
+                    metadata=run_metadata,
+                )
+            if accepted_budget_run_id is not None:
+                _append_event(
+                    conn,
+                    task_id,
+                    "accepted_terminal_after_budget_bench",
+                    {"budget_run_id": accepted_budget_run_id},
+                    run_id=run_id,
+                )
+            ev_summary = effective_result.strip().splitlines()[0][:400] if effective_result else ""
+            completed_payload: dict = {
+                "result_len": len(effective_result) if effective_result else 0,
+                "summary": ev_summary or None,
+            }
+            if verified_cards:
+                completed_payload["verified_cards"] = verified_cards
+            cleaned_artifacts = _artifact_list_from_metadata(metadata)
+            if cleaned_artifacts:
+                completed_payload["artifacts"] = cleaned_artifacts
             _append_event(
-                conn,
-                task_id,
-                "accepted_terminal_after_budget_bench",
-                {"budget_run_id": accepted_budget_run_id},
+                conn, task_id, terminal_outcome,
+                completed_payload,
                 run_id=run_id,
             )
-        ev_summary = effective_result.strip().splitlines()[0][:400] if effective_result else ""
-        completed_payload: dict = {
-            "result_len": len(effective_result) if effective_result else 0,
-            "summary": ev_summary or None,
-        }
-        if verified_cards:
-            completed_payload["verified_cards"] = verified_cards
-        cleaned_artifacts = _artifact_list_from_metadata(metadata)
-        if cleaned_artifacts:
-            completed_payload["artifacts"] = cleaned_artifacts
-        _append_event(
-            conn, task_id, terminal_outcome,
-            completed_payload,
-            run_id=run_id,
-        )
-        terminal_event_id = _last_event_id(conn, task_id)
-        if review_pending_ids:
-            now = int(time.time())
-            for reviewer_id in review_pending_ids:
-                _request_review_in_txn(
-                    conn, task_id, reviewer_id, run_id,
-                    now=now, reason=effective_result,
-                )
+            terminal_event_id = _last_event_id(conn, task_id)
+            if review_pending_ids:
+                now = int(time.time())
+                for reviewer_id in review_pending_ids:
+                    _request_review_in_txn(
+                        conn, task_id, reviewer_id, run_id,
+                        now=now, reason=effective_result,
+                    )
 
-        assert run_id is not None
-        conn.execute(
-            """
-            INSERT INTO task_completion_results (
-                task_id, run_id, digest, status, terminal_status, outcome,
-                summary, result, metadata_json, created_cards_json,
-                review_pending_json, published_artifacts_json,
-                terminal_event_id, completed_at, finalized_at
-            ) VALUES (?, ?, ?, 'committed', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL)
-            """,
-            (
-                task_id,
-                int(run_id),
-                canonical_digest,
-                terminal_status,
-                terminal_outcome,
-                summary if summary else None,
-                result if result else None,
-                json.dumps(metadata if isinstance(metadata, dict) else {}, ensure_ascii=False),
-                json.dumps(verified_cards, ensure_ascii=False),
-                json.dumps(list(review_pending_ids), ensure_ascii=False),
-                json.dumps(artifact_manifest, ensure_ascii=False),
-                terminal_event_id,
-                now,
-            ),
-        )
+            assert run_id is not None
+            conn.execute(
+                """
+                INSERT INTO task_completion_results (
+                    task_id, run_id, digest, status, terminal_status, outcome,
+                    summary, result, metadata_json, created_cards_json,
+                    review_pending_json, published_artifacts_json,
+                    terminal_event_id, completed_at, finalized_at
+                ) VALUES (?, ?, ?, 'committed', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL)
+                """,
+                (
+                    task_id,
+                    int(run_id),
+                    canonical_digest,
+                    terminal_status,
+                    terminal_outcome,
+                    summary if summary else None,
+                    result if result else None,
+                    json.dumps(metadata if isinstance(metadata, dict) else {}, ensure_ascii=False),
+                    json.dumps(verified_cards, ensure_ascii=False),
+                    json.dumps(list(review_pending_ids), ensure_ascii=False),
+                    json.dumps(artifact_manifest, ensure_ascii=False),
+                    terminal_event_id,
+                    now,
+                ),
+            )
 
     if finalize_after_txn is not None:
         final_run_id, final_terminal_event_id, already_terminal = finalize_after_txn

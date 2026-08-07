@@ -471,15 +471,17 @@ def test_crash_during_finalization_resumes_and_cleans_workspace(populated_db, mo
 
 
 def test_concurrent_duplicate_completion_is_idempotent(populated_db):
-    """Two concurrent calls with the exact same payload are both accepted."""
+    """Two concurrent calls with the exact same payload produce exactly one transition."""
     conn, tid, run_id, _child = populated_db
 
     results: list[kb.CompletionResult] = []
     errors: list[BaseException] = []
+    barrier = threading.Barrier(2)
 
     def _complete():
         try:
             c = kb.connect()
+            barrier.wait()
             results.append(
                 kb.complete_task(c, tid, summary="done", expected_run_id=run_id)
             )
@@ -494,10 +496,6 @@ def test_concurrent_duplicate_completion_is_idempotent(populated_db):
 
     assert not errors
     assert all(r.ok for r in results)
-    # The task must be terminal after the race; concurrent completions without
-    # a same-run idempotency guard inside the write lock may each create their
-    # own terminal run/event. The invariant we require is that every caller
-    # observes a successful terminal result and the task is done exactly once.
     assert _task_status(conn, tid) == "done"
     terminal_run_count = int(
         conn.execute(
@@ -505,11 +503,96 @@ def test_concurrent_duplicate_completion_is_idempotent(populated_db):
             (tid,),
         ).fetchone()[0]
     )
-    assert terminal_run_count >= 1
+    assert terminal_run_count == 1
     completed_events = int(
         conn.execute(
             "SELECT COUNT(*) FROM task_events WHERE task_id=? AND kind='completed'",
             (tid,),
         ).fetchone()[0]
     )
-    assert completed_events >= 1
+    assert completed_events == 1
+    ledger_rows = int(
+        conn.execute(
+            "SELECT COUNT(*) FROM task_completion_results WHERE task_id=?",
+            (tid,),
+        ).fetchone()[0]
+    )
+    assert ledger_rows == 1
+    assert (
+        int(
+            conn.execute(
+                "SELECT COUNT(*) FROM task_completion_results WHERE task_id=? AND status IN ('committed', 'finalized')",
+                (tid,),
+            ).fetchone()[0]
+        )
+        == 1
+    )
+
+
+def test_synchronized_concurrent_duplicate_completion_exactly_once(kanban_home):
+    """20-iteration synchronized race: exactly one terminal run/event/ledger each time."""
+    failures: list[dict[str, Any]] = []
+    for index in range(20):
+        conn = kb.connect()
+        task_id = kb.create_task(conn, title="probe", assignee="review-probe")
+        assert kb.claim_task(conn, task_id) is not None
+        run_id = int(
+            conn.execute(
+                "SELECT current_run_id FROM tasks WHERE id=?", (task_id,)
+            ).fetchone()[0]
+        )
+        results: list[kb.CompletionResult] = []
+        errors: list[str] = []
+        barrier = threading.Barrier(2)
+
+        def _complete():
+            try:
+                c = kb.connect()
+                barrier.wait()
+                results.append(
+                    kb.complete_task(c, task_id, summary="done", expected_run_id=run_id)
+                )
+            except BaseException as exc:
+                errors.append(repr(exc))
+
+        threads = [threading.Thread(target=_complete) for _ in range(2)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(timeout=15)
+
+        counts: dict[str, Any] = {
+            "results": len(results),
+            "ok": sum(1 for r in results if r.ok),
+            "errors": errors,
+            "completed_runs": int(
+                conn.execute(
+                    "SELECT COUNT(*) FROM task_runs WHERE task_id=? AND outcome='completed'",
+                    (task_id,),
+                ).fetchone()[0]
+            ),
+            "completed_events": int(
+                conn.execute(
+                    "SELECT COUNT(*) FROM task_events WHERE task_id=? AND kind='completed'",
+                    (task_id,),
+                ).fetchone()[0]
+            ),
+            "ledger_rows": int(
+                conn.execute(
+                    "SELECT COUNT(*) FROM task_completion_results WHERE task_id=?",
+                    (task_id,),
+                ).fetchone()[0]
+            ),
+        }
+        expected = {
+            "results": 2,
+            "ok": 2,
+            "errors": [],
+            "completed_runs": 1,
+            "completed_events": 1,
+            "ledger_rows": 1,
+        }
+        if any(counts[key] != value for key, value in expected.items()):
+            failures.append({"iteration": index, **counts})
+
+    assert not failures, json.dumps(failures, indent=2)
