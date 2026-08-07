@@ -783,6 +783,14 @@ def _resolve_claim_ttl_seconds(ttl_seconds: Optional[int] = None) -> int:
 # during the launch window.
 DEFAULT_CRASH_GRACE_SECONDS = 30
 
+# Lease time for the post-commit completion finalizer. A caller that claims the
+# ledger row by moving it to 'finalizing' has this long to finish side effects
+# (artifact publication, recompute, cleanup, lifecycle hook) before another
+# retry is allowed to reclaim the row and resume. This prevents a crashed
+# finalizer from permanently blocking completion while keeping concurrent
+# losers from running duplicate side effects.
+_FINALIZATION_LEASE_SECONDS = 30
+
 
 # Sentinel exit code a kanban worker uses to signal a transient provider
 # throttle, not a task failure.
@@ -2213,8 +2221,9 @@ CREATE INDEX IF NOT EXISTS idx_completion_results_task_run
     ON task_completion_results(task_id, run_id);
 CREATE INDEX IF NOT EXISTS idx_completion_results_digest
     ON task_completion_results(digest);
-CREATE UNIQUE INDEX IF NOT EXISTS idx_completion_results_task_digest
-    ON task_completion_results(task_id, digest);
+-- The unique (task_id, digest) index is created AFTER the additive
+-- migration pass has had a chance to dedupe historical duplicate rows. See
+-- _migrate_add_optional_columns for the dedupe + index creation sequence.
 
 CREATE INDEX IF NOT EXISTS idx_notify_task           ON kanban_notify_subs(task_id);
 CREATE INDEX IF NOT EXISTS idx_review_candidate      ON review_requests(candidate_id, status);
@@ -3826,7 +3835,8 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
         # gets a different digest and is allowed; a racing duplicate call for
         # the same run+digest is rejected at the schema level. Existing duplicate
         # rows produced by the pre-fix race are repaired by keeping the earliest
-        # run id per (task_id, digest).
+        # run id per (task_id, digest). The unique index is created after dedupe
+        # so legacy boards carrying pre-fix duplicate rows upgrade cleanly.
         _dedupe_completion_results(conn)
         _create_unique_index_if_missing(
             conn,
@@ -7828,33 +7838,110 @@ def _finalize_completion_result(
     idempotent so a retry can resume safely from any committed row.
     """
     now = int(time.time())
-    row = _load_completion_result(conn, task_id, run_id)
-    if row is None:
-        raise RuntimeError(
-            f"cannot finalize completion: no completion row for {task_id} run {run_id}"
+    lease_timeout = _FINALIZATION_LEASE_SECONDS
+    # Claim finalization ownership in the ledger itself. Only the caller that
+    # successfully transitions the row from 'committed' to 'finalizing' may run
+    # the consequential side effects (hook, workspace cleanup, dependent
+    # recompute). Subsequent concurrent callers observe the row and either wait
+    # for the active finalizer or, if the lease has expired, reclaim the row so
+    # a crashed finalizer does not permanently block completion.
+    claimed = False
+    with _transaction_or_current(conn):
+        row = _load_completion_result(conn, task_id, run_id)
+        if row is None:
+            raise RuntimeError(
+                f"cannot finalize completion: no completion row for {task_id} run {run_id}"
+            )
+        if row["status"] == "finalized":
+            return CompletionResult(
+                ok=True,
+                task_id=task_id,
+                run_id=run_id,
+                terminal_status=row["terminal_status"],
+                outcome=row["outcome"],
+                summary=row["summary"],
+                result=row["result"],
+                already_terminal=True,
+            )
+        # CAS: exactly one caller wins the right to run side effects.
+        cur = conn.execute(
+            """
+            UPDATE task_completion_results
+               SET status = 'finalizing',
+                   finalized_at = ?,
+                   terminal_event_id = ?
+             WHERE task_id = ? AND run_id = ? AND status = 'committed'
+            """,
+            (now, terminal_event_id, task_id, run_id),
         )
+        claimed = cur.rowcount == 1
 
-    if row["status"] == "finalized":
+    if not claimed:
+        # Another caller may be actively finalizing. Poll for it to finish;
+        # if the finalization lease expires, attempt to reclaim so crash
+        # recovery can resume.
+        poll_start = time.time()
+        while time.time() - poll_start < lease_timeout:
+            row = _load_completion_result(conn, task_id, run_id)
+            if row is None:
+                raise RuntimeError(
+                    f"cannot finalize completion: no completion row for {task_id} run {run_id}"
+                )
+            if row["status"] == "finalized":
+                return CompletionResult(
+                    ok=True,
+                    task_id=task_id,
+                    run_id=run_id,
+                    terminal_status=row["terminal_status"],
+                    outcome=row["outcome"],
+                    summary=row["summary"],
+                    result=row["result"],
+                    already_terminal=True,
+                )
+            time.sleep(0.05)
+
+        # Lease expired: try to reclaim a stale 'finalizing' row.
+        reclaim_at = int(time.time())
+        lease_deadline = reclaim_at - lease_timeout
+        with _transaction_or_current(conn):
+            cur = conn.execute(
+                """
+                UPDATE task_completion_results
+                   SET status = 'finalizing',
+                       finalized_at = ?,
+                       terminal_event_id = ?
+                 WHERE task_id = ? AND run_id = ? AND status = 'finalizing'
+                   AND finalized_at <= ?
+                """,
+                (reclaim_at, terminal_event_id, task_id, run_id, lease_deadline),
+            )
+            claimed = cur.rowcount == 1
+
+    if not claimed:
+        # Another active finalizer holds a valid lease. Return the stored
+        # result as already_terminal without running side effects.
+        row = _load_completion_result(conn, task_id, run_id)
         return CompletionResult(
             ok=True,
             task_id=task_id,
             run_id=run_id,
-            terminal_status=row["terminal_status"],
-            outcome=row["outcome"],
-            summary=row["summary"],
-            result=row["result"],
+            terminal_status=row["terminal_status"] if row else None,
+            outcome=row["outcome"] if row else None,
+            summary=row["summary"] if row else None,
+            result=row["result"] if row else None,
             already_terminal=True,
         )
 
     source_to_stored: dict[str, str] = {}
-    finalized_in_txn = False
-
-    with _transaction_or_current(conn):
-        # Re-check under lock.
-        row = _load_completion_result(conn, task_id, run_id)
-        if row is None or row["status"] == "finalized":
-            finalized_in_txn = True
-        else:
+    try:
+        with _transaction_or_current(conn):
+            # Re-load the now-claimed row (still under a transaction) to finalize
+            # durable idempotent mutations.
+            row = _load_completion_result(conn, task_id, run_id)
+            if row is None:
+                raise RuntimeError(
+                    f"cannot finalize completion: no completion row for {task_id} run {run_id}"
+                )
             manifest = _normalize_published_artifacts_json(
                 row["published_artifacts_json"]
             )
@@ -7871,7 +7958,7 @@ def _finalize_completion_result(
                         UPDATE task_completion_results
                            SET published_artifacts_json = ?
                          WHERE task_id = ? AND run_id = ?
-                           AND status != 'finalized'
+                           AND status = 'finalizing'
                         """,
                         (
                             json.dumps(published_manifest, ensure_ascii=False),
@@ -7931,59 +8018,65 @@ def _finalize_completion_result(
                 (task_id,),
             )
 
-    if finalized_in_txn:
-        row = _load_completion_result(conn, task_id, run_id)
-        return CompletionResult(
-            ok=True,
-            task_id=task_id,
-            run_id=run_id,
-            terminal_status=row["terminal_status"] if row else None,
-            outcome=row["outcome"] if row else None,
-            summary=row["summary"] if row else None,
-            result=row["result"] if row else None,
-            already_terminal=True,
-        )
+        # Dependent readiness, workspace cleanup, and lifecycle hook run BEFORE
+        # the terminal finalized marker is written. Each step is idempotent so a
+        # retry can resume safely after a crash at any point in this sequence.
+        # These side effects are owned by the caller that claimed 'finalizing'.
+        recompute_ready(conn)
+        if not review_pending_ids:
+            _cleanup_workspace(conn, task_id)
 
-    # Dependent readiness, workspace cleanup, and lifecycle hook run BEFORE
-    # the terminal finalized marker is written. Each step is idempotent so a
-    # retry can resume safely after a crash at any point in this sequence.
-    recompute_ready(conn)
-    if not review_pending_ids:
-        _cleanup_workspace(conn, task_id)
+        _done_task = get_task(conn, task_id)
+        if not _event_exists(conn, task_id, run_id, "completed_hook_fired"):
+            try:
+                _fire_kanban_lifecycle_hook(
+                    "kanban_task_completed",
+                    task_id,
+                    board=get_current_board(),
+                    assignee=_done_task.assignee if _done_task else None,
+                    run_id=run_id,
+                    summary=(summary or result or ""),
+                )
+                _append_event(
+                    conn,
+                    task_id,
+                    "completed_hook_fired",
+                    {"run_id": run_id},
+                    run_id=run_id,
+                )
+            except Exception:
+                _log.exception("kanban_task_completed lifecycle hook failed")
 
-    _done_task = get_task(conn, task_id)
-    if not _event_exists(conn, task_id, run_id, "completed_hook_fired"):
-        try:
-            _fire_kanban_lifecycle_hook(
-                "kanban_task_completed",
-                task_id,
-                board=get_current_board(),
-                assignee=_done_task.assignee if _done_task else None,
-                run_id=run_id,
-                summary=(summary or result or ""),
+        # Mark finalized only after all finalizer obligations are durably complete.
+        with _transaction_or_current(conn):
+            conn.execute(
+                """
+                UPDATE task_completion_results
+                   SET status = 'finalized',
+                       finalized_at = ?
+                 WHERE task_id = ? AND run_id = ? AND status = 'finalizing'
+                """,
+                (int(time.time()), task_id, run_id),
             )
-            _append_event(
-                conn,
-                task_id,
-                "completed_hook_fired",
-                {"run_id": run_id},
-                run_id=run_id,
-            )
-        except Exception:
-            _log.exception("kanban_task_completed lifecycle hook failed")
-
-    # Mark finalized only after all finalizer obligations are durably complete.
-    with _transaction_or_current(conn):
-        conn.execute(
-            """
-            UPDATE task_completion_results
-               SET status = 'finalized',
-                   finalized_at = ?,
-                   terminal_event_id = ?
-             WHERE task_id = ? AND run_id = ? AND status != 'finalized'
-            """,
-            (now, terminal_event_id, task_id, run_id),
-        )
+    except Exception:
+        # A crash during finalization leaves the row 'finalizing', which blocks
+        # future retries until the lease expires. Reset to 'committed' so the
+        # next retry can resume promptly.
+        if claimed:
+            try:
+                with _transaction_or_current(conn):
+                    conn.execute(
+                        """
+                        UPDATE task_completion_results
+                           SET status = 'committed',
+                               finalized_at = NULL
+                         WHERE task_id = ? AND run_id = ? AND status = 'finalizing'
+                        """,
+                        (task_id, run_id),
+                    )
+            except Exception:
+                pass
+        raise
 
     row = _load_completion_result(conn, task_id, run_id)
     return CompletionResult(

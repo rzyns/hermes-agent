@@ -442,6 +442,7 @@ def test_crash_during_finalization_resumes_and_cleans_workspace(populated_db, mo
         return real_recompute(_conn)
 
     monkeypatch.setattr(kb, "recompute_ready", wrapper)
+    monkeypatch.setattr(kb, "_FINALIZATION_LEASE_SECONDS", 0)
     with pytest.raises(RuntimeError, match="crash during recompute_ready"):
         kb.complete_task(conn, tid, summary="done", expected_run_id=run_id)
 
@@ -450,7 +451,7 @@ def test_crash_during_finalization_resumes_and_cleans_workspace(populated_db, mo
         "SELECT status FROM task_completion_results WHERE task_id=? AND run_id=?",
         (tid, run_id),
     ).fetchone()
-    assert row["status"] == "committed"
+    assert row["status"] in {"committed", "finalizing"}
     # Workspace cleanup has not run yet.
     assert ws.exists()
 
@@ -596,3 +597,233 @@ def test_synchronized_concurrent_duplicate_completion_exactly_once(kanban_home):
             failures.append({"iteration": index, **counts})
 
     assert not failures, json.dumps(failures, indent=2)
+
+def test_concurrent_duplicate_completion_return_semantics(kanban_home):
+    """20-iteration race: winner gets already_terminal=False, loser gets True."""
+    failures: list[dict[str, Any]] = []
+    for index in range(20):
+        conn = kb.connect()
+        task_id = kb.create_task(conn, title="probe", assignee="review-probe")
+        assert kb.claim_task(conn, task_id) is not None
+        run_id = int(
+            conn.execute(
+                "SELECT current_run_id FROM tasks WHERE id=?", (task_id,)
+            ).fetchone()[0]
+        )
+        results: list[kb.CompletionResult] = []
+        errors: list[str] = []
+        barrier = threading.Barrier(2)
+
+        def _complete():
+            try:
+                c = kb.connect()
+                barrier.wait()
+                results.append(
+                    kb.complete_task(c, task_id, summary="done", expected_run_id=run_id)
+                )
+            except BaseException as exc:
+                errors.append(repr(exc))
+
+        threads = [threading.Thread(target=_complete) for _ in range(2)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(timeout=15)
+
+        already_terminals = sorted(bool(r.already_terminal) for r in results)
+        returned_run_ids = sorted(r.run_id for r in results)
+        returned_summaries = sorted(r.summary for r in results)
+        row = {
+            "iteration": index,
+            "results": len(results),
+            "ok": sum(1 for r in results if r.ok),
+            "already_terminal": already_terminals,
+            "returned_run_ids": returned_run_ids,
+            "returned_summaries": returned_summaries,
+            "errors": errors,
+            "completed_runs": int(
+                conn.execute(
+                    "SELECT COUNT(*) FROM task_runs WHERE task_id=? AND outcome='completed'",
+                    (task_id,),
+                ).fetchone()[0]
+            ),
+            "completed_events": int(
+                conn.execute(
+                    "SELECT COUNT(*) FROM task_events WHERE task_id=? AND kind='completed'",
+                    (task_id,),
+                ).fetchone()[0]
+            ),
+            "ledger_rows": int(
+                conn.execute(
+                    "SELECT COUNT(*) FROM task_completion_results WHERE task_id=?",
+                    (task_id,),
+                ).fetchone()[0]
+            ),
+        }
+        expected = {
+            "results": 2,
+            "ok": 2,
+            "already_terminal": [False, True],
+            "returned_run_ids": [run_id, run_id],
+            "returned_summaries": ["done", "done"],
+            "errors": [],
+            "completed_runs": 1,
+            "completed_events": 1,
+            "ledger_rows": 1,
+        }
+        mismatch = {
+            key: {"expected": value, "actual": row[key]}
+            for key, value in expected.items()
+            if row[key] != value
+        }
+        if mismatch:
+            failures.append({"iteration": index, "mismatch": mismatch})
+        conn.close()
+
+    assert not failures, json.dumps(failures, indent=2)
+
+
+def test_historical_duplicate_completion_migration(kanban_home):
+    """init_db repairs a legacy DB with duplicate (task_id, digest) rows.
+
+    The unique index must not be created until dedupe has run; the survivor is
+    the row with the lowest run_id (and lowest rowid as tie-breaker).
+    """
+    conn = kb.connect()
+    conn.execute("DROP INDEX idx_completion_results_task_digest")
+    insert_sql = """
+        INSERT INTO task_completion_results (
+            task_id, run_id, digest, status, terminal_status, outcome, summary, result,
+            metadata_json, created_cards_json, review_pending_json, published_artifacts_json,
+            terminal_event_id, completed_at, finalized_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    """
+
+    def _ledger_values(run: int, summary: str) -> tuple:
+        return (
+            "historical-task", run, "same-digest", "committed", "done", "completed",
+            summary, summary, "{}", "[]", "[]", "[]", None, 1000 + run, None,
+        )
+
+    conn.execute(insert_sql, _ledger_values(22, "later-row"))
+    conn.execute(insert_sql, _ledger_values(11, "earlier-run"))
+    conn.commit()
+    conn.close()
+
+    # Force reinit through the public entry point.
+    kb._INITIALIZED_PATHS.clear()
+    kb._INITIALIZED_PATH_FINGERPRINTS.clear()
+    db_path = Path(os.environ["HERMES_KANBAN_DB"])
+    kb.init_db(db_path)
+
+    raw = sqlite3.connect(str(db_path))
+    rows = raw.execute(
+        "SELECT run_id, summary FROM task_completion_results WHERE task_id=? ORDER BY run_id",
+        ("historical-task",),
+    ).fetchall()
+    index_exists = bool(
+        raw.execute(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type='index' AND name='idx_completion_results_task_digest'"
+        ).fetchone()[0]
+    )
+    raw.close()
+
+    assert rows == [(11, "earlier-run")], rows
+    assert index_exists
+
+    # Second init is a no-op and remains consistent.
+    kb._INITIALIZED_PATHS.clear()
+    kb._INITIALIZED_PATH_FINGERPRINTS.clear()
+    kb.init_db(db_path)
+    raw = sqlite3.connect(str(db_path))
+    rows_after = raw.execute(
+        "SELECT run_id, summary FROM task_completion_results WHERE task_id=? ORDER BY run_id",
+        ("historical-task",),
+    ).fetchall()
+    raw.close()
+    assert rows_after == [(11, "earlier-run")]
+
+
+def test_synchronized_finalizer_hook_runs_exactly_once(kanban_home):
+    """A racing loser must not run lifecycle-hook side effects."""
+    conn = kb.connect()
+    task_id = kb.create_task(conn, title="finalizer-race", assignee="review-probe")
+    assert kb.claim_task(conn, task_id) is not None
+    run_id = int(
+        conn.execute("SELECT current_run_id FROM tasks WHERE id=?", (task_id,)).fetchone()[0]
+    )
+
+    hook_calls: list[dict[str, Any]] = []
+    hook_lock = threading.Lock()
+
+    def _counting_hook(*args, **kwargs):
+        with hook_lock:
+            hook_calls.append({"args": list(args), "kwargs": kwargs})
+
+    original_hook = kb._fire_kanban_lifecycle_hook
+    kb._fire_kanban_lifecycle_hook = _counting_hook
+    try:
+        barrier = threading.Barrier(2)
+        results: list[kb.CompletionResult] = []
+        errors: list[str] = []
+
+        def _complete():
+            try:
+                c = kb.connect()
+                barrier.wait()
+                results.append(
+                    kb.complete_task(c, task_id, summary="done", expected_run_id=run_id)
+                )
+            except BaseException as exc:
+                errors.append(repr(exc))
+
+        threads = [threading.Thread(target=_complete) for _ in range(2)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(timeout=20)
+
+        assert not errors
+        assert len(results) == 2
+        assert all(r.ok for r in results)
+        assert sorted(bool(r.already_terminal) for r in results) == [False, True]
+        assert len(hook_calls) == 1
+        assert (
+            int(
+                conn.execute(
+                    "SELECT COUNT(*) FROM task_events WHERE task_id=? AND kind='completed_hook_fired'",
+                    (task_id,),
+                ).fetchone()[0]
+            )
+            == 1
+        )
+        assert (
+            int(
+                conn.execute(
+                    "SELECT COUNT(*) FROM task_runs WHERE task_id=? AND outcome='completed'",
+                    (task_id,),
+                ).fetchone()[0]
+            )
+            == 1
+        )
+        assert (
+            int(
+                conn.execute(
+                    "SELECT COUNT(*) FROM task_events WHERE task_id=? AND kind='completed'",
+                    (task_id,),
+                ).fetchone()[0]
+            )
+            == 1
+        )
+        assert (
+            int(
+                conn.execute(
+                    "SELECT COUNT(*) FROM task_completion_results WHERE task_id=?",
+                    (task_id,),
+                ).fetchone()[0]
+            )
+            == 1
+        )
+    finally:
+        kb._fire_kanban_lifecycle_hook = original_hook
+    conn.close()
