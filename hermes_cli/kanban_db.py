@@ -2159,6 +2159,16 @@ CREATE TABLE IF NOT EXISTS review_requests (
     resolved_by_operator TEXT
 );
 
+-- Routing-inheritance provenance. A worker-created child may inherit
+-- notification subscriptions, project_id, and board default_workdir from the
+-- task that spawned it without becoming a dependency of that task. One row
+-- per child; the source task is on the same board as the child.
+CREATE TABLE IF NOT EXISTS task_inherit_sources (
+    child_id       TEXT PRIMARY KEY,
+    source_task_id TEXT NOT NULL,
+    created_at     INTEGER NOT NULL
+);
+
 CREATE INDEX IF NOT EXISTS idx_tasks_assignee_status ON tasks(assignee, status);
 CREATE INDEX IF NOT EXISTS idx_tasks_status          ON tasks(status);
 CREATE INDEX IF NOT EXISTS idx_links_child           ON task_links(child_id);
@@ -2171,6 +2181,8 @@ CREATE INDEX IF NOT EXISTS idx_attachments_task      ON task_attachments(task_id
 CREATE INDEX IF NOT EXISTS idx_notify_task           ON kanban_notify_subs(task_id);
 CREATE INDEX IF NOT EXISTS idx_review_candidate      ON review_requests(candidate_id, status);
 CREATE INDEX IF NOT EXISTS idx_review_reviewer      ON review_requests(reviewer_task_id, status);
+CREATE INDEX IF NOT EXISTS idx_inherit_child        ON task_inherit_sources(child_id);
+CREATE INDEX IF NOT EXISTS idx_inherit_source        ON task_inherit_sources(source_task_id);
 """
 
 
@@ -3632,6 +3644,28 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
         "ON task_events(run_id, id)"
     )
 
+    # Typed routing-inheritance provenance (t_3f1549c4). Created additively so
+    # legacy boards upgrade cleanly. The new table is intentionally independent
+    # of ``task_links``; it records where a worker-created child copied routing
+    # context without creating a dependency edge.
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS task_inherit_sources (
+            child_id       TEXT PRIMARY KEY,
+            source_task_id TEXT NOT NULL,
+            created_at     INTEGER NOT NULL
+        )
+        """
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_inherit_child "
+        "ON task_inherit_sources(child_id)"
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_inherit_source "
+        "ON task_inherit_sources(source_task_id)"
+    )
+
     notify_table_exists = conn.execute(
         "SELECT name FROM sqlite_master WHERE type='table' AND name='kanban_notify_subs'"
     ).fetchone() is not None
@@ -4045,6 +4079,7 @@ def create_task(
     board: Optional[str] = None,
     project_id: Optional[str] = None,
     project_source_task_id: Optional[str] = None,
+    inherit_from: Optional[str] = None,
 ) -> str:
     """Create a new task and optionally link it under parent tasks.
 
@@ -4082,8 +4117,16 @@ def create_task(
     ``project_source_task_id`` is an internal cross-profile fallback for a
     worker-created child. When the active profile cannot resolve ``project_id``
     in its own projects.db, a matching canonical project-linked task in this
-    board can supply the repo and branch convention. Its literal worktree is
+    same board can supply the repo and branch convention. Its literal worktree
     never reused; the new task still gets its own task-id-keyed path.
+
+    ``inherit_from`` is an optional same-board source task id. When set, the
+    child copies gateway notification subscriptions from the source (caught
+    up to the child's creation cursor) and records a typed routing-provenance
+    row in ``task_inherit_sources``. It does NOT create a dependency edge;
+    the new task is ``ready`` regardless of the source's status. The source
+    must exist in the same board; a missing source is treated as "no
+    inheritance" so cross-board workers fail closed rather than leak routing.
     """
     model_override = (model_override or "").strip() or None
     provider_override = (provider_override or "").strip() or None
@@ -4221,6 +4264,15 @@ def create_task(
                 project_repo = str(project_obj.primary_path)
 
     parents = tuple(p for p in parents if p)
+
+    # Validate the routing-inheritance source, if any. The source must exist in
+    # this same board; otherwise we silently drop it so a worker on board A
+    # cannot accidentally inherit from a task on board B.
+    inherit_sources: list[str] = []
+    if inherit_from:
+        source = get_task(conn, str(inherit_from))
+        if source is not None:
+            inherit_sources.append(source.id)
 
     # Normalise + validate skills: strip whitespace, drop empties, dedupe
     # (preserving order). Refuse commas inside a single name so we don't
@@ -4440,6 +4492,12 @@ def create_task(
                         "INSERT OR IGNORE INTO task_links (parent_id, child_id) VALUES (?, ?)",
                         (pid, task_id),
                     )
+                for source_id in inherit_sources:
+                    conn.execute(
+                        "INSERT INTO task_inherit_sources (child_id, source_task_id, created_at) "
+                        "VALUES (?, ?, ?)",
+                        (task_id, source_id, now),
+                    )
                 _append_event(
                     conn,
                     task_id,
@@ -4458,6 +4516,7 @@ def create_task(
                         "model_override": model_override,
                         "provider_override": provider_override,
                         "complexity_proxy": complexity_proxy,
+                        "inherit_from": inherit_sources[0] if inherit_sources else None,
                     },
                 )
                 # Informational budget-ladder projection. Emitted whenever the
@@ -4493,7 +4552,11 @@ def create_task(
                             "initial_status": True,
                         },
                     )
-                _inherit_notify_subs(conn, task_id, parents, created_at=now)
+                # Inherit gateway notification subscriptions from both explicit
+                # dependency parents and the typed routing-inheritance source.
+                _inherit_notify_subs(
+                    conn, task_id, parents + tuple(inherit_sources), created_at=now
+                )
             return task_id
         except sqlite3.IntegrityError:
             if attempt == 1:
@@ -4539,12 +4602,16 @@ def _inherit_notify_subs(
     ).fetchone()
     cursor = int(row["cursor"] if row is not None else 0)
     placeholders = ",".join("?" * len(parent_ids))
+    # Copy the full routing tuple so inherited subscriptions keep their
+    # chat_type and delivery_metadata. The creation-time cursor is pinned to
+    # the child's current max event id; we do not replay pre-inheritance events.
     conn.execute(
         f"""
         INSERT OR IGNORE INTO kanban_notify_subs
-            (task_id, platform, chat_id, thread_id, user_id,
-             notifier_profile, created_at, last_event_id)
-        SELECT ?, platform, chat_id, thread_id, user_id, notifier_profile, ?, ?
+            (task_id, platform, chat_id, chat_type, thread_id, user_id,
+             notifier_profile, delivery_metadata, created_at, last_event_id)
+        SELECT ?, platform, chat_id, chat_type, thread_id, user_id,
+               notifier_profile, delivery_metadata, ?, ?
           FROM kanban_notify_subs
          WHERE task_id IN ({placeholders})
         """,
@@ -9884,6 +9951,10 @@ def archive_task(conn: sqlite3.Connection, task_id: str) -> bool:
             outcome="reclaimed", status="reclaimed",
             summary="task archived with run still active",
         )
+        # Routing-inheritance provenance is a run-time routing aid, but it
+        # mirrors the lifecycle of task_links and kanban_notify_subs: it survives
+        # soft archive so the task can be restored with its routing context
+        # intact, and is only removed during hard delete / archive-purge.
         _append_event(conn, task_id, "archived", None, run_id=run_id)
     # ``archived`` parents only unblock children when the dependency predicate
     # is satisfied (see ``_parent_dependency_satisfied``). A bare archived
@@ -9910,6 +9981,10 @@ def delete_archived_task(conn: sqlite3.Connection, task_id: str) -> bool:
             "DELETE FROM task_links WHERE parent_id = ? OR child_id = ?",
             (task_id, task_id),
         )
+        conn.execute(
+            "DELETE FROM task_inherit_sources WHERE child_id = ? OR source_task_id = ?",
+            (task_id, task_id),
+        )
         conn.execute("DELETE FROM task_comments WHERE task_id = ?", (task_id,))
         conn.execute("DELETE FROM task_events WHERE task_id = ?", (task_id,))
         conn.execute("DELETE FROM task_runs WHERE task_id = ?", (task_id,))
@@ -9933,6 +10008,10 @@ def delete_task(conn: sqlite3.Connection, task_id: str) -> bool:
         if cur.rowcount != 1:
             return False
         conn.execute("DELETE FROM task_links WHERE parent_id = ? OR child_id = ?", (task_id, task_id))
+        conn.execute(
+            "DELETE FROM task_inherit_sources WHERE child_id = ? OR source_task_id = ?",
+            (task_id, task_id),
+        )
         conn.execute("DELETE FROM task_comments WHERE task_id = ?", (task_id,))
         conn.execute("DELETE FROM task_events WHERE task_id = ?", (task_id,))
         conn.execute("DELETE FROM task_runs WHERE task_id = ?", (task_id,))

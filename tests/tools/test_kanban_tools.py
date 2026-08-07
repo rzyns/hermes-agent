@@ -1738,6 +1738,638 @@ def test_create_cross_profile_project_children_keep_isolated_worktree_routing(
     )
 
 
+# ---------------------------------------------------------------------------
+# Routing inheritance (t_3f1549c4)
+# ---------------------------------------------------------------------------
+# A worker-created follow-up card must receive the safe lane context from the
+# task that spawned it (notification subscriptions, project_id) without
+# becoming a dependency of that task.  The closed inheritable field set and the
+# ``inherit_from_current_task=false`` opt-out are the contract; anything outside
+# the closed set must not leak.
+
+
+def _inherit_sources_for(task_id):
+    from hermes_cli import kanban_db as kb
+    conn = kb.connect()
+    try:
+        rows = conn.execute(
+            "SELECT source_task_id FROM task_inherit_sources WHERE child_id = ?",
+            (task_id,),
+        ).fetchall()
+        return [r["source_task_id"] for r in rows]
+    finally:
+        conn.close()
+
+
+def _inherit_children_for(source_id):
+    from hermes_cli import kanban_db as kb
+    conn = kb.connect()
+    try:
+        rows = conn.execute(
+            "SELECT child_id FROM task_inherit_sources WHERE source_task_id = ?",
+            (source_id,),
+        ).fetchall()
+        return [r["child_id"] for r in rows]
+    finally:
+        conn.close()
+
+
+def _task_links_for(child_id):
+    from hermes_cli import kanban_db as kb
+    conn = kb.connect()
+    try:
+        rows = conn.execute(
+            "SELECT parent_id FROM task_links WHERE child_id = ?", (child_id,)
+        ).fetchall()
+        return [r["parent_id"] for r in rows]
+    finally:
+        conn.close()
+
+
+def _count_relations(task_id):
+    """Return the per-relation-family row counts touching ``task_id``.
+
+    Mirrors the archive-consistency probe used by review t_62a532c4.
+    """
+    from hermes_cli import kanban_db as kb
+    conn = kb.connect()
+    try:
+        links = conn.execute(
+            "SELECT COUNT(*) AS n FROM task_links WHERE parent_id = ? OR child_id = ?",
+            (task_id, task_id),
+        ).fetchone()["n"]
+        inherit = conn.execute(
+            "SELECT COUNT(*) AS n FROM task_inherit_sources "
+            "WHERE child_id = ? OR source_task_id = ?",
+            (task_id, task_id),
+        ).fetchone()["n"]
+        subs = conn.execute(
+            "SELECT COUNT(*) AS n FROM kanban_notify_subs WHERE task_id = ?",
+            (task_id,),
+        ).fetchone()["n"]
+        return {"task_links": links, "task_inherit_sources": inherit, "kanban_notify_subs": subs}
+    finally:
+        conn.close()
+
+
+def test_worker_spawn_inherits_notify_subscriptions(worker_env, monkeypatch):
+    """A worker-created follow-up copies the parent's gateway subscriptions
+    and records typed routing provenance, without adding a dependency edge."""
+    from hermes_cli import kanban_db as kb
+    from tools import kanban_tools as kt
+
+    conn = kb.connect()
+    try:
+        kb.add_notify_sub(
+            conn,
+            task_id=worker_env,
+            platform="telegram",
+            chat_id="chat-42",
+            chat_type="private",
+            thread_id="20197",
+            user_id="user-9",
+            notifier_profile="notifier",
+            delivery_metadata={"reply_to": "msg-11"},
+        )
+    finally:
+        conn.close()
+
+    out = kt._handle_create({"title": "inherited routing", "assignee": "peer"})
+    d = json.loads(out)
+    assert d["ok"] is True, d
+    child_id = d["task_id"]
+    assert d["inherit_from"] == worker_env
+    assert d["status"] == "ready"
+
+    subs = _sub_index(_list_subs_for_task(child_id))
+    assert len(subs) == 1, subs
+    s = subs[0]
+    assert s["platform"] == "telegram"
+    assert s["chat_id"] == "chat-42"
+    assert s["chat_type"] == "private"
+    assert s["thread_id"] == "20197"
+    assert s["user_id"] == "user-9"
+    assert s["notifier_profile"] == "notifier"
+    assert s["delivery_metadata"] == {"reply_to": "msg-11"}
+
+    # The inherited subscription's cursor is pinned to the child's creation-time
+    # max event id, so pre-inheritance events are not replayed.
+    conn = kb.connect()
+    try:
+        max_event = conn.execute(
+            "SELECT COALESCE(MAX(id), 0) AS n FROM task_events WHERE task_id = ?",
+            (child_id,),
+        ).fetchone()["n"]
+        assert s["last_event_id"] == max_event
+    finally:
+        conn.close()
+
+    assert _inherit_sources_for(child_id) == [worker_env]
+    assert worker_env not in _task_links_for(child_id)
+
+
+def test_worker_spawned_child_runnable_while_creator_open(worker_env):
+    """Inherited routing must not create a scheduling dependency: the child
+    is ``ready`` even while the parent is still ``running``."""
+    from hermes_cli import kanban_db as kb
+    from tools import kanban_tools as kt
+
+    out = kt._handle_create({"title": "parallel follow-up", "assignee": "peer"})
+    d = json.loads(out)
+    assert d["ok"] is True
+    assert d["status"] == "ready"
+
+    conn = kb.connect()
+    try:
+        parent = kb.get_task(conn, worker_env)
+        child = kb.get_task(conn, d["task_id"])
+        assert parent is not None and parent.status == "running"
+        assert child is not None and child.status == "ready"
+    finally:
+        conn.close()
+
+
+def test_worker_spawn_inherits_board_default_workdir(worker_env, tmp_path):
+    """When a worker explicitly asks for a persistent workspace kind without a
+    path, the board's ``default_workdir`` is inherited like any other task on
+    that board, and project_id still inherits from the current task."""
+    from hermes_cli import kanban_db as kb
+    from hermes_cli import projects_db as pdb
+    from tools import kanban_tools as kt
+
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    with pdb.connect_closing() as pconn:
+        project_id = pdb.create_project(pconn, name="Default Project", folders=[str(repo)])
+
+    kb.create_board("wt-board", default_workdir=str(repo))
+
+    conn = kb.connect(board="wt-board")
+    try:
+        parent_id = kb.create_task(
+            conn, title="parent", assignee="worker", board="wt-board",
+            project_id=project_id,
+        )
+        kb.claim_task(conn, parent_id)
+    finally:
+        conn.close()
+
+    import os as _os
+    _os.environ["HERMES_KANBAN_TASK"] = parent_id
+    # Reset connect's board cache by clearing the env-based board since the tool
+    # will connect to the default board unless HERMES_KANBAN_BOARD is set.
+    _os.environ["HERMES_KANBAN_BOARD"] = "wt-board"
+
+    out = kt._handle_create(
+        {
+            "title": "child with default workdir",
+            "assignee": "peer",
+            "workspace_kind": "worktree",
+        },
+        board="wt-board",
+    )
+    d = json.loads(out)
+    assert d["ok"] is True, d
+    assert d["workspace_kind"] == "worktree"
+    assert d["workspace_path"].startswith(str(repo))
+    assert d["project_id"] == project_id
+
+
+def test_explicit_workspace_path_keeps_project_inheritance(worker_env, tmp_path):
+    """An explicit workspace_path is not an opt-out of project_id inheritance.
+    The closed inheritable set still copies project_id while keeping the
+    caller's literal workspace path."""
+    from hermes_cli import kanban_db as kb
+    from hermes_cli import projects_db as pdb
+    from tools import kanban_tools as kt
+
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    with pdb.connect_closing() as pconn:
+        project_id = pdb.create_project(pconn, name="Path Project", folders=[str(repo)])
+
+    conn = kb.connect()
+    try:
+        kb.add_notify_sub(conn, task_id=worker_env, platform="slack", chat_id="path-chat")
+        conn.execute(
+            "UPDATE tasks SET project_id = ? WHERE id = ?", (project_id, worker_env)
+        )
+    finally:
+        conn.close()
+
+    explicit_path = tmp_path / "explicit-dir"
+    explicit_path.mkdir()
+    out = kt._handle_create(
+        {
+            "title": "path child",
+            "assignee": "peer",
+            "workspace_kind": "dir",
+            "workspace_path": str(explicit_path),
+        }
+    )
+    d = json.loads(out)
+    assert d["ok"] is True, d
+    assert d["workspace_kind"] == "dir"
+    assert d["workspace_path"] == str(explicit_path)
+    assert d["project_id"] == project_id
+    assert d["inherit_from"] == worker_env
+
+    conn = kb.connect()
+    try:
+        child = kb.get_task(conn, d["task_id"])
+        assert child is not None
+        assert child.project_id == project_id
+        assert child.workspace_path == str(explicit_path)
+        assert len(_sub_index(_list_subs_for_task(d["task_id"]))) == 1
+    finally:
+        conn.close()
+
+
+def test_explicit_override_takes_precedence(worker_env, tmp_path):
+    """An explicit ``project`` arg beats the inherited current-task project_id;
+    subscriptions still copy because no ``parents`` were given."""
+    from hermes_cli import kanban_db as kb
+    from hermes_cli import projects_db as pdb
+    from tools import kanban_tools as kt
+
+    repo_a = tmp_path / "repo-a"
+    repo_b = tmp_path / "repo-b"
+    repo_a.mkdir()
+    repo_b.mkdir()
+    with pdb.connect_closing() as pconn:
+        parent_project = pdb.create_project(pconn, name="Parent Project", folders=[str(repo_a)])
+        override_project = pdb.create_project(pconn, name="Override Project", folders=[str(repo_b)])
+
+    conn = kb.connect()
+    try:
+        kb.add_notify_sub(
+            conn, task_id=worker_env, platform="discord", chat_id="ch-1"
+        )
+        parent = kb.get_task(conn, worker_env)
+        conn.execute(
+            "UPDATE tasks SET project_id = ? WHERE id = ?",
+            (parent_project, worker_env),
+        )
+    finally:
+        conn.close()
+
+    out = kt._handle_create(
+        {
+            "title": "override child",
+            "assignee": "peer",
+            "project": override_project,
+        }
+    )
+    d = json.loads(out)
+    assert d["ok"] is True
+    assert d["project_id"] == override_project
+    assert d["inherit_from"] == worker_env
+
+    conn = kb.connect()
+    try:
+        child = kb.get_task(conn, d["task_id"])
+        assert child.project_id == override_project
+        assert child.project_id != parent_project
+        assert len(_sub_index(_list_subs_for_task(d["task_id"]))) == 1
+    finally:
+        conn.close()
+
+
+def test_independent_spawn_escape_hatch(worker_env, tmp_path):
+    """``inherit_from_current_task=false`` creates an isolated child: no
+    project_id, no subscriptions, and no ``task_inherit_sources`` row."""
+    from hermes_cli import kanban_db as kb
+    from hermes_cli import projects_db as pdb
+    from tools import kanban_tools as kt
+
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    with pdb.connect_closing() as pconn:
+        project_id = pdb.create_project(pconn, name="Parent Project", folders=[str(repo)])
+
+    conn = kb.connect()
+    try:
+        kb.add_notify_sub(
+            conn, task_id=worker_env, platform="slack", chat_id="ch-2"
+        )
+        conn.execute(
+            "UPDATE tasks SET project_id = ? WHERE id = ?",
+            (project_id, worker_env),
+        )
+    finally:
+        conn.close()
+
+    out = kt._handle_create(
+        {
+            "title": "isolated child",
+            "assignee": "peer",
+            "inherit_from_current_task": False,
+        }
+    )
+    d = json.loads(out)
+    assert d["ok"] is True
+    assert d.get("inherit_from") is None
+    assert d["project_id"] is None
+    assert d["workspace_kind"] == "scratch"
+
+    conn = kb.connect()
+    try:
+        child = kb.get_task(conn, d["task_id"])
+        assert child.project_id is None
+        assert _list_subs_for_task(child.id) == []
+        assert _inherit_sources_for(child.id) == []
+    finally:
+        conn.close()
+
+
+def test_delegated_child_cannot_inherit_lane(monkeypatch, worker_env):
+    """A delegate_task child must never create board tasks, even with the
+    current task id in env."""
+    from agent.delegation_context import delegated_child_context
+    from tools import kanban_tools as kt
+
+    before = _list_tasks()
+    with delegated_child_context():
+        out = kt._handle_create({"title": "bad child", "assignee": "peer"})
+    d = json.loads(out)
+    assert "error" in d
+    assert "delegate_task child" in d["error"]
+    assert _list_tasks() == before
+
+
+def _list_tasks():
+    from hermes_cli import kanban_db as kb
+    conn = kb.connect()
+    try:
+        return [t.id for t in kb.list_tasks(conn)]
+    finally:
+        conn.close()
+
+
+def test_cross_board_spawn_no_leak(worker_env, tmp_path):
+    """A worker on board A spawning a child on board B must not inherit
+    routing from the board-A task."""
+    from hermes_cli import kanban_db as kb
+    from tools import kanban_tools as kt
+
+    kb.create_board("board-a")
+    kb.create_board("board-b")
+
+    conn_a = kb.connect(board="board-a")
+    try:
+        parent_a = kb.create_task(
+            conn_a, title="parent on a", assignee="worker", board="board-a"
+        )
+        kb.claim_task(conn_a, parent_a)
+        kb.add_notify_sub(conn_a, task_id=parent_a, platform="telegram", chat_id="a-chat")
+    finally:
+        conn_a.close()
+
+    import os as _os
+    _os.environ["HERMES_KANBAN_TASK"] = parent_a
+
+    out = kt._handle_create(
+        {"title": "child on b", "assignee": "peer"},
+        board="board-b",
+    )
+    d = json.loads(out)
+    assert d["ok"] is True, d
+    assert d.get("inherit_from") is None
+
+    conn_b = kb.connect(board="board-b")
+    try:
+        child = kb.get_task(conn_b, d["task_id"])
+        assert child is not None
+        assert _list_subs_for_task(child.id) == []
+        assert _inherit_sources_for(child.id) == []
+    finally:
+        conn_b.close()
+
+
+def test_non_inheritable_fields_do_not_leak(worker_env):
+    """``model``, ``provider``, ``skills``, ``max_retries``,
+    ``goal_max_turns``, ``worker_max_turns``, ``priority``, and ``tenant`` are
+    outside the closed inheritable set and must not leak to a worker-created
+    child.  Likewise run/claim identity and the literal workspace path stay
+    behind."""
+    from hermes_cli import kanban_db as kb
+    from tools import kanban_tools as kt
+
+    conn = kb.connect()
+    try:
+        kb.set_model_override(conn, worker_env, "fancy-model", provider="fancy-provider")
+        conn.execute(
+            "UPDATE tasks SET skills = ?, max_retries = ?, goal_max_turns = ?, "
+            "worker_max_turns = ?, priority = ?, tenant = ?, "
+            "current_run_id = ?, claim_lock = ?, workspace_path = ? WHERE id = ?",
+            (
+                json.dumps(["github-code-review"]),
+                7,
+                13,
+                21,
+                99,
+                "secret-tenant",
+                42,
+                "claim-me",
+                "/should/not/copy",
+                worker_env,
+            ),
+        )
+    finally:
+        conn.close()
+
+    out = kt._handle_create({"title": "clean child", "assignee": "peer"})
+    d = json.loads(out)
+    assert d["ok"] is True
+
+    conn = kb.connect()
+    try:
+        child = kb.get_task(conn, d["task_id"])
+        assert child is not None
+        assert child.model_override is None
+        assert child.provider_override is None
+        assert child.skills is None
+        assert child.max_retries is None
+        assert child.goal_max_turns is None
+        assert child.worker_max_turns is None
+        assert child.priority == 0
+        assert child.tenant is None
+        assert child.current_run_id is None
+        assert child.claim_lock is None
+        assert child.workspace_path != "/should/not/copy"
+    finally:
+        conn.close()
+
+
+def test_explicit_parents_suppress_typed_routing_inheritance(worker_env):
+    """When the worker passes explicit ``parents``, the typed
+    ``inherit_from`` source is not set, but subscriptions still copy through
+    the normal dependency-parent path."""
+    from hermes_cli import kanban_db as kb
+    from tools import kanban_tools as kt
+
+    conn = kb.connect()
+    try:
+        kb.add_notify_sub(
+            conn, task_id=worker_env, platform="discord", chat_id="dep-chat"
+        )
+    finally:
+        conn.close()
+
+    out = kt._handle_create(
+        {
+            "title": "dependency child",
+            "assignee": "peer",
+            "parents": [worker_env],
+        }
+    )
+    d = json.loads(out)
+    assert d["ok"] is True
+    assert d.get("inherit_from") is None
+    assert worker_env in _task_links_for(d["task_id"])
+    assert _inherit_sources_for(d["task_id"]) == []
+    assert len(_sub_index(_list_subs_for_task(d["task_id"]))) == 1
+
+
+def test_inheritance_relation_cascades_on_archive_and_delete(worker_env):
+    """task_inherit_sources rows survive soft archive (like task_links and
+    kanban_notify_subs) and are only removed when either side of the relation
+    is hard-deleted or purged."""
+    from hermes_cli import kanban_db as kb
+    from tools import kanban_tools as kt
+
+    # Archive a source: inheritance provenance survives, just like links/subs.
+    out = kt._handle_create({"title": "archive-source child", "assignee": "peer"})
+    d = json.loads(out)
+    assert d["ok"] is True
+    child_id = d["task_id"]
+    assert _inherit_sources_for(child_id) == [worker_env]
+
+    conn = kb.connect()
+    try:
+        assert kb.archive_task(conn, worker_env)
+        assert _inherit_sources_for(child_id) == [worker_env]
+        # Sibling relation families also survive archive.
+        counts = _count_relations(worker_env)
+        assert counts["task_links"] == 0
+        assert counts["task_inherit_sources"] == 1
+        assert counts["kanban_notify_subs"] == 0
+    finally:
+        conn.close()
+
+    # Hard-delete the archived source removes its inheritance rows.
+    conn = kb.connect()
+    try:
+        assert kb.delete_task(conn, worker_env)
+        assert _inherit_sources_for(child_id) == []
+    finally:
+        conn.close()
+
+    # Archive a child: its provenance row also survives.  Need a fresh source
+    # because the previous one was hard-deleted.
+    conn = kb.connect()
+    try:
+        fresh_source = kb.create_task(conn, title="fresh source", assignee="peer")
+        kb.claim_task(conn, fresh_source)
+    finally:
+        conn.close()
+
+    import os as _os
+    _os.environ["HERMES_KANBAN_TASK"] = fresh_source
+
+    out2 = kt._handle_create({"title": "archive child", "assignee": "peer"})
+    d2 = json.loads(out2)
+    assert d2["ok"] is True
+    child_id2 = d2["task_id"]
+    assert _inherit_sources_for(child_id2) == [fresh_source]
+
+    conn = kb.connect()
+    try:
+        assert kb.archive_task(conn, child_id2)
+        assert _inherit_sources_for(child_id2) == [fresh_source]
+        assert _inherit_children_for(fresh_source) == [child_id2]
+    finally:
+        conn.close()
+
+
+def test_inheritance_provenance_survives_archive_and_purge(worker_env):
+    """Archive consistency probe: task_inherit_sources must share the lifecycle
+    of task_links and kanban_notify_subs: survive archive, survive restore,
+    and be destroyed only on archive-purge (delete_archived_task).
+
+    Regression for review t_62a532c4.
+    """
+    from hermes_cli import kanban_db as kb
+    from tools import kanban_tools as kt
+
+    # Create parent with a dependency link, a subscription, and an inherited child.
+    conn = kb.connect()
+    try:
+        kb.add_notify_sub(
+            conn,
+            task_id=worker_env,
+            platform="telegram",
+            chat_id="probe-chat",
+            chat_type="private",
+            thread_id="20197",
+        )
+        dep = kb.create_task(conn, title="dep child", assignee="peer")
+        kb.link_tasks(conn, worker_env, dep)
+    finally:
+        conn.close()
+
+    out = kt._handle_create({"title": "inherited child", "assignee": "peer"})
+    d = json.loads(out)
+    assert d["ok"] is True
+    inherited_id = d["task_id"]
+
+    before = _count_relations(worker_env)
+    assert before == {
+        "task_links": 1,
+        "task_inherit_sources": 1,
+        "kanban_notify_subs": 1,
+    }
+
+    # Soft archive must leave all three relation families in place.
+    conn = kb.connect()
+    try:
+        assert kb.archive_task(conn, worker_env)
+    finally:
+        conn.close()
+    after_archive = _count_relations(worker_env)
+    assert after_archive == before
+
+    # Simulate restore: provenance is still intact.
+    conn = kb.connect()
+    try:
+        conn.execute(
+            "UPDATE tasks SET status = 'todo' WHERE id = ? AND status = 'archived'",
+            (worker_env,),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+    after_restore = _count_relations(worker_env)
+    assert after_restore["task_inherit_sources"] == 1
+    assert _inherit_sources_for(inherited_id) == [worker_env]
+
+    # Re-archive then purge: now all related rows are removed.
+    conn = kb.connect()
+    try:
+        assert kb.archive_task(conn, worker_env)
+        assert kb.delete_archived_task(conn, worker_env)
+    finally:
+        conn.close()
+    after_purge = _count_relations(worker_env)
+    assert after_purge == {
+        "task_links": 0,
+        "task_inherit_sources": 0,
+        "kanban_notify_subs": 0,
+    }
+    assert _inherit_sources_for(inherited_id) == []
+    assert _task_links_for(dep) == []
+
+
 def test_create_no_worker_task_stays_scratch(monkeypatch, worker_env):
     """Orchestrator/CLI callers keep the same isolated scratch default."""
     from tools import kanban_tools as kt
@@ -1803,7 +2435,7 @@ def test_create_session_id_arg_overrides_env(monkeypatch, worker_env):
 
 
 def test_create_session_id_absent_when_env_unset(monkeypatch, worker_env):
-    """No env var, no arg → session_id stays NULL. Important for backwards
+    """No env var, no arg -> session_id stays NULL. Important for backwards
     compatibility: pre-ACP-propagation hosts and CLI-driven creates must
     not accidentally inherit a stale id."""
     monkeypatch.delenv("HERMES_SESSION_ID", raising=False)
@@ -1964,7 +2596,7 @@ def test_link_rejects_missing_args(worker_env):
 
 
 def test_link_rejects_cycle(worker_env):
-    """A → B, then try to link B → A."""
+    """A -> B, then try to link B -> A."""
     from hermes_cli import kanban_db as kb
     conn = kb.connect()
     try:
