@@ -1761,6 +1761,19 @@ def _inherit_sources_for(task_id):
         conn.close()
 
 
+def _inherit_children_for(source_id):
+    from hermes_cli import kanban_db as kb
+    conn = kb.connect()
+    try:
+        rows = conn.execute(
+            "SELECT child_id FROM task_inherit_sources WHERE source_task_id = ?",
+            (source_id,),
+        ).fetchall()
+        return [r["child_id"] for r in rows]
+    finally:
+        conn.close()
+
+
 def _task_links_for(child_id):
     from hermes_cli import kanban_db as kb
     conn = kb.connect()
@@ -1769,6 +1782,32 @@ def _task_links_for(child_id):
             "SELECT parent_id FROM task_links WHERE child_id = ?", (child_id,)
         ).fetchall()
         return [r["parent_id"] for r in rows]
+    finally:
+        conn.close()
+
+
+def _count_relations(task_id):
+    """Return the per-relation-family row counts touching ``task_id``.
+
+    Mirrors the archive-consistency probe used by review t_62a532c4.
+    """
+    from hermes_cli import kanban_db as kb
+    conn = kb.connect()
+    try:
+        links = conn.execute(
+            "SELECT COUNT(*) AS n FROM task_links WHERE parent_id = ? OR child_id = ?",
+            (task_id, task_id),
+        ).fetchone()["n"]
+        inherit = conn.execute(
+            "SELECT COUNT(*) AS n FROM task_inherit_sources "
+            "WHERE child_id = ? OR source_task_id = ?",
+            (task_id, task_id),
+        ).fetchone()["n"]
+        subs = conn.execute(
+            "SELECT COUNT(*) AS n FROM kanban_notify_subs WHERE task_id = ?",
+            (task_id,),
+        ).fetchone()["n"]
+        return {"task_links": links, "task_inherit_sources": inherit, "kanban_notify_subs": subs}
     finally:
         conn.close()
 
@@ -2193,36 +2232,142 @@ def test_explicit_parents_suppress_typed_routing_inheritance(worker_env):
 
 
 def test_inheritance_relation_cascades_on_archive_and_delete(worker_env):
-    """task_inherit_sources rows are removed when either side of the relation
-    is archived or hard-deleted, matching task_links and subscriptions."""
+    """task_inherit_sources rows survive soft archive (like task_links and
+    kanban_notify_subs) and are only removed when either side of the relation
+    is hard-deleted or purged."""
     from hermes_cli import kanban_db as kb
     from tools import kanban_tools as kt
 
-    # Archive a source removes its inheritance rows.
+    # Archive a source: inheritance provenance survives, just like links/subs.
     out = kt._handle_create({"title": "archive-source child", "assignee": "peer"})
     d = json.loads(out)
     assert d["ok"] is True
-    assert _inherit_sources_for(d["task_id"]) == [worker_env]
+    child_id = d["task_id"]
+    assert _inherit_sources_for(child_id) == [worker_env]
 
     conn = kb.connect()
     try:
         assert kb.archive_task(conn, worker_env)
-        assert _inherit_sources_for(d["task_id"]) == []
+        assert _inherit_sources_for(child_id) == [worker_env]
+        # Sibling relation families also survive archive.
+        counts = _count_relations(worker_env)
+        assert counts["task_links"] == 0
+        assert counts["task_inherit_sources"] == 1
+        assert counts["kanban_notify_subs"] == 0
     finally:
         conn.close()
 
-    # Hard-delete a source removes its inheritance rows.
-    out2 = kt._handle_create({"title": "delete-source child", "assignee": "peer"})
-    d2 = json.loads(out2)
-    assert d2["ok"] is True
-    assert _inherit_sources_for(d2["task_id"]) == [worker_env]
-
+    # Hard-delete the archived source removes its inheritance rows.
     conn = kb.connect()
     try:
         assert kb.delete_task(conn, worker_env)
-        assert _inherit_sources_for(d2["task_id"]) == []
+        assert _inherit_sources_for(child_id) == []
     finally:
         conn.close()
+
+    # Archive a child: its provenance row also survives.  Need a fresh source
+    # because the previous one was hard-deleted.
+    conn = kb.connect()
+    try:
+        fresh_source = kb.create_task(conn, title="fresh source", assignee="peer")
+        kb.claim_task(conn, fresh_source)
+    finally:
+        conn.close()
+
+    import os as _os
+    _os.environ["HERMES_KANBAN_TASK"] = fresh_source
+
+    out2 = kt._handle_create({"title": "archive child", "assignee": "peer"})
+    d2 = json.loads(out2)
+    assert d2["ok"] is True
+    child_id2 = d2["task_id"]
+    assert _inherit_sources_for(child_id2) == [fresh_source]
+
+    conn = kb.connect()
+    try:
+        assert kb.archive_task(conn, child_id2)
+        assert _inherit_sources_for(child_id2) == [fresh_source]
+        assert _inherit_children_for(fresh_source) == [child_id2]
+    finally:
+        conn.close()
+
+
+def test_inheritance_provenance_survives_archive_and_purge(worker_env):
+    """Archive consistency probe: task_inherit_sources must share the lifecycle
+    of task_links and kanban_notify_subs: survive archive, survive restore,
+    and be destroyed only on archive-purge (delete_archived_task).
+
+    Regression for review t_62a532c4.
+    """
+    from hermes_cli import kanban_db as kb
+    from tools import kanban_tools as kt
+
+    # Create parent with a dependency link, a subscription, and an inherited child.
+    conn = kb.connect()
+    try:
+        kb.add_notify_sub(
+            conn,
+            task_id=worker_env,
+            platform="telegram",
+            chat_id="probe-chat",
+            chat_type="private",
+            thread_id="20197",
+        )
+        dep = kb.create_task(conn, title="dep child", assignee="peer")
+        kb.link_tasks(conn, worker_env, dep)
+    finally:
+        conn.close()
+
+    out = kt._handle_create({"title": "inherited child", "assignee": "peer"})
+    d = json.loads(out)
+    assert d["ok"] is True
+    inherited_id = d["task_id"]
+
+    before = _count_relations(worker_env)
+    assert before == {
+        "task_links": 1,
+        "task_inherit_sources": 1,
+        "kanban_notify_subs": 1,
+    }
+
+    # Soft archive must leave all three relation families in place.
+    conn = kb.connect()
+    try:
+        assert kb.archive_task(conn, worker_env)
+    finally:
+        conn.close()
+    after_archive = _count_relations(worker_env)
+    assert after_archive == before
+
+    # Simulate restore: provenance is still intact.
+    conn = kb.connect()
+    try:
+        conn.execute(
+            "UPDATE tasks SET status = 'todo' WHERE id = ? AND status = 'archived'",
+            (worker_env,),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+    after_restore = _count_relations(worker_env)
+    assert after_restore["task_inherit_sources"] == 1
+    assert _inherit_sources_for(inherited_id) == [worker_env]
+
+    # Re-archive then purge: now all related rows are removed.
+    conn = kb.connect()
+    try:
+        assert kb.archive_task(conn, worker_env)
+        assert kb.delete_archived_task(conn, worker_env)
+    finally:
+        conn.close()
+    after_purge = _count_relations(worker_env)
+    assert after_purge == {
+        "task_links": 0,
+        "task_inherit_sources": 0,
+        "kanban_notify_subs": 0,
+    }
+    assert _inherit_sources_for(inherited_id) == []
+    assert _task_links_for(dep) == []
 
 
 def test_create_no_worker_task_stays_scratch(monkeypatch, worker_env):

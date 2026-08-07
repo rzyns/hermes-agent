@@ -9909,15 +9909,10 @@ def archive_task(conn: sqlite3.Connection, task_id: str) -> bool:
             outcome="reclaimed", status="reclaimed",
             summary="task archived with run still active",
         )
-        # Routing-inheritance provenance is a run-time routing aid, not
-        # long-term lineage. Drop it on archive so archived sources/children
-        # behave the same way as links and subscriptions (both removed at
-        # archive-purge), and so the relation table never points at a task
-        # whose routing context is frozen.
-        conn.execute(
-            "DELETE FROM task_inherit_sources WHERE child_id = ? OR source_task_id = ?",
-            (task_id, task_id),
-        )
+        # Routing-inheritance provenance is a run-time routing aid, but it
+        # mirrors the lifecycle of task_links and kanban_notify_subs: it survives
+        # soft archive so the task can be restored with its routing context
+        # intact, and is only removed during hard delete / archive-purge.
         _append_event(conn, task_id, "archived", None, run_id=run_id)
     # ``archived`` parents only unblock children when the dependency predicate
     # is satisfied (see ``_parent_dependency_satisfied``). A bare archived
