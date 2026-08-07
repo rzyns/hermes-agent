@@ -126,8 +126,97 @@ def test_build_overhead_envelope_tolerates_missing_attrs() -> None:
     assert env["last_prompt_tokens"] == 0
 
 
+def test_timed_out_below_threshold_preserves_overhead_envelope(kanban_home: Path) -> None:
+    """A first-timeout run (below the breaker threshold) must keep the envelope.
+
+    This matches the live gap: run 1679 timed out at 220/220 with only
+    ``failures: 1`` because the below-threshold path dropped the envelope
+    staged by the agent finalizer.
+    """
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(
+            conn, title="bug fix", body="Fix the bug.\n\n```python\nfoo()\n```", assignee="worker"
+        )
+        kb.claim_task(conn, tid)
+        run = kb.latest_run(conn, tid)
+        assert run is not None
+
+        overhead = {"api_call_count": 50, "max_iterations": 90, "budget_used": 50}
+        # Simulate what the agent finalizer now does for every terminal run.
+        kb._stage_run_telemetry(conn, tid, overhead_envelope=overhead)
+
+        tripped = kb._record_task_failure(
+            conn,
+            tid,
+            error="Iteration budget exhausted (50/90)",
+            outcome="timed_out",
+            release_claim=True,
+            end_run=True,
+            expected_run_id=run.id,
+            failure_limit=3,
+        )
+        # Below the threshold: task is released for retry, not blocked.
+        assert tripped is False
+
+        task = kb.get_task(conn, tid)
+        assert task is not None
+        assert task.status == "ready"
+
+        run2 = kb.latest_run(conn, tid)
+        assert run2 is not None
+        assert run2.outcome == "timed_out"
+        assert run2.metadata is not None
+        assert run2.metadata["overhead_envelope"]["api_call_count"] == 50
+        assert run2.metadata["complexity_proxy"]["score"] > 1.0
+
+        timed_out = [e for e in kb.list_events(conn, tid) if e.kind == "timed_out"]
+        assert len(timed_out) == 1
+        assert timed_out[0].payload is not None
+        assert timed_out[0].payload["overhead_envelope"]["api_call_count"] == 50
+        assert timed_out[0].payload["complexity_proxy"]["score"] > 1.0
+    finally:
+        conn.close()
+
+
+def test_complete_task_preserves_staged_overhead_envelope(kanban_home: Path) -> None:
+    """A normal worker completion must surface the finalizer-staged envelope."""
+    conn = kb.connect()
+    try:
+        body = "Refactor parser.\n\n```python\nparse()\n```"
+        tid = kb.create_task(conn, title="parser refactor", body=body, assignee="worker")
+        kb.claim_task(conn, tid)
+        run = kb.latest_run(conn, tid)
+        assert run is not None
+
+        overhead = {"api_call_count": 12, "max_iterations": 90, "budget_used": 12}
+        kb._stage_run_telemetry(conn, tid, overhead_envelope=overhead)
+
+        ok = kb.complete_task(conn, tid, summary="done", expected_run_id=run.id)
+        assert ok
+
+        task = kb.get_task(conn, tid)
+        assert task is not None
+        assert task.status == "done"
+
+        run2 = kb.latest_run(conn, tid)
+        assert run2 is not None
+        assert run2.outcome == "completed"
+        assert run2.metadata is not None
+        assert run2.metadata["overhead_envelope"]["api_call_count"] == 12
+        assert run2.metadata["complexity_proxy"]["score"] > 1.0
+
+        completed = [e for e in kb.list_events(conn, tid) if e.kind == "completed"]
+        assert len(completed) == 1
+        assert completed[0].payload is not None
+        assert completed[0].payload["overhead_envelope"]["api_call_count"] == 12
+        assert completed[0].payload["complexity_proxy"]["score"] > 1.0
+    finally:
+        conn.close()
+
+
 # ---------------------------------------------------------------------------
-# Integration: _record_task_failure enriches telemetry
+# Integration: complete_task enriches telemetry
 # ---------------------------------------------------------------------------
 
 

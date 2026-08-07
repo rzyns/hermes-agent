@@ -507,6 +507,65 @@ def test_pending_response_records_kanban_timeout(monkeypatch):
     )
 
 
+def test_finalizer_stages_overhead_envelope_on_normal_completion(tmp_path, monkeypatch):
+    """The agent finalizer must write terminal telemetry for a healthy run.
+
+    This is the dispatcher-spawned path: the worker process ends the
+    conversation successfully, and the envelope must already live on the
+    run row before ``kanban_complete`` closes it.
+    """
+    task_id, run_id = _claimed_worker(
+        tmp_path, monkeypatch, body="Do work.\n\n```python\nprint(1)\n```"
+    )
+    agent = _LimitAgent(max_iterations=10)
+    _finalize(
+        agent,
+        final_response="all done",
+        exit_reason="text_response(all done)",
+        api_call_count=3,
+    )
+
+    with kb.connect() as conn:
+        run = kb.get_run(conn, run_id)
+        assert run is not None
+        assert run.metadata is not None
+        assert run.metadata["overhead_envelope"]["api_call_count"] == 3
+        assert run.metadata["overhead_envelope"]["budget_max"] == 10
+        assert run.metadata["complexity_proxy"]["score"] > 1.0
+
+
+def test_finalizer_stages_and_complete_task_carries_envelope(tmp_path, monkeypatch):
+    """End-to-end dispatcher shape: finalizer stages, then kanban_complete closes."""
+    task_id, run_id = _claimed_worker(
+        tmp_path, monkeypatch, body="End-to-end work.\n\n```python\nok()\n```"
+    )
+    agent = _LimitAgent(max_iterations=10)
+    _finalize(
+        agent,
+        final_response="all done",
+        exit_reason="text_response(all done)",
+        api_call_count=3,
+    )
+
+    completion = _complete_worker("done")
+    assert completion["ok"] is True
+
+    with kb.connect() as conn:
+        task = kb.get_task(conn, task_id)
+        assert task is not None
+        assert task.status == "done"
+        run = kb.get_run(conn, run_id)
+        assert run is not None
+        assert run.outcome == "completed"
+        assert run.metadata is not None
+        assert run.metadata["overhead_envelope"]["api_call_count"] == 3
+        completed = [e for e in kb.list_events(conn, task_id) if e.kind == "completed"]
+        assert len(completed) == 1
+        assert completed[0].payload is not None
+        assert completed[0].payload["overhead_envelope"]["api_call_count"] == 3
+        assert completed[0].payload["complexity_proxy"]["score"] > 1.0
+
+
 def test_published_pending_candidate_is_not_duplicated_by_finalizer(monkeypatch):
     """When budget exhaustion preserves a verification candidate that is
     already the tail assistant message, the finalizer must NOT append a
