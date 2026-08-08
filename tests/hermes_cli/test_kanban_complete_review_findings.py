@@ -442,7 +442,7 @@ def test_crash_during_finalization_resumes_and_cleans_workspace(populated_db, mo
         return real_recompute(_conn)
 
     monkeypatch.setattr(kb, "recompute_ready", wrapper)
-    monkeypatch.setattr(kb, "_FINALIZATION_LEASE_SECONDS", 0)
+    monkeypatch.setenv("HERMES_KANBAN_FINALIZATION_LEASE_SECONDS", "0")
     with pytest.raises(RuntimeError, match="crash during recompute_ready"):
         kb.complete_task(conn, tid, summary="done", expected_run_id=run_id)
 
@@ -467,8 +467,10 @@ def test_crash_during_finalization_resumes_and_cleans_workspace(populated_db, mo
     assert row["status"] == "finalized"
     assert row["finalized_at"] is not None
     assert not ws.exists()
-    # First crash plus the successful retry means recompute ran twice total.
-    assert calls["count"] == 2
+    # The first crash plus the successful retry means the recompute body was
+    # attempted twice, but the durable event guard means only one actual
+    # recompute ran.
+    assert calls["count"] == 1
 
 
 def test_concurrent_duplicate_completion_is_idempotent(populated_db):
@@ -749,9 +751,7 @@ def test_synchronized_finalizer_hook_runs_exactly_once(kanban_home):
     conn = kb.connect()
     task_id = kb.create_task(conn, title="finalizer-race", assignee="review-probe")
     assert kb.claim_task(conn, task_id) is not None
-    run_id = int(
-        conn.execute("SELECT current_run_id FROM tasks WHERE id=?", (task_id,)).fetchone()[0]
-    )
+    run_id = _current_run_id(conn, task_id)
 
     hook_calls: list[dict[str, Any]] = []
     hook_lock = threading.Lock()
@@ -826,4 +826,192 @@ def test_synchronized_finalizer_hook_runs_exactly_once(kanban_home):
         )
     finally:
         kb._fire_kanban_lifecycle_hook = original_hook
+    conn.close()
+
+
+def test_live_owner_lease_reclaim_does_not_duplicate_recompute_or_cleanup(kanban_home, monkeypatch):
+    """A live finalizer past its lease must not let two callers run recompute/cleanup.
+
+    This is the permanent regression for the round-8 concern: the reclaim
+    predicate is wall-clock, so an unusually slow finalizer can be reclaimed
+    while still alive. With event guards, only one caller's side effects run.
+    """
+    conn = kb.connect()
+    task_id = kb.create_task(conn, title="lease-race", assignee="review-probe")
+    assert kb.claim_task(conn, task_id) is not None
+    run_id = _current_run_id(conn, task_id)
+    task = kb.get_task(conn, task_id)
+    assert task is not None
+    ws = kb.resolve_workspace(task)
+    kb.set_workspace_path(conn, task_id, ws)
+    (ws / "artifact.txt").write_text("data")
+
+    monkeypatch.setenv("HERMES_KANBAN_FINALIZATION_LEASE_SECONDS", "1")
+
+    recompute_entries = {"count": 0}
+    cleanup_entries = {"count": 0}
+    real_recompute = kb.recompute_ready
+    real_cleanup = kb._cleanup_workspace
+    state_lock = threading.Lock()
+    entered = threading.Event()
+    may_finish = threading.Event()
+    max_active = {"recompute": 0, "cleanup": 0}
+
+    def held_recompute(_conn):
+        with state_lock:
+            recompute_entries["count"] += 1
+            entry = recompute_entries["count"]
+            max_active["recompute"] = max(max_active["recompute"], entry)
+            entered.set()
+        try:
+            assert may_finish.wait(timeout=8), "first recompute never released"
+            time.sleep(0.1)
+        finally:
+            with state_lock:
+                recompute_entries["count"] -= 1
+        return real_recompute(_conn)
+
+    def held_cleanup(_conn, _task_id):
+        with state_lock:
+            cleanup_entries["count"] += 1
+            entry = cleanup_entries["count"]
+            max_active["cleanup"] = max(max_active["cleanup"], entry)
+        time.sleep(0.05)
+        with state_lock:
+            cleanup_entries["count"] -= 1
+        return real_cleanup(_conn, _task_id)
+
+    monkeypatch.setattr(kb, "recompute_ready", held_recompute)
+    monkeypatch.setattr(kb, "_cleanup_workspace", held_cleanup)
+
+    results: list[kb.CompletionResult] = []
+    errors: list[str] = []
+
+    def _complete():
+        try:
+            c = kb.connect()
+            results.append(
+                kb.complete_task(c, task_id, summary="done", expected_run_id=run_id)
+            )
+        except BaseException as exc:
+            errors.append(repr(exc))
+
+    first = threading.Thread(target=_complete)
+    first.start()
+    assert entered.wait(timeout=8), "first finalizer never entered recompute"
+    time.sleep(1.1)  # original owner alive beyond the 1s lease
+    second = threading.Thread(target=_complete)
+    second.start()
+    # Let the second caller attempt reclaim; with the guard it should skip the
+    # side-effect body and wait for the first finalizer to finish.
+    time.sleep(0.3)
+    may_finish.set()
+    first.join(timeout=15)
+    second.join(timeout=15)
+
+    assert not errors, errors
+    assert len(results) == 2
+    assert sorted(bool(r.already_terminal) for r in results) == [False, True]
+
+    # With the event guards, only one caller's recompute/cleanup body ran even
+    # though the unguarded probe showed max_simultaneous_recompute=2.
+    assert max_active["recompute"] == 1, (
+        "recompute_ready ran concurrently: max_active=%s" % max_active
+    )
+    assert max_active["cleanup"] == 1, (
+        "_cleanup_workspace ran concurrently: max_active=%s" % max_active
+    )
+
+    final_status = conn.execute(
+        "SELECT status FROM task_completion_results WHERE task_id=? AND run_id=?",
+        (task_id, run_id),
+    ).fetchone()[0]
+    assert final_status == "finalized"
+
+    # Workspace cleanup actually ran (once) and the event is recorded.
+    assert not ws.exists()
+    assert (
+        int(
+            conn.execute(
+                "SELECT COUNT(*) FROM task_events WHERE task_id=? AND kind='finalizer_cleaned_workspace'",
+                (task_id,),
+            ).fetchone()[0]
+        )
+        == 1
+    )
+    assert (
+        int(
+            conn.execute(
+                "SELECT COUNT(*) FROM task_events WHERE task_id=? AND kind='finalizer_recomputed_ready'",
+                (task_id,),
+            ).fetchone()[0]
+        )
+        == 1
+    )
+    conn.close()
+
+
+def test_finalizer_lease_env_override_is_respected(kanban_home, monkeypatch):
+    """HERMES_KANBAN_FINALIZATION_LEASE_SECONDS overrides the default."""
+    monkeypatch.setenv("HERMES_KANBAN_FINALIZATION_LEASE_SECONDS", "7")
+    assert kb._resolve_finalization_lease_seconds() == 7
+    # Explicit call-site value still wins.
+    assert kb._resolve_finalization_lease_seconds(lease_seconds=3) == 3
+    assert kb._resolve_finalization_lease_seconds(lease_seconds=0) == 0
+
+
+def test_finalizer_lease_env_override_rejects_bad_values(kanban_home, monkeypatch):
+    """Invalid env values fall back to the default silently."""
+    monkeypatch.setenv("HERMES_KANBAN_FINALIZATION_LEASE_SECONDS", "not-a-number")
+    assert kb._resolve_finalization_lease_seconds() == kb.DEFAULT_FINALIZATION_LEASE_SECONDS
+    monkeypatch.setenv("HERMES_KANBAN_FINALIZATION_LEASE_SECONDS", "-5")
+    assert kb._resolve_finalization_lease_seconds() == kb.DEFAULT_FINALIZATION_LEASE_SECONDS
+
+
+def test_finalizer_side_effects_converge_when_reclaimed_mid_crash(kanban_home, monkeypatch):
+    """A crash between recompute and cleanup leaves events that let a retry skip safely."""
+    conn = kb.connect()
+    task_id = kb.create_task(conn, title="mid-crash", assignee="review-probe")
+    assert kb.claim_task(conn, task_id) is not None
+    run_id = _current_run_id(conn, task_id)
+
+    recompute_ran = {"count": 0}
+    real_recompute = kb.recompute_ready
+
+    def crash_after_recompute(_conn):
+        recompute_ran["count"] += 1
+        real_recompute(_conn)
+        raise RuntimeError("crash after recompute, before cleanup")
+
+    monkeypatch.setattr(kb, "recompute_ready", crash_after_recompute)
+    monkeypatch.setenv("HERMES_KANBAN_FINALIZATION_LEASE_SECONDS", "0")
+
+    with pytest.raises(RuntimeError, match="crash after recompute"):
+        kb.complete_task(conn, task_id, summary="done", expected_run_id=run_id)
+
+    # The recompute event was written before the crash.
+    assert (
+        int(
+            conn.execute(
+                "SELECT COUNT(*) FROM task_events WHERE task_id=? AND kind='finalizer_recomputed_ready'",
+                (task_id,),
+            ).fetchone()[0]
+        )
+        == 1
+    )
+
+    # Retry skips recompute and runs cleanup/hook, then finalizes.
+    # Restore the real recompute; keep the 0s lease so reclaim is immediate.
+    monkeypatch.setattr(kb, "recompute_ready", real_recompute)
+    result = kb.complete_task(conn, task_id, summary="done", expected_run_id=run_id)
+    assert result.ok
+    assert result.already_terminal is False
+
+    row = conn.execute(
+        "SELECT status FROM task_completion_results WHERE task_id=? AND run_id=?",
+        (task_id, run_id),
+    ).fetchone()
+    assert row["status"] == "finalized"
+    # recompute body ran exactly once; the retry observed the event and skipped it.
+    assert recompute_ran["count"] == 1
     conn.close()

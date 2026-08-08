@@ -789,7 +789,31 @@ DEFAULT_CRASH_GRACE_SECONDS = 30
 # retry is allowed to reclaim the row and resume. This prevents a crashed
 # finalizer from permanently blocking completion while keeping concurrent
 # losers from running duplicate side effects.
-_FINALIZATION_LEASE_SECONDS = 30
+DEFAULT_FINALIZATION_LEASE_SECONDS = 30
+
+
+def _resolve_finalization_lease_seconds(lease_seconds: Optional[int] = None) -> int:
+    """Return the effective finalization lease, honoring the env override.
+
+    Explicit call-site values win. Otherwise a non-negative integer from
+    ``HERMES_KANBAN_FINALIZATION_LEASE_SECONDS`` overrides the built-in
+    default. Invalid or negative env values fall back silently so existing
+    installs keep working. A value of 0 disables the lease wait and makes
+    crash-recovery tests reclaim immediately.
+    """
+    if lease_seconds is not None:
+        return max(0, int(lease_seconds))
+
+    raw = os.environ.get("HERMES_KANBAN_FINALIZATION_LEASE_SECONDS", "").strip()
+    if raw:
+        try:
+            parsed = int(raw)
+        except ValueError:
+            parsed = -1
+        if parsed >= 0:
+            return parsed
+
+    return DEFAULT_FINALIZATION_LEASE_SECONDS
 
 
 # Sentinel exit code a kanban worker uses to signal a transient provider
@@ -3683,6 +3707,14 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
     if "run_id" not in ev_cols:
         _add_column_if_missing(conn, "task_events", "run_id", "run_id INTEGER")
 
+    conn.execute(
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_events_run_kind "
+        "ON task_events(task_id, run_id, kind) "
+        "WHERE run_id IS NOT NULL AND kind IN ("
+        "'finalizer_recomputed_ready','finalizer_cleaned_workspace','completed_hook_fired'"
+        ")"
+    )
+
     # Same ordering rule as the additive ``tasks`` indexes above: create the
     # index after the additive column migration so legacy ``task_events``
     # tables don't fail during SCHEMA_SQL execution before ``run_id`` exists.
@@ -5756,6 +5788,31 @@ def _event_exists(
         (task_id, int(run_id), kind),
     ).fetchone()
     return row is not None
+
+
+def _record_once_event(
+    conn: sqlite3.Connection,
+    task_id: str,
+    run_id: int,
+    kind: str,
+    payload: Optional[dict] = None,
+) -> bool:
+    """Record ``kind`` exactly once per (task_id, run_id).
+
+    Returns True iff this call was the first to persist the event. Uses a
+    partial unique index on ``(task_id, run_id, kind)`` scoped to the
+    finalizer-once kinds so concurrent callers serialize on the write lock;
+    the loser sees ``INSERT OR IGNORE`` return rowcount 0 and returns False
+    without running the associated side effect.
+    """
+    pl = json.dumps(payload if payload is not None else {"run_id": run_id}, ensure_ascii=False)
+    with _transaction_or_current(conn):
+        cur = conn.execute(
+            "INSERT OR IGNORE INTO task_events (task_id, run_id, kind, payload, created_at) "
+            "VALUES (?, ?, ?, ?, ?)",
+            (task_id, int(run_id), kind, pl, int(time.time())),
+        )
+        return cur.rowcount == 1
 
 
 def _stage_run_telemetry(
@@ -7908,7 +7965,7 @@ def _finalize_completion_result(
     idempotent so a retry can resume safely from any committed row.
     """
     now = int(time.time())
-    lease_timeout = _FINALIZATION_LEASE_SECONDS
+    lease_timeout = _resolve_finalization_lease_seconds()
     # Claim finalization ownership in the ledger itself. Only the caller that
     # successfully transitions the row from 'committed' to 'finalizing' may run
     # the consequential side effects (hook, workspace cleanup, dependent
@@ -8092,13 +8149,21 @@ def _finalize_completion_result(
         # the terminal finalized marker is written. Each step is idempotent so a
         # retry can resume safely after a crash at any point in this sequence.
         # These side effects are owned by the caller that claimed 'finalizing'.
-        recompute_ready(conn)
+        # We guard recompute/cleanup with a durable event so a live-owner lease
+        # reclaim cannot let two callers run them concurrently: only the winner
+        # that first records the event executes the side effect.
+        recompute_performed = _record_once_event(conn, task_id, run_id, "finalizer_recomputed_ready")
+        if recompute_performed:
+            recompute_ready(conn)
         if not review_pending_ids:
-            _cleanup_workspace(conn, task_id)
+            cleanup_performed = _record_once_event(conn, task_id, run_id, "finalizer_cleaned_workspace")
+            if cleanup_performed:
+                _cleanup_workspace(conn, task_id)
 
-        _done_task = get_task(conn, task_id)
-        if not _event_exists(conn, task_id, run_id, "completed_hook_fired"):
+        hook_performed = _record_once_event(conn, task_id, run_id, "completed_hook_fired")
+        if hook_performed:
             try:
+                _done_task = get_task(conn, task_id)
                 _fire_kanban_lifecycle_hook(
                     "kanban_task_completed",
                     task_id,
@@ -8106,13 +8171,6 @@ def _finalize_completion_result(
                     assignee=_done_task.assignee if _done_task else None,
                     run_id=run_id,
                     summary=(summary or result or ""),
-                )
-                _append_event(
-                    conn,
-                    task_id,
-                    "completed_hook_fired",
-                    {"run_id": run_id},
-                    run_id=run_id,
                 )
             except Exception:
                 _log.exception("kanban_task_completed lifecycle hook failed")
@@ -8661,6 +8719,11 @@ def complete_task(
     if run_id is None:
         return CompletionResult(ok=False, task_id=task_id)
 
+    # Finalize outside the main transaction so plugin lifecycle hooks and FS
+    # side effects never run while a SQLite write lock is held. The finalizer
+    # is idempotent: if it crashes, the ledger row stays 'committed' or
+    # 'finalizing' and a retry resumes safely.
+    conn.commit()
     completion_result = _finalize_completion_result(
         conn,
         task_id,
