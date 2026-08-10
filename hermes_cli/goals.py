@@ -227,15 +227,19 @@ def _render_verification_output_block(
     text = str(verification_output).strip()
     if not text:
         return ""
-    wrapper = "Verification/test output (bounded):\n\n".encode("utf-8")
-    sentinel = "… [truncated]".encode("utf-8")
-    # Reserve wrapper bytes plus worst-case sentinel bytes. If text fits under
-    # that budget, no sentinel is appended, leaving room equivalent to the
-    # sentinel bytes. If text exceeds it, _truncate adds the sentinel and we
-    # must have reserved its bytes.
-    payload_limit = max(0, JUDGE_VERIFICATION_OUTPUT_MAX_BYTES - len(wrapper) - len(sentinel))
+    # Derive the framing allowance from the exact rendered prefix and suffix so
+    # the budget cannot drift from hand-counted constants. The final block is
+    # PREFIX + text + SUFFIX, where SUFFIX may include a sentinel if truncated.
+    prefix = "Verification/test output (bounded):\n"
+    suffix = "\n\n"
+    sentinel = "… [truncated]"
+    framing = (prefix + suffix).encode("utf-8")
+    # Reserve bytes for the framing plus the worst-case sentinel.
+    payload_limit = max(
+        0, JUDGE_VERIFICATION_OUTPUT_MAX_BYTES - len(framing) - len(sentinel.encode("utf-8"))
+    )
     text = _truncate(text, payload_limit, byte_limit=True)
-    return f"Verification/test output (bounded):\n{text}\n\n"
+    return f"{prefix}{text}{suffix}"
 
 
 JUDGE_USER_PROMPT_TEMPLATE = (
@@ -824,12 +828,13 @@ def _extract_verification_output(
     if not text:
         return None
     sentinel = "… [truncated]".encode("utf-8")
-    # Reserve the sentinel bytes so the returned text plus a later wrapper never
-    # exceeds the budget. The renderer adds its own wrapper and sentinel, so this
-    # helper caps the payload portion to fit.
+    # Reserve bytes for the rendered wrapper plus the worst-case sentinel.
+    rendered_prefix = "Verification/test output (bounded):\n"
+    rendered_suffix = "\n\n"
+    framing = (rendered_prefix + rendered_suffix).encode("utf-8")
     return _truncate(
         text,
-        max(0, JUDGE_VERIFICATION_OUTPUT_MAX_BYTES - len(sentinel)),
+        max(0, JUDGE_VERIFICATION_OUTPUT_MAX_BYTES - len(framing) - len(sentinel)),
         byte_limit=True,
     )
 

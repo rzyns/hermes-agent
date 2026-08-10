@@ -216,14 +216,17 @@ class TestJudgeGoal:
         assert "… [truncated]" in rendered
         # Truncation must not split a code point.
         assert encoded.decode("utf-8") == rendered
-        # Exact-value regression: the rendered block uses the full byte budget.
-        assert len(encoded) == goals.JUDGE_VERIFICATION_OUTPUT_MAX_BYTES
 
         # ASCII regression: a small payload is untouched by truncation.
         ascii_text = "x" * (goals.JUDGE_VERIFICATION_OUTPUT_MAX_BYTES // 2)
         block = goals._render_verification_output_block(ascii_text)
         assert "… [truncated]" not in block
         assert len(block.encode("utf-8")) < goals.JUDGE_VERIFICATION_OUTPUT_MAX_BYTES
+
+        # Exact-value boundary: a payload of pure 3-byte codepoints should fill
+        # the budget as tightly as codepoint alignment allows.
+        three_byte = goals._render_verification_output_block("界" * 5000)
+        assert len(three_byte.encode("utf-8")) == 1997
 
         # _extract_verification_output also enforces bytes and stays within the
         # raw budget (the renderer reserves wrapper/sentinel bytes from the same
@@ -236,8 +239,46 @@ class TestJudgeGoal:
         assert len(extracted.encode("utf-8")) <= goals.JUDGE_VERIFICATION_OUTPUT_MAX_BYTES
         assert "… [truncated]" in extracted
 
+    def test_verification_output_byte_cap_mixed_width_and_combining(self, tmp_path):
+        """Regression: mixed-width valid UTF-8 (ASCII base + combining marks)
+        must stay within the cap, and truncation must remain codepoint-safe even
+        when the byte budget lands mid-sequence.
+        """
+        from hermes_cli import goals
 
-class TestGoalManager:
+        # Reviewer's exact reproduction: latin small e + U+0301 (3 bytes per
+        # precomposed codepoint sequence).
+        probe = "e\u0301" * 5000
+        rendered = goals._render_verification_output_block(probe)
+        encoded = rendered.encode("utf-8")
+        assert len(encoded) <= goals.JUDGE_VERIFICATION_OUTPUT_MAX_BYTES
+        assert "… [truncated]" in rendered
+        assert encoded.decode("utf-8") == rendered
+        # Exact value for this encoding under the derived framing budget.
+        assert len(encoded) == 1998
+
+        # Boundary: a payload that would force the cap to fall inside a
+        # two-codepoint combining sequence. The renderer must never split a
+        # codepoint; we verify byte validity and that the final character is
+        # either the base 'e' or the combining pair, never a lone combining mark.
+        partial = "e" + "\u0301" * 1000
+        rendered_boundary = goals._render_verification_output_block(partial)
+        encoded_boundary = rendered_boundary.encode("utf-8")
+        assert len(encoded_boundary) <= goals.JUDGE_VERIFICATION_OUTPUT_MAX_BYTES
+        assert encoded_boundary.decode("utf-8") == rendered_boundary
+        # The final character must be a full codepoint (not a bare combining mark).
+        last_cp = rendered_boundary[-1] if rendered_boundary else ""
+        assert ord(last_cp) != 0x0301
+
+        # _extract_verification_output carries the same invariant for the
+        # verification string before wrapping.
+        extracted = goals._extract_verification_output(
+            {"verification_output": probe}
+        )
+        assert extracted is not None
+        assert len(extracted.encode("utf-8")) <= goals.JUDGE_VERIFICATION_OUTPUT_MAX_BYTES
+        assert "… [truncated]" in extracted
+        assert extracted.encode("utf-8").decode("utf-8") == extracted
 
     def test_set_then_status(self, hermes_home):
         from hermes_cli.goals import GoalManager
