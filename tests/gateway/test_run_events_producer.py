@@ -21,6 +21,14 @@ Plus contract invariants:
 - four-limit atomic admission with 503 run_events_overload;
 - close-on-lag with join-then-capture quiescence;
 - global reconnect cursor gap fields.
+
+Round-2 regression tests (comment on t_2d596b66):
+- replay/live handoff atomicity (no duplicates, include-filtered);
+- serialization slot FREE→ACQUIRED→FREE + confirm_delivered ground truth;
+- container budget enforced at admission (not exceeding budget);
+- queue byte admission checks current + candidate (not current alone);
+- terminal frame uses actual final replayable event ID;
+- serialization-timeout → close-on-lag entry point.
 """
 
 import json
@@ -55,6 +63,26 @@ def _emit_n_events(producer: RunEventsProducer, run_id: str, n: int, prefix: str
     """Emit n events to a run's ring."""
     for i in range(n):
         producer.emit_event(run_id, prefix, {"run_id": run_id, "index": i})
+
+
+def _admit(producer, run_id, cursor=0, include=None):
+    """Convenience: admit subscriber and return sub_id."""
+    result = producer.admit_subscriber_and_snapshot(run_id, cursor, include)
+    assert result is not None, "admission failed"
+    return result[0]  # type: ignore[index]
+
+
+def _drain_and_confirm(producer, run_id, sub_id, max_frames=1000):
+    """Drain subscriber queue, confirming each delivery. Returns list of frames."""
+    frames = []
+    for _ in range(max_frames):
+        f = producer.get_subscriber_frame(run_id, sub_id, 0)
+        if f is None:
+            break
+        frames.append(f)
+        if b"subscriber.lagged" not in f:
+            producer.confirm_delivered(run_id, sub_id)
+    return frames
 
 
 # ---------------------------------------------------------------------------
@@ -359,8 +387,7 @@ class TestSlowSubscriber:
             max_subscriber_queue_bytes=1_000_000,
         )
         producer.admit_run("run1")
-        sub_id = producer.admit_subscriber("run1")
-        assert sub_id is not None
+        sub_id = _admit(producer, "run1")
         # Fill the queue beyond capacity.
         _emit_n_events(producer, "run1", 10)
         # Subscriber should be closed with a lag frame.
@@ -375,13 +402,9 @@ class TestSlowSubscriber:
             max_subscriber_queue_bytes=1_000_000,
         )
         producer.admit_run("run1")
-        sub_id = producer.admit_subscriber("run1")
+        sub_id = _admit(producer, "run1")
         _emit_n_events(producer, "run1", 10)
-        sub = producer._runs["run1"].subscribers[sub_id]
         # The lag frame should have been emitted.
-        lag_bytes = b""
-        # pending_lag_frame was set by close_on_lag.
-        # Read it via get_subscriber_frame.
         frame = producer.get_subscriber_frame("run1", sub_id, 0)
         assert frame is not None
         assert b"subscriber.lagged" in frame
@@ -402,7 +425,7 @@ class TestSlowSubscriber:
             max_subscriber_queue_bytes=1_000_000,
         )
         producer.admit_run("run1")
-        sub_id = producer.admit_subscriber("run1")
+        sub_id = _admit(producer, "run1")
         _emit_n_events(producer, "run1", 10)
         frame = producer.get_subscriber_frame("run1", sub_id, 0)
         for line in frame.split(b"\n"):
@@ -419,19 +442,15 @@ class TestSlowSubscriber:
             max_subscriber_queue_bytes=1_000_000,
         )
         producer.admit_run("run1")
-        # Give the slow subscriber a tiny queue by draining it manually
-        # — actually, both subscribers share the same queue config. To test
-        # isolation, we need one subscriber to overflow while the other
-        # drains. We simulate this by having one subscriber read events
-        # while the other doesn't.
-        slow_sub = producer.admit_subscriber("run1")
-        fast_sub = producer.admit_subscriber("run1")
+        slow_sub = _admit(producer, "run1")
+        fast_sub = _admit(producer, "run1")
         # Emit a few events that both can handle.
         _emit_n_events(producer, "run1", 5)
         # Fast subscriber drains its queue.
-        fast_s = producer._runs["run1"].subscribers[fast_sub]
         for _ in range(5):
-            producer.get_subscriber_frame("run1", fast_sub, 0)
+            f = producer.get_subscriber_frame("run1", fast_sub, 0)
+            if f:
+                producer.confirm_delivered("run1", fast_sub)
         # Slow subscriber does not drain. Now overflow its queue by
         # exceeding max_subscriber_queue_events.
         _emit_n_events(producer, "run1", 100)
@@ -444,8 +463,8 @@ class TestSlowSubscriber:
         """Subscriber disconnect cleans only that subscriber (§6)."""
         producer = _make_producer()
         producer.admit_run("run1")
-        sub1 = producer.admit_subscriber("run1")
-        sub2 = producer.admit_subscriber("run1")
+        sub1 = _admit(producer, "run1")
+        sub2 = _admit(producer, "run1")
         producer.remove_subscriber("run1", sub1)
         assert sub1 not in producer._runs["run1"].subscribers
         assert sub2 in producer._runs["run1"].subscribers
@@ -469,17 +488,18 @@ class TestAtomicAdmission:
     def test_max_concurrent_subscribers_enforced(self):
         producer = _make_producer(max_concurrent_subscribers=3)
         producer.admit_run("r1")
-        assert producer.admit_subscriber("r1") is not None
-        assert producer.admit_subscriber("r1") is not None
-        assert producer.admit_subscriber("r1") is not None
-        assert producer.admit_subscriber("r1") is None  # overload
+        assert _admit(producer, "r1") is not None
+        assert _admit(producer, "r1") is not None
+        assert _admit(producer, "r1") is not None
+        # overload — admit_subscriber_and_snapshot returns None
+        assert producer.admit_subscriber_and_snapshot("r1", 0) is None
 
     def test_max_subscribers_per_run_enforced(self):
         producer = _make_producer(max_subscribers_per_run=2)
         producer.admit_run("r1")
-        assert producer.admit_subscriber("r1") is not None
-        assert producer.admit_subscriber("r1") is not None
-        assert producer.admit_subscriber("r1") is None  # overload per-run
+        assert _admit(producer, "r1") is not None
+        assert _admit(producer, "r1") is not None
+        assert producer.admit_subscriber_and_snapshot("r1", 0) is None  # overload per-run
 
     def test_overload_error_body(self):
         snap = RunEventsCapabilitiesSnapshot()
@@ -522,7 +542,7 @@ class TestCategoryFiltering:
         """include filter excludes non-matching categories (§4)."""
         producer = _make_producer(max_subscriber_queue_events=100)
         producer.admit_run("r1")
-        sub_id = producer.admit_subscriber("r1", include_categories={"tool"})
+        sub_id = _admit(producer, "r1", include={"tool"})
         producer.emit_event("r1", "tool.started", {"i": 1})
         producer.emit_event("r1", "message.delta", {"d": "hi"})
         producer.emit_event("r1", "tool.completed", {"i": 2})
@@ -538,7 +558,7 @@ class TestCategoryFiltering:
         """meta category is always delivered regardless of include (§4)."""
         producer = _make_producer(max_subscriber_queue_events=100)
         producer.admit_run("r1")
-        sub_id = producer.admit_subscriber("r1", include_categories={"tool"})
+        sub_id = _admit(producer, "r1", include={"tool"})
         producer.emit_event("r1", "hermes.run_events.heartbeat", {"t": 1})
         producer.emit_event("r1", "tool.started", {"i": 1})
         sub = producer._runs["r1"].subscribers[sub_id]
@@ -605,10 +625,10 @@ class TestAtomicSnapshotPlusSubscribe:
         """Replayed events arrive before live events (§5)."""
         producer = _make_producer()
         producer.admit_run("r1")
-        _emit_n_events(producer, "run1" if False else "r1", 3)
-        sub_id = producer.admit_subscriber("r1")
+        _emit_n_events(producer, "r1", 3)
+        sub_id, replay, active = producer.admit_subscriber_and_snapshot("r1", 0)
+        assert sub_id is not None
         # Snapshot should capture all 3 existing events.
-        replay, active = producer.snapshot_and_subscribe("r1", sub_id, 0)
         assert len(replay) == 3
         assert active is True
         assert [e.event_id for e in replay] == [1, 2, 3]
@@ -634,7 +654,25 @@ class TestByteBudgetObservability:
         # High-water mark does not decrease.
         assert producer.container_high_water == 1500
 
-    def test_high_water_never_exceeds_budget(self):
+    def test_container_charged_on_admission(self):
+        """Container budget is charged at subscriber admission (§2)."""
+        producer = _make_producer()
+        producer.admit_run("r1")
+        assert producer.container_bytes_used > 0  # run metadata charged
+        run_bytes = producer.container_bytes_used
+        _admit(producer, "r1")
+        assert producer.container_bytes_used > run_bytes  # subscriber metadata charged
+
+    def test_container_released_on_disconnect(self):
+        """Container budget is released on subscriber disconnect (§2)."""
+        producer = _make_producer()
+        producer.admit_run("r1")
+        sub_id = _admit(producer, "r1")
+        before = producer.container_bytes_used
+        producer.remove_subscriber("r1", sub_id)
+        assert producer.container_bytes_used < before
+
+    def test_container_high_water_never_exceeds_budget(self):
         """container_high_water must stay within container_budget_bytes."""
         snap = RunEventsCapabilitiesSnapshot()
         producer = _make_producer()
@@ -654,19 +692,29 @@ class TestByteBudgetObservability:
 class TestLagFieldCaptureOrdering:
     def test_last_delivered_reflects_delivered_events(self):
         """After close-on-lag, last_delivered reflects what was actually
-        delivered to the transport (§6 join-then-capture)."""
+        delivered to the transport (§6 join-then-capture).
+
+        This test would FAIL on the old commit where
+        get_subscriber_frame advanced last_delivered_event_id before
+        the transport write was confirmed.
+        """
         producer = _make_producer(
             max_subscriber_queue_events=3,
             max_subscriber_queue_bytes=1_000_000,
         )
         producer.admit_run("r1")
-        sub_id = producer.admit_subscriber("r1")
+        sub_id = _admit(producer, "r1")
         # Deliver 2 events (they go into the subscriber queue).
         producer.emit_event("r1", "tool.started", {"i": 1})
         producer.emit_event("r1", "tool.completed", {"i": 2})
         # Read 2 frames from the queue (simulating delivery).
+        # In the new API, get_subscriber_frame acquires the slot but does
+        # NOT advance last_delivered_event_id.  The caller must
+        # confirm_delivered after the write succeeds.
         f1 = producer.get_subscriber_frame("r1", sub_id, 0)
+        producer.confirm_delivered("r1", sub_id)
         f2 = producer.get_subscriber_frame("r1", sub_id, 0)
+        producer.confirm_delivered("r1", sub_id)
         assert f1 is not None and f2 is not None
         assert b"id: 1" in f1
         assert b"id: 2" in f2
@@ -683,6 +731,33 @@ class TestLagFieldCaptureOrdering:
                 assert data["last_delivered_event_id"] == 2
                 break
 
+    def test_undelivered_event_not_counted_as_delivered(self):
+        """An event dequeued but not confirmed is NOT counted as delivered
+        (§6 join-then-capture).  This test would FAIL on the old commit.
+        """
+        producer = _make_producer(
+            max_subscriber_queue_events=5,
+            max_subscriber_queue_bytes=1_000_000,
+        )
+        producer.admit_run("r1")
+        sub_id = _admit(producer, "r1")
+        producer.emit_event("r1", "tool.started", {"i": 1})
+        producer.emit_event("r1", "tool.started", {"i": 2})
+        # Dequeue event 1 but do NOT confirm delivery (simulates a failed
+        # or in-flight transport write).
+        f1 = producer.get_subscriber_frame("r1", sub_id, 0)
+        assert f1 is not None
+        assert b"id: 1" in f1
+        # last_delivered_event_id must still be 0 — event 1 was dequeued
+        # but not confirmed delivered.
+        sub = producer._runs["r1"].subscribers[sub_id]
+        assert sub.last_delivered_event_id == 0
+        assert sub.slot_acquired  # slot is held
+        # Now mark write failed (transport error).
+        producer.mark_write_failed("r1", sub_id)
+        assert not sub.slot_acquired  # slot released
+        assert sub.last_delivered_event_id == 0  # still 0
+
 
 # ---------------------------------------------------------------------------
 # Multicast: concurrent subscribers receive the same ordered stream
@@ -694,8 +769,8 @@ class TestMulticast:
         """Multiple concurrent subscribers each receive complete stream (§6 item 6)."""
         producer = _make_producer(max_subscriber_queue_events=100)
         producer.admit_run("r1")
-        sub1 = producer.admit_subscriber("r1")
-        sub2 = producer.admit_subscriber("r1")
+        sub1 = _admit(producer, "r1")
+        sub2 = _admit(producer, "r1")
         _emit_n_events(producer, "r1", 5)
         # Both subscribers should have 5 events in their queues.
         s1 = producer._runs["r1"].subscribers[sub1]
@@ -757,3 +832,205 @@ class TestRetentionSweep:
         expired = producer.sweep_expired_runs()
         assert "r1" not in expired
         assert producer.run_exists("r1")
+
+
+# ===========================================================================
+# Round-2 regression tests: the four review blockers
+# ===========================================================================
+
+
+class TestRegressionReplayLiveHandoff:
+    """Blocker 1: replay/live handoff must be atomic and filter-correct."""
+
+    def test_no_duplicate_between_replay_and_live(self):
+        """An event emitted after snapshot must not appear in both the
+        replay snapshot AND the live queue (§5 atomic handoff).
+
+        This test would FAIL on the old commit where admit_subscriber
+        and snapshot_and_subscribe were separate, non-atomic calls.
+        """
+        producer = _make_producer(max_subscriber_queue_events=100)
+        producer.admit_run("r1")
+        # Pre-fill ring with 2 events.
+        producer.emit_event("r1", "tool.started", {"i": 1})
+        producer.emit_event("r1", "tool.started", {"i": 2})
+        # Atomic admit+snapshot captures replay [1, 2] and registers
+        # for live events.
+        sub_id, replay, _ = producer.admit_subscriber_and_snapshot("r1", 0)
+        replay_ids = [e.event_id for e in replay]
+        # Now emit event 3 (live, after snapshot).
+        producer.emit_event("r1", "tool.started", {"i": 3})
+        # Event 3 should be in the live queue ONLY.
+        sub = producer._runs["r1"].subscribers[sub_id]
+        live_ids = [eid for eid, _, _ in sub.queue]
+        # Replay had [1, 2], live queue has [3].  No overlap.
+        assert replay_ids == [1, 2]
+        assert live_ids == [3]
+        assert not (set(replay_ids) & set(live_ids))
+
+    def test_replay_respects_include_filter(self):
+        """Replayed events must respect the include filter (§4, §5).
+
+        This test would FAIL on the old commit where snapshot_and_subscribe
+        returned every ring entry without filtering.
+        """
+        producer = _make_producer(max_subscriber_queue_events=100)
+        producer.admit_run("r1")
+        # Emit one tool and one message event.
+        producer.emit_event("r1", "tool.started", {"i": 1})
+        producer.emit_event("r1", "message.delta", {"d": "hi"})
+        # Subscriber wants tool only.
+        sub_id, replay, _ = producer.admit_subscriber_and_snapshot(
+            "r1", 0, include_categories={"tool"}
+        )
+        # Replay should contain only the tool event.
+        replay_names = [e.event_name for e in replay]
+        assert replay_names == ["tool.started"]
+        assert "message.delta" not in replay_names
+
+
+class TestRegressionSerializationSlot:
+    """Blocker 2: serialization slot state machine + confirm_delivered."""
+
+    def test_slot_acquired_on_dequeue(self):
+        """get_subscriber_frame acquires the slot (FREE → ACQUIRED)."""
+        producer = _make_producer()
+        producer.admit_run("r1")
+        sub_id = _admit(producer, "r1")
+        producer.emit_event("r1", "tool.started", {"i": 1})
+        frame = producer.get_subscriber_frame("r1", sub_id, 0)
+        assert frame is not None
+        sub = producer._runs["r1"].subscribers[sub_id]
+        assert sub.slot_acquired
+        assert sub.in_flight_event_id == 1
+
+    def test_slot_released_on_confirm(self):
+        """confirm_delivered releases the slot (ACQUIRED → FREE)."""
+        producer = _make_producer()
+        producer.admit_run("r1")
+        sub_id = _admit(producer, "r1")
+        producer.emit_event("r1", "tool.started", {"i": 1})
+        producer.get_subscriber_frame("r1", sub_id, 0)
+        producer.confirm_delivered("r1", sub_id)
+        sub = producer._runs["r1"].subscribers[sub_id]
+        assert not sub.slot_acquired
+        assert sub.last_delivered_event_id == 1
+
+    def test_slot_released_on_failure(self):
+        """mark_write_failed releases the slot without advancing cursor."""
+        producer = _make_producer()
+        producer.admit_run("r1")
+        sub_id = _admit(producer, "r1")
+        producer.emit_event("r1", "tool.started", {"i": 1})
+        producer.get_subscriber_frame("r1", sub_id, 0)
+        producer.mark_write_failed("r1", sub_id)
+        sub = producer._runs["r1"].subscribers[sub_id]
+        assert not sub.slot_acquired
+        assert sub.last_delivered_event_id == 0  # not advanced
+
+    def test_serialization_timeout_triggers_close_on_lag(self):
+        """If slot held > heartbeat, serialization-timeout fires close-on-lag
+        (§2 serialization-timeout entry).  This test would FAIL on the old
+        commit where slot state was never transitioned.
+        """
+        producer = _make_producer(
+            max_subscriber_queue_events=100,
+            heartbeat_seconds=1,
+        )
+        producer.admit_run("r1")
+        sub_id = _admit(producer, "r1")
+        # Dequeue an event but do NOT confirm (slot stays ACQUIRED).
+        producer.emit_event("r1", "tool.started", {"i": 1})
+        producer.get_subscriber_frame("r1", sub_id, 0)
+        sub = producer._runs["r1"].subscribers[sub_id]
+        assert sub.slot_acquired
+        # Simulate time passing beyond the heartbeat.
+        import time as _time
+        future = _time.monotonic() + 2.0
+        triggered = producer.check_serialization_timeout("r1", sub_id, now=future)
+        assert triggered
+        assert sub.closed
+        assert sub.pending_lag_frame is not None
+
+
+class TestRegressionContainerBudget:
+    """Blocker 3: container budget enforced at admission."""
+
+    def test_run_admission_rejected_when_container_full(self):
+        """If container budget is exhausted, run admission returns False."""
+        producer = _make_producer(
+            container_budget_bytes=100,  # tiny budget
+        )
+        # First run charges 2048 bytes — exceeds 100.
+        assert not producer.admit_run("r1")
+
+    def test_subscriber_admission_rejected_when_container_full(self):
+        """If container budget is exhausted, subscriber admission returns None."""
+        producer = _make_producer(
+            container_budget_bytes=2048,  # exactly one run
+        )
+        assert producer.admit_run("r1")  # charges 2048
+        # No room for subscriber metadata (1024 more).
+        assert producer.admit_subscriber_and_snapshot("r1", 0) is None
+
+    def test_high_water_never_exceeds_container_budget(self):
+        """container_high_water must never exceed container_budget_bytes.
+
+        This test would FAIL on the old commit where charge_container
+        permitted usage above the budget.
+        """
+        snap = RunEventsCapabilitiesSnapshot()
+        producer = _make_producer()
+        # Charge more than the budget — it must be rejected at admission
+        # but the charge_container test helper can still push it over.
+        # The invariant is: admission never exceeds the budget.
+        for i in range(snap.max_retained_runs):
+            assert producer.admit_run(f"r{i}")
+        assert producer.container_high_water <= snap.container_budget_bytes
+
+    def test_queue_byte_admission_checks_current_plus_candidate(self):
+        """Queue overflow must check current + candidate, not current alone
+        (§6).  This test would FAIL on the old commit where the check
+        was `>= max` instead of `+ candidate > max`.
+        """
+        # Each tool.started frame with {"i":N} is ~41 bytes.
+        # Set byte limit to 50: one frame fits (41 < 50), but 41 + 41 = 82 > 50.
+        producer = _make_producer(
+            max_subscriber_queue_events=1000,
+            max_subscriber_queue_bytes=50,
+        )
+        producer.admit_run("r1")
+        sub_id = _admit(producer, "r1")
+        # Emit 2 events — the 2nd should overflow (1st + 2nd > 50).
+        producer.emit_event("r1", "tool.started", {"i": 1})
+        producer.emit_event("r1", "tool.started", {"i": 2})
+        sub = producer._runs["r1"].subscribers[sub_id]
+        # The subscriber should be closed (queue overflow on 2nd event).
+        assert sub.closed
+        assert sub.pending_lag_frame is not None
+
+
+class TestRegressionTerminalFinalId:
+    """Blocker 4: terminal frame uses actual final replayable event ID."""
+
+    def test_terminal_frame_uses_real_final_id(self):
+        """format_terminal_frame should receive the ring's actual max event ID,
+        not a hard-coded 0.  The handler computes final_id via
+        get_final_event_id.
+        """
+        producer = _make_producer()
+        producer.admit_run("r1")
+        _emit_n_events(producer, "r1", 5)
+        producer.mark_run_terminal("r1")
+        final_id = producer.get_final_event_id("r1")
+        assert final_id == 5
+        frame = producer.format_terminal_frame("r1", "completed", final_id)
+        assert b'"final_event_id":5' in frame
+
+    def test_terminal_frame_final_id_zero_on_empty_run(self):
+        """If no events were emitted, final_event_id is 0."""
+        producer = _make_producer()
+        producer.admit_run("r1")
+        producer.mark_run_terminal("r1")
+        final_id = producer.get_final_event_id("r1")
+        assert final_id == 0

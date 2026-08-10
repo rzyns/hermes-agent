@@ -7032,21 +7032,23 @@ class APIServerAdapter(BasePlatformAdapter):
         except CursorError as exc:
             return web.json_response(exc.error_body(), status=exc.http_status)
 
-        # ── Admit subscriber (four-limit atomic admission, §2) ──────────
-        sub_id = producer.admit_subscriber(run_id, include_categories)
-        if sub_id is None:
+        # ── Atomic subscriber admission + snapshot (§2, §5) ──────────────
+        # admit_subscriber_and_snapshot atomically reserves the subscriber
+        # slot AND captures the replay ring under one lock — no event can
+        # fall between the snapshot and live registration (the race that
+        # caused duplicate delivery in the first implementation).
+        result = producer.admit_subscriber_and_snapshot(
+            run_id, cursor, include_categories
+        )
+        if result is None:
             return web.json_response(
                 snapshot.overload_error(),
                 status=503,
                 headers={"Retry-After": "1"},
             )
+        sub_id, replay_entries, run_active = result
 
         self._run_stream_subscribers.add(run_id)
-
-        # ── Atomic snapshot-plus-subscribe (§5) ──────────────────────────
-        replay_entries, run_active = producer.snapshot_and_subscribe(
-            run_id, sub_id, cursor
-        )
 
         response = web.StreamResponse(
             status=200,
@@ -7074,7 +7076,9 @@ class APIServerAdapter(BasePlatformAdapter):
             if not await _write_frame(producer.format_capabilities_frame()):
                 return response
 
-            # 2. Replayed events (with id).
+            # 2. Replayed events (with id).  Replay frames do not use the
+            #    serialization slot — they are written once at stream start
+            #    before the live loop begins.  No confirm_delivered needed.
             for entry in replay_entries:
                 if not await _write_frame(producer.format_replay_frame(entry)):
                     return response
@@ -7085,13 +7089,23 @@ class APIServerAdapter(BasePlatformAdapter):
             last_heartbeat = time.monotonic()
 
             while True:
+                # Check for serialization-timeout (§2): if a subscriber's
+                # slot has been held > heartbeat, fire close-on-lag.
+                producer.check_serialization_timeout(run_id, sub_id)
+
                 # Check for subscriber frames (data events or lag frames).
                 frame = producer.get_subscriber_frame(
                     run_id, sub_id, timeout=poll_interval
                 )
                 if frame is not None:
                     if not await _write_frame(frame):
+                        # Transport write failed — release slot without
+                        # advancing last_delivered_event_id.
+                        producer.mark_write_failed(run_id, sub_id)
                         break
+                    # Confirm delivery — advance last_delivered_event_id
+                    # to reflect transport ground truth (§6 join-then-capture).
+                    producer.confirm_delivered(run_id, sub_id)
                     # Check if this was a lag frame → close after sending it.
                     if b"subscriber.lagged" in frame:
                         # Lag frame was the final frame; close cleanly.
@@ -7112,9 +7126,8 @@ class APIServerAdapter(BasePlatformAdapter):
                 if not producer.run_is_active(run_id):
                     # Run has terminated.  Emit the terminal frame if there
                     # are no more pending subscriber frames.
-                    final_id = 0
+                    final_id = producer.get_final_event_id(run_id)
                     # Drain any remaining frames first.
-                    drained_any = False
                     while True:
                         frame = producer.get_subscriber_frame(
                             run_id, sub_id, timeout=0
@@ -7122,8 +7135,9 @@ class APIServerAdapter(BasePlatformAdapter):
                         if frame is None:
                             break
                         if not await _write_frame(frame):
+                            producer.mark_write_failed(run_id, sub_id)
                             break
-                        drained_any = True
+                        producer.confirm_delivered(run_id, sub_id)
                     # Emit terminal frame.
                     status_info = self._run_statuses.get(run_id, {})
                     terminal_status = status_info.get("status", "completed")

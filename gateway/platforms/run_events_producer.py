@@ -21,6 +21,16 @@ The producer is intentionally framework-light: it operates on plain
 ``bytes`` frames and delegates the actual SSE wire writing to the
 caller (``_handle_run_events`` in ``api_server.py``).  This keeps it
 unit-testable without an aiohttp transport.
+
+Delivery model
+--------------
+``get_subscriber_frame`` dequeues an event and *acquires* the
+serialization slot, returning the formatted frame **without** advancing
+``last_delivered_event_id``.  The caller MUST call ``confirm_delivered``
+after the transport write succeeds (advancing the cursor) or
+``mark_write_failed`` if it fails (releasing the slot without advancing).
+This ensures ``last_delivered_event_id`` always reflects transport
+ground truth — the core invariant for join-then-capture lag recovery.
 """
 
 from __future__ import annotations
@@ -34,6 +44,14 @@ from dataclasses import dataclass, field
 from typing import Any, Deque, Dict, List, Optional, Set, Tuple
 
 logger = logging.getLogger(__name__)
+
+# ── Container-budget size classes (§2) ───────────────────────────────────────
+# Charged to container_budget at admission, released at disconnect/expiry.
+# These represent the allocator's full size-class byte count for the
+# metadata object (header, alignment, arena overhead), not the logical
+# payload length.
+_CONTAINER_SIZE_CLASS_RUN = 2048
+_CONTAINER_SIZE_CLASS_SUBSCRIBER = 1024
 
 # ── Category map (§4) ───────────────────────────────────────────────────────
 
@@ -386,6 +404,9 @@ class _Subscriber:
     # Serialization slot: atomic FREE → ACQUIRED → FREE (§2).
     slot_acquired: bool = False
     slot_acquired_at: float = 0.0
+    # In-flight event held in the serialization slot.
+    in_flight_event_id: int = 0
+    in_flight_event_name: str = ""
     # Lag/close state.
     closed: bool = False
     # Filtering.
@@ -458,9 +479,19 @@ class RunEventsProducer:
                 return False
             if self._active_run_count >= self.snapshot.max_active_runs_for_events:
                 return False
+            # Check container budget for run metadata.
+            if (
+                self._container_bytes_used + _CONTAINER_SIZE_CLASS_RUN
+                > self.snapshot.container_budget_bytes
+            ):
+                return False
             # Reserve.
             self._retained_run_count += 1
             self._active_run_count += 1
+            self._container_bytes_used += _CONTAINER_SIZE_CLASS_RUN
+            self._container_high_water = max(
+                self._container_high_water, self._container_bytes_used
+            )
             ring = _ReplayRing(
                 self.snapshot.max_replay_events,
                 self.snapshot.max_replay_bytes,
@@ -492,6 +523,9 @@ class RunEventsProducer:
                 self._active_run_count = max(0, self._active_run_count - 1)
             self._retained_run_count = max(0, self._retained_run_count - 1)
             self._total_subscribers -= len(run.subscribers)
+            # Release container budget for run metadata + subscriber metadata.
+            release = _CONTAINER_SIZE_CLASS_RUN + len(run.subscribers) * _CONTAINER_SIZE_CLASS_SUBSCRIBER
+            self._container_bytes_used = max(0, self._container_bytes_used - release)
 
     def run_exists(self, run_id: str) -> bool:
         with self._global_lock:
@@ -539,18 +573,24 @@ class RunEventsProducer:
                     409,
                 )
 
-    # ── Subscriber admission ──────────────────────────────────────────────
+    # ── Atomic subscriber admission + snapshot (§5) ────────────────────────
 
-    def admit_subscriber(
+    def admit_subscriber_and_snapshot(
         self,
         run_id: str,
+        cursor: int,
         include_categories: Optional[Set[str]] = None,
-    ) -> Optional[int]:
-        """Atomically reserve capacity for a new subscriber.
+    ) -> Optional[Tuple[int, List[_RingEntry], bool]]:
+        """Atomically admit a subscriber AND capture the replay ring snapshot.
 
-        Returns the subscriber ID if admitted, or None if overloaded (caller
-        returns 503).  The caller must subsequently call
-        :meth:`snapshot_and_subscribe` to get replay events + register for live.
+        This is the §5 atomic snapshot-plus-subscribe: no event may fall
+        between the ring snapshot and live registration.  The subscriber
+        is added to live routing *inside* the same lock that captures the
+        ring, so events emitted after this call are exclusively live (in
+        the subscriber's queue) and never duplicated in replay.
+
+        Returns ``(sub_id, filtered_replay_entries, run_is_active)``, or
+        ``None`` if any limit is saturated (caller returns 503).
         """
         with self._global_lock:
             run = self._runs.get(run_id)
@@ -561,7 +601,13 @@ class RunEventsProducer:
                 return None
             if len(run.subscribers) >= self.snapshot.max_subscribers_per_run:
                 return None
-            # Reserve.
+            # Check container budget for subscriber metadata.
+            if (
+                self._container_bytes_used + _CONTAINER_SIZE_CLASS_SUBSCRIBER
+                > self.snapshot.container_budget_bytes
+            ):
+                return None
+            # Atomically: reserve subscriber slot + charge container + snapshot ring.
             sub_id = run._next_subscriber_id
             run._next_subscriber_id += 1
             sub = _Subscriber(
@@ -570,7 +616,19 @@ class RunEventsProducer:
             )
             run.subscribers[sub_id] = sub
             self._total_subscribers += 1
-            return sub_id
+            self._container_bytes_used += _CONTAINER_SIZE_CLASS_SUBSCRIBER
+            self._container_high_water = max(
+                self._container_high_water, self._container_bytes_used
+            )
+            # Capture replay entries (atomically — same lock).
+            replay_entries = run.ring.replay_after(cursor)
+            # Apply include filter to replay entries (§4, §6).
+            if include_categories is not None:
+                replay_entries = [
+                    e for e in replay_entries
+                    if self._is_category_allowed(e.event_name, include_categories)
+                ]
+            return sub_id, replay_entries, run.active
 
     def remove_subscriber(self, run_id: str, sub_id: int) -> None:
         """Release a subscriber reservation (on disconnect or close-on-lag)."""
@@ -580,28 +638,27 @@ class RunEventsProducer:
                 return
             if run.subscribers.pop(sub_id, None) is not None:
                 self._total_subscribers = max(0, self._total_subscribers - 1)
+                self._container_bytes_used = max(
+                    0, self._container_bytes_used - _CONTAINER_SIZE_CLASS_SUBSCRIBER
+                )
 
-    # ── Atomic snapshot-plus-subscribe (§5) ───────────────────────────────
+    # ── Category filtering helper ─────────────────────────────────────────
 
-    def snapshot_and_subscribe(
-        self,
-        run_id: str,
-        sub_id: int,
-        cursor: int,
-    ) -> Tuple[List[_RingEntry], bool]:
-        """Atomically capture the replay ring and register for live events.
+    @staticmethod
+    def _is_category_allowed(
+        event_name: str, include_categories: Optional[Set[str]]
+    ) -> bool:
+        """Whether *event_name* passes the include filter.
 
-        Returns ``(replay_entries, run_is_active)``.  No event may fall between
-        the snapshot and live registration — this method holds the run lock
-        for the entire operation.
+        ``meta`` is always delivered.  When *include_categories* is ``None``
+        (absent include key), all categories are delivered.
         """
-        with self._global_lock:
-            run = self._runs.get(run_id)
-            if run is None:
-                return [], False
-            # Capture replay entries under the lock.
-            replay_entries = run.ring.replay_after(cursor)
-            return replay_entries, run.active
+        if include_categories is None:
+            return True
+        cat = _event_category(event_name)
+        if cat == "meta":
+            return True
+        return cat in include_categories
 
     # ── Event emission ────────────────────────────────────────────────────
 
@@ -656,10 +713,10 @@ class RunEventsProducer:
                 if category != "meta" and sub.include_categories is not None:
                     if category not in sub.include_categories:
                         continue
-                # Enqueue with dual-limit check.
+                # Enqueue with dual-limit check (current + candidate, §6).
                 if (
-                    sub.queue_event_count >= snapshot.max_subscriber_queue_events
-                    or sub.queue_byte_count >= snapshot.max_subscriber_queue_bytes
+                    sub.queue_event_count + 1 > snapshot.max_subscriber_queue_events
+                    or sub.queue_byte_count + frame > snapshot.max_subscriber_queue_bytes
                 ):
                     # Queue-overflow entry → close-on-lag.
                     self._close_on_lag(
@@ -682,17 +739,21 @@ class RunEventsProducer:
     ) -> None:
         """Execute close-on-lag: freeze, capture, discard, emit lag, close.
 
-        Must be called under ``run._lock`` (caller holds it via _global_lock).
-        Join-then-capture quiescence: the in-flight write is conceptually
-        joined (in this synchronous model, the last_delivered_event_id
-        already reflects what was delivered).  Fields are captured after
-        quiescence.
+        Must be called under ``self._global_lock``.
+
+        Join-then-capture quiescence (§6): ``last_delivered_event_id``
+        reflects only events whose transport write was confirmed via
+        ``confirm_delivered``.  An in-flight write (slot acquired but not
+        confirmed) is NOT counted as delivered — this is the join-then-
+        capture invariant.  The lag frame's gap fields describe the
+        global reconnect cursor interval.
         """
-        snapshot = self.snapshot
         # 1. Freeze: detach from live routing, seal queue.
         sub.closed = True
-        # 2. Join in-flight write: in this model, delivery is synchronous, so
-        #    last_delivered_event_id is already ground truth.
+        # 2. Join in-flight write: in this synchronous model, the slot state
+        #    tells us whether a write is in-flight.  last_delivered_event_id
+        #    reflects only confirmed deliveries (confirm_delivered was called).
+        #    The in-flight event (if any) is NOT counted as delivered.
         # 3. Capture fields (global reconnect cursor interval).
         last_delivered = sub.last_delivered_event_id
         latest_available = run.ring.max_event_id
@@ -702,6 +763,9 @@ class RunEventsProducer:
         sub.queue.clear()
         sub.queue_event_count = 0
         sub.queue_byte_count = 0
+        # Release the serialization slot if held (in-flight write abandoned).
+        sub.slot_acquired = False
+        sub.in_flight_event_id = 0
         # 5. Emit lag frame from the control_slot_pool.
         lag_data = {
             "event": "hermes.run_events.subscriber.lagged",
@@ -736,10 +800,15 @@ class RunEventsProducer:
     def get_subscriber_frame(
         self, run_id: str, sub_id: int, timeout: float
     ) -> Optional[bytes]:
-        """Get the next SSE frame for a subscriber, or a heartbeat.
+        """Get the next SSE frame for a subscriber.
 
-        Returns formatted bytes, a heartbeat comment, or None if the
-        subscriber is closed and has no pending lag frame.
+        Acquires the serialization slot (FREE→ACQUIRED) and returns the
+        formatted frame **without** advancing ``last_delivered_event_id``.
+        The caller MUST call :meth:`confirm_delivered` after a successful
+        transport write, or :meth:`mark_write_failed` if the write fails.
+
+        Returns formatted bytes, or None if the subscriber is closed and
+        has no pending lag frame.
         """
         with self._global_lock:
             run = self._runs.get(run_id)
@@ -749,21 +818,99 @@ class RunEventsProducer:
             if sub is None:
                 return None
             # If there's a pending lag frame, deliver it and signal close.
+            # Lag frames are control frames — no slot acquisition needed.
             if sub.pending_lag_frame is not None:
                 frame = sub.pending_lag_frame
                 sub.pending_lag_frame = None
                 return frame
             if sub.closed:
                 return None
-            # Drain the queue.
+            # Drain the queue — acquire serialization slot.
             if sub.queue:
                 event_id, event_name, data_bytes = sub.queue.popleft()
                 sub.queue_event_count -= 1
                 frame_size = self._frame_size(event_name, data_bytes, event_id)
                 sub.queue_byte_count -= frame_size
-                sub.last_delivered_event_id = event_id
+                # Acquire slot (FREE → ACQUIRED).
+                sub.slot_acquired = True
+                sub.slot_acquired_at = time.monotonic()
+                sub.in_flight_event_id = event_id
+                sub.in_flight_event_name = event_name
+                # NOTE: last_delivered_event_id is NOT advanced here.
+                # confirm_delivered() advances it after transport success.
                 return self._format_replayable_frame(event_name, event_id, data_bytes)
             return None  # no data right now
+
+    def confirm_delivered(self, run_id: str, sub_id: int) -> None:
+        """Confirm that the in-flight frame was delivered to the transport.
+
+        Advances ``last_delivered_event_id`` to the in-flight event's ID
+        and releases the serialization slot (ACQUIRED → FREE).
+
+        No-op if no slot is acquired (e.g., lag/control frame was delivered).
+        """
+        with self._global_lock:
+            run = self._runs.get(run_id)
+            if run is None:
+                return
+            sub = run.subscribers.get(sub_id)
+            if sub is None:
+                return
+            if sub.slot_acquired:
+                # Only advance if the subscriber isn't already closed
+                # (lag frame may have already been captured).
+                if not sub.closed:
+                    sub.last_delivered_event_id = sub.in_flight_event_id
+                sub.slot_acquired = False
+                sub.in_flight_event_id = 0
+                sub.in_flight_event_name = ""
+
+    def mark_write_failed(self, run_id: str, sub_id: int) -> None:
+        """Release the serialization slot without advancing last_delivered.
+
+        Called when the transport write failed.  The in-flight event is
+        NOT counted as delivered.
+        """
+        with self._global_lock:
+            run = self._runs.get(run_id)
+            if run is None:
+                return
+            sub = run.subscribers.get(sub_id)
+            if sub is None:
+                return
+            sub.slot_acquired = False
+            sub.in_flight_event_id = 0
+            sub.in_flight_event_name = ""
+
+    def check_serialization_timeout(
+        self, run_id: str, sub_id: int, now: Optional[float] = None
+    ) -> bool:
+        """Check if the subscriber's serialization slot has been held too long.
+
+        If the slot has been ACQUIRED for longer than one heartbeat interval
+        (the serialization-timeout transition, §2), fire close-on-lag as the
+        second entry point.  Returns True if close-on-lag was triggered.
+        """
+        if now is None:
+            now = time.monotonic()
+        with self._global_lock:
+            run = self._runs.get(run_id)
+            if run is None:
+                return False
+            sub = run.subscribers.get(sub_id)
+            if sub is None or sub.closed:
+                return False
+            if sub.slot_acquired and (
+                now - sub.slot_acquired_at
+            ) > self.snapshot.heartbeat_seconds:
+                # Serialization-timeout → close-on-lag (§2, §6).
+                self._close_on_lag(
+                    run, sub_id, sub,
+                    triggering_event_id=sub.in_flight_event_id,
+                    triggering_event_name=sub.in_flight_event_name,
+                )
+                return True
+            return False
 
     def format_capabilities_frame(self) -> bytes:
         """Format the initial in-stream capabilities control frame."""
@@ -790,6 +937,14 @@ class RunEventsProducer:
         }
         data_bytes = self._serialize_event("hermes.run_events.terminal", data)
         return self._format_control_frame("hermes.run_events.terminal", data_bytes)
+
+    def get_final_event_id(self, run_id: str) -> int:
+        """Return the ring's max replayable event ID (for terminal frames)."""
+        with self._global_lock:
+            run = self._runs.get(run_id)
+            if run is None:
+                return 0
+            return run.ring.max_event_id
 
     # ── Retention sweep ───────────────────────────────────────────────────
 
@@ -842,7 +997,12 @@ class RunEventsProducer:
         return self._container_high_water
 
     def charge_container(self, nbytes: int) -> None:
-        """Charge *nbytes* to the container budget (size-class accounting)."""
+        """Charge *nbytes* to the container budget (size-class accounting).
+
+        This is a diagnostic/testing helper.  Admission-time charges are
+        handled internally by :meth:`admit_run` and
+        :meth:`admit_subscriber_and_snapshot`.
+        """
         with self._global_lock:
             self._container_bytes_used += nbytes
             if self._container_bytes_used > self._container_high_water:
