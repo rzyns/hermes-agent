@@ -39,6 +39,7 @@ from agent.redact import redact_sensitive_text
 from hermes_cli.goals import (
     judge_goal,
     _build_artifact_manifest_for_judge_gate,
+    _build_declared_artifact_readback_list,
     _extract_verification_output,
     _verify_artifact_manifest_and_log,
 )
@@ -884,25 +885,34 @@ def _handle_complete(args: dict, **kw) -> str:
                 verdict = "done"
                 reason = ""
                 try:
-                    # Build the canonical content-bound artifact manifest (inherited
-                    # from kanban_db) and optional bounded verification output for
-                    # the judge. Run a producer-side readback gate on the declared
-                    # files so the judge reasons about bytes that exist on disk,
-                    # not stale metadata pointers.
+                    # Run the producer-side readback gate in two passes:
+                    # 1) over every raw declared path, so a missing out-of-scratch
+                    #    file is surfaced to the judge instead of being silently
+                    #    dropped by the preservation gate;
+                    # 2) over the canonical content-bound manifest, so a managed
+                    #    artifact whose bytes no longer match its recorded hash
+                    #    is caught before the judge sees it.
+                    raw_declared = _build_declared_artifact_readback_list(
+                        metadata, artifacts
+                    )
+                    raw_failures = _verify_artifact_manifest_and_log(
+                        raw_declared, "pre-judge readback"
+                    )
                     manifest = _build_artifact_manifest_for_judge_gate(
                         metadata, artifacts
                     )
-                    verification_output = _extract_verification_output(metadata)
-                    readback_failures = _verify_artifact_manifest_and_log(
-                        manifest, "pre-judge readback"
+                    manifest_failures = _verify_artifact_manifest_and_log(
+                        manifest, "pre-judge manifest readback"
                     )
+                    readback_failures = raw_failures + manifest_failures
+                    verification_output = _extract_verification_output(metadata)
                     if readback_failures:
                         manifest = []
                         failure_block = "Artifact readback failures:\n" + "\n".join(
                             readback_failures
                         )
                         verification_output = (
-                            f"{verification_output}\n\n{failure_block}"
+                            f"{failure_block}\n\n{verification_output}"
                             if verification_output
                             else failure_block
                         )

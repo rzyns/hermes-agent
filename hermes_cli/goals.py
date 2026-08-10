@@ -72,10 +72,12 @@ DEFAULT_MAX_CONSECUTIVE_PARSE_FAILURES = 3
 # A broken/invalid API key returns 401 every call — the loop must not
 # run until the turn budget, wasting every turn on an unreachable judge.
 DEFAULT_MAX_CONSECUTIVE_TRANSPORT_FAILURES = 5
-# Max characters of verification output (test logs, command output, etc.)
+# Max ENCODED BYTES of verification output (test logs, command output, etc.)
 # passed to the goal-mode judge as evidence. Kept small so the prompt stays
-# within the auxiliary model's context budget.
-JUDGE_VERIFICATION_OUTPUT_MAX_CHARS = 2000
+# within the auxiliary model's context budget. Measured against the final
+# UTF-8 rendered surface, not Python code points, so multibyte characters do
+# not silently expand the budget.
+JUDGE_VERIFICATION_OUTPUT_MAX_BYTES = 2000
 
 
 CONTINUATION_PROMPT_TEMPLATE = (
@@ -216,14 +218,23 @@ def _render_verification_output_block(
     """Render bounded verification output for the judge prompt.
 
     Empty/None returns an empty string so the prompt is unchanged when no
-    verification output is supplied.
+    verification output is supplied. The verification text is truncated so the
+    final rendered block never exceeds
+    :data:`JUDGE_VERIFICATION_OUTPUT_MAX_BYTES` encoded UTF-8 bytes.
     """
     if not verification_output:
         return ""
     text = str(verification_output).strip()
     if not text:
         return ""
-    text = _truncate(text, JUDGE_VERIFICATION_OUTPUT_MAX_CHARS)
+    wrapper = "Verification/test output (bounded):\n\n".encode("utf-8")
+    sentinel = "… [truncated]".encode("utf-8")
+    # Reserve wrapper bytes plus worst-case sentinel bytes. If text fits under
+    # that budget, no sentinel is appended, leaving room equivalent to the
+    # sentinel bytes. If text exceeds it, _truncate adds the sentinel and we
+    # must have reserved its bytes.
+    payload_limit = max(0, JUDGE_VERIFICATION_OUTPUT_MAX_BYTES - len(wrapper) - len(sentinel))
+    text = _truncate(text, payload_limit, byte_limit=True)
     return f"Verification/test output (bounded):\n{text}\n\n"
 
 
@@ -797,7 +808,8 @@ def _extract_verification_output(
 
     Accepts a plain string or a dict with ``verification_output`` or
     ``verification`` key. The output is capped to
-    :data:`JUDGE_VERIFICATION_OUTPUT_MAX_CHARS` characters.
+    :data:`JUDGE_VERIFICATION_OUTPUT_MAX_BYTES` encoded UTF-8 bytes of the
+    final rendered judge block.
     """
     raw: Optional[str] = None
     if isinstance(metadata, dict):
@@ -811,7 +823,15 @@ def _extract_verification_output(
     text = str(raw).strip()
     if not text:
         return None
-    return _truncate(text, JUDGE_VERIFICATION_OUTPUT_MAX_CHARS)
+    sentinel = "… [truncated]".encode("utf-8")
+    # Reserve the sentinel bytes so the returned text plus a later wrapper never
+    # exceeds the budget. The renderer adds its own wrapper and sentinel, so this
+    # helper caps the payload portion to fit.
+    return _truncate(
+        text,
+        max(0, JUDGE_VERIFICATION_OUTPUT_MAX_BYTES - len(sentinel)),
+        byte_limit=True,
+    )
 
 
 def _build_artifact_manifest_for_judge_gate(
@@ -846,14 +866,51 @@ def _build_artifact_manifest_for_judge_gate(
     return _build_judge_artifact_manifest(merged_metadata)
 
 
+def _build_declared_artifact_readback_list(
+    metadata: Optional[dict],
+    artifacts: Optional[list[str]],
+) -> list[dict[str, Any]]:
+    """Return a minimal manifest entry for every unique declared artifact path.
+
+    The canonical content-bound manifest only includes managed scratch paths;
+    out-of-scratch declarations are intentionally omitted from the digest. This
+    helper is used by the *pre-preservation* producer-side readback gate so that
+    a missing out-of-scratch file is still surfaced to the judge instead of being
+    silently dropped before the preservation gate is reached.
+    """
+    seen: set[str] = set()
+    entries: list[dict[str, Any]] = []
+    raw = []
+    if isinstance(metadata, dict):
+        raw.extend(metadata.get("artifacts") or [])
+    raw.extend(artifacts or [])
+    for item in raw:
+        s = str(item).strip()
+        if not s or s in seen:
+            continue
+        seen.add(s)
+        entries.append({"source_path": s})
+    return entries
+
+
 # ──────────────────────────────────────────────────────────────────────
 # Judge
 # ──────────────────────────────────────────────────────────────────────
 
 
-def _truncate(text: str, limit: int) -> str:
+def _truncate(text: str, limit: int, *, byte_limit: bool = False) -> str:
     if not text:
         return ""
+    if byte_limit:
+        encoded = text.encode("utf-8")
+        if len(encoded) <= limit:
+            return text
+        # Truncate on a character boundary; never split a code point.
+        truncated_bytes = encoded[:limit]
+        # A UTF-8 continuation byte has the top two bits = 10.
+        while truncated_bytes and (truncated_bytes[-1] & 0xC0) == 0x80:
+            truncated_bytes = truncated_bytes[:-1]
+        return truncated_bytes.decode("utf-8", errors="ignore") + "… [truncated]"
     if len(text) <= limit:
         return text
     return text[:limit] + "… [truncated]"

@@ -198,6 +198,44 @@ class TestJudgeGoal:
         assert failures
         assert "hash mismatch" in failures[0]
 
+    def test_verification_output_byte_cap_multibyte_regression(self, tmp_path):
+        """Regression: the verification-output cap must be measured in encoded
+        UTF-8 bytes of the final rendered judge block, not Python code points.
+
+        The reviewer's probe produced ~6,000+ bytes against a nominal 2,000 cap.
+        With byte bounding the final rendered block must stay at or below the
+        byte budget, and truncation must never split a codepoint.
+        """
+        from hermes_cli import goals
+
+        # Same probe class the reviewer used: many copies of a 3-byte char.
+        probe = "界" * 5000
+        rendered = goals._render_verification_output_block(probe)
+        encoded = rendered.encode("utf-8")
+        assert len(encoded) <= goals.JUDGE_VERIFICATION_OUTPUT_MAX_BYTES
+        assert "… [truncated]" in rendered
+        # Truncation must not split a code point.
+        assert encoded.decode("utf-8") == rendered
+        # Exact-value regression: the rendered block uses the full byte budget.
+        assert len(encoded) == goals.JUDGE_VERIFICATION_OUTPUT_MAX_BYTES
+
+        # ASCII regression: a small payload is untouched by truncation.
+        ascii_text = "x" * (goals.JUDGE_VERIFICATION_OUTPUT_MAX_BYTES // 2)
+        block = goals._render_verification_output_block(ascii_text)
+        assert "… [truncated]" not in block
+        assert len(block.encode("utf-8")) < goals.JUDGE_VERIFICATION_OUTPUT_MAX_BYTES
+
+        # _extract_verification_output also enforces bytes and stays within the
+        # raw budget (the renderer reserves wrapper/sentinel bytes from the same
+        # budget, so extracted text itself must not exceed it).
+        long_text = "界" * 3000
+        extracted = goals._extract_verification_output(
+            {"verification_output": long_text}
+        )
+        assert extracted is not None
+        assert len(extracted.encode("utf-8")) <= goals.JUDGE_VERIFICATION_OUTPUT_MAX_BYTES
+        assert "… [truncated]" in extracted
+
 
 class TestGoalManager:
 
