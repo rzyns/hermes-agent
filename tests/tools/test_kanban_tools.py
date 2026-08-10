@@ -779,7 +779,7 @@ def test_complete_goal_mode_rejected_by_judge(monkeypatch, tmp_path):
 
     # Mock the judge to reject the completion. The gate only runs when a
     # judge is reachable, so force the availability probe True as well.
-    def mock_judge_goal(goal, last_response, *, timeout=30.0, subgoals=None):
+    def mock_judge_goal(goal, last_response, *, timeout=30.0, subgoals=None, artifact_manifest=None, verification_output=None):
         # Match the real judge_goal contract:
         # (verdict, reason, parse_failed, wait_directive, transport_failed)
         return "continue", "missing verification evidence", False, None, False
@@ -800,6 +800,128 @@ def test_complete_goal_mode_rejected_by_judge(monkeypatch, tmp_path):
     try:
         task = kb.get_task(conn2, goal_task_id)
         assert task.status == "running"  # Should still be running, not done
+    finally:
+        conn2.close()
+
+
+def test_complete_goal_mode_accepts_weak_summary_with_verified_artifacts(monkeypatch, tmp_path):
+    """Regression: a terse summary is accepted when the artifact manifest
+    proves the goal, and the verification output is passed through."""
+    from pathlib import Path as _Path
+    from hermes_cli import kanban_db as kb
+    from tools import kanban_tools as kt
+
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setenv("HERMES_PROFILE", "test-worker")
+    # Treat tmp_path as managed scratch so artifacts are content-bound.
+    monkeypatch.setenv("HERMES_KANBAN_WORKSPACES_ROOT", str(tmp_path))
+    monkeypatch.delenv("HERMES_SESSION_ID", raising=False)
+    monkeypatch.setattr(_Path, "home", lambda: tmp_path)
+
+    kb._INITIALIZED_PATHS.clear()
+    kb.init_db()
+    conn = kb.connect()
+    try:
+        goal_task_id = kb.create_task(
+            conn, title="goal-mode-test", assignee="test-worker",
+            body="Produce report.md with findings.", goal_mode=True
+        )
+        kb.claim_task(conn, goal_task_id)
+    finally:
+        conn.close()
+    monkeypatch.setenv("HERMES_KANBAN_TASK", goal_task_id)
+
+    workspace = tmp_path / goal_task_id
+    workspace.mkdir()
+    report = workspace / "report.md"
+    report.write_text("# Verified findings\n", encoding="utf-8")
+
+    captured = {}
+    def mock_judge_goal(*, goal, last_response, artifact_manifest=None, verification_output=None, **kwargs):
+        captured["manifest"] = artifact_manifest
+        captured["verification_output"] = verification_output
+        # Accept only when the manifest proves the artifact exists.
+        if artifact_manifest and any(m.get("logical_name") == "report.md" for m in artifact_manifest):
+            return "done", "manifest proves completion", False, None, False
+        return "continue", "no manifest evidence", False, None, False
+
+    monkeypatch.setattr("tools.kanban_tools.judge_goal", mock_judge_goal)
+    monkeypatch.setattr("tools.kanban_tools._goal_judge_available", lambda: True)
+
+    out = kt._handle_complete(
+        {
+            "summary": "done",
+            "artifacts": [str(report)],
+            "metadata": {"verification_output": "pytest -q passed 5 tests"},
+        }
+    )
+    d = json.loads(out)
+    assert d.get("ok") is True, d
+    assert captured["verification_output"] == "pytest -q passed 5 tests"
+    assert captured["manifest"]
+    assert any(m.get("logical_name") == "report.md" for m in captured["manifest"])
+
+    conn2 = kb.connect()
+    try:
+        assert kb.get_task(conn2, goal_task_id).status == "done"
+    finally:
+        conn2.close()
+
+
+def test_complete_goal_mode_rejects_missing_artifact_claim(monkeypatch, tmp_path):
+    """Regression: a summary claiming an artifact that does not exist on disk
+    must be rejected because the pre-judge readback gate removes the manifest."""
+    from pathlib import Path as _Path
+    from hermes_cli import kanban_db as kb
+    from tools import kanban_tools as kt
+
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setenv("HERMES_PROFILE", "test-worker")
+    monkeypatch.setenv("HERMES_KANBAN_WORKSPACES_ROOT", str(tmp_path))
+    monkeypatch.delenv("HERMES_SESSION_ID", raising=False)
+    monkeypatch.setattr(_Path, "home", lambda: tmp_path)
+
+    kb._INITIALIZED_PATHS.clear()
+    kb.init_db()
+    conn = kb.connect()
+    try:
+        goal_task_id = kb.create_task(
+            conn, title="goal-mode-test", assignee="test-worker",
+            body="Produce report.md with findings.", goal_mode=True
+        )
+        kb.claim_task(conn, goal_task_id)
+    finally:
+        conn.close()
+    monkeypatch.setenv("HERMES_KANBAN_TASK", goal_task_id)
+
+    # Claim a file that does not exist.
+    missing = tmp_path / goal_task_id / "report.md"
+
+    def mock_judge_goal(*, goal, last_response, artifact_manifest=None, verification_output=None, **kwargs):
+        # Reject when no manifest evidence is present (the readback gate should
+        # have removed the bogus manifest and injected a failure note).
+        if not artifact_manifest and "Artifact readback failures" in (verification_output or ""):
+            return "continue", "claimed artifact missing on disk", False, None, False
+        return "done", "accepted", False, None, False
+
+    monkeypatch.setattr("tools.kanban_tools.judge_goal", mock_judge_goal)
+    monkeypatch.setattr("tools.kanban_tools._goal_judge_available", lambda: True)
+
+    out = kt._handle_complete(
+        {"summary": "done", "artifacts": [str(missing)]}
+    )
+    d = json.loads(out)
+    assert "error" in d, d
+    # The missing artifact is blocked before the judge gate (artifact
+    # preservation gate). The important invariant is the task is NOT done.
+
+    conn2 = kb.connect()
+    try:
+        assert kb.get_task(conn2, goal_task_id).status == "running"
     finally:
         conn2.close()
 

@@ -35,6 +35,7 @@ import re
 import time
 from dataclasses import dataclass, field, asdict
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 logger = logging.getLogger(__name__)
@@ -71,6 +72,10 @@ DEFAULT_MAX_CONSECUTIVE_PARSE_FAILURES = 3
 # A broken/invalid API key returns 401 every call — the loop must not
 # run until the turn budget, wasting every turn on an unreachable judge.
 DEFAULT_MAX_CONSECUTIVE_TRANSPORT_FAILURES = 5
+# Max characters of verification output (test logs, command output, etc.)
+# passed to the goal-mode judge as evidence. Kept small so the prompt stays
+# within the auxiliary model's context budget.
+JUDGE_VERIFICATION_OUTPUT_MAX_CHARS = 2000
 
 
 CONTINUATION_PROMPT_TEMPLATE = (
@@ -117,11 +122,18 @@ CONTINUATION_PROMPT_WITH_SUBGOALS_TEMPLATE = (
 JUDGE_SYSTEM_PROMPT = (
     "You are a strict judge evaluating whether an autonomous agent has "
     "achieved a user's stated goal. You receive the goal text, the agent's "
-    "most recent response, and — when present — a list of background "
-    "processes the agent has running. Decide one of three verdicts.\n\n"
+    "most recent response, an optional content-verified artifact manifest, "
+    "optional bounded verification output, and — when present — a list of "
+    "background processes the agent has running. Decide one of three verdicts.\n\n"
     "DONE — the goal is fully satisfied:\n"
     "- The response explicitly confirms the goal was completed, OR\n"
     "- The response clearly shows the final deliverable was produced, OR\n"
+    "- The artifact manifest lists real files whose SHA-256 hashes and sizes "
+    "plausibly prove the deliverables exist and match the goal, even if the "
+    "response wording is terse or vague. Use the manifest as primary evidence "
+    "when it is present and non-empty.\n"
+    "- The bounded verification output (command results, test output, etc.) "
+    "concretely proves the verification criterion.\n"
     "- The response explains the goal is unachievable / blocked / needs "
     "user input (treat this as DONE with reason describing the block).\n\n"
     "WAIT — the goal is NOT done, but the next step is to wait for async "
@@ -163,11 +175,75 @@ JUDGE_BACKGROUND_BLOCK_TEMPLATE = (
 )
 
 
+def _render_artifact_manifest_block(
+    artifact_manifest: Optional[List[Dict[str, Any]]],
+) -> str:
+    """Render the canonical artifact manifest for the judge prompt.
+
+    Each entry is expected to have ``logical_name``, ``source_path``,
+    ``size``, and ``content_hash``. Returns an empty string when the manifest
+    is empty so the prompt is byte-identical to the no-manifest case.
+    """
+    if not artifact_manifest:
+        return ""
+    lines: List[str] = []
+    for entry in artifact_manifest:
+        if not isinstance(entry, dict):
+            continue
+        name = entry.get("logical_name") or entry.get("source_path") or "artifact"
+        size = entry.get("size")
+        h = entry.get("content_hash") or "unknown"
+        path = entry.get("source_path") or ""
+        line = f"- {name}"
+        if size is not None:
+            line += f" ({size} bytes)"
+        line += f" sha256={h}"
+        if path:
+            line += f" path={path}"
+        lines.append(line)
+    if not lines:
+        return ""
+    return (
+        "Declared deliverables (content-verified artifact manifest):\n"
+        + "\n".join(lines)
+        + "\n\n"
+    )
+
+
+def _render_verification_output_block(
+    verification_output: Optional[str],
+) -> str:
+    """Render bounded verification output for the judge prompt.
+
+    Empty/None returns an empty string so the prompt is unchanged when no
+    verification output is supplied.
+    """
+    if not verification_output:
+        return ""
+    text = str(verification_output).strip()
+    if not text:
+        return ""
+    text = _truncate(text, JUDGE_VERIFICATION_OUTPUT_MAX_CHARS)
+    return f"Verification/test output (bounded):\n{text}\n\n"
+
+
 JUDGE_USER_PROMPT_TEMPLATE = (
     "Goal:\n{goal}\n\n"
+    "{artifact_manifest_block}"
+    "{verification_block}"
     "Agent's most recent response:\n{response}\n\n"
     "{background_block}"
     "Current time: {current_time}\n\n"
+    "Decision rules:\n"
+    "- The goal is DONE if the response and the artifact manifest together "
+    "prove the work was completed. A weak summary ('done', 'shipped') is "
+    "acceptable ONLY when the manifest lists real, on-disk files with "
+    "matching SHA-256 hashes that plausibly satisfy the goal.\n"
+    "- The goal is NOT done if the manifest is empty or the listed files "
+    "do not substantively address the goal.\n"
+    "- If the response explains the work is blocked / unachievable / needs "
+    "user input, treat it as DONE with the reason describing the block.\n"
+    "- Otherwise the goal is NOT done — CONTINUE.\n\n"
     "Is the goal satisfied — done, continue, or wait?"
 )
 
@@ -177,17 +253,20 @@ JUDGE_USER_PROMPT_WITH_SUBGOALS_TEMPLATE = (
     "Goal:\n{goal}\n\n"
     "Additional criteria the user added mid-loop (all must also be "
     "satisfied for the goal to be DONE):\n{subgoals_block}\n\n"
+    "{artifact_manifest_block}"
+    "{verification_block}"
     "Agent's most recent response:\n{response}\n\n"
     "{background_block}"
     "Current time: {current_time}\n\n"
-    "Decision: For each numbered criterion above, find concrete "
-    "evidence in the agent's response that the criterion is "
-    "satisfied. Do not accept generic phrases like 'all requirements "
-    "met' or 'implying it was done' — require specific evidence (a "
-    "file contents excerpt, an output line, a command result). If "
-    "ANY criterion lacks specific evidence in the response, the goal "
-    "is NOT done — return CONTINUE (or WAIT if blocked on a listed "
-    "background process).\n\n"
+    "Decision: For each numbered criterion above, find concrete evidence "
+    "in the agent's response OR in the artifact manifest / verification "
+    "output that the criterion is satisfied. Do not accept generic phrases "
+    "like 'all requirements met' or 'implying it was done' — require "
+    "specific evidence (a file contents excerpt, an output line, a command "
+    "result, or a matching artifact hash). If ANY criterion lacks specific "
+    "evidence, the goal is NOT done — return CONTINUE (or WAIT if blocked "
+    "on a listed background process). A weak summary is acceptable when the "
+    "manifest and verification output together prove the criterion.\n\n"
     "Is the goal AND every additional criterion satisfied?"
 )
 
@@ -199,14 +278,17 @@ JUDGE_USER_PROMPT_WITH_CONTRACT_TEMPLATE = (
     "Goal:\n{goal}\n\n"
     "Completion contract (the authoritative definition of done):\n"
     "{contract_block}\n\n"
+    "{artifact_manifest_block}"
+    "{verification_block}"
     "Agent's most recent response:\n{response}\n\n"
     "{background_block}"
     "Current time: {current_time}\n\n"
     "Decision rules:\n"
-    "- The goal is DONE only when the Verification criterion is satisfied AND "
-    "the response shows concrete evidence of it (a command result, file "
-    "contents excerpt, test/benchmark output) — not a claim like 'done' or "
-    "'all tests pass' without evidence.\n"
+    "- The goal is DONE only when the Verification criterion is satisfied. "
+    "Evidence may come from the response text, the verification output, OR the "
+    "artifact manifest. A weak summary ('done', 'all tests pass') is "
+    "acceptable ONLY when the manifest lists real files with matching SHA-256 "
+    "hashes and/or the verification output proves the criterion.\n"
     "- If any stated Constraint was violated, the goal is NOT done — CONTINUE.\n"
     "- If the response shows the agent is waiting on a listed background "
     "process to satisfy the Verification criterion (e.g. CI is the "
@@ -614,6 +696,156 @@ def migrate_goal_to_session(old_session_id: str, new_session_id: str, *, reason:
         return False
 
 
+def _readback_artifact_manifest(
+    artifact_manifest: Optional[List[Dict[str, Any]]],
+) -> list[str]:
+    """Verify every manifest entry still exists on disk with the recorded hash.
+
+    Returns a list of human-readable failure strings. An empty list means all
+    declared files are present and their SHA-256 hashes match the manifest. This
+    is the producer-side readback gate: it runs on the bytes the judge will be
+    told about, ensuring the judge is reasoning about files that actually exist
+    right now, not stale metadata pointers.
+    """
+    if not artifact_manifest:
+        return []
+    failures: list[str] = []
+    for entry in artifact_manifest:
+        if not isinstance(entry, dict):
+            failures.append(f"invalid manifest entry: {entry!r}")
+            continue
+        path_str = entry.get("source_path") or entry.get("stored_path")
+        expected_hash = entry.get("content_hash")
+        if not path_str:
+            failures.append("manifest entry missing source_path/stored_path")
+            continue
+        path = Path(str(path_str)).expanduser()
+        try:
+            resolved = path.resolve(strict=False)
+        except OSError as exc:
+            failures.append(f"cannot resolve {path}: {exc}")
+            continue
+        if not resolved.is_file():
+            failures.append(f"declared artifact missing on disk: {resolved}")
+            continue
+        if expected_hash:
+            try:
+                actual_hash = _sha256_file_readback(resolved)
+            except OSError as exc:
+                failures.append(f"cannot hash {resolved}: {exc}")
+                continue
+            if actual_hash != expected_hash:
+                failures.append(
+                    f"hash mismatch for {resolved}: expected {expected_hash[:16]}..., "
+                    f"got {actual_hash[:16]}..."
+                )
+    return failures
+
+
+def _sha256_file_readback(path: Path) -> str:
+    """Compute SHA-256 of ``path`` for the readback gate.
+
+    Mirrors the canonical hashing in :mod:`hermes_cli.kanban_db` without adding
+    a circular import. Kept as a small local helper so the readback gate can run
+    independently.
+    """
+    import hashlib
+
+    h = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def _verify_artifact_manifest_and_log(
+    artifact_manifest: Optional[List[Dict[str, Any]]],
+    context: str,
+) -> list[str]:
+    """Run the readback gate and log each failure for observability."""
+    failures = _readback_artifact_manifest(artifact_manifest)
+    for failure in failures:
+        logger.warning("%s: %s", context, failure)
+    return failures
+
+
+def _build_judge_artifact_manifest(
+    metadata: Optional[dict],
+) -> list[dict[str, Any]]:
+    """Build the canonical artifact manifest for the judge from metadata.
+
+    Reuses :func:`kanban_db._artifact_manifest_from_metadata` so the judge sees
+    the exact same content-bound identity (logical_name, source_path, size,
+    content_hash) that the completion digest uses.
+    """
+    if not isinstance(metadata, dict):
+        return []
+    try:
+        from hermes_cli.kanban_db import _artifact_manifest_from_metadata
+
+        return _artifact_manifest_from_metadata(metadata)
+    except Exception as exc:
+        logger.debug("goal judge: could not build artifact manifest: %s", exc)
+        return []
+
+
+def _extract_verification_output(
+    metadata: Optional[dict],
+    top_level: Optional[str] = None,
+) -> Optional[str]:
+    """Return bounded verification output, preferring metadata then top-level.
+
+    Accepts a plain string or a dict with ``verification_output`` or
+    ``verification`` key. The output is capped to
+    :data:`JUDGE_VERIFICATION_OUTPUT_MAX_CHARS` characters.
+    """
+    raw: Optional[str] = None
+    if isinstance(metadata, dict):
+        raw = metadata.get("verification_output")
+        if raw is None and isinstance(metadata.get("verification"), str):
+            raw = metadata["verification"]
+    if raw is None and top_level:
+        raw = top_level
+    if raw is None:
+        return None
+    text = str(raw).strip()
+    if not text:
+        return None
+    return _truncate(text, JUDGE_VERIFICATION_OUTPUT_MAX_CHARS)
+
+
+def _build_artifact_manifest_for_judge_gate(
+    metadata: Optional[dict],
+    artifacts: Optional[list[str]],
+) -> list[dict[str, Any]]:
+    """Merge top-level artifacts into metadata and build the canonical manifest.
+
+    The kanban_complete tool allows artifacts both as a top-level parameter and
+    inside metadata. This helper merges them the same way the tool does, then
+    delegates to the canonical kanban_db manifest builder.
+    """
+    merged_metadata: dict = {}
+    if isinstance(metadata, dict):
+        merged_metadata = dict(metadata)
+    existing = merged_metadata.get("artifacts")
+    seen: set[str] = set()
+    merged: list[str] = []
+    if isinstance(existing, (list, tuple)):
+        for item in existing:
+            s = str(item).strip()
+            if s and s not in seen:
+                seen.add(s)
+                merged.append(s)
+    for item in (artifacts or []):
+        s = str(item).strip()
+        if s and s not in seen:
+            seen.add(s)
+            merged.append(s)
+    if merged:
+        merged_metadata["artifacts"] = merged
+    return _build_judge_artifact_manifest(merged_metadata)
+
+
 # ──────────────────────────────────────────────────────────────────────
 # Judge
 # ──────────────────────────────────────────────────────────────────────
@@ -851,6 +1083,8 @@ def judge_goal(
     subgoals: Optional[List[str]] = None,
     background_processes: Optional[List[Dict[str, Any]]] = None,
     contract: Optional[GoalContract] = None,
+    artifact_manifest: Optional[List[Dict[str, Any]]] = None,
+    verification_output: Optional[str] = None,
 ) -> Tuple[str, str, bool, Optional[Dict[str, Any]], bool]:
     """Ask the auxiliary model whether the goal is satisfied.
 
@@ -878,10 +1112,18 @@ def judge_goal(
     verdict naming its pid, parking the loop instead of re-poking.
     ``contract`` is an optional structured completion contract; when present
     the judge decides DONE strictly against its Verification criterion and
-    refuses completion when a Constraint was violated. All three are additive
-    — a contract, subgoals, and a background-process list can coexist in one
-    judge prompt; when none are set, behavior is identical to the original
-    free-form judge.
+    refuses completion when a Constraint was violated.
+
+    ``artifact_manifest`` is the canonical content-bound artifact manifest
+    (path, size, SHA-256 hash per file) produced by the current turn. When
+    present, the judge is instructed to treat matching artifact hashes as
+    primary evidence and may accept a terse summary if the manifest proves
+    the goal. ``verification_output`` is an optional bounded block of command
+    output/test results that the judge may also weigh as evidence.
+
+    All inputs are additive — a contract, subgoals, background-process list,
+    artifact manifest, and verification output can coexist in one judge prompt;
+    when none are set, behavior is identical to the original free-form judge.
 
     This is deliberately fail-open: transport errors return ``("continue", ..., ..., None, True)``
     — the ``transport_failed=True`` flag lets callers track and auto-pause after
@@ -907,6 +1149,8 @@ def judge_goal(
     # truth.
     clean_subgoals = [s.strip() for s in (subgoals or []) if s and s.strip()]
     background_block = _render_background_block(background_processes)
+    artifact_manifest_block = _render_artifact_manifest_block(artifact_manifest)
+    verification_block = _render_verification_output_block(verification_output)
     current_time = datetime.now(tz=timezone.utc).astimezone().strftime("%Y-%m-%d %H:%M:%S %Z")
 
     if contract is not None and not contract.is_empty():
@@ -922,6 +1166,8 @@ def judge_goal(
             contract_block=_truncate(contract_block, 2500),
             response=_truncate(last_response, _JUDGE_RESPONSE_SNIPPET_CHARS),
             background_block=background_block,
+            artifact_manifest_block=artifact_manifest_block,
+            verification_block=verification_block,
             current_time=current_time,
         )
     elif clean_subgoals:
@@ -933,6 +1179,8 @@ def judge_goal(
             subgoals_block=_truncate(subgoals_block, 2000),
             response=_truncate(last_response, _JUDGE_RESPONSE_SNIPPET_CHARS),
             background_block=background_block,
+            artifact_manifest_block=artifact_manifest_block,
+            verification_block=verification_block,
             current_time=current_time,
         )
     else:
@@ -940,6 +1188,8 @@ def judge_goal(
             goal=_truncate(goal, 2000),
             response=_truncate(last_response, _JUDGE_RESPONSE_SNIPPET_CHARS),
             background_block=background_block,
+            artifact_manifest_block=artifact_manifest_block,
+            verification_block=verification_block,
             current_time=current_time,
         )
 

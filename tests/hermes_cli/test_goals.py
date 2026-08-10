@@ -96,10 +96,107 @@ class TestJudgeGoal:
         assert verdict == "done"
         assert reason == "achieved"
 
+    def test_judge_prompt_includes_artifact_manifest_and_verification(self):
+        """The judge prompt must carry the canonical content-bound manifest and
+        bounded verification output so a terse summary can be accepted on
+        evidence rather than wording alone."""
+        from unittest.mock import patch
+        from hermes_cli import goals
 
-# ──────────────────────────────────────────────────────────────────────
-# GoalManager lifecycle + persistence
-# ──────────────────────────────────────────────────────────────────────
+        captured = {}
+
+        class _FakeMsg:
+            content = '{"done": true, "reason": "manifest proves it"}'
+        class _FakeChoice:
+            message = _FakeMsg()
+        class _FakeResp:
+            choices = [_FakeChoice()]
+        def _fake_call_llm(**kwargs):
+            captured.update(kwargs)
+            return _FakeResp()
+
+        manifest = [
+            {
+                "logical_name": "report.md",
+                "source_path": "/tmp/report.md",
+                "size": 42,
+                "content_hash": "a" * 64,
+            }
+        ]
+        with patch("agent.auxiliary_client.call_llm", side_effect=_fake_call_llm):
+            verdict, reason, _, _, _ = goals.judge_goal(
+                "ship the report",
+                "done",
+                artifact_manifest=manifest,
+                verification_output="pytest -q passed 12 tests",
+            )
+
+        assert verdict == "done"
+        sent_messages = captured.get("messages") or []
+        user_msg = next(
+            (m["content"] for m in sent_messages if m["role"] == "user"), ""
+        )
+        assert "Declared deliverables" in user_msg
+        assert "report.md" in user_msg
+        assert "sha256=" + "a" * 64 in user_msg
+        assert "Verification/test output (bounded)" in user_msg
+        assert "pytest -q passed 12 tests" in user_msg
+
+    def test_readback_gate_rejects_missing_artifact(self, tmp_path):
+        """A manifest entry pointing at a missing file must produce a readback
+        failure, not be silently passed to the judge as evidence."""
+        from hermes_cli import goals
+
+        manifest = [
+            {
+                "logical_name": "missing.txt",
+                "source_path": str(tmp_path / "does-not-exist.txt"),
+                "size": 1,
+                "content_hash": "a" * 64,
+            }
+        ]
+        failures = goals._readback_artifact_manifest(manifest)
+        assert failures
+        assert "missing on disk" in failures[0]
+
+    def test_readback_gate_accepts_matching_hash(self, tmp_path):
+        """A manifest entry whose file exists and hash matches must pass the
+        readback gate with no failures."""
+        import hashlib
+        from hermes_cli import goals
+
+        artifact = tmp_path / "real.txt"
+        data = b"real artifact bytes"
+        artifact.write_bytes(data)
+        expected = hashlib.sha256(data).hexdigest()
+        manifest = [
+            {
+                "logical_name": "real.txt",
+                "source_path": str(artifact),
+                "size": len(data),
+                "content_hash": expected,
+            }
+        ]
+        assert goals._readback_artifact_manifest(manifest) == []
+
+    def test_readback_gate_rejects_hash_mismatch(self, tmp_path):
+        """A manifest entry whose bytes changed since the digest was recorded
+        must produce a hash-mismatch failure."""
+        from hermes_cli import goals
+
+        artifact = tmp_path / "stale.txt"
+        artifact.write_bytes(b"original")
+        manifest = [
+            {
+                "logical_name": "stale.txt",
+                "source_path": str(artifact),
+                "size": 8,
+                "content_hash": "0" * 64,
+            }
+        ]
+        failures = goals._readback_artifact_manifest(manifest)
+        assert failures
+        assert "hash mismatch" in failures[0]
 
 
 class TestGoalManager:
@@ -707,7 +804,8 @@ class TestJudgeWithContract:
         )
         assert "completion contract" in user_msg.lower()
         assert "pytest -q passes" in user_msg
-        assert "concrete evidence" in user_msg
+        assert "Evidence may come from" in user_msg
+        assert "artifact manifest" in user_msg
 
 
 class TestDraftContract:

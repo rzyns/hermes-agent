@@ -2824,10 +2824,37 @@ def _cmd_complete(args: argparse.Namespace) -> int:
                 except Exception:
                     pass
                 if judge_available:
-                    from hermes_cli.goals import judge_goal
+                    from hermes_cli.goals import (
+                        judge_goal,
+                        _build_artifact_manifest_for_judge_gate,
+                        _extract_verification_output,
+                        _verify_artifact_manifest_and_log,
+                    )
                     verdict = "done"
                     reason = ""
                     try:
+                        # Build canonical manifest + bounded verification output.
+                        # Run a producer-side readback gate so the judge reasons
+                        # about bytes that exist on disk.
+                        manifest = _build_artifact_manifest_for_judge_gate(
+                            metadata, None
+                        )
+                        verification_output = _extract_verification_output(
+                            metadata
+                        )
+                        readback_failures = _verify_artifact_manifest_and_log(
+                            manifest, "pre-judge readback"
+                        )
+                        if readback_failures:
+                            manifest = []
+                            failure_block = "Artifact readback failures:\n" + "\n".join(
+                                readback_failures
+                            )
+                            verification_output = (
+                                f"{verification_output}\n\n{failure_block}"
+                                if verification_output
+                                else failure_block
+                            )
                         # judge_goal returns (verdict, reason, parse_failed,
                         # wait_directive, transport_failed) — see
                         # hermes_cli/goals.py. Unpacking fewer raises
@@ -2836,6 +2863,8 @@ def _cmd_complete(args: argparse.Namespace) -> int:
                         verdict, reason, _, _, _ = judge_goal(
                             goal=f"{task.title}\n\n{task.body or ''}".strip(),
                             last_response=(summary or args.result or "").strip(),
+                            artifact_manifest=manifest,
+                            verification_output=verification_output,
                         )
                     except Exception as judge_exc:
                         import logging as _logging

@@ -53,3 +53,50 @@ def test_build_artifact_manifest_flags_missing_or_external_paths(tmp_path):
     assert manifest["artifacts"][0]["in_workspace"] is False
     assert manifest["artifacts"][1]["exists"] is False
     assert manifest["artifacts"][1]["in_workspace"] is True
+
+
+def test_post_publish_readback_gate_catches_hash_mismatch(tmp_path):
+    """The attachment-insertion readback gate must re-hash stored files and
+    reject a manifest whose recorded content_hash no longer matches disk bytes."""
+    import hashlib
+    from hermes_cli import kanban_db as kb
+
+    stored = tmp_path / "report.md"
+    stored.write_bytes(b"original bytes")
+    expected = hashlib.sha256(b"original bytes").hexdigest()
+    manifest = [
+        {
+            "logical_name": "report.md",
+            "source_path": str(stored),
+            "stored_path": str(stored),
+            "size": len(b"original bytes"),
+            "content_hash": expected,
+        }
+    ]
+    assert kb._verify_published_artifact_manifest(manifest) == []
+
+    # Simulate corruption/overwrite after insertion.
+    stored.write_bytes(b"tampered bytes")
+    failures = kb._verify_published_artifact_manifest(manifest)
+    assert failures
+    assert "post-publish hash mismatch" in failures[0]
+
+
+def test_post_publish_readback_gate_flags_missing_file(tmp_path):
+    """The attachment-insertion readback gate must flag a stored_path that no
+    longer exists on disk."""
+    from hermes_cli import kanban_db as kb
+
+    stored = tmp_path / "gone.txt"
+    manifest = [
+        {
+            "logical_name": "gone.txt",
+            "source_path": str(stored),
+            "stored_path": str(stored),
+            "size": 0,
+            "content_hash": "0" * 64,
+        }
+    ]
+    failures = kb._verify_published_artifact_manifest(manifest)
+    assert failures
+    assert "published artifact missing on disk" in failures[0]

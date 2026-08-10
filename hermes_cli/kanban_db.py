@@ -7810,6 +7810,49 @@ def _record_completion_artifacts(
     return recorded
 
 
+def _verify_published_artifact_manifest(
+    published_manifest: list[dict[str, Any]],
+) -> list[str]:
+    """Post-insertion readback gate for published attachment files.
+
+    Re-hashes every stored file and compares it to the content_hash recorded in
+    the manifest. Returns a list of human-readable failure strings; an empty list
+    means every attachment byte on disk matches the manifest the judge and the
+    completion digest reasoned about. This is the attachment-insertion boundary
+    counterpart of the pre-judge readback gate.
+    """
+    if not published_manifest:
+        return []
+    failures: list[str] = []
+    for entry in published_manifest:
+        stored = entry.get("stored_path")
+        expected_hash = entry.get("content_hash")
+        if not stored:
+            failures.append("published entry missing stored_path")
+            continue
+        path = Path(str(stored)).expanduser()
+        try:
+            resolved = path.resolve(strict=False)
+        except OSError as exc:
+            failures.append(f"cannot resolve {path}: {exc}")
+            continue
+        if not resolved.is_file():
+            failures.append(f"published artifact missing on disk: {resolved}")
+            continue
+        if expected_hash:
+            try:
+                actual_hash = _sha256_file(resolved)
+            except OSError as exc:
+                failures.append(f"cannot hash {resolved}: {exc}")
+                continue
+            if actual_hash != expected_hash:
+                failures.append(
+                    f"post-publish hash mismatch for {resolved}: "
+                    f"expected {expected_hash[:16]}..., got {actual_hash[:16]}..."
+                )
+    return failures
+
+
 def _rewrite_completed_event_artifact_paths(
     conn: sqlite3.Connection,
     task_id: str,
@@ -8023,6 +8066,14 @@ def _finalize_completion_result(
                     _record_completion_artifacts(
                         conn, task_id, published_manifest, now=now
                     )
+                    readback_failures = _verify_published_artifact_manifest(
+                        published_manifest
+                    )
+                    if readback_failures:
+                        raise ArtifactPreservationError(
+                            "post-publish artifact readback failed: "
+                            + "; ".join(readback_failures)
+                        )
                     conn.execute(
                         """
                         UPDATE task_completion_results
