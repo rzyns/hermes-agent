@@ -12,6 +12,7 @@ Covers three layers:
 
 from __future__ import annotations
 
+import json
 import sqlite3
 from pathlib import Path
 
@@ -416,7 +417,8 @@ class TestCLIJudgeGate:
     """
 
     def _run(self, monkeypatch, *, goal_mode=True, judge_available=True,
-             verdict="done", reason="", complete_ok=True, summary="done"):
+             verdict="done", reason="", complete_ok=True, summary="done",
+             metadata=None, build_manifest=None, verify_failures=None):
         import argparse
         import types
         from unittest.mock import MagicMock
@@ -429,6 +431,8 @@ class TestCLIJudgeGate:
         )
         fake_conn = MagicMock()
         complete_calls: list = []
+        readback_contexts: list = []
+        manifest_calls: list = []
 
         def fake_connect_closing():
             from contextlib import contextmanager
@@ -441,6 +445,16 @@ class TestCLIJudgeGate:
             complete_calls.append(tid)
             return complete_ok
 
+        def fake_build_manifest(md, artifacts):
+            manifest_calls.append((md, artifacts))
+            if build_manifest is not None:
+                return build_manifest
+            return []
+
+        def fake_verify_manifest(manifest, context):
+            readback_contexts.append(context)
+            return verify_failures or []
+
         monkeypatch.setattr("hermes_cli.kanban.kb.get_task", lambda conn, tid: fake_task)
         monkeypatch.setattr("hermes_cli.kanban.kb.complete_task", fake_complete_task)
         monkeypatch.setattr("hermes_cli.kanban.kb.connect_closing", fake_connect_closing)
@@ -451,18 +465,30 @@ class TestCLIJudgeGate:
             "agent.auxiliary_client.get_text_auxiliary_client",
             lambda name: _aux_client,
         )
+        monkeypatch.setattr(
+            "hermes_cli.goals._build_artifact_manifest_for_judge_gate",
+            fake_build_manifest,
+        )
+        monkeypatch.setattr(
+            "hermes_cli.goals._verify_artifact_manifest_and_log",
+            fake_verify_manifest,
+        )
         # Match the real judge_goal contract:
         # (verdict, reason, parse_failed, wait_directive, transport_failed)
-        monkeypatch.setattr(
-            "hermes_cli.goals.judge_goal",
-            lambda **kw: (verdict, reason, False, None, False),
-        )
+        captured = {}
+        def fake_judge_goal(*, goal, last_response, artifact_manifest=None, verification_output=None, **kwargs):
+            captured["manifest"] = artifact_manifest
+            captured["verification_output"] = verification_output
+            return (verdict, reason, False, None, False)
 
-        args = argparse.Namespace(task_ids=["t1"], summary=summary, result=None, metadata=None)
-        return _cmd_complete(args), complete_calls
+        monkeypatch.setattr("hermes_cli.goals.judge_goal", fake_judge_goal)
+
+        args = argparse.Namespace(task_ids=["t1"], summary=summary, result=None, metadata=json.dumps(metadata) if isinstance(metadata, dict) else metadata)
+        rc = _cmd_complete(args)
+        return rc, complete_calls, readback_contexts, manifest_calls, captured
 
     def test_judge_rejects_premature_completion(self, monkeypatch):
-        rc, complete_calls = self._run(
+        rc, complete_calls, *_ = self._run(
             monkeypatch, verdict="continue", reason="criteria not met"
         )
         assert rc != 0, "judge rejection must produce non-zero exit code"
@@ -471,18 +497,52 @@ class TestCLIJudgeGate:
         )
 
     def test_judge_allows_accepted_completion(self, monkeypatch):
-        rc, complete_calls = self._run(monkeypatch, verdict="done")
+        rc, complete_calls, *_ = self._run(monkeypatch, verdict="done")
         assert rc == 0
         assert complete_calls == ["t1"]
 
     def test_judge_unavailable_fails_open(self, monkeypatch):
         """No auxiliary client configured → gate skipped, task completes."""
-        rc, complete_calls = self._run(monkeypatch, judge_available=False)
+        rc, complete_calls, *_ = self._run(monkeypatch, judge_available=False)
         assert rc == 0
         assert complete_calls == ["t1"]
 
     def test_non_goal_mode_task_skips_gate(self, monkeypatch):
         """Plain (non-goal_mode) tasks are never sent to the judge."""
-        rc, complete_calls = self._run(monkeypatch, goal_mode=False)
+        rc, complete_calls, *_ = self._run(monkeypatch, goal_mode=False)
         assert rc == 0
         assert complete_calls == ["t1"]
+
+    def test_readback_gate_wired_into_cli_complete(self, monkeypatch):
+        """The CLI goal-mode path must invoke the producer-side readback
+        helper; removing the call would make this fail."""
+        rc, complete_calls, readback_contexts, manifest_calls, captured = self._run(
+            monkeypatch,
+            verdict="done",
+            metadata={"verification_output": "tests pass", "artifacts": ["/tmp/report.md"]},
+            build_manifest=[{"logical_name": "report.md"}],
+        )
+        assert rc == 0
+        assert complete_calls == ["t1"]
+        assert readback_contexts == ["pre-judge readback", "pre-judge manifest readback"]
+        assert manifest_calls == [({"verification_output": "tests pass", "artifacts": ["/tmp/report.md"]}, None)]
+        assert captured["manifest"] == [{"logical_name": "report.md"}]
+        assert "tests pass" in (captured["verification_output"] or "")
+
+    def test_readback_failure_blocks_manifest_before_judge(self, monkeypatch):
+        """When the readback gate reports failures, the CLI must empty the
+        manifest and prepend the failure block to verification_output."""
+        rc, complete_calls, readback_contexts, _, captured = self._run(
+            monkeypatch,
+            verdict="continue",
+            reason="readback failed",
+            metadata={"verification_output": "tests pass"},
+            build_manifest=[{"logical_name": "report.md", "source_path": "/tmp/report.md"}],
+            verify_failures=["declared artifact missing on disk: /tmp/report.md"],
+        )
+        assert rc != 0
+        assert complete_calls == []
+        assert readback_contexts == ["pre-judge readback", "pre-judge manifest readback"]
+        assert captured["manifest"] == []
+        assert "Artifact readback failures" in (captured["verification_output"] or "")
+        assert "tests pass" in (captured["verification_output"] or "")

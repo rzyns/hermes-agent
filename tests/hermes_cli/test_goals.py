@@ -96,13 +96,189 @@ class TestJudgeGoal:
         assert verdict == "done"
         assert reason == "achieved"
 
+    def test_judge_prompt_includes_artifact_manifest_and_verification(self):
+        """The judge prompt must carry the canonical content-bound manifest and
+        bounded verification output so a terse summary can be accepted on
+        evidence rather than wording alone."""
+        from unittest.mock import patch
+        from hermes_cli import goals
 
-# ──────────────────────────────────────────────────────────────────────
-# GoalManager lifecycle + persistence
-# ──────────────────────────────────────────────────────────────────────
+        captured = {}
 
+        class _FakeMsg:
+            content = '{"done": true, "reason": "manifest proves it"}'
+        class _FakeChoice:
+            message = _FakeMsg()
+        class _FakeResp:
+            choices = [_FakeChoice()]
+        def _fake_call_llm(**kwargs):
+            captured.update(kwargs)
+            return _FakeResp()
 
-class TestGoalManager:
+        manifest = [
+            {
+                "logical_name": "report.md",
+                "source_path": "/tmp/report.md",
+                "size": 42,
+                "content_hash": "a" * 64,
+            }
+        ]
+        with patch("agent.auxiliary_client.call_llm", side_effect=_fake_call_llm):
+            verdict, reason, _, _, _ = goals.judge_goal(
+                "ship the report",
+                "done",
+                artifact_manifest=manifest,
+                verification_output="pytest -q passed 12 tests",
+            )
+
+        assert verdict == "done"
+        sent_messages = captured.get("messages") or []
+        user_msg = next(
+            (m["content"] for m in sent_messages if m["role"] == "user"), ""
+        )
+        assert "Declared deliverables" in user_msg
+        assert "report.md" in user_msg
+        assert "sha256=" + "a" * 64 in user_msg
+        assert "Verification/test output (bounded)" in user_msg
+        assert "pytest -q passed 12 tests" in user_msg
+
+    def test_readback_gate_rejects_missing_artifact(self, tmp_path):
+        """A manifest entry pointing at a missing file must produce a readback
+        failure, not be silently passed to the judge as evidence."""
+        from hermes_cli import goals
+
+        manifest = [
+            {
+                "logical_name": "missing.txt",
+                "source_path": str(tmp_path / "does-not-exist.txt"),
+                "size": 1,
+                "content_hash": "a" * 64,
+            }
+        ]
+        failures = goals._readback_artifact_manifest(manifest)
+        assert failures
+        assert "missing on disk" in failures[0]
+
+    def test_readback_gate_accepts_matching_hash(self, tmp_path):
+        """A manifest entry whose file exists and hash matches must pass the
+        readback gate with no failures."""
+        import hashlib
+        from hermes_cli import goals
+
+        artifact = tmp_path / "real.txt"
+        data = b"real artifact bytes"
+        artifact.write_bytes(data)
+        expected = hashlib.sha256(data).hexdigest()
+        manifest = [
+            {
+                "logical_name": "real.txt",
+                "source_path": str(artifact),
+                "size": len(data),
+                "content_hash": expected,
+            }
+        ]
+        assert goals._readback_artifact_manifest(manifest) == []
+
+    def test_readback_gate_rejects_hash_mismatch(self, tmp_path):
+        """A manifest entry whose bytes changed since the digest was recorded
+        must produce a hash-mismatch failure."""
+        from hermes_cli import goals
+
+        artifact = tmp_path / "stale.txt"
+        artifact.write_bytes(b"original")
+        manifest = [
+            {
+                "logical_name": "stale.txt",
+                "source_path": str(artifact),
+                "size": 8,
+                "content_hash": "0" * 64,
+            }
+        ]
+        failures = goals._readback_artifact_manifest(manifest)
+        assert failures
+        assert "hash mismatch" in failures[0]
+
+    def test_verification_output_byte_cap_multibyte_regression(self, tmp_path):
+        """Regression: the verification-output cap must be measured in encoded
+        UTF-8 bytes of the final rendered judge block, not Python code points.
+
+        The reviewer's probe produced ~6,000+ bytes against a nominal 2,000 cap.
+        With byte bounding the final rendered block must stay at or below the
+        byte budget, and truncation must never split a codepoint.
+        """
+        from hermes_cli import goals
+
+        # Same probe class the reviewer used: many copies of a 3-byte char.
+        probe = "界" * 5000
+        rendered = goals._render_verification_output_block(probe)
+        encoded = rendered.encode("utf-8")
+        assert len(encoded) <= goals.JUDGE_VERIFICATION_OUTPUT_MAX_BYTES
+        assert "… [truncated]" in rendered
+        # Truncation must not split a code point.
+        assert encoded.decode("utf-8") == rendered
+
+        # ASCII regression: a small payload is untouched by truncation.
+        ascii_text = "x" * (goals.JUDGE_VERIFICATION_OUTPUT_MAX_BYTES // 2)
+        block = goals._render_verification_output_block(ascii_text)
+        assert "… [truncated]" not in block
+        assert len(block.encode("utf-8")) < goals.JUDGE_VERIFICATION_OUTPUT_MAX_BYTES
+
+        # Exact-value boundary: a payload of pure 3-byte codepoints should fill
+        # the budget as tightly as codepoint alignment allows.
+        three_byte = goals._render_verification_output_block("界" * 5000)
+        assert len(three_byte.encode("utf-8")) == 1997
+
+        # _extract_verification_output also enforces bytes and stays within the
+        # raw budget (the renderer reserves wrapper/sentinel bytes from the same
+        # budget, so extracted text itself must not exceed it).
+        long_text = "界" * 3000
+        extracted = goals._extract_verification_output(
+            {"verification_output": long_text}
+        )
+        assert extracted is not None
+        assert len(extracted.encode("utf-8")) <= goals.JUDGE_VERIFICATION_OUTPUT_MAX_BYTES
+        assert "… [truncated]" in extracted
+
+    def test_verification_output_byte_cap_mixed_width_and_combining(self, tmp_path):
+        """Regression: mixed-width valid UTF-8 (ASCII base + combining marks)
+        must stay within the cap, and truncation must remain codepoint-safe even
+        when the byte budget lands mid-sequence.
+        """
+        from hermes_cli import goals
+
+        # Reviewer's exact reproduction: latin small e + U+0301 (3 bytes per
+        # precomposed codepoint sequence).
+        probe = "e\u0301" * 5000
+        rendered = goals._render_verification_output_block(probe)
+        encoded = rendered.encode("utf-8")
+        assert len(encoded) <= goals.JUDGE_VERIFICATION_OUTPUT_MAX_BYTES
+        assert "… [truncated]" in rendered
+        assert encoded.decode("utf-8") == rendered
+        # Exact value for this encoding under the derived framing budget.
+        assert len(encoded) == 1998
+
+        # Boundary: a payload that would force the cap to fall inside a
+        # two-codepoint combining sequence. The renderer must never split a
+        # codepoint; we verify byte validity and that the final character is
+        # either the base 'e' or the combining pair, never a lone combining mark.
+        partial = "e" + "\u0301" * 1000
+        rendered_boundary = goals._render_verification_output_block(partial)
+        encoded_boundary = rendered_boundary.encode("utf-8")
+        assert len(encoded_boundary) <= goals.JUDGE_VERIFICATION_OUTPUT_MAX_BYTES
+        assert encoded_boundary.decode("utf-8") == rendered_boundary
+        # The final character must be a full codepoint (not a bare combining mark).
+        last_cp = rendered_boundary[-1] if rendered_boundary else ""
+        assert ord(last_cp) != 0x0301
+
+        # _extract_verification_output carries the same invariant for the
+        # verification string before wrapping.
+        extracted = goals._extract_verification_output(
+            {"verification_output": probe}
+        )
+        assert extracted is not None
+        assert len(extracted.encode("utf-8")) <= goals.JUDGE_VERIFICATION_OUTPUT_MAX_BYTES
+        assert "… [truncated]" in extracted
+        assert extracted.encode("utf-8").decode("utf-8") == extracted
 
     def test_set_then_status(self, hermes_home):
         from hermes_cli.goals import GoalManager
@@ -707,7 +883,8 @@ class TestJudgeWithContract:
         )
         assert "completion contract" in user_msg.lower()
         assert "pytest -q passes" in user_msg
-        assert "concrete evidence" in user_msg
+        assert "Evidence may come from" in user_msg
+        assert "artifact manifest" in user_msg
 
 
 class TestDraftContract:
