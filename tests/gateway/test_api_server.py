@@ -1125,8 +1125,8 @@ class TestRunEventCallback:
     async def test_forwards_subagent_lifecycle_events(self, adapter):
         run_id = "run_subagent_events"
         loop = asyncio.get_running_loop()
-        queue = asyncio.Queue()
-        adapter._run_streams[run_id] = queue
+        adapter._run_events_producer.admit_run(run_id)
+        adapter._run_streams[run_id] = True
         adapter._run_statuses.pop(run_id, None)
 
         callback = adapter._make_run_event_callback(run_id, loop)
@@ -1152,21 +1152,25 @@ class TestRunEventCallback:
             api_calls=2,
         )
 
-        start_event = await asyncio.wait_for(queue.get(), timeout=1.0)
-        complete_event = await asyncio.wait_for(queue.get(), timeout=1.0)
+        # Read events from the producer's replay ring.
+        ring = adapter._run_events_producer._runs[run_id].ring
+        entries = ring.replay_after(0)
+        assert len(entries) == 2
+        start_data = json.loads(entries[0].data)
+        complete_data = json.loads(entries[1].data)
 
-        assert start_event["event"] == "subagent.start"
-        assert start_event["preview"] == "research candidate issue"
-        assert start_event["task_index"] == 0
-        assert start_event["task_count"] == 1
-        assert start_event["subagent_id"] == "deleg_123"
+        assert start_data["event"] == "subagent.start"
+        assert start_data["preview"] == "research candidate issue"
+        assert start_data["task_index"] == 0
+        assert start_data["task_count"] == 1
+        assert start_data["subagent_id"] == "deleg_123"
 
-        assert complete_event["event"] == "subagent.complete"
-        assert complete_event["preview"] == "Timed out after 300s"
-        assert complete_event["status"] == "timeout"
-        assert complete_event["duration_seconds"] == 300.0
-        assert complete_event["api_calls"] == 2
-        assert "timed out after 300s" in complete_event["summary"]
+        assert complete_data["event"] == "subagent.complete"
+        assert complete_data["preview"] == "Timed out after 300s"
+        assert complete_data["status"] == "timeout"
+        assert complete_data["duration_seconds"] == 300.0
+        assert complete_data["api_calls"] == 2
+        assert "timed out after 300s" in complete_data["summary"]
 
         assert adapter._run_statuses[run_id]["last_event"] == "subagent.complete"
 
@@ -1178,8 +1182,8 @@ class TestRunEventCallback:
         correlate the child's session."""
         run_id = "run_subagent_redact"
         loop = asyncio.get_running_loop()
-        queue = asyncio.Queue()
-        adapter._run_streams[run_id] = queue
+        adapter._run_events_producer.admit_run(run_id)
+        adapter._run_streams[run_id] = True
         adapter._run_statuses.pop(run_id, None)
 
         callback = adapter._make_run_event_callback(run_id, loop)
@@ -1195,7 +1199,10 @@ class TestRunEventCallback:
             output_tail=f"env shows {secret}",
         )
 
-        event = await asyncio.wait_for(queue.get(), timeout=1.0)
+        ring = adapter._run_events_producer._runs[run_id].ring
+        entries = ring.replay_after(0)
+        assert len(entries) == 1
+        event = json.loads(entries[0].data)
         assert event["child_session_id"] == "child-sess-42"
         for field in ("preview", "goal", "summary", "output_tail"):
             assert secret not in event[field], field

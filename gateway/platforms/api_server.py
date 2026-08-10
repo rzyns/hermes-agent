@@ -94,6 +94,16 @@ from gateway.platforms.base import (
 from agent.redact import redact_sensitive_text
 from agent.interrupt_compat import request_hard_interrupt
 from gateway.readiness import collect_runtime_readiness
+from gateway.platforms.run_events_producer import (
+    CursorError,
+    DEFAULT_SNAPSHOT,
+    IncludeParseError,
+    RunEventsCapabilitiesSnapshot,
+    RunEventsProducer,
+    is_replayable_event,
+    parse_cursor,
+    parse_include,
+)
 
 from agent.secret_scope import UnscopedSecretError as _UnscopedSecretError
 from agent.secret_scope import get_secret as _scoped_get_secret
@@ -1569,8 +1579,18 @@ class APIServerAdapter(BasePlatformAdapter):
         self._runner: Optional["web.AppRunner"] = None
         self._site: Optional["web.TCPSite"] = None
         self._response_store = ResponseStore()
-        # Active run streams: run_id -> asyncio.Queue of SSE event dicts
-        self._run_streams: Dict[str, "asyncio.Queue[Optional[Dict]]"] = {}
+        # ── SSE run-events producer (round-6 contract) ────────────────────
+        # Replaces the former single asyncio.Queue per run with a bounded
+        # replay ring + per-subscriber queues, serialization slots, and
+        # four-limit atomic admission.  See run_events_producer.py and the
+        # accepted contract (sha256 162676cd...e8143).
+        self._run_events_producer: RunEventsProducer = RunEventsProducer(
+            RunEventsCapabilitiesSnapshot()
+        )
+        # Legacy existence-tracking dicts retained for the subscriber-polling
+        # loop and TTL sweep; the producer owns the actual event buffers.
+        # Active run streams: run_id -> sentinel (existence tracking only)
+        self._run_streams: Dict[str, Any] = {}
         # Creation timestamps for orphaned-run TTL sweep
         self._run_streams_created: Dict[str, float] = {}
         # Runs with a connected SSE consumer; their queue is actively draining.
@@ -3238,6 +3258,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 "session_key_header": "X-Hermes-Session-Key",
                 "cors": bool(self._cors_origins),
             },
+            "run_events": self._run_events_producer.capabilities_endpoint_block(),
             "endpoints": {
                 "health": {"method": "GET", "path": "/health"},
                 "health_detailed": {"method": "GET", "path": "/health/detailed"},
@@ -6426,20 +6447,20 @@ class APIServerAdapter(BasePlatformAdapter):
         return current
 
     def _make_run_event_callback(self, run_id: str, loop: "asyncio.AbstractEventLoop"):
-        """Return a tool_progress_callback that pushes structured events to the run's SSE queue."""
+        """Return a tool_progress_callback that pushes structured events to the run's SSE producer."""
         def _push(event: Dict[str, Any]) -> None:
             self._set_run_status(
                 run_id,
                 self._run_statuses.get(run_id, {}).get("status", "running"),
                 last_event=event.get("event"),
             )
-            q = self._run_streams.get(run_id)
-            if q is None:
-                return
+            # Emit through the run-events producer (replay ring + subscriber
+            # queues).  The producer is thread-safe; call_soon_threadsafe is
+            # not needed because emit_event operates on plain Python objects.
             try:
-                loop.call_soon_threadsafe(q.put_nowait, event)
+                self._run_events_producer.emit_event(run_id, event.get("event", "error"), event)
             except Exception:
-                pass
+                logger.debug("[api_server] run-events producer emit failed for %s", run_id, exc_info=True)
 
         def _callback(event_type: str, tool_name: str = None, preview: str = None, args=None, **kwargs):
             ts = time.time()
@@ -6615,18 +6636,39 @@ class APIServerAdapter(BasePlatformAdapter):
         approval_session_key = run_id
         ephemeral_system_prompt = instructions
         loop = asyncio.get_running_loop()
-        q: "asyncio.Queue[Optional[Dict]]" = asyncio.Queue()
+        # Admit the run to the run-events producer (four-limit atomic
+        # admission).  If the producer is saturated, return 503 before
+        # creating any stream state.
+        if not self._run_events_producer.admit_run(run_id):
+            return web.json_response(
+                self._run_events_producer.snapshot.overload_error(),
+                status=503,
+                headers={"Retry-After": "1"},
+            )
         created_at = time.time()
-        self._run_streams[run_id] = q
+        self._run_streams[run_id] = True  # existence sentinel
         self._run_streams_created[run_id] = created_at
         self._run_approval_sessions[run_id] = approval_session_key
 
         event_cb = self._make_run_event_callback(run_id, loop)
 
-        def _put_event_if_active(event: Optional[Dict]) -> None:
-            """Enqueue only while this run still owns live transport state."""
-            if self._run_streams.get(run_id) is q:
-                q.put_nowait(event)
+        def _emit_event_if_active(event: Optional[Dict]) -> None:
+            """Emit only while this run still owns live transport state."""
+            if event is None:
+                # Sentinel: the run is terminal.  Mark it terminal in the
+                # producer to start retention countdown.
+                self._run_events_producer.mark_run_terminal(run_id)
+                return
+            if run_id not in self._run_streams:
+                return
+            try:
+                self._run_events_producer.emit_event(
+                    run_id, event.get("event", "error"), event
+                )
+            except Exception:
+                logger.debug(
+                    "[api_server] run-events emit failed for %s", run_id, exc_info=True
+                )
 
         # Also wire stream_delta_callback so message.delta events flow through.
         def _text_cb(delta: Optional[str]) -> None:
@@ -6635,7 +6677,7 @@ class APIServerAdapter(BasePlatformAdapter):
             if run_id not in self._run_streams:
                 return
             try:
-                loop.call_soon_threadsafe(_put_event_if_active, {
+                loop.call_soon_threadsafe(_emit_event_if_active, {
                     "event": "message.delta",
                     "run_id": run_id,
                     "timestamp": time.time(),
@@ -6660,7 +6702,7 @@ class APIServerAdapter(BasePlatformAdapter):
             try:
                 self._set_run_status(run_id, "running")
                 if run_id in self._stopping_run_ids:
-                    _put_event_if_active({
+                    _emit_event_if_active({
                         "event": "run.cancelled",
                         "run_id": run_id,
                         "timestamp": time.time(),
@@ -6710,7 +6752,7 @@ class APIServerAdapter(BasePlatformAdapter):
                         last_event="approval.request",
                     )
                     try:
-                        loop.call_soon_threadsafe(q.put_nowait, event)
+                        loop.call_soon_threadsafe(_emit_event_if_active, event)
                     except Exception:
                         pass
 
@@ -6785,7 +6827,7 @@ class APIServerAdapter(BasePlatformAdapter):
 
                 result, usage = await asyncio.get_running_loop().run_in_executor(None, _run_sync)
                 if run_id in self._stopping_run_ids:
-                    _put_event_if_active({
+                    _emit_event_if_active({
                         "event": "run.cancelled",
                         "run_id": run_id,
                         "timestamp": time.time(),
@@ -6800,7 +6842,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 # block below never fires — issue #15561).
                 elif isinstance(result, dict) and result.get("failed"):
                     error_msg = _redact_api_error_text(result.get("error") or "agent run failed")
-                    _put_event_if_active({
+                    _emit_event_if_active({
                         "event": "run.failed",
                         "run_id": run_id,
                         "timestamp": time.time(),
@@ -6814,7 +6856,7 @@ class APIServerAdapter(BasePlatformAdapter):
                     )
                 else:
                     final_response = result.get("final_response", "") if isinstance(result, dict) else ""
-                    _put_event_if_active({
+                    _emit_event_if_active({
                         "event": "run.completed",
                         "run_id": run_id,
                         "timestamp": time.time(),
@@ -6835,7 +6877,7 @@ class APIServerAdapter(BasePlatformAdapter):
                     last_event="run.cancelled",
                 )
                 try:
-                    _put_event_if_active({
+                    _emit_event_if_active({
                         "event": "run.cancelled",
                         "run_id": run_id,
                         "timestamp": time.time(),
@@ -6860,7 +6902,7 @@ class APIServerAdapter(BasePlatformAdapter):
                     last_event="run.failed",
                 )
                 try:
-                    _put_event_if_active({
+                    _emit_event_if_active({
                         "event": "run.failed",
                         "run_id": run_id,
                         "timestamp": time.time(),
@@ -6877,7 +6919,7 @@ class APIServerAdapter(BasePlatformAdapter):
                     last_event="run.failed",
                 )
                 try:
-                    _put_event_if_active({
+                    _emit_event_if_active({
                         "event": "run.failed",
                         "run_id": run_id,
                         "timestamp": time.time(),
@@ -6899,7 +6941,7 @@ class APIServerAdapter(BasePlatformAdapter):
                     pass
                 # Sentinel: signal SSE stream to close
                 try:
-                    _put_event_if_active(None)
+                    _emit_event_if_active(None)
                 except Exception:
                     pass
                 self._active_run_agents.pop(run_id, None)
@@ -6942,53 +6984,166 @@ class APIServerAdapter(BasePlatformAdapter):
         return web.json_response(status)
 
     async def _handle_run_events(self, request: "web.Request") -> "web.StreamResponse":
-        """GET /v1/runs/{run_id}/events — SSE stream of structured agent lifecycle events."""
+        """GET /v1/runs/{run_id}/events — SSE stream of structured agent lifecycle events.
+
+        Implements the accepted round-6 SSE run-events contract: per-run
+        monotonic IDs, replay ring, per-subscriber bounded queues,
+        Last-Event-ID replay, category include filtering, capabilities
+        control frame, heartbeat, terminal closure, and close-on-lag.
+        """
         auth_err = self._check_auth(request)
         if auth_err:
             return auth_err
 
         run_id = request.match_info["run_id"]
+        producer = self._run_events_producer
+        snapshot = producer.snapshot
 
-        # Allow subscribing slightly before the run is registered (race condition window)
+        # ── Parse include (§4) ───────────────────────────────────────────
+        raw_includes = request.query.getall("include") if "include" in request.query else []
+        try:
+            include_categories = parse_include(raw_includes, snapshot)
+        except IncludeParseError as exc:
+            return web.json_response(exc.error_body(), status=400)
+
+        # ── Parse cursor (§5) ────────────────────────────────────────────
+        raw_cursor = request.headers.get("Last-Event-ID")
+        if raw_cursor is None:
+            raw_cursor = request.query.get("after")
+        try:
+            cursor = parse_cursor(raw_cursor)
+        except CursorError as exc:
+            return web.json_response(exc.error_body(), status=exc.http_status)
+
+        # Allow subscribing slightly before the run is registered (race window).
         for _ in range(20):
-            if run_id in self._run_streams:
+            if producer.run_exists(run_id):
                 break
             await asyncio.sleep(0.05)
         else:
-            return web.json_response(_openai_error(f"Run not found: {run_id}", code="run_not_found"), status=404)
+            return web.json_response(
+                _openai_error(f"Run not found: {run_id}", code="run_not_found"),
+                status=404,
+            )
 
-        q = self._run_streams[run_id]
+        # ── Validate cursor against run state (§5) ───────────────────────
+        try:
+            producer.validate_cursor(run_id, cursor)
+        except CursorError as exc:
+            return web.json_response(exc.error_body(), status=exc.http_status)
+
+        # ── Admit subscriber (four-limit atomic admission, §2) ──────────
+        sub_id = producer.admit_subscriber(run_id, include_categories)
+        if sub_id is None:
+            return web.json_response(
+                snapshot.overload_error(),
+                status=503,
+                headers={"Retry-After": "1"},
+            )
+
         self._run_stream_subscribers.add(run_id)
+
+        # ── Atomic snapshot-plus-subscribe (§5) ──────────────────────────
+        replay_entries, run_active = producer.snapshot_and_subscribe(
+            run_id, sub_id, cursor
+        )
 
         response = web.StreamResponse(
             status=200,
             headers={
                 "Content-Type": "text/event-stream",
-                "Cache-Control": "no-cache",
+                "Cache-Control": "no-cache, no-transform",
                 "X-Accel-Buffering": "no",
+                "Connection": "keep-alive",
             },
         )
         await response.prepare(request)
 
+        async def _write_frame(frame_bytes: bytes) -> bool:
+            """Write a frame to the response. Returns False on broken pipe."""
+            try:
+                await response.write(frame_bytes)
+                return True
+            except (ConnectionResetError, BrokenPipeError):
+                return False
+            except Exception:
+                return False
+
         try:
+            # 1. Capabilities control frame (no id).
+            if not await _write_frame(producer.format_capabilities_frame()):
+                return response
+
+            # 2. Replayed events (with id).
+            for entry in replay_entries:
+                if not await _write_frame(producer.format_replay_frame(entry)):
+                    return response
+
+            # 3. Live event loop.
+            heartbeat_interval = snapshot.heartbeat_seconds
+            poll_interval = 0.05  # 50ms polling for subscriber queue frames
+            last_heartbeat = time.monotonic()
+
             while True:
-                try:
-                    event = await asyncio.wait_for(q.get(), timeout=30.0)
-                except asyncio.TimeoutError:
-                    await response.write(b": keepalive\n\n")
+                # Check for subscriber frames (data events or lag frames).
+                frame = producer.get_subscriber_frame(
+                    run_id, sub_id, timeout=poll_interval
+                )
+                if frame is not None:
+                    if not await _write_frame(frame):
+                        break
+                    # Check if this was a lag frame → close after sending it.
+                    if b"subscriber.lagged" in frame:
+                        # Lag frame was the final frame; close cleanly.
+                        await response.write(b": stream closed\n\n")
+                        break
+                    last_heartbeat = time.monotonic()
                     continue
-                if event is None:
-                    # Run finished — send final SSE comment and close
+
+                # Heartbeat.
+                now_mono = time.monotonic()
+                if now_mono - last_heartbeat >= heartbeat_interval:
+                    if not await _write_frame(producer.format_heartbeat()):
+                        break
+                    last_heartbeat = now_mono
+                    continue
+
+                # Check if the run is terminal and all queues are drained.
+                if not producer.run_is_active(run_id):
+                    # Run has terminated.  Emit the terminal frame if there
+                    # are no more pending subscriber frames.
+                    final_id = 0
+                    # Drain any remaining frames first.
+                    drained_any = False
+                    while True:
+                        frame = producer.get_subscriber_frame(
+                            run_id, sub_id, timeout=0
+                        )
+                        if frame is None:
+                            break
+                        if not await _write_frame(frame):
+                            break
+                        drained_any = True
+                    # Emit terminal frame.
+                    status_info = self._run_statuses.get(run_id, {})
+                    terminal_status = status_info.get("status", "completed")
+                    terminal_frame = producer.format_terminal_frame(
+                        run_id, terminal_status, final_id
+                    )
+                    await _write_frame(terminal_frame)
                     await response.write(b": stream closed\n\n")
                     break
-                payload = f"data: {json.dumps(event)}\n\n"
-                await response.write(payload.encode())
+
+                await asyncio.sleep(poll_interval)
+
         except Exception as exc:
             logger.debug("[api_server] SSE stream error for run %s: %s", run_id, exc)
         finally:
+            producer.remove_subscriber(run_id, sub_id)
             self._run_stream_subscribers.discard(run_id)
-            self._run_streams.pop(run_id, None)
-            self._run_streams_created.pop(run_id, None)
+            # Note: we do NOT pop _run_streams here — the producer retains
+            # the replay ring for terminal_retention_seconds.  The TTL sweep
+            # handles final cleanup.
 
         return response
 
@@ -7123,6 +7278,12 @@ class APIServerAdapter(BasePlatformAdapter):
         """Expire old SSE buffers without treating transport age as run age."""
         if now is None:
             now = time.time()
+        # First, let the run-events producer expire runs whose terminal
+        # retention has elapsed (round-6 contract §2).
+        producer_expired = self._run_events_producer.sweep_expired_runs(now)
+        for run_id in producer_expired:
+            self._run_streams.pop(run_id, None)
+            self._run_streams_created.pop(run_id, None)
         stale = [
             run_id
             for run_id, created_at in list(self._run_streams_created.items())
