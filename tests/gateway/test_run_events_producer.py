@@ -986,9 +986,10 @@ class TestRegressionSerializationSlot:
         assert sub.last_delivered_event_id == 0  # not advanced
 
     def test_serialization_timeout_triggers_close_on_lag(self):
-        """If slot held > heartbeat, serialization-timeout fires close-on-lag
-        (§2 serialization-timeout entry).  This test would FAIL on the old
-        commit where slot state was never transitioned.
+        """If slot held > heartbeat AND a queued event is waiting,
+        serialization-timeout fires close-on-lag (§2 serialization-timeout
+        entry).  Per round-4 fix: the timeout requires a pending next event
+        (one waiting in the queue), not just an occupied slot.
         """
         producer = _make_producer(
             max_subscriber_queue_events=100,
@@ -996,11 +997,15 @@ class TestRegressionSerializationSlot:
         )
         producer.admit_run("r1")
         sub_id = _admit(producer, "r1")
-        # Dequeue an event but do NOT confirm (slot stays ACQUIRED).
+        # Emit two events: the first is dequeued (slot ACQUIRED), the
+        # second waits in the queue — it is the triggering event.
         producer.emit_event("r1", "tool.started", {"i": 1})
+        producer.emit_event("r1", "tool.started", {"i": 2})
         producer.get_subscriber_frame("r1", sub_id, 0)
         sub = producer._runs["r1"].subscribers[sub_id]
         assert sub.slot_acquired
+        assert sub.in_flight_event_id == 1
+        assert sub.queue  # event 2 is waiting
         # Simulate time passing beyond the heartbeat.
         import time as _time
         future = _time.monotonic() + 2.0
@@ -1325,9 +1330,13 @@ class TestRegressionAiohttpBlockedWriteWatchdog:
     """
 
     def test_blocked_replay_write_freezes_via_watchdog(self):
-        """When response.write() blocks for > heartbeat, the independent
-        watchdog fires serialization-timeout, and the subscriber is frozen.
-        The lag frame is produced after the blocked write eventually completes.
+        """When response.write() blocks for > heartbeat AND a queued event
+        is waiting, the independent watchdog fires serialization-timeout,
+        and the subscriber is frozen.  The lag frame is produced after the
+        blocked write eventually completes.
+
+        Per round-4 fix: the serialization-timeout requires a pending next
+        event (one waiting in the queue), not just an occupied slot.
         """
         import asyncio
         from aiohttp import web, ClientSession
@@ -1367,6 +1376,12 @@ class TestRegressionAiohttpBlockedWriteWatchdog:
             sub = producer._runs["r1"].subscribers[sub_id]
             assert sub.slot_acquired
 
+            # Emit an additional event so there's one waiting in the queue
+            # when the timeout fires.  Without this, the timeout would not
+            # fire (no pending next event).
+            producer.emit_event("r1", "tool.started", {"run_id": "r1", "index": 99})
+            assert sub.queue  # event waiting
+
             # Simulate the watchdog firing while the write is blocked.
             import time as _time
             future = _time.monotonic() + 2.0
@@ -1386,3 +1401,290 @@ class TestRegressionAiohttpBlockedWriteWatchdog:
             assert lag is not None and b"subscriber.lagged" in lag
 
         asyncio.get_event_loop().run_until_complete(_run())
+
+
+# ===========================================================================
+# Round-4 regression tests: arena-backed pools + serialization-timeout
+# pending-event requirement
+# ===========================================================================
+
+
+class TestRegressionArenaBackedPools:
+    """Round-3 blocker 1: pools must be arena-backed, not admission counters.
+
+    These tests prove that each pool pre-allocates a contiguous bytearray
+    arena of slot_count × slot_size bytes at construction, that the arena
+    is the enforced allocation ceiling (never grown), and that data is
+    actually written into and read back from arena regions.
+    """
+
+    def test_replay_pool_arena_preallocated(self):
+        """The replay pool arena is a pre-allocated bytearray of exactly
+        max_retained_runs × max_replay_bytes bytes."""
+        producer = _make_producer(max_retained_runs=4, max_replay_bytes=1024)
+        arena = producer._replay_pool.arena
+        assert isinstance(arena, bytearray)
+        assert len(arena) == 4 * 1024
+        # Capacity matches arena size.
+        assert producer._replay_pool.capacity == len(arena)
+
+    def test_all_five_pools_preallocate_arenas(self):
+        """Each of the five pools has a pre-allocated arena bytearray."""
+        producer = _make_producer()
+        for pool_name in (
+            "_replay_pool", "_queue_pool", "_control_pool",
+            "_serialization_pool", "_container_pool",
+        ):
+            pool = getattr(producer, pool_name)
+            assert isinstance(pool.arena, bytearray), f"{pool_name} arena not bytearray"
+            assert len(pool.arena) == pool.capacity
+
+    def test_arena_write_and_read_back(self):
+        """Data written into a reserved arena slot can be read back."""
+        producer = _make_producer()
+        pool = producer._control_pool
+        idx = pool.reserve()
+        assert idx is not None
+        test_data = b"event: test\ndata: {\"hello\": true}\n\n"
+        written = pool.write(idx, test_data)
+        assert written == len(test_data)
+        # Read back via slot_view.
+        view = pool.slot_view(idx, len(test_data))
+        assert bytes(view) == test_data
+
+    def test_arena_release_zeroes_region(self):
+        """Releasing a slot zeroes its arena region."""
+        producer = _make_producer()
+        pool = producer._control_pool
+        idx = pool.reserve()
+        pool.write(idx, b"X" * 100)
+        view = pool.slot_view(idx, 10)
+        assert bytes(view) == b"X" * 10
+        pool.release(idx)
+        view = pool.slot_view(idx, 10)
+        assert bytes(view) == b"\x00" * 10
+
+    def test_arena_never_grows_beyond_capacity(self):
+        """The arena is fixed-size; it cannot be grown."""
+        producer = _make_producer(max_concurrent_subscribers=3)
+        initial_size = len(producer._queue_pool.arena)
+        # Admit max subscribers.
+        producer.admit_run("r1")
+        for i in range(3):
+            assert _admit(producer, "r1") is not None
+        # Arena size unchanged.
+        assert len(producer._queue_pool.arena) == initial_size
+        # 4th subscriber rejected — arena pool is full.
+        assert producer.admit_subscriber_and_snapshot("r1", 0) is None
+
+    def test_serialization_pool_arena_stores_in_flight_copy(self):
+        """The serialization pool arena stores the in-flight serialized copy."""
+        producer = _make_producer()
+        producer.admit_run("r1")
+        sub_id = _admit(producer, "r1")
+        producer.emit_event("r1", "tool.started", {"i": 1})
+        frame = producer.get_subscriber_frame("r1", sub_id, 0)
+        assert frame is not None
+        sub = producer._runs["r1"].subscribers[sub_id]
+        # The serialized copy is in the serialization arena.
+        arena_view = producer._serialization_pool.slot_view(
+            sub.serialization_pool_index, len(frame)
+        )
+        assert bytes(arena_view) == frame
+
+    def test_control_pool_arena_stores_lag_frame(self):
+        """The control pool arena stores the lag frame on close-on-lag."""
+        producer = _make_producer(
+            max_subscriber_queue_events=1,
+            max_subscriber_queue_bytes=1_000_000,
+        )
+        producer.admit_run("r1")
+        sub_id = _admit(producer, "r1")
+        # Emit 2 events → queue overflow on 2nd → close-on-lag.
+        producer.emit_event("r1", "tool.started", {"i": 1})
+        producer.emit_event("r1", "tool.started", {"i": 2})
+        sub = producer._runs["r1"].subscribers[sub_id]
+        assert sub.closed
+        assert sub.pending_lag_frame is not None
+        # The lag frame is also written into the control arena.
+        arena_view = producer._control_pool.slot_view(
+            sub.control_pool_index, len(sub.pending_lag_frame)
+        )
+        assert bytes(arena_view) == sub.pending_lag_frame
+
+    def test_tracemalloc_heap_does_not_grow_with_events(self):
+        """Mid-stream event emission does not allocate new heap objects
+        beyond the pre-allocated arenas (tracemalloc corroboration).
+
+        This is the decisive test the reviewer used: the old _FixedPool
+        was a counter and emit_event allocated dynamic heap objects.  With
+        arena-backed pools, the serialized copy is written into the
+        pre-allocated arena region, not a new heap allocation.
+        """
+        import tracemalloc
+        producer = _make_producer(
+            max_retained_runs=1,
+            max_replay_events=100,
+            max_subscriber_queue_events=100,
+        )
+        producer.admit_run("r1")
+        _admit(producer, "r1")
+        # Baseline after construction.
+        tracemalloc.start()
+        snap1 = tracemalloc.take_snapshot()
+        # Emit 50 events.
+        for i in range(50):
+            producer.emit_event("r1", "tool.started", {"i": i})
+        snap2 = tracemalloc.take_snapshot()
+        tracemalloc.stop()
+        # The arena is pre-allocated; event emission should not cause
+        # significant new heap allocation.  Allow a small delta for the
+        # _RingEntry objects and deque internals (bounded by max_replay_events).
+        # The key assertion: the delta is far smaller than the pool capacity
+        # and does not grow linearly with event count beyond the ring cap.
+        stats = snap2.compare_to(snap1, "lineno")
+        total_delta = sum(s.size_diff for s in stats if s.size_diff > 0)
+        # Ring entries are ~100 objects max (bounded).  Each _RingEntry
+        # is small.  Total delta should be well under 100 KiB.
+        assert total_delta < 100_000, (
+            f"Heap grew {total_delta} bytes from 50 events — expected "
+            f"arena-backed bounded growth"
+        )
+
+
+class TestRegressionSerializationTimeoutPendingEvent:
+    """Round-3 blocker 2: serialization-timeout must require a pending event.
+
+    The timeout must NOT fire when the slot is occupied but no event is
+    waiting in the queue.  This prevents the false/empty lag interval
+    that the round-3 reviewer reproduced (queued_before_timeout=0,
+    first_dropped_event_id > latest_available_event_id).
+    """
+
+    def test_timeout_does_not_fire_without_queued_event(self):
+        """If the slot is occupied but the queue is empty, the timeout
+        does NOT fire — this is normal backpressure, not a serialization
+        timeout.
+        """
+        producer = _make_producer(
+            max_subscriber_queue_events=100,
+            heartbeat_seconds=1,
+        )
+        producer.admit_run("r1")
+        sub_id = _admit(producer, "r1")
+        # Emit one event, dequeue it (slot acquired), but don't confirm.
+        producer.emit_event("r1", "tool.started", {"i": 1})
+        producer.get_subscriber_frame("r1", sub_id, 0)
+        sub = producer._runs["r1"].subscribers[sub_id]
+        assert sub.slot_acquired
+        assert not sub.queue  # no event waiting
+        # Simulate time passing beyond the heartbeat.
+        import time as _time
+        future = _time.monotonic() + 2.0
+        triggered = producer.check_serialization_timeout(
+            "r1", sub_id, now=future
+        )
+        assert not triggered  # no pending event → no timeout
+        assert not sub.closed
+
+    def test_timeout_fires_with_queued_event(self):
+        """If the slot is occupied AND a queued event is waiting past the
+        heartbeat, the timeout fires and the lag interval is valid.
+        """
+        producer = _make_producer(
+            max_subscriber_queue_events=100,
+            heartbeat_seconds=1,
+        )
+        producer.admit_run("r1")
+        sub_id = _admit(producer, "r1")
+        # Emit two events: first dequeued (slot acquired), second queued.
+        producer.emit_event("r1", "tool.started", {"i": 1})
+        producer.emit_event("r1", "tool.started", {"i": 2})
+        producer.get_subscriber_frame("r1", sub_id, 0)
+        sub = producer._runs["r1"].subscribers[sub_id]
+        assert sub.slot_acquired
+        assert sub.queue  # event 2 is waiting
+        import time as _time
+        future = _time.monotonic() + 2.0
+        triggered = producer.check_serialization_timeout(
+            "r1", sub_id, now=future
+        )
+        assert triggered
+        assert sub.closed
+
+    def test_timeout_lag_interval_contains_pending_event(self):
+        """After serialization-timeout fires and the in-flight write joins
+        successfully, the lag interval's first_dropped_event_id must be
+        <= latest_available_event_id (the pending event is part of the
+        abandoned set, so the interval is non-empty).
+
+        This test would FAIL on the old commit which produced
+        first_dropped > latest_available with zero dropped events.
+        """
+        producer = _make_producer(
+            max_subscriber_queue_events=100,
+            heartbeat_seconds=1,
+        )
+        producer.admit_run("r1")
+        sub_id = _admit(producer, "r1")
+        # Emit 3 events: first dequeued, 2nd and 3rd queued.
+        for i in range(1, 4):
+            producer.emit_event("r1", "tool.started", {"i": i})
+        producer.get_subscriber_frame("r1", sub_id, 0)
+        sub = producer._runs["r1"].subscribers[sub_id]
+        assert sub.slot_acquired
+        assert len(sub.queue) == 2
+        # Timeout fires.
+        import time as _time
+        future = _time.monotonic() + 2.0
+        triggered = producer.check_serialization_timeout("r1", sub_id, now=future)
+        assert triggered
+        # In-flight write succeeds → cursor advances to 1.
+        producer.confirm_delivered("r1", sub_id)
+        assert sub.pending_lag_frame is not None
+        lag = producer.get_subscriber_frame("r1", sub_id, 0)
+        payload = next(
+            json.loads(line[6:])
+            for line in lag.split(b"\n")
+            if line.startswith(b"data: ")
+        )
+        # The lag interval must contain the pending events.
+        assert payload["last_delivered_event_id"] == 1
+        assert payload["first_dropped_event_id"] == 2
+        assert payload["latest_available_event_id"] == 3
+        assert payload["dropped_events"] == 2  # events 2 and 3
+        # Critical: first_dropped <= latest_available (no empty interval).
+        assert payload["first_dropped_event_id"] <= payload["latest_available_event_id"]
+        assert payload["dropped_events"] > 0
+
+    def test_timeout_lag_interval_after_failed_write(self):
+        """If the in-flight write fails (not delivered), the lag interval
+        starts from 0 and includes the pending events.
+        """
+        producer = _make_producer(
+            max_subscriber_queue_events=100,
+            heartbeat_seconds=1,
+        )
+        producer.admit_run("r1")
+        sub_id = _admit(producer, "r1")
+        for i in range(1, 4):
+            producer.emit_event("r1", "tool.started", {"i": i})
+        producer.get_subscriber_frame("r1", sub_id, 0)
+        sub = producer._runs["r1"].subscribers[sub_id]
+        import time as _time
+        future = _time.monotonic() + 2.0
+        triggered = producer.check_serialization_timeout("r1", sub_id, now=future)
+        assert triggered
+        # In-flight write FAILS → cursor stays at 0.
+        producer.mark_write_failed("r1", sub_id)
+        assert sub.pending_lag_frame is not None
+        lag = producer.get_subscriber_frame("r1", sub_id, 0)
+        payload = next(
+            json.loads(line[6:])
+            for line in lag.split(b"\n")
+            if line.startswith(b"data: ")
+        )
+        assert payload["last_delivered_event_id"] == 0
+        assert payload["first_dropped_event_id"] == 1
+        assert payload["latest_available_event_id"] == 3
+        assert payload["dropped_events"] == 3

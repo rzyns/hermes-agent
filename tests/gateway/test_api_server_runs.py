@@ -370,6 +370,14 @@ class TestRunEvents:
                         break
                     await asyncio.sleep(0.01)
 
+                # Emit an additional event so the serialization-timeout has a
+                # valid pending next event (in_flight < latest_available).
+                # Per round-4 fix: the timeout must not fire when there is no
+                # event beyond the in-flight one.
+                adapter._run_events_producer.emit_event(
+                    run_id, "message.delta", {"text": "extra"}
+                )
+
                 events_resp = await cli.get(f"/v1/runs/{run_id}/events")
                 await asyncio.wait_for(write_started.wait(), timeout=1)
                 await asyncio.sleep(1.1)

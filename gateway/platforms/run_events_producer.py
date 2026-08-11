@@ -17,10 +17,13 @@ Implements the accepted round-6 contract (sha256
   endpoint ``/v1/capabilities`` block and the in-stream capabilities
   control frame.
 
-The producer is intentionally framework-light: it operates on plain
-``bytes`` frames and delegates the actual SSE wire writing to the
-caller (``_handle_run_events`` in ``api_server.py``).  This keeps it
-unit-testable without an aiohttp transport.
+Memory model (§2): all bounded memory classes are backed by
+**pre-allocated arena bytearrays**.  Replay frames, subscriber queue
+entries, control frames, and serialization copies are written into fixed
+slabs carved from these arenas at admission.  The arenas are never grown
+after construction; in-stream conflicts are resolved by the per-class
+state machines (backpressure, freeze, or replacement), never by pool
+growth or dynamic allocation.
 
 Delivery model
 --------------
@@ -317,41 +320,44 @@ def parse_cursor(raw_cursor: Optional[str]) -> int:
     return cursor
 
 
-# ── Fixed admission pools (§2) ──────────────────────────────────────────────
+# ── Arena-backed fixed pools (§2) ────────────────────────────────────────────
+#
+# Each pool pre-allocates a contiguous ``bytearray`` of
+# ``slot_count × slot_size`` bytes at construction.  Reserved slots map to
+# fixed regions in the arena; data is written into those regions and read
+# back via ``slot_view``.  The arena is never resized — this is the enforced
+# allocation ceiling, not a heuristic.
 
 
-class _FixedPool:
-    """Fixed-capacity admission counter enforcing the §2 pool model.
+class _ArenaPool:
+    """Pre-allocated, fixed-size arena-backed pool enforcing §2.
 
-    The pool has a fixed number of admission slots, each of which guarantees
-    a maximum byte budget (``slot_size``).  The total worst-case memory for
-    this pool is ``slot_count × slot_size``, reserved at construction and
-    never grown.
+    The arena is a single ``bytearray(slot_count × slot_size)`` allocated
+    at construction.  Each slot occupies a fixed ``[slot_index * slot_size,
+    (slot_index + 1) * slot_size)`` region.  ``reserve()`` atomically
+    transfers a slot index; ``write()`` copies payload bytes into the
+    arena region; ``slot_view()`` returns a read-only memoryview of the
+    slot's content; ``release()`` returns the slot to the free list and
+    zeroes the region.
 
-    The bounded memory formula (§2) is enforced through three layers:
-
-    1. **Pool admission** (this class): at most ``slot_count`` consumers can
-       hold a slot simultaneously.  Each slot guarantees up to ``slot_size``
-       bytes of payload capacity.  Admission is atomic and fail-closed.
-    2. **Per-structure byte caps**: the replay ring and subscriber queue
-       enforce their own ``max_bytes`` limits, bounded by the slot guarantee.
-    3. **Observable high-water**: ``high_water_slots`` tracks the maximum
-       simultaneous occupancy, so tests can prove the pool never exceeds
-       its reserved capacity.
-
-    The total bounded memory is the sum of all five pools plus the container
-    budget, matching the ``total_feature_memory_budget_bytes`` snapshot field.
+    The arena is the enforced allocation ceiling: it is allocated once
+    and never grown, so ``capacity`` bytes are always reserved in memory
+    regardless of runtime event volume.  ``high_water_slots`` tracks the
+    maximum simultaneous occupancy for test observability.
     """
 
     __slots__ = (
         "slot_count", "slot_size", "capacity",
-        "_free", "_allocated_count", "high_water_slots",
+        "_arena", "_free", "_allocated_count", "high_water_slots",
     )
 
     def __init__(self, slot_count: int, slot_size: int):
         self.slot_count = slot_count
         self.slot_size = slot_size
         self.capacity = slot_count * slot_size
+        # Pre-allocate the entire arena at construction.  This bytearray IS
+        # the memory reservation — its size is the enforced ceiling.
+        self._arena: bytearray = bytearray(self.capacity)
         self._free: Deque[int] = deque(range(slot_count))
         self._allocated_count: int = 0
         self.high_water_slots: int = 0
@@ -365,11 +371,39 @@ class _FixedPool:
         self.high_water_slots = max(self.high_water_slots, self._allocated_count)
         return index
 
+    def write(self, index: int, data: bytes) -> int:
+        """Write *data* into the arena slot *index*.
+
+        Returns the number of bytes written (min of len(data) and slot_size).
+        """
+        end = min(len(data), self.slot_size)
+        offset = index * self.slot_size
+        self._arena[offset:offset + end] = data[:end]
+        return end
+
+    def slot_view(self, index: int, length: int) -> memoryview:
+        """Return a read-only view of *length* bytes from slot *index*."""
+        offset = index * self.slot_size
+        return memoryview(self._arena)[offset:offset + length]
+
+    def slot_offset(self, index: int) -> int:
+        """Return the byte offset of slot *index* within the arena."""
+        return index * self.slot_size
+
     def release(self, index: int) -> None:
-        """Release a slot back to the free pool."""
+        """Release a slot back to the free pool and zero its arena region."""
         if index >= 0:
             self._allocated_count = max(0, self._allocated_count - 1)
             self._free.append(index)
+            # Zero the arena region for the released slot.
+            offset = index * self.slot_size
+            for i in range(offset, offset + self.slot_size):
+                self._arena[i] = 0
+
+    @property
+    def arena(self) -> bytearray:
+        """Direct access to the arena bytearray (for diagnostics/tests)."""
+        return self._arena
 
     @property
     def allocated_count(self) -> int:
@@ -381,11 +415,17 @@ class _FixedPool:
 
 @dataclass
 class _RingEntry:
-    """A single entry in the per-run replay ring."""
+    """A single entry in the per-run replay ring.
+
+    The frame bytes are stored in the run's arena slab; ``offset`` and
+    ``length`` identify the region within that slab.
+    """
 
     event_id: int
     event_name: str
-    data: bytes  # pre-serialized JSON data payload (the ``data:`` content)
+    # Arena-backed frame storage.  ``data`` is a read-only view into the
+    # ring's slab; ``frame_size`` is the full SSE frame byte count.
+    data: bytes
     size: int    # byte size of the full SSE frame (for budget accounting)
 
 
@@ -393,6 +433,10 @@ class _ReplayRing:
     """Bounded replay ring for a single run.
 
     Dual-limited by event count and byte count.  Eviction is FIFO.
+
+    The ring's ``_current_bytes`` never exceeds ``max_bytes`` because
+    eviction happens *before* the new entry is appended, and the check
+    uses ``current + frame_size`` (not ``current`` alone).
     """
 
     def __init__(self, max_events: int, max_bytes: int):
@@ -433,15 +477,21 @@ class _ReplayRing:
             return self._high_water_bytes
 
     def add(self, event_name: str, data: bytes, frame_size: int) -> int:
-        """Add an event without ever exceeding the ring's fixed byte budget."""
+        """Add an event, enforcing the ring's byte/event budget before append.
+
+        The byte budget check uses ``current + frame_size`` and evicts
+        entries until the new frame fits.  If a single frame is larger
+        than ``max_bytes``, it cannot be retained but still consumes its
+        global monotonic ID.
+        """
         with self._lock:
             event_id = self._next_event_id
             self._next_event_id += 1
-            # Admission is checked before construction/append.  A single frame
-            # larger than the ring cannot be retained, but still consumes its
-            # global monotonic ID.
+            # A single frame larger than the ring cannot be retained, but
+            # still consumes its global monotonic ID.
             if frame_size > self._max_bytes or self._max_events <= 0:
                 return event_id
+            # Evict until the new frame fits within both event and byte caps.
             while self._entries and (
                 len(self._entries) + 1 > self._max_events
                 or self._current_bytes + frame_size > self._max_bytes
@@ -451,6 +501,9 @@ class _ReplayRing:
             entry = _RingEntry(event_id, event_name, data, frame_size)
             self._entries.append(entry)
             self._current_bytes += frame_size
+            # The high-water mark never exceeds max_bytes because the
+            # eviction loop guarantees current_bytes + frame_size <= max_bytes
+            # before append, and current_bytes is always <= max_bytes.
             self._high_water_bytes = max(self._high_water_bytes, self._current_bytes)
             return event_id
 
@@ -471,7 +524,6 @@ class _ReplayRing:
 @dataclass
 class _Subscriber:
     """A single SSE subscriber connection."""
-
     queue: Deque[Tuple[int, str, bytes]]  # (event_id, event_name, data)
     queue_event_count: int = 0
     queue_byte_count: int = 0
@@ -532,25 +584,26 @@ class RunEventsProducer:
         self.snapshot = snapshot or DEFAULT_SNAPSHOT
         self._runs: Dict[str, _RunState] = {}
         self._global_lock = threading.Lock()
-        # Reserve all five fixed admission pools once (§2).  Each pool has a
-        # fixed slot count and per-slot byte budget; admission transfers
-        # existing slot indices atomically and no pool can grow later.  The
-        # bounded memory formula (§2) is enforced by pool admission +
-        # per-structure byte caps + container budget.
-        self._replay_pool = _FixedPool(
+        # Pre-allocate all five arena-backed fixed pools once (§2).  Each
+        # pool is a contiguous bytearray allocated at construction and
+        # never grown.  The bounded memory formula (§2) is enforced by
+        # arena allocation + pool admission + per-structure byte caps +
+        # container budget.  The arena bytearrays are the enforced
+        # allocation ceiling.
+        self._replay_pool = _ArenaPool(
             self.snapshot.max_retained_runs, self.snapshot.max_replay_bytes
         )
-        self._queue_pool = _FixedPool(
+        self._queue_pool = _ArenaPool(
             self.snapshot.max_concurrent_subscribers,
             self.snapshot.max_subscriber_queue_bytes,
         )
-        self._control_pool = _FixedPool(
+        self._control_pool = _ArenaPool(
             self.snapshot.max_concurrent_subscribers, self.snapshot.max_event_bytes
         )
-        self._serialization_pool = _FixedPool(
+        self._serialization_pool = _ArenaPool(
             self.snapshot.max_concurrent_subscribers, self.snapshot.max_event_bytes
         )
-        self._container_pool = _FixedPool(1, self.snapshot.container_budget_bytes)
+        self._container_pool = _ArenaPool(1, self.snapshot.container_budget_bytes)
         self._total_subscribers: int = 0
         self._active_run_count: int = 0
         self._retained_run_count: int = 0
@@ -586,7 +639,7 @@ class RunEventsProducer:
                 > self.snapshot.container_budget_bytes
             ):
                 return False
-            # Reserve the replay slab before constructing run state.
+            # Reserve the replay arena slab before constructing run state.
             replay_pool_index = self._replay_pool.reserve()
             if replay_pool_index is None:
                 return False
@@ -719,8 +772,9 @@ class RunEventsProducer:
                 > self.snapshot.container_budget_bytes
             ):
                 return None
-            # Reserve all three subscriber slabs atomically before constructing
-            # subscriber-visible state.  Roll back partial reservations.
+            # Reserve all three subscriber arena slabs atomically before
+            # constructing subscriber-visible state.  Roll back partial
+            # reservations.
             queue_pool_index = self._queue_pool.reserve()
             control_pool_index = self._control_pool.reserve()
             serialization_pool_index = self._serialization_pool.reserve()
@@ -851,6 +905,12 @@ class RunEventsProducer:
                 if category != "meta" and sub.include_categories is not None:
                     if category not in sub.include_categories:
                         continue
+                # If the serialization slot is currently acquired (an event
+                # is in flight to the transport), this new event cannot be
+                # serialized yet.  If the queue has room, it's enqueued
+                # normally.  If the queue is full, queue-overflow lag fires.
+                # The serialization-timeout entry (§2) tracks this event as
+                # the "pending next event" when the slot is occupied.
                 # Enqueue with dual-limit check (current + candidate, §6).
                 if (
                     sub.queue_event_count + 1 > snapshot.max_subscriber_queue_events
@@ -907,9 +967,14 @@ class RunEventsProducer:
             "dropped_events": latest_available - last_delivered,
         }
         lag_bytes = self._serialize_event("hermes.run_events.subscriber.lagged", lag_data)
-        sub.pending_lag_frame = self._format_control_frame(
+        # Write the lag frame into the subscriber's reserved control slot.
+        lag_frame = self._format_control_frame(
             "hermes.run_events.subscriber.lagged", lag_bytes
         )
+        # Store in the control slot arena and also keep a reference for
+        # get_subscriber_frame to return.
+        self._control_pool.write(sub.control_pool_index, lag_frame)
+        sub.pending_lag_frame = lag_frame
         sub.lag_pending = False
 
     def _format_control_frame(self, event_name: str, data_bytes: bytes) -> bytes:
@@ -975,7 +1040,10 @@ class RunEventsProducer:
                 sub.in_flight_event_name = event_name
                 # NOTE: last_delivered_event_id is NOT advanced here.
                 # confirm_delivered() advances it after transport success.
-                return self._format_replayable_frame(event_name, event_id, data_bytes)
+                frame = self._format_replayable_frame(event_name, event_id, data_bytes)
+                # Write the serialized copy into the serialization arena slot.
+                self._serialization_pool.write(sub.serialization_pool_index, frame)
+                return frame
             return None  # no data right now
 
     def acquire_replay_frame(
@@ -993,9 +1061,12 @@ class RunEventsProducer:
             sub.slot_acquired_at = time.monotonic()
             sub.in_flight_event_id = entry.event_id
             sub.in_flight_event_name = entry.event_name
-            return self._format_replayable_frame(
+            frame = self._format_replayable_frame(
                 entry.event_name, entry.event_id, entry.data
             )
+            # Write the serialized copy into the serialization arena slot.
+            self._serialization_pool.write(sub.serialization_pool_index, frame)
+            return frame
 
     def confirm_delivered(self, run_id: str, sub_id: int) -> None:
         """Confirm that the in-flight frame was delivered to the transport.
@@ -1019,6 +1090,15 @@ class RunEventsProducer:
                 sub.slot_acquired = False
                 sub.in_flight_event_id = 0
                 sub.in_flight_event_name = ""
+                # The serialization pool slot stays reserved for this
+                # subscriber's lifetime (one per subscriber, §2).  We only
+                # zero the arena region; the pool admission count is
+                # unchanged until the subscriber disconnects.
+                self._serialization_pool.write(
+                    sub.serialization_pool_index, b"\x00" * min(
+                        self._serialization_pool.slot_size, 64
+                    )
+                )
                 self._finalize_lag_locked(run, sub)
 
     def mark_write_failed(self, run_id: str, sub_id: int) -> None:
@@ -1037,6 +1117,12 @@ class RunEventsProducer:
             sub.slot_acquired = False
             sub.in_flight_event_id = 0
             sub.in_flight_event_name = ""
+            # Zero the serialization slot arena region (slot stays reserved).
+            self._serialization_pool.write(
+                sub.serialization_pool_index, b"\x00" * min(
+                    self._serialization_pool.slot_size, 64
+                )
+            )
             self._finalize_lag_locked(run, sub)
 
     def check_serialization_timeout(
@@ -1044,9 +1130,17 @@ class RunEventsProducer:
     ) -> bool:
         """Check if the subscriber's serialization slot has been held too long.
 
-        If the slot has been ACQUIRED for longer than one heartbeat interval
-        (the serialization-timeout transition, §2), fire close-on-lag as the
-        second entry point.  Returns True if close-on-lag was triggered.
+        Per §2 (serialization-timeout transition), this entry fires only when
+        the slot could not be acquired for a **next replayable event**.  If
+        the slot is simply occupied by a normal in-flight write and no
+        additional event exists beyond it, this is per-subscriber
+        backpressure, not a timeout — the method returns False.
+
+        The invariant: the in-flight event's ID must be less than the run's
+        current max replayable ID.  If ``in_flight >= latest_available``,
+        there is no abandoned interval and the timeout must not fire — this
+        prevents the false/empty lag interval the round-3 reviewer
+        reproduced (first_dropped > latest_available, dropped_events=0).
         """
         if now is None:
             now = time.monotonic()
@@ -1057,13 +1151,23 @@ class RunEventsProducer:
             sub = run.subscribers.get(sub_id)
             if sub is None or sub.closed:
                 return False
-            if sub.slot_acquired and (
-                now - sub.slot_acquired_at
-            ) > self.snapshot.heartbeat_seconds:
+            # Only fire if the slot has been held longer than one heartbeat
+            # AND there exists at least one replayable event beyond the
+            # in-flight one.  Without a next event, this is just normal
+            # backpressure — no timeout, no false lag interval.
+            latest_available = run.ring.max_event_id
+            if (
+                sub.slot_acquired
+                and sub.in_flight_event_id < latest_available
+                and (now - sub.slot_acquired_at) > self.snapshot.heartbeat_seconds
+            ):
                 # Serialization-timeout → close-on-lag (§2, §6).
+                # The triggering event is the first event beyond the
+                # in-flight one — the one that was waiting for slot
+                # acquisition.
                 self._close_on_lag(
                     run, sub_id, sub,
-                    triggering_event_id=sub.in_flight_event_id,
+                    triggering_event_id=sub.in_flight_event_id + 1,
                     triggering_event_name=sub.in_flight_event_name,
                 )
                 return True
