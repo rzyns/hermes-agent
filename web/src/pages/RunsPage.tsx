@@ -1,4 +1,4 @@
-import { useCallback, useMemo, useState } from "react";
+import { type ComponentType, useCallback, useMemo, useState } from "react";
 import {
   Activity,
   AlertCircle,
@@ -69,7 +69,7 @@ function categoryForEvent(name: string): string {
 function StatusBadge({ status }: { status: RunEventsStatus }) {
   const map: Record<
     RunEventsStatus,
-    { label: string; cls: string; icon: typeof Activity }
+    { label: string; cls: string; icon: ComponentType<{ className?: string }> }
   > = {
     idle: { label: "Idle", cls: "bg-muted text-muted-foreground", icon: Pause },
     connecting: {
@@ -313,7 +313,7 @@ export default function RunsPage() {
           </Button>
           {activeRunId && (
             <Button
-              variant="outline"
+              outlined
               onClick={() => {
                 setActiveRunId(null);
                 setRunIdInput("");
@@ -375,7 +375,7 @@ export default function RunsPage() {
             );
           })}
           <Button
-            variant="ghost"
+            ghost
             size="sm"
             className="ml-auto h-7 px-2 text-xs"
             onClick={clearEvents}
