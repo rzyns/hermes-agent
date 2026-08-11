@@ -25,6 +25,7 @@ const BUILTIN_LITERAL: Record<string, string> = {
   "/webhooks": "Webhooks",
   "/pairing": "Pairing",
   "/system": "System",
+  "/runs": "Run Events",
 };
 
 export function resolvePageTitle(
