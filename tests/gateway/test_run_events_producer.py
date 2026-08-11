@@ -1,4 +1,4 @@
-"""Tests for the SSE run-events producer (round-6 contract).
+"""Tests for the SSE run-events producer (A1-r4 contract).
 
 Covers the eight-item verification matrix from t_d135602a plus the
 contract's own testable invariants:
@@ -13,7 +13,8 @@ contract's own testable invariants:
 8. regression coverage for run status/stop/approval.
 
 Plus contract invariants:
-- byte-budget high-water observability;
+- dual-ledger byte-accounting budget (reservation + settled-current);
+- 24-counter observability with formula-derived maxima;
 - lag-field capture ordering;
 - cursor-0 sentinel;
 - snapshot completeness;
@@ -22,13 +23,14 @@ Plus contract invariants:
 - close-on-lag with join-then-capture quiescence;
 - global reconnect cursor gap fields.
 
-Round-2 regression tests (comment on t_2d596b66):
+A1-r4 regression tests:
+- dual-ledger budget enforcement (per-class, total, high-water);
+- settlement/settle-release at every charge point;
 - replay/live handoff atomicity (no duplicates, include-filtered);
 - serialization slot FREE→ACQUIRED→FREE + confirm_delivered ground truth;
-- container budget enforced at admission (not exceeding budget);
-- queue byte admission checks current + candidate (not current alone);
-- terminal frame uses actual final replayable event ID;
-- serialization-timeout → close-on-lag entry point.
+- serialization-timeout with subscriber-local pending event;
+- adversarial: filtered later IDs, sparse/global ID gaps, no-pending stall;
+- terminal frame uses actual final replayable event ID.
 """
 
 import json
@@ -42,6 +44,8 @@ from gateway.platforms.run_events_producer import (
     RunEventsCapabilitiesSnapshot,
     RunEventsProducer,
     SUPPORTED_INCLUDE_CATEGORIES,
+    _CONTAINER_CHARGE_RUN,
+    _SUBSCRIBER_CONTAINER_TOTAL,
     is_replayable_event,
     parse_cursor,
     parse_include,
@@ -105,8 +109,8 @@ class TestCapabilitySnapshot:
             "terminal_retention_seconds",
             "total_feature_memory_budget_bytes",
             "container_budget_bytes",
-            "control_slot_pool_bytes",
-            "serialization_pool_bytes",
+            "control_frame_budget_bytes",
+            "serialization_budget_bytes",
             "supported_include_categories",
             "mandatory_category", "include_match",
         ]
@@ -550,7 +554,7 @@ class TestCategoryFiltering:
         # Only tool events should be in the queue.
         events = []
         while sub.queue:
-            eid, name, data = sub.queue.popleft()
+            eid, name, data, _sz = sub.queue.popleft()
             events.append(name)
         assert events == ["tool.started", "tool.completed"]
 
@@ -564,7 +568,7 @@ class TestCategoryFiltering:
         sub = producer._runs["r1"].subscribers[sub_id]
         events = []
         while sub.queue:
-            eid, name, data = sub.queue.popleft()
+            eid, name, data, _sz = sub.queue.popleft()
             events.append(name)
         assert "hermes.run_events.heartbeat" in events
         assert "tool.started" in events
@@ -778,8 +782,8 @@ class TestMulticast:
         assert s1.queue_event_count == 5
         assert s2.queue_event_count == 5
         # And the IDs should match.
-        ids1 = [eid for eid, _, _ in s1.queue]
-        ids2 = [eid for eid, _, _ in s2.queue]
+        ids1 = [eid for eid, _, _, _ in s1.queue]
+        ids2 = [eid for eid, _, _, _ in s2.queue]
         assert ids1 == ids2 == [1, 2, 3, 4, 5]
 
 
@@ -862,7 +866,7 @@ class TestRegressionReplayLiveHandoff:
         producer.emit_event("r1", "tool.started", {"i": 3})
         # Event 3 should be in the live queue ONLY.
         sub = producer._runs["r1"].subscribers[sub_id]
-        live_ids = [eid for eid, _, _ in sub.queue]
+        live_ids = [eid for eid, _, _, _ in sub.queue]
         # Replay had [1, 2], live queue has [3].  No overlap.
         assert replay_ids == [1, 2]
         assert live_ids == [3]
@@ -1019,23 +1023,81 @@ class TestRegressionSerializationSlot:
         assert sub.pending_lag_frame is not None
 
 
-class TestRegressionContainerBudget:
-    """Blocker 3: all five fixed pools enforce the 256 MiB budget."""
+class TestRegressionDualLedgerBudget:
+    """A1-r4 blocker: dual-ledger byte accounting enforces the 256 MiB budget.
 
-    def test_fixed_pool_capacities_sum_to_advertised_budget(self):
+    Tests that the reservation ledger enforces per-class and total budgets,
+    the settled-current ledger tracks actual usage, and all 24 counters
+    are observable (§2 A1-r4).
+    """
+
+    def test_budget_formula_matches_contract(self):
+        """The five class budgets + total match the A1-r4 formula."""
+        snap = RunEventsCapabilitiesSnapshot()
+        assert snap.retained_run_budget == 64 * 1_048_576
+        assert snap.subscriber_queue_budget == 256 * 524_288
+        assert snap.control_frame_budget_bytes == 256 * 65_536
+        assert snap.serialization_budget_bytes == 256 * 65_536
+        expected_total = (
+            snap.retained_run_budget
+            + snap.subscriber_queue_budget
+            + snap.control_frame_budget_bytes
+            + snap.serialization_budget_bytes
+            + snap.container_budget_bytes
+        )
+        assert snap.total_feature_memory_budget_bytes == expected_total
+        assert snap.total_feature_memory_budget_bytes == 268_435_456
+
+    def test_all_24_counters_exposed(self):
+        """budget_observability must expose all 24 counters (§2 test interface)."""
         producer = _make_producer()
-        capacities = producer.pool_capacities
-        assert capacities == {
-            "retained_run_buffers": 64 * 1_048_576,
-            "subscriber_queues": 256 * 524_288,
-            "control_slot_pool": 256 * 65_536,
-            "serialization_pool": 256 * 65_536,
-            "container_budget": 33_554_432,
-        }
-        assert sum(capacities.values()) == producer.snapshot.total_feature_memory_budget_bytes
-        # Pools start with zero allocated slots; high-water is observable.
-        hw = producer.pool_high_water_slots
-        assert all(v == 0 for v in hw.values())
+        obs = producer.budget_observability
+        # 5 classes × 4 counters + 4 total counters = 24.
+        assert len(obs) == 24
+        # Verify all counter names follow the pattern.
+        for cls_prefix in ("retained_run", "subscriber_queue", "control_frame", "serialization", "container"):
+            assert f"reserved_{cls_prefix}_bytes" in obs
+            assert f"reserved_{cls_prefix}_high_water_bytes" in obs
+            assert f"current_{cls_prefix}_charged_bytes" in obs
+            assert f"{cls_prefix}_high_water_bytes" in obs
+        assert "total_reserved_bytes" in obs
+        assert "total_reserved_high_water_bytes" in obs
+        assert "total_feature_charged_bytes" in obs
+        assert "total_feature_high_water_bytes" in obs
+
+    def test_run_admission_charges_reservation_ledger(self):
+        """Run admission reserves max_replay_bytes in the reservation ledger."""
+        snap = RunEventsCapabilitiesSnapshot()
+        producer = _make_producer()
+        assert producer.admit_run("r1")
+        obs = producer.budget_observability
+        # Reserved retained_run budget.
+        assert obs["reserved_retained_run_bytes"] == snap.max_replay_bytes
+        assert obs["reserved_retained_run_high_water_bytes"] == snap.max_replay_bytes
+        # Container dual-ledger atomic admission (both ledgers).
+        assert obs["reserved_container_bytes"] == _CONTAINER_CHARGE_RUN
+        assert obs["current_container_charged_bytes"] == _CONTAINER_CHARGE_RUN
+        assert obs["container_high_water_bytes"] == _CONTAINER_CHARGE_RUN
+        # Settled ring bytes start at 0 (no events yet).
+        assert obs["current_retained_run_charged_bytes"] == 0
+        # Total.
+        expected_total = snap.max_replay_bytes + _CONTAINER_CHARGE_RUN
+        assert obs["total_reserved_bytes"] == expected_total
+
+    def test_subscriber_admission_charges_three_reservation_classes(self):
+        """Subscriber admission reserves queue + control + serialization + container."""
+        snap = RunEventsCapabilitiesSnapshot()
+        producer = _make_producer()
+        producer.admit_run("r1")
+        _admit(producer, "r1")
+        obs = producer.budget_observability
+        assert obs["reserved_subscriber_queue_bytes"] == snap.max_subscriber_queue_bytes
+        assert obs["reserved_control_frame_bytes"] == snap.max_event_bytes
+        assert obs["reserved_serialization_bytes"] == snap.max_event_bytes
+        # Container charge: run + subscriber.
+        expected_container = _CONTAINER_CHARGE_RUN + _SUBSCRIBER_CONTAINER_TOTAL
+        assert obs["current_container_charged_bytes"] == expected_container
+        assert obs["container_high_water_bytes"] == expected_container
 
     def test_ring_never_transiently_exceeds_byte_capacity(self):
         producer = _make_producer(max_replay_events=10, max_replay_bytes=100)
@@ -1051,53 +1113,177 @@ class TestRegressionContainerBudget:
         producer = _make_producer(
             container_budget_bytes=100,  # tiny budget
         )
-        # First run charges 2048 bytes — exceeds 100.
+        # First run charges 1024 bytes — exceeds 100.
         assert not producer.admit_run("r1")
 
     def test_subscriber_admission_rejected_when_container_full(self):
         """If container budget is exhausted, subscriber admission returns None."""
         producer = _make_producer(
-            container_budget_bytes=2048,  # exactly one run
+            container_budget_bytes=1024,  # exactly one run
         )
-        assert producer.admit_run("r1")  # charges 2048
-        # No room for subscriber metadata (1024 more).
+        assert producer.admit_run("r1")  # charges 1024
+        # No room for subscriber metadata (1280 more).
         assert producer.admit_subscriber_and_snapshot("r1", 0) is None
 
     def test_high_water_never_exceeds_container_budget(self):
-        """container_high_water must never exceed container_budget_bytes.
-
-        This test would FAIL on the old commit where charge_container
-        permitted usage above the budget.
-        """
+        """container_high_water must never exceed container_budget_bytes."""
         snap = RunEventsCapabilitiesSnapshot()
         producer = _make_producer()
-        # Charge more than the budget — it must be rejected at admission
-        # but the charge_container test helper can still push it over.
-        # The invariant is: admission never exceeds the budget.
         for i in range(snap.max_retained_runs):
             assert producer.admit_run(f"r{i}")
         assert producer.container_high_water <= snap.container_budget_bytes
 
     def test_queue_byte_admission_checks_current_plus_candidate(self):
-        """Queue overflow must check current + candidate, not current alone
-        (§6).  This test would FAIL on the old commit where the check
-        was `>= max` instead of `+ candidate > max`.
-        """
-        # Each tool.started frame with {"i":N} is ~41 bytes.
-        # Set byte limit to 50: one frame fits (41 < 50), but 41 + 41 = 82 > 50.
+        """Queue overflow must check current + candidate, not current alone (§6)."""
         producer = _make_producer(
             max_subscriber_queue_events=1000,
             max_subscriber_queue_bytes=50,
         )
         producer.admit_run("r1")
         sub_id = _admit(producer, "r1")
-        # Emit 2 events — the 2nd should overflow (1st + 2nd > 50).
         producer.emit_event("r1", "tool.started", {"i": 1})
         producer.emit_event("r1", "tool.started", {"i": 2})
         sub = producer._runs["r1"].subscribers[sub_id]
-        # The subscriber should be closed (queue overflow on 2nd event).
         assert sub.closed
         assert sub.pending_lag_frame is not None
+
+    def test_reservation_release_on_disconnect(self):
+        """Subscriber disconnect releases all reservations (§2 lifetime release)."""
+        snap = RunEventsCapabilitiesSnapshot()
+        producer = _make_producer()
+        producer.admit_run("r1")
+        sub_id = _admit(producer, "r1")
+        obs_before = producer.budget_observability
+        assert obs_before["reserved_subscriber_queue_bytes"] == snap.max_subscriber_queue_bytes
+        producer.remove_subscriber("r1", sub_id)
+        obs_after = producer.budget_observability
+        assert obs_after["reserved_subscriber_queue_bytes"] == 0
+        assert obs_after["reserved_control_frame_bytes"] == 0
+        assert obs_after["reserved_serialization_bytes"] == 0
+        # Container is released too.
+        assert obs_after["current_container_charged_bytes"] == _CONTAINER_CHARGE_RUN
+
+    def test_reservation_release_on_expire(self):
+        """Run expiry releases the retained_run reservation + container charge."""
+        snap = RunEventsCapabilitiesSnapshot()
+        producer = _make_producer()
+        producer.admit_run("r1")
+        obs_before = producer.budget_observability
+        assert obs_before["reserved_retained_run_bytes"] == snap.max_replay_bytes
+        producer.expire_run("r1")
+        obs_after = producer.budget_observability
+        assert obs_after["reserved_retained_run_bytes"] == 0
+        assert obs_after["current_container_charged_bytes"] == 0
+
+    def test_settlement_at_emit_increases_settled_current(self):
+        """Emitting events settles ring bytes (Phase 2 settle)."""
+        producer = _make_producer()
+        producer.admit_run("r1")
+        producer.emit_event("r1", "tool.started", {"i": 1})
+        obs = producer.budget_observability
+        # The settled ring bytes should be > 0 after emitting one event.
+        assert obs["current_retained_run_charged_bytes"] > 0
+        assert obs["retained_run_high_water_bytes"] > 0
+
+    def test_settle_release_on_dequeue(self):
+        """Dequeuing a queue entry settle-releases the subscriber_queue charge."""
+        producer = _make_producer()
+        producer.admit_run("r1")
+        sub_id = _admit(producer, "r1")
+        producer.emit_event("r1", "tool.started", {"i": 1})
+        # The queue charge is settled.
+        obs_before = producer.budget_observability
+        assert obs_before["current_subscriber_queue_charged_bytes"] > 0
+        # Dequeue the event.
+        frame = producer.get_subscriber_frame("r1", sub_id, 0)
+        assert frame is not None
+        # Settle-release happened on dequeue.
+        obs_after = producer.budget_observability
+        assert obs_after["current_subscriber_queue_charged_bytes"] == 0
+        # But the serialization copy charge is now settled.
+        assert obs_after["current_serialization_charged_bytes"] > 0
+
+    def test_settle_release_on_confirm_delivered(self):
+        """Confirming delivery settle-releases the serialization charge."""
+        producer = _make_producer()
+        producer.admit_run("r1")
+        sub_id = _admit(producer, "r1")
+        producer.emit_event("r1", "tool.started", {"i": 1})
+        producer.get_subscriber_frame("r1", sub_id, 0)  # acquire slot
+        obs_before = producer.budget_observability
+        assert obs_before["current_serialization_charged_bytes"] > 0
+        producer.confirm_delivered("r1", sub_id)
+        obs_after = producer.budget_observability
+        assert obs_after["current_serialization_charged_bytes"] == 0
+
+    def test_instantaneous_invariant_settled_le_reserved(self):
+        """§2: each settled-current current ≤ corresponding reservation current."""
+        producer = _make_producer()
+        producer.admit_run("r1")
+        _admit(producer, "r1")
+        producer.emit_event("r1", "tool.started", {"i": 1})
+        producer.emit_event("r1", "tool.started", {"i": 2})
+        obs = producer.budget_observability
+        for cls in ("retained_run", "subscriber_queue", "control_frame", "serialization", "container"):
+            settled = obs[f"current_{cls}_charged_bytes"]
+            reserved = obs[f"reserved_{cls}_bytes"]
+            assert settled <= reserved, f"{cls}: settled {settled} > reserved {reserved}"
+        assert obs["total_feature_charged_bytes"] <= obs["total_reserved_bytes"]
+
+    def test_high_water_invariant_settled_hw_le_reserved_hw(self):
+        """§2: each settled-current high-water ≤ corresponding reservation high-water."""
+        producer = _make_producer()
+        producer.admit_run("r1")
+        _admit(producer, "r1")
+        producer.emit_event("r1", "tool.started", {"i": 1})
+        producer.get_subscriber_frame("r1", sub_id := 1, 0)
+        producer.confirm_delivered("r1", sub_id)
+        producer.remove_subscriber("r1", sub_id)
+        obs = producer.budget_observability
+        for cls in ("retained_run", "subscriber_queue", "control_frame", "serialization", "container"):
+            settled_hw = obs[f"{cls}_high_water_bytes"]
+            reserved_hw = obs[f"reserved_{cls}_high_water_bytes"]
+            assert settled_hw <= reserved_hw, f"{cls}: settled_hw {settled_hw} > reserved_hw {reserved_hw}"
+        assert obs["total_feature_high_water_bytes"] <= obs["total_reserved_high_water_bytes"]
+
+    def test_formula_derived_container_high_water(self):
+        """Container high-water equals the formula-derived maximum under max load.
+
+        Per §2 A1-r4: 64×1024 + 256×(1024+128+128) = 393,216 B.
+        """
+        snap = RunEventsCapabilitiesSnapshot()
+        producer = _make_producer()
+        for i in range(snap.max_retained_runs):
+            assert producer.admit_run(f"r{i}")
+        for i in range(snap.max_retained_runs):
+            for j in range(snap.max_subscribers_per_run):
+                result = producer.admit_subscriber_and_snapshot(f"r{i}", 0)
+                if result is None:
+                    break
+        expected = 64 * 1024 + 256 * (1024 + 128 + 128)
+        assert expected == 393_216
+        obs = producer.budget_observability
+        assert obs["reserved_container_high_water_bytes"] == expected
+        assert obs["container_high_water_bytes"] == expected
+
+    def test_formula_derived_total_reserved_high_water(self):
+        """Total reserved high-water equals the formula-derived maximum.
+
+        Per §2 A1-r4: 67,108,864 + 134,217,728 + 16,777,216 + 16,777,216 + 393,216 = 235,274,240 B.
+        """
+        snap = RunEventsCapabilitiesSnapshot()
+        producer = _make_producer()
+        for i in range(snap.max_retained_runs):
+            assert producer.admit_run(f"r{i}")
+        for i in range(snap.max_retained_runs):
+            for j in range(snap.max_subscribers_per_run):
+                result = producer.admit_subscriber_and_snapshot(f"r{i}", 0)
+                if result is None:
+                    break
+        expected = 67_108_864 + 134_217_728 + 16_777_216 + 16_777_216 + 393_216
+        assert expected == 235_274_240
+        obs = producer.budget_observability
+        assert obs["total_reserved_high_water_bytes"] == expected
 
 
 class TestRegressionTerminalFinalId:
@@ -1219,32 +1405,36 @@ class TestRegressionReplayPhaseOverflow:
         assert payload["first_dropped_event_id"] == 1
 
 
-class TestRegressionFixedPoolEnforcement:
-    """Blocker 3: each pool's high-water never exceeds its slot count."""
+class TestRegressionBudgetEnforcement:
+    """A1-r4: dual-ledger enforcement replaces the fixed-pool admission model.
 
-    def test_replay_pool_high_water_never_exceeds_max_retained_runs(self):
+    Tests that the per-class and total reservation ledgers enforce admission
+    limits, and that reservations are released on expire/disconnect.
+    """
+
+    def test_retained_run_reservation_enforced(self):
         """At most max_retained_runs replay slots can be reserved."""
         producer = _make_producer(max_retained_runs=3)
         assert producer.admit_run("r1")
         assert producer.admit_run("r2")
         assert producer.admit_run("r3")
-        assert not producer.admit_run("r4")  # pool full
-        hw = producer.pool_high_water_slots
-        assert hw["retained_run_buffers"] == 3
+        assert not producer.admit_run("r4")  # budget exhausted
+        obs = producer.budget_observability
+        assert obs["reserved_retained_run_bytes"] == 3 * producer.snapshot.max_replay_bytes
 
-    def test_replay_pool_slots_released_on_expire(self):
-        """Expiring a run releases its replay pool slot."""
+    def test_reservation_released_on_expire(self):
+        """Expiring a run releases its retained_run reservation."""
         producer = _make_producer(max_retained_runs=2)
         assert producer.admit_run("r1")
         assert producer.admit_run("r2")
         producer.expire_run("r1")
-        # Slot released → r3 can be admitted.
+        # Reservation released → r3 can be admitted.
         assert producer.admit_run("r3")
-        alloc = producer.pool_allocated_slots
-        assert alloc["retained_run_buffers"] == 2
+        obs = producer.budget_observability
+        assert obs["reserved_retained_run_bytes"] == 2 * producer.snapshot.max_replay_bytes
 
-    def test_queue_pool_high_water_never_exceeds_max_concurrent_subscribers(self):
-        """Subscriber queue pool enforces max_concurrent_subscribers."""
+    def test_subscriber_queue_reservation_enforced(self):
+        """Subscriber queue reservation enforces max_concurrent_subscribers."""
         producer = _make_producer(
             max_concurrent_subscribers=3,
             max_subscribers_per_run=10,
@@ -1253,35 +1443,35 @@ class TestRegressionFixedPoolEnforcement:
         assert _admit(producer, "r1") is not None
         assert _admit(producer, "r1") is not None
         assert _admit(producer, "r1") is not None
-        # 4th subscriber → pool full → 503.
+        # 4th subscriber → reservation exhausted → 503.
         assert producer.admit_subscriber_and_snapshot("r1", 0) is None
-        hw = producer.pool_high_water_slots
-        assert hw["subscriber_queues"] == 3
+        obs = producer.budget_observability
+        assert obs["reserved_subscriber_queue_bytes"] == 3 * producer.snapshot.max_subscriber_queue_bytes
 
-    def test_control_and_serialization_pools_track_subscribers(self):
-        """Control and serialization pools reserve one slot per subscriber."""
+    def test_control_and_serialization_reservations_track_subscribers(self):
+        """Control and serialization reservations are per subscriber."""
+        snap = RunEventsCapabilitiesSnapshot()
         producer = _make_producer()
         producer.admit_run("r1")
         _admit(producer, "r1")
         _admit(producer, "r1")
-        alloc = producer.pool_allocated_slots
-        assert alloc["control_slot_pool"] == 2
-        assert alloc["serialization_pool"] == 2
+        obs = producer.budget_observability
+        assert obs["reserved_control_frame_bytes"] == 2 * snap.max_event_bytes
+        assert obs["reserved_serialization_bytes"] == 2 * snap.max_event_bytes
 
-    def test_pool_slots_released_on_subscriber_disconnect(self):
-        """Removing a subscriber releases its three pool slots."""
+    def test_reservations_released_on_subscriber_disconnect(self):
+        """Removing a subscriber releases its three reservations."""
+        snap = RunEventsCapabilitiesSnapshot()
         producer = _make_producer()
         producer.admit_run("r1")
         sub_id = _admit(producer, "r1")
-        alloc_before = producer.pool_allocated_slots
-        assert alloc_before["subscriber_queues"] == 1
-        assert alloc_before["control_slot_pool"] == 1
-        assert alloc_before["serialization_pool"] == 1
+        obs_before = producer.budget_observability
+        assert obs_before["reserved_subscriber_queue_bytes"] == snap.max_subscriber_queue_bytes
         producer.remove_subscriber("r1", sub_id)
-        alloc_after = producer.pool_allocated_slots
-        assert alloc_after["subscriber_queues"] == 0
-        assert alloc_after["control_slot_pool"] == 0
-        assert alloc_after["serialization_pool"] == 0
+        obs_after = producer.budget_observability
+        assert obs_after["reserved_subscriber_queue_bytes"] == 0
+        assert obs_after["reserved_control_frame_bytes"] == 0
+        assert obs_after["reserved_serialization_bytes"] == 0
 
     def test_ring_high_water_observable_and_bounded(self):
         """Ring byte high-water is observable and bounded by max_replay_bytes."""
@@ -1295,15 +1485,20 @@ class TestRegressionFixedPoolEnforcement:
         assert hw["r1"] > 0
 
     def test_total_bounded_memory_formula_holds(self):
-        """The total_feature_memory_budget equals the sum of all pool capacities.
+        """The total_feature_memory_budget equals the sum of all five class budgets.
 
         This is the §2 formula: rings + queues + control + serialization +
         container = 256 MiB.
         """
-        producer = _make_producer()
-        caps = producer.pool_capacities
-        total = sum(caps.values())
-        assert total == producer.snapshot.total_feature_memory_budget_bytes
+        snap = RunEventsCapabilitiesSnapshot()
+        total = (
+            snap.retained_run_budget
+            + snap.subscriber_queue_budget
+            + snap.control_frame_budget_bytes
+            + snap.serialization_budget_bytes
+            + snap.container_budget_bytes
+        )
+        assert total == snap.total_feature_memory_budget_bytes
         assert total == 268_435_456  # 256 MiB
 
     def test_container_high_water_under_max_admitted_load(self):
@@ -1409,147 +1604,88 @@ class TestRegressionAiohttpBlockedWriteWatchdog:
 # ===========================================================================
 
 
-class TestRegressionArenaBackedPools:
-    """Round-3 blocker 1: pools must be arena-backed, not admission counters.
+class TestRegressionFilteredPendingEvent:
+    """A1-r4 round-5: adversarial serialization-timeout pending-candidate cases.
 
-    These tests prove that each pool pre-allocates a contiguous bytearray
-    arena of slot_count × slot_size bytes at construction, that the arena
-    is the enforced allocation ceiling (never grown), and that data is
-    actually written into and read back from arena regions.
+    These tests prove that a filtered-out later event does NOT trigger
+    the serialization timeout, and that the pending candidate is a real
+    extant event in the subscriber's own queue.
     """
 
-    def test_replay_pool_arena_preallocated(self):
-        """The replay pool arena is a pre-allocated bytearray of exactly
-        max_retained_runs × max_replay_bytes bytes."""
-        producer = _make_producer(max_retained_runs=4, max_replay_bytes=1024)
-        arena = producer._replay_pool.arena
-        assert isinstance(arena, bytearray)
-        assert len(arena) == 4 * 1024
-        # Capacity matches arena size.
-        assert producer._replay_pool.capacity == len(arena)
-
-    def test_all_five_pools_preallocate_arenas(self):
-        """Each of the five pools has a pre-allocated arena bytearray."""
-        producer = _make_producer()
-        for pool_name in (
-            "_replay_pool", "_queue_pool", "_control_pool",
-            "_serialization_pool", "_container_pool",
-        ):
-            pool = getattr(producer, pool_name)
-            assert isinstance(pool.arena, bytearray), f"{pool_name} arena not bytearray"
-            assert len(pool.arena) == pool.capacity
-
-    def test_arena_write_and_read_back(self):
-        """Data written into a reserved arena slot can be read back."""
-        producer = _make_producer()
-        pool = producer._control_pool
-        idx = pool.reserve()
-        assert idx is not None
-        test_data = b"event: test\ndata: {\"hello\": true}\n\n"
-        written = pool.write(idx, test_data)
-        assert written == len(test_data)
-        # Read back via slot_view.
-        view = pool.slot_view(idx, len(test_data))
-        assert bytes(view) == test_data
-
-    def test_arena_release_zeroes_region(self):
-        """Releasing a slot zeroes its arena region."""
-        producer = _make_producer()
-        pool = producer._control_pool
-        idx = pool.reserve()
-        pool.write(idx, b"X" * 100)
-        view = pool.slot_view(idx, 10)
-        assert bytes(view) == b"X" * 10
-        pool.release(idx)
-        view = pool.slot_view(idx, 10)
-        assert bytes(view) == b"\x00" * 10
-
-    def test_arena_never_grows_beyond_capacity(self):
-        """The arena is fixed-size; it cannot be grown."""
-        producer = _make_producer(max_concurrent_subscribers=3)
-        initial_size = len(producer._queue_pool.arena)
-        # Admit max subscribers.
-        producer.admit_run("r1")
-        for i in range(3):
-            assert _admit(producer, "r1") is not None
-        # Arena size unchanged.
-        assert len(producer._queue_pool.arena) == initial_size
-        # 4th subscriber rejected — arena pool is full.
-        assert producer.admit_subscriber_and_snapshot("r1", 0) is None
-
-    def test_serialization_pool_arena_stores_in_flight_copy(self):
-        """The serialization pool arena stores the in-flight serialized copy."""
-        producer = _make_producer()
-        producer.admit_run("r1")
-        sub_id = _admit(producer, "r1")
-        producer.emit_event("r1", "tool.started", {"i": 1})
-        frame = producer.get_subscriber_frame("r1", sub_id, 0)
-        assert frame is not None
-        sub = producer._runs["r1"].subscribers[sub_id]
-        # The serialized copy is in the serialization arena.
-        arena_view = producer._serialization_pool.slot_view(
-            sub.serialization_pool_index, len(frame)
-        )
-        assert bytes(arena_view) == frame
-
-    def test_control_pool_arena_stores_lag_frame(self):
-        """The control pool arena stores the lag frame on close-on-lag."""
-        producer = _make_producer(
-            max_subscriber_queue_events=1,
-            max_subscriber_queue_bytes=1_000_000,
-        )
-        producer.admit_run("r1")
-        sub_id = _admit(producer, "r1")
-        # Emit 2 events → queue overflow on 2nd → close-on-lag.
-        producer.emit_event("r1", "tool.started", {"i": 1})
-        producer.emit_event("r1", "tool.started", {"i": 2})
-        sub = producer._runs["r1"].subscribers[sub_id]
-        assert sub.closed
-        assert sub.pending_lag_frame is not None
-        # The lag frame is also written into the control arena.
-        arena_view = producer._control_pool.slot_view(
-            sub.control_pool_index, len(sub.pending_lag_frame)
-        )
-        assert bytes(arena_view) == sub.pending_lag_frame
-
-    def test_tracemalloc_heap_does_not_grow_with_events(self):
-        """Mid-stream event emission does not allocate new heap objects
-        beyond the pre-allocated arenas (tracemalloc corroboration).
-
-        This is the decisive test the reviewer used: the old _FixedPool
-        was a counter and emit_event allocated dynamic heap objects.  With
-        arena-backed pools, the serialized copy is written into the
-        pre-allocated arena region, not a new heap allocation.
+    def test_filtered_later_id_does_not_trigger_timeout(self):
+        """A later event filtered out by include never enters the queue, so
+        the timeout must NOT fire even though in_flight < ring.max_event_id.
         """
-        import tracemalloc
         producer = _make_producer(
-            max_retained_runs=1,
-            max_replay_events=100,
             max_subscriber_queue_events=100,
+            heartbeat_seconds=1,
         )
         producer.admit_run("r1")
-        _admit(producer, "r1")
-        # Baseline after construction.
-        tracemalloc.start()
-        snap1 = tracemalloc.take_snapshot()
-        # Emit 50 events.
-        for i in range(50):
-            producer.emit_event("r1", "tool.started", {"i": i})
-        snap2 = tracemalloc.take_snapshot()
-        tracemalloc.stop()
-        # The arena is pre-allocated; event emission should not cause
-        # significant new heap allocation.  Allow a small delta for the
-        # _RingEntry objects and deque internals (bounded by max_replay_events).
-        # The key assertion: the delta is far smaller than the pool capacity
-        # and does not grow linearly with event count beyond the ring cap.
-        stats = snap2.compare_to(snap1, "lineno")
-        total_delta = sum(s.size_diff for s in stats if s.size_diff > 0)
-        # Ring entries are ~100 objects max (bounded).  Each _RingEntry
-        # is small.  Total delta should be well under 100 KiB.
-        assert total_delta < 100_000, (
-            f"Heap grew {total_delta} bytes from 50 events — expected "
-            f"arena-backed bounded growth"
+        # Subscriber includes only 'tool'.
+        sub_id = _admit(producer, "r1", include={"tool"})
+        # Emit a tool event (event 1, goes to queue/dequeued) then a
+        # message event (event 2, filtered out — never in this sub's queue).
+        producer.emit_event("r1", "tool.started", {"i": 1})
+        producer.emit_event("r1", "message.delta", {"text": "hello"})
+        # Dequeue the tool event — slot acquired.
+        producer.get_subscriber_frame("r1", sub_id, 0)
+        sub = producer._runs["r1"].subscribers[sub_id]
+        assert sub.slot_acquired
+        assert not sub.queue  # the message event was filtered out
+        # Time passes beyond heartbeat.
+        import time as _time
+        future = _time.monotonic() + 2.0
+        triggered = producer.check_serialization_timeout("r1", sub_id, now=future)
+        assert not triggered  # no pending event in this subscriber's queue
+        assert not sub.closed
+
+    def test_sparse_id_gap_does_not_trigger_without_pending(self):
+        """A sparse global ID gap (ring evictions) does not create a pending
+        candidate when the subscriber's queue is empty.
+        """
+        producer = _make_producer(
+            max_replay_events=3,
+            max_subscriber_queue_events=100,
+            heartbeat_seconds=1,
         )
+        producer.admit_run("r1")
+        sub_id = _admit(producer, "r1")
+        # Emit 5 events — ring evicts the oldest 2.
+        for i in range(1, 6):
+            producer.emit_event("r1", "tool.started", {"i": i})
+        # Dequeue one — slot acquired. Queue may have others.
+        producer.get_subscriber_frame("r1", sub_id, 0)
+        sub = producer._runs["r1"].subscribers[sub_id]
+        assert sub.slot_acquired
+        # Drain remaining queue so no pending event exists.
+        while sub.queue:
+            producer.confirm_delivered("r1", sub_id)
+            producer.get_subscriber_frame("r1", sub_id, 0)
+        assert not sub.queue
+        import time as _time
+        future = _time.monotonic() + 2.0
+        triggered = producer.check_serialization_timeout("r1", sub_id, now=future)
+        assert not triggered  # no pending event despite ring.max_event_id > in_flight
+
+    def test_no_pending_event_stall_does_not_timeout(self):
+        """If the subscriber has no queued events and the slot is occupied
+        (slow transport), the timeout must NOT fire.
+        """
+        producer = _make_producer(
+            max_subscriber_queue_events=100,
+            heartbeat_seconds=1,
+        )
+        producer.admit_run("r1")
+        sub_id = _admit(producer, "r1")
+        producer.emit_event("r1", "tool.started", {"i": 1})
+        producer.get_subscriber_frame("r1", sub_id, 0)
+        sub = producer._runs["r1"].subscribers[sub_id]
+        assert sub.slot_acquired
+        assert not sub.queue
+        import time as _time
+        future = _time.monotonic() + 10.0
+        triggered = producer.check_serialization_timeout("r1", sub_id, now=future)
+        assert not triggered
 
 
 class TestRegressionSerializationTimeoutPendingEvent:

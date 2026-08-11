@@ -1,7 +1,8 @@
 """SSE run-events producer for ``GET /v1/runs/{run_id}/events``.
 
-Implements the accepted round-6 contract (sha256
-162676cd8dc0d58f3162a68eb9adfb14d84cdd498d52136ce5f996f7f97e8143):
+Implements the ADOPTED contract amendment A1-r4 (sha256
+0d4378df38d836780d4b647da2276776a71cc5e570b1ac524261a76c24f30bfb,
+version 2026-08-11-r6-A1-r4):
 
 - Per-run bounded replay ring (256 events / 1 MiB) with monotonic IDs.
 - Independent per-subscriber bounded queues (128 events / 512 KiB).
@@ -17,13 +18,13 @@ Implements the accepted round-6 contract (sha256
   endpoint ``/v1/capabilities`` block and the in-stream capabilities
   control frame.
 
-Memory model (§2): all bounded memory classes are backed by
-**pre-allocated arena bytearrays**.  Replay frames, subscriber queue
-entries, control frames, and serialization copies are written into fixed
-slabs carved from these arenas at admission.  The arenas are never grown
-after construction; in-stream conflicts are resolved by the per-class
-state machines (backpressure, freeze, or replacement), never by pool
-growth or dynamic allocation.
+Memory model (§2 A1-r4): **dual-ledger enforced byte-accounting budget**.
+Two independent ledgers per class: a **reservation ledger** (admission-
+time capacity holds that enforce the 256 MiB total) and a **settled-
+current ledger** (actual bytes held at any moment, for observability).
+Every charge goes through two distinct phases — reserve at admission,
+settle at emission — and two distinct release transitions — per-item
+settle release and lifetime reservation release.
 
 Delivery model
 --------------
@@ -48,13 +49,23 @@ from typing import Any, Deque, Dict, List, Optional, Set, Tuple
 
 logger = logging.getLogger(__name__)
 
-# ── Container-budget size classes (§2) ───────────────────────────────────────
-# Charged to container_budget at admission, released at disconnect/expiry.
-# These represent the allocator's full size-class byte count for the
-# metadata object (header, alignment, arena overhead), not the logical
-# payload length.
-_CONTAINER_SIZE_CLASS_RUN = 2048
-_CONTAINER_SIZE_CLASS_SUBSCRIBER = 1024
+# ── Constants from contract §2 (normative — no deviation permitted) ──────────
+
+#: Normative maximum SSE framing overhead per event (§2).
+MAX_SSE_FRAMING_BYTES = 128
+
+#: Container-budget fixed per-object charges (§2, container charge table).
+_CONTAINER_CHARGE_RUN = 1_024           # Run container per run
+_CONTAINER_CHARGE_SUBSCRIBER = 1_024    # Subscriber container per subscriber
+_CONTAINER_CHARGE_MAPPING_ENTRY = 128   # Subscriber mapping-table entry
+_CONTAINER_CHARGE_LOCK_STATE = 128      # Lock/state object per subscriber
+
+# Total per-subscriber container charge (subscriber + mapping + lock/state).
+_SUBSCRIBER_CONTAINER_TOTAL = (
+    _CONTAINER_CHARGE_SUBSCRIBER
+    + _CONTAINER_CHARGE_MAPPING_ENTRY
+    + _CONTAINER_CHARGE_LOCK_STATE
+)
 
 # ── Category map (§4) ───────────────────────────────────────────────────────
 
@@ -134,13 +145,21 @@ class RunEventsCapabilitiesSnapshot:
     terminal_retention_seconds: int = 300
     total_feature_memory_budget_bytes: int = 268_435_456
     container_budget_bytes: int = 33_554_432
-    control_slot_pool_bytes: int = 16_777_216
-    serialization_pool_bytes: int = 16_777_216
+    control_frame_budget_bytes: int = 16_777_216
+    serialization_budget_bytes: int = 16_777_216
     supported_include_categories: List[str] = field(
         default_factory=lambda: list(SUPPORTED_INCLUDE_CATEGORIES)
     )
     mandatory_category: str = "meta"
     include_match: str = "category"
+
+    @property
+    def retained_run_budget(self) -> int:
+        return self.max_retained_runs * self.max_replay_bytes
+
+    @property
+    def subscriber_queue_budget(self) -> int:
+        return self.max_concurrent_subscribers * self.max_subscriber_queue_bytes
 
     def endpoint_block(self) -> Dict[str, Any]:
         """Dict for the ``run_events`` key in ``/v1/capabilities``."""
@@ -162,8 +181,8 @@ class RunEventsCapabilitiesSnapshot:
             "terminal_retention_seconds": self.terminal_retention_seconds,
             "total_feature_memory_budget_bytes": self.total_feature_memory_budget_bytes,
             "container_budget_bytes": self.container_budget_bytes,
-            "control_slot_pool_bytes": self.control_slot_pool_bytes,
-            "serialization_pool_bytes": self.serialization_pool_bytes,
+            "control_frame_budget_bytes": self.control_frame_budget_bytes,
+            "serialization_budget_bytes": self.serialization_budget_bytes,
             "supported_include_categories": list(self.supported_include_categories),
             "mandatory_category": self.mandatory_category,
             "include_match": self.include_match,
@@ -320,94 +339,273 @@ def parse_cursor(raw_cursor: Optional[str]) -> int:
     return cursor
 
 
-# ── Arena-backed fixed pools (§2) ────────────────────────────────────────────
+# ── Dual-ledger byte-accounting budget (§2 A1-r4) ───────────────────────────
 #
-# Each pool pre-allocates a contiguous ``bytearray`` of
-# ``slot_count × slot_size`` bytes at construction.  Reserved slots map to
-# fixed regions in the arena; data is written into those regions and read
-# back via ``slot_view``.  The arena is never resized — this is the enforced
-# allocation ceiling, not a heuristic.
+# Two independent ledgers per class:
+#
+# 1. **Reservation ledger** — admission-time capacity holds.  Each class has a
+#    per-class ``reserved_<class>_bytes`` counter and a ``total_reserved_bytes``
+#    counter.  The reservation ledger enforces the budget bound.
+#
+# 2. **Settled-current ledger** — actual bytes held at any moment.  Each class
+#    has a per-class ``current_<class>_charged_bytes`` counter and a
+#    ``total_feature_charged_bytes`` counter.  Provides observability of real
+#    usage.
+#
+# Both ledgers maintain high-water counters.  All operations are atomic under
+# the producer's ``_global_lock``.
+
+# Budget class identifiers (internal keys).
+_BUDGET_CLASSES = (
+    "retained_run",
+    "subscriber_queue",
+    "control_frame",
+    "serialization",
+    "container",
+)
 
 
-class _ArenaPool:
-    """Pre-allocated, fixed-size arena-backed pool enforcing §2.
+@dataclass
+class _BudgetClassLedgers:
+    """Reservation and settled-current ledgers for one budget class."""
 
-    The arena is a single ``bytearray(slot_count × slot_size)`` allocated
-    at construction.  Each slot occupies a fixed ``[slot_index * slot_size,
-    (slot_index + 1) * slot_size)`` region.  ``reserve()`` atomically
-    transfers a slot index; ``write()`` copies payload bytes into the
-    arena region; ``slot_view()`` returns a read-only memoryview of the
-    slot's content; ``release()`` returns the slot to the free list and
-    zeroes the region.
+    # Reservation ledger.
+    reserved_bytes: int = 0
+    reserved_high_water: int = 0
+    # Settled-current ledger.
+    current_charged_bytes: int = 0
+    current_high_water: int = 0
 
-    The arena is the enforced allocation ceiling: it is allocated once
-    and never grown, so ``capacity`` bytes are always reserved in memory
-    regardless of runtime event volume.  ``high_water_slots`` tracks the
-    maximum simultaneous occupancy for test observability.
+    def reserve(self, amount: int, class_budget: int) -> bool:
+        """Atomically reserve *amount* against class_budget.
+
+        Updates the reservation-ledger counter and high-water.  Does NOT
+        touch the settled-current ledger (container is the exception,
+        handled via :meth:`reserve_and_settle_container`).
+
+        Returns True if the reservation fits within class_budget, False
+        otherwise.
+        """
+        assert amount >= 0
+        new_reserved = self.reserved_bytes + amount
+        if new_reserved > class_budget:
+            return False
+        self.reserved_bytes = new_reserved
+        self.reserved_high_water = max(self.reserved_high_water, self.reserved_bytes)
+        return True
+
+    def release_reservation(self, amount: int) -> None:
+        """Release a lifetime reservation (decrements reservation ledger)."""
+        assert amount >= 0
+        self.reserved_bytes = max(0, self.reserved_bytes - amount)
+
+    def settle(self, amount: int) -> None:
+        """Atomically settle *amount* within a pre-existing reservation.
+
+        Updates the settled-current ledger counter and high-water.  Never
+        touches the reservation ledger.  Per §2 "Atomic settlement (Phase 2)".
+        """
+        assert amount >= 0
+        self.current_charged_bytes += amount
+        self.current_high_water = max(self.current_high_water, self.current_charged_bytes)
+
+    def settle_release(self, amount: int) -> None:
+        """Release a per-item settled charge (decrements settled-current).
+
+        High-water is monotonic — never decremented.  Per §2 "Settle release".
+        """
+        assert amount >= 0
+        self.current_charged_bytes = max(0, self.current_charged_bytes - amount)
+
+    def reserve_and_settle(self, amount: int, class_budget: int) -> bool:
+        """Container dual-ledger atomic admission: reserve + settle in one op.
+
+        For the container class, the charge is final at admission (fixed
+        size-class), so Phase 1 and Phase 2 coincide.  This atomically updates
+        both ledgers, both high-waters.  Per §2 "Container fixed-charge
+        admission path".
+        """
+        assert amount >= 0
+        new_reserved = self.reserved_bytes + amount
+        if new_reserved > class_budget:
+            return False
+        self.reserved_bytes = new_reserved
+        self.reserved_high_water = max(self.reserved_high_water, self.reserved_bytes)
+        self.current_charged_bytes += amount
+        self.current_high_water = max(self.current_high_water, self.current_charged_bytes)
+        return True
+
+    def release_container(self, amount: int) -> None:
+        """Container release: decrements both ledgers atomically.
+
+        Because the container charge is fixed at admission, both the
+        reservation and the settled-current charge are released together.
+        """
+        assert amount >= 0
+        self.reserved_bytes = max(0, self.reserved_bytes - amount)
+        self.current_charged_bytes = max(0, self.current_charged_bytes - amount)
+
+
+@dataclass
+class _DualLedgerBudget:
+    """Process-wide dual-ledger enforced byte-accounting budget (§2 A1-r4).
+
+    Tracks all five budget classes with reservation and settled-current
+    ledgers, plus a total for each.  All operations are performed under the
+    producer's ``_global_lock`` (the caller holds it).
     """
 
-    __slots__ = (
-        "slot_count", "slot_size", "capacity",
-        "_arena", "_free", "_allocated_count", "high_water_slots",
+    classes: Dict[str, _BudgetClassLedgers] = field(
+        default_factory=lambda: {c: _BudgetClassLedgers() for c in _BUDGET_CLASSES}
     )
+    # Totals.
+    total_reserved: int = 0
+    total_reserved_high_water: int = 0
+    total_feature_charged: int = 0
+    total_feature_high_water: int = 0
 
-    def __init__(self, slot_count: int, slot_size: int):
-        self.slot_count = slot_count
-        self.slot_size = slot_size
-        self.capacity = slot_count * slot_size
-        # Pre-allocate the entire arena at construction.  This bytearray IS
-        # the memory reservation — its size is the enforced ceiling.
-        self._arena: bytearray = bytearray(self.capacity)
-        self._free: Deque[int] = deque(range(slot_count))
-        self._allocated_count: int = 0
-        self.high_water_slots: int = 0
+    # ── Phase 1: atomic reservation ──────────────────────────────────────
 
-    def reserve(self) -> Optional[int]:
-        """Atomically reserve one slot. Returns the slot index, or None if full."""
-        if not self._free:
-            return None
-        index = self._free.popleft()
-        self._allocated_count += 1
-        self.high_water_slots = max(self.high_water_slots, self._allocated_count)
-        return index
+    def reserve(self, cls: str, amount: int, class_budget: int, total_budget: int) -> bool:
+        """Atomically reserve *amount* for *cls* against class AND total budget.
 
-    def write(self, index: int, data: bytes) -> int:
-        """Write *data* into the arena slot *index*.
+        One atomic reserve-and-validate: simultaneously increments the
+        per-class reservation ledger and ``total_reserved``.  Checks both
+        the per-class budget and the total budget; if either fails, no
+        ledger is incremented and returns False.
 
-        Returns the number of bytes written (min of len(data) and slot_size).
+        Per §2 "Atomic reservation (Phase 1)".
         """
-        end = min(len(data), self.slot_size)
-        offset = index * self.slot_size
-        self._arena[offset:offset + end] = data[:end]
-        return end
+        assert amount >= 0
+        if amount == 0:
+            return True
+        ledger = self.classes[cls]
+        new_class_reserved = ledger.reserved_bytes + amount
+        new_total = self.total_reserved + amount
+        if new_class_reserved > class_budget:
+            return False
+        if new_total > total_budget:
+            return False
+        ledger.reserved_bytes = new_class_reserved
+        ledger.reserved_high_water = max(ledger.reserved_high_water, ledger.reserved_bytes)
+        self.total_reserved = new_total
+        self.total_reserved_high_water = max(self.total_reserved_high_water, self.total_reserved)
+        return True
 
-    def slot_view(self, index: int, length: int) -> memoryview:
-        """Return a read-only view of *length* bytes from slot *index*."""
-        offset = index * self.slot_size
-        return memoryview(self._arena)[offset:offset + length]
+    def release_reservation(self, cls: str, amount: int) -> None:
+        """Release a lifetime reservation for *cls* (reservation release).
 
-    def slot_offset(self, index: int) -> int:
-        """Return the byte offset of slot *index* within the arena."""
-        return index * self.slot_size
+        Decrements the per-class reservation ledger and ``total_reserved``.
+        Per §2 "Reservation release (lifetime)".
+        """
+        assert amount >= 0
+        if amount == 0:
+            return
+        ledger = self.classes[cls]
+        ledger.reserved_bytes = max(0, ledger.reserved_bytes - amount)
+        self.total_reserved = max(0, self.total_reserved - amount)
 
-    def release(self, index: int) -> None:
-        """Release a slot back to the free pool and zero its arena region."""
-        if index >= 0:
-            self._allocated_count = max(0, self._allocated_count - 1)
-            self._free.append(index)
-            # Zero the arena region for the released slot.
-            offset = index * self.slot_size
-            for i in range(offset, offset + self.slot_size):
-                self._arena[i] = 0
+    # ── Phase 2: atomic settlement ───────────────────────────────────────
 
-    @property
-    def arena(self) -> bytearray:
-        """Direct access to the arena bytearray (for diagnostics/tests)."""
-        return self._arena
+    def settle(self, cls: str, amount: int) -> None:
+        """Atomically settle *amount* for *cls* (within a pre-existing reservation).
 
-    @property
-    def allocated_count(self) -> int:
-        return self._allocated_count
+        One atomic settle: simultaneously increments the per-class
+        settled-current counter, ``total_feature_charged``, and both
+        affected high-waters.  Never touches the reservation ledger.
+
+        Per §2 "Atomic settlement (Phase 2)".
+        """
+        assert amount >= 0
+        if amount == 0:
+            return
+        ledger = self.classes[cls]
+        ledger.current_charged_bytes += amount
+        ledger.current_high_water = max(ledger.current_high_water, ledger.current_charged_bytes)
+        self.total_feature_charged += amount
+        self.total_feature_high_water = max(self.total_feature_high_water, self.total_feature_charged)
+
+    def settle_release(self, cls: str, amount: int) -> None:
+        """Release a per-item settled charge for *cls* (settle release).
+
+        Decrements the per-class settled-current counter and
+        ``total_feature_charged``.  High-waters are monotonic — unchanged.
+
+        Per §2 "Settle release (per item)".
+        """
+        assert amount >= 0
+        if amount == 0:
+            return
+        ledger = self.classes[cls]
+        ledger.current_charged_bytes = max(0, ledger.current_charged_bytes - amount)
+        self.total_feature_charged = max(0, self.total_feature_charged - amount)
+
+    # ── Container dual-ledger atomic admission ───────────────────────────
+
+    def reserve_and_settle_container(
+        self, amount: int, class_budget: int, total_budget: int
+    ) -> bool:
+        """Container dual-ledger atomic admission (reserve + settle in one op).
+
+        Atomically increments reservation-ledger and settled-current-ledger
+        for the container class, plus both totals and all four high-waters.
+        Per §2 "Container fixed-charge admission path".
+        """
+        assert amount >= 0
+        if amount == 0:
+            return True
+        ledger = self.classes["container"]
+        new_class_reserved = ledger.reserved_bytes + amount
+        new_total = self.total_reserved + amount
+        if new_class_reserved > class_budget:
+            return False
+        if new_total > total_budget:
+            return False
+        ledger.reserved_bytes = new_class_reserved
+        ledger.reserved_high_water = max(ledger.reserved_high_water, ledger.reserved_bytes)
+        ledger.current_charged_bytes += amount
+        ledger.current_high_water = max(ledger.current_high_water, ledger.current_charged_bytes)
+        self.total_reserved = new_total
+        self.total_reserved_high_water = max(self.total_reserved_high_water, self.total_reserved)
+        self.total_feature_charged += amount
+        self.total_feature_high_water = max(self.total_feature_high_water, self.total_feature_charged)
+        return True
+
+    def release_container(self, amount: int) -> None:
+        """Release a container charge (decrements both ledgers + total).
+
+        Per §2: container release coincides reservation release + settle
+        release because the charge is fixed at admission.
+        """
+        assert amount >= 0
+        if amount == 0:
+            return
+        ledger = self.classes["container"]
+        ledger.reserved_bytes = max(0, ledger.reserved_bytes - amount)
+        ledger.current_charged_bytes = max(0, ledger.current_charged_bytes - amount)
+        self.total_reserved = max(0, self.total_reserved - amount)
+        self.total_feature_charged = max(0, self.total_feature_charged - amount)
+
+    # ── Observability ────────────────────────────────────────────────────
+
+    def observability_snapshot(self) -> Dict[str, int]:
+        """Return all 24 counters (12 current, 12 high-water) for testing.
+
+        Per §2 "Test interface": all twenty-four counters must be exposed.
+        """
+        result: Dict[str, int] = {
+            "total_reserved_bytes": self.total_reserved,
+            "total_reserved_high_water_bytes": self.total_reserved_high_water,
+            "total_feature_charged_bytes": self.total_feature_charged,
+            "total_feature_high_water_bytes": self.total_feature_high_water,
+        }
+        for cls in _BUDGET_CLASSES:
+            ledger = self.classes[cls]
+            result[f"reserved_{cls}_bytes"] = ledger.reserved_bytes
+            result[f"reserved_{cls}_high_water_bytes"] = ledger.reserved_high_water
+            result[f"current_{cls}_charged_bytes"] = ledger.current_charged_bytes
+            result[f"{cls}_high_water_bytes"] = ledger.current_high_water
+        return result
 
 
 # ── Replay ring ─────────────────────────────────────────────────────────────
@@ -415,18 +613,14 @@ class _ArenaPool:
 
 @dataclass
 class _RingEntry:
-    """A single entry in the per-run replay ring.
-
-    The frame bytes are stored in the run's arena slab; ``offset`` and
-    ``length`` identify the region within that slab.
-    """
+    """A single entry in the per-run replay ring."""
 
     event_id: int
     event_name: str
-    # Arena-backed frame storage.  ``data`` is a read-only view into the
-    # ring's slab; ``frame_size`` is the full SSE frame byte count.
+    #: JSON ``data:`` payload bytes (without SSE framing).
     data: bytes
-    size: int    # byte size of the full SSE frame (for budget accounting)
+    #: Full SSE frame byte count (payload + framing).
+    size: int
 
 
 class _ReplayRing:
@@ -476,8 +670,11 @@ class _ReplayRing:
         with self._lock:
             return self._high_water_bytes
 
-    def add(self, event_name: str, data: bytes, frame_size: int) -> int:
+    def add(self, event_name: str, data: bytes, frame_size: int) -> Tuple[int, List[int]]:
         """Add an event, enforcing the ring's byte/event budget before append.
+
+        Returns ``(event_id, [evicted_event_ids])``.  The caller uses the
+        evicted list to settle-release the old frame charges.
 
         The byte budget check uses ``current + frame_size`` and evicts
         entries until the new frame fits.  If a single frame is larger
@@ -487,10 +684,11 @@ class _ReplayRing:
         with self._lock:
             event_id = self._next_event_id
             self._next_event_id += 1
+            evicted_ids: List[int] = []
             # A single frame larger than the ring cannot be retained, but
             # still consumes its global monotonic ID.
             if frame_size > self._max_bytes or self._max_events <= 0:
-                return event_id
+                return event_id, evicted_ids
             # Evict until the new frame fits within both event and byte caps.
             while self._entries and (
                 len(self._entries) + 1 > self._max_events
@@ -498,6 +696,7 @@ class _ReplayRing:
             ):
                 evicted = self._entries.popleft()
                 self._current_bytes -= evicted.size
+                evicted_ids.append(evicted.event_id)
             entry = _RingEntry(event_id, event_name, data, frame_size)
             self._entries.append(entry)
             self._current_bytes += frame_size
@@ -505,7 +704,7 @@ class _ReplayRing:
             # eviction loop guarantees current_bytes + frame_size <= max_bytes
             # before append, and current_bytes is always <= max_bytes.
             self._high_water_bytes = max(self._high_water_bytes, self._current_bytes)
-            return event_id
+            return event_id, evicted_ids
 
     def replay_after(self, cursor: int) -> List[_RingEntry]:
         """Return entries with event_id > *cursor*, in order.
@@ -524,7 +723,8 @@ class _ReplayRing:
 @dataclass
 class _Subscriber:
     """A single SSE subscriber connection."""
-    queue: Deque[Tuple[int, str, bytes]]  # (event_id, event_name, data)
+    #: Queue entries: (event_id, event_name, data_bytes, frame_size).
+    queue: Deque[Tuple[int, str, bytes, int]] = field(default_factory=deque)
     queue_event_count: int = 0
     queue_byte_count: int = 0
     last_delivered_event_id: int = 0
@@ -534,18 +734,19 @@ class _Subscriber:
     # In-flight event held in the serialization slot.
     in_flight_event_id: int = 0
     in_flight_event_name: str = ""
+    #: The in-flight frame's settled charge (for settle-release on confirm/fail).
+    in_flight_frame_size: int = 0
     # Lag/close state.
     closed: bool = False
     # Filtering.
     include_categories: Optional[Set[str]] = None  # None = all
-    # Lag frame to deliver (if any), allocated from control_slot_pool.
+    # Lag frame to deliver (if any), charged from control_frame_budget.
     pending_lag_frame: Optional[bytes] = None
+    #: The settled charge for the pending lag frame (for settle-release).
+    pending_lag_frame_size: int = 0
     # A freeze requests recovery; field capture waits until an acquired write
     # joins via confirm_delivered/mark_write_failed.
     lag_pending: bool = False
-    queue_pool_index: int = -1
-    control_pool_index: int = -1
-    serialization_pool_index: int = -1
 
 
 # ── Run state ───────────────────────────────────────────────────────────────
@@ -561,7 +762,6 @@ class _RunState:
     active: bool = True
     terminal_time: Optional[float] = None  # when the run ended
     retention_expiry: Optional[float] = None  # terminal_time + retention
-    replay_pool_index: int = -1
     _next_subscriber_id: int = 1
     _lock: threading.Lock = field(default_factory=threading.Lock)
 
@@ -575,40 +775,23 @@ class RunEventsProducer:
     Manages replay rings and subscriber queues for all runs, enforces the
     four-limit atomic admission, and serialises events for delivery.
 
-    Thread-safety: all mutable state is guarded by per-run locks and a
-    process-wide lock for admission counters.  The producer is designed to
-    be called from both sync (event callback) and async (handler) contexts.
+    Thread-safety: all mutable state is guarded by ``_global_lock``.  The
+    producer is designed to be called from both sync (event callback) and
+    async (handler) contexts.
     """
 
     def __init__(self, snapshot: Optional[RunEventsCapabilitiesSnapshot] = None):
         self.snapshot = snapshot or DEFAULT_SNAPSHOT
         self._runs: Dict[str, _RunState] = {}
         self._global_lock = threading.Lock()
-        # Pre-allocate all five arena-backed fixed pools once (§2).  Each
-        # pool is a contiguous bytearray allocated at construction and
-        # never grown.  The bounded memory formula (§2) is enforced by
-        # arena allocation + pool admission + per-structure byte caps +
-        # container budget.  The arena bytearrays are the enforced
-        # allocation ceiling.
-        self._replay_pool = _ArenaPool(
-            self.snapshot.max_retained_runs, self.snapshot.max_replay_bytes
-        )
-        self._queue_pool = _ArenaPool(
-            self.snapshot.max_concurrent_subscribers,
-            self.snapshot.max_subscriber_queue_bytes,
-        )
-        self._control_pool = _ArenaPool(
-            self.snapshot.max_concurrent_subscribers, self.snapshot.max_event_bytes
-        )
-        self._serialization_pool = _ArenaPool(
-            self.snapshot.max_concurrent_subscribers, self.snapshot.max_event_bytes
-        )
-        self._container_pool = _ArenaPool(1, self.snapshot.container_budget_bytes)
+        # Dual-ledger budget (§2 A1-r4).
+        self._budget = _DualLedgerBudget()
         self._total_subscribers: int = 0
         self._active_run_count: int = 0
         self._retained_run_count: int = 0
-        self._container_bytes_used: int = 0
-        self._container_high_water: int = 0
+        # Track per-run and per-subscriber settled charges for clean release.
+        self._run_ring_settled: Dict[str, int] = {}  # run_id → settled ring bytes
+        self._sub_queue_settled: Dict[Tuple[str, int], int] = {}  # (run, sub) → settled queue bytes
         # Terminal retention sweeper hook (set by the adapter).
         self._retention_sweep_callback: Optional[Any] = None
 
@@ -625,40 +808,37 @@ class RunEventsProducer:
         Returns True if admitted, False if overloaded (caller returns 503).
         Idempotent for an already-admitted run (returns True).
         """
+        snap = self.snapshot
         with self._global_lock:
             if run_id in self._runs:
                 return True
             # Check all four limits atomically.
-            if self._retained_run_count >= self.snapshot.max_retained_runs:
+            if self._retained_run_count >= snap.max_retained_runs:
                 return False
-            if self._active_run_count >= self.snapshot.max_active_runs_for_events:
+            if self._active_run_count >= snap.max_active_runs_for_events:
                 return False
-            # Check container budget for run metadata.
-            if (
-                self._container_bytes_used + _CONTAINER_SIZE_CLASS_RUN
-                > self.snapshot.container_budget_bytes
+            # ── Phase 1 reservations (dual-ledger, §2) ──
+            # Reserve retained_run budget: max_replay_bytes per run.
+            if not self._budget.reserve(
+                "retained_run", snap.max_replay_bytes,
+                snap.retained_run_budget, snap.total_feature_memory_budget_bytes,
             ):
                 return False
-            # Reserve the replay arena slab before constructing run state.
-            replay_pool_index = self._replay_pool.reserve()
-            if replay_pool_index is None:
+            # Container dual-ledger atomic admission for run metadata.
+            if not self._budget.reserve_and_settle_container(
+                _CONTAINER_CHARGE_RUN,
+                snap.container_budget_bytes,
+                snap.total_feature_memory_budget_bytes,
+            ):
+                # Rollback the retained_run reservation.
+                self._budget.release_reservation("retained_run", snap.max_replay_bytes)
                 return False
-            # Reserve.
+            # All reservations succeeded — construct state.
             self._retained_run_count += 1
             self._active_run_count += 1
-            self._container_bytes_used += _CONTAINER_SIZE_CLASS_RUN
-            self._container_high_water = max(
-                self._container_high_water, self._container_bytes_used
-            )
-            ring = _ReplayRing(
-                self.snapshot.max_replay_events,
-                self.snapshot.max_replay_bytes,
-            )
-            self._runs[run_id] = _RunState(
-                run_id=run_id,
-                ring=ring,
-                replay_pool_index=replay_pool_index,
-            )
+            ring = _ReplayRing(snap.max_replay_events, snap.max_replay_bytes)
+            self._runs[run_id] = _RunState(run_id=run_id, ring=ring)
+            self._run_ring_settled[run_id] = 0
             return True
 
     def mark_run_terminal(self, run_id: str) -> None:
@@ -676,7 +856,12 @@ class RunEventsProducer:
                 self._active_run_count = max(0, self._active_run_count - 1)
 
     def expire_run(self, run_id: str) -> None:
-        """Release a run's retained reservation (after retention expiry)."""
+        """Release a run's retained reservation (after retention expiry).
+
+        Per §2 "Retention expiry": reservation release + remaining settle
+        releases for all ring items.
+        """
+        snap = self.snapshot
         with self._global_lock:
             run = self._runs.pop(run_id, None)
             if run is None:
@@ -684,13 +869,17 @@ class RunEventsProducer:
             if run.active:
                 self._active_run_count = max(0, self._active_run_count - 1)
             self._retained_run_count = max(0, self._retained_run_count - 1)
-            self._replay_pool.release(run.replay_pool_index)
-            for sub in run.subscribers.values():
-                self._release_subscriber_pools(sub)
+            # Release all subscriber reservations + settled charges.
+            for sub_id, sub in list(run.subscribers.items()):
+                self._release_subscriber_reservations_locked(run_id, sub_id, sub)
             self._total_subscribers -= len(run.subscribers)
-            # Release container budget for run metadata + subscriber metadata.
-            release = _CONTAINER_SIZE_CLASS_RUN + len(run.subscribers) * _CONTAINER_SIZE_CLASS_SUBSCRIBER
-            self._container_bytes_used = max(0, self._container_bytes_used - release)
+            # Release ring settled charges.
+            ring_settled = self._run_ring_settled.pop(run_id, 0)
+            if ring_settled > 0:
+                self._budget.settle_release("retained_run", ring_settled)
+            # Release run reservations: retained_run reservation + container.
+            self._budget.release_reservation("retained_run", snap.max_replay_bytes)
+            self._budget.release_container(_CONTAINER_CHARGE_RUN)
 
     def run_exists(self, run_id: str) -> bool:
         with self._global_lock:
@@ -757,54 +946,51 @@ class RunEventsProducer:
         Returns ``(sub_id, filtered_replay_entries, run_is_active)``, or
         ``None`` if any limit is saturated (caller returns 503).
         """
+        snap = self.snapshot
         with self._global_lock:
             run = self._runs.get(run_id)
             if run is None:
                 return None
             # Check subscriber limits.
-            if self._total_subscribers >= self.snapshot.max_concurrent_subscribers:
+            if self._total_subscribers >= snap.max_concurrent_subscribers:
                 return None
-            if len(run.subscribers) >= self.snapshot.max_subscribers_per_run:
+            if len(run.subscribers) >= snap.max_subscribers_per_run:
                 return None
-            # Check container budget for subscriber metadata.
-            if (
-                self._container_bytes_used + _CONTAINER_SIZE_CLASS_SUBSCRIBER
-                > self.snapshot.container_budget_bytes
+            # ── Phase 1 reservations (dual-ledger, §2) ──
+            # Reserve subscriber_queue, control_frame, serialization budgets.
+            reservation_amounts = [
+                ("subscriber_queue", snap.max_subscriber_queue_bytes, snap.subscriber_queue_budget),
+                ("control_frame", snap.max_event_bytes, snap.control_frame_budget_bytes),
+                ("serialization", snap.max_event_bytes, snap.serialization_budget_bytes),
+            ]
+            reserved_classes: List[str] = []
+            for cls, amount, class_budget in reservation_amounts:
+                if not self._budget.reserve(
+                    cls, amount, class_budget, snap.total_feature_memory_budget_bytes,
+                ):
+                    # Rollback already-reserved classes.
+                    for prev_cls in reserved_classes:
+                        prev_amount = next(a for c, a, _ in reservation_amounts if c == prev_cls)
+                        self._budget.release_reservation(prev_cls, prev_amount)
+                    return None
+                reserved_classes.append(cls)
+            # Container dual-ledger atomic admission for subscriber metadata.
+            if not self._budget.reserve_and_settle_container(
+                _SUBSCRIBER_CONTAINER_TOTAL,
+                snap.container_budget_bytes,
+                snap.total_feature_memory_budget_bytes,
             ):
+                # Rollback subscriber reservations.
+                for cls, amount, _ in reservation_amounts:
+                    self._budget.release_reservation(cls, amount)
                 return None
-            # Reserve all three subscriber arena slabs atomically before
-            # constructing subscriber-visible state.  Roll back partial
-            # reservations.
-            queue_pool_index = self._queue_pool.reserve()
-            control_pool_index = self._control_pool.reserve()
-            serialization_pool_index = self._serialization_pool.reserve()
-            if None in (queue_pool_index, control_pool_index, serialization_pool_index):
-                if queue_pool_index is not None:
-                    self._queue_pool.release(queue_pool_index)
-                if control_pool_index is not None:
-                    self._control_pool.release(control_pool_index)
-                if serialization_pool_index is not None:
-                    self._serialization_pool.release(serialization_pool_index)
-                return None
-            assert queue_pool_index is not None
-            assert control_pool_index is not None
-            assert serialization_pool_index is not None
-            # Atomically: reserve subscriber slot + charge container + snapshot ring.
+            # All reservations succeeded — construct subscriber state.
             sub_id = run._next_subscriber_id
             run._next_subscriber_id += 1
-            sub = _Subscriber(
-                queue=deque(),
-                include_categories=include_categories,
-                queue_pool_index=queue_pool_index,
-                control_pool_index=control_pool_index,
-                serialization_pool_index=serialization_pool_index,
-            )
+            sub = _Subscriber(include_categories=include_categories)
             run.subscribers[sub_id] = sub
             self._total_subscribers += 1
-            self._container_bytes_used += _CONTAINER_SIZE_CLASS_SUBSCRIBER
-            self._container_high_water = max(
-                self._container_high_water, self._container_bytes_used
-            )
+            self._sub_queue_settled[(run_id, sub_id)] = 0
             # Capture replay entries (atomically — same lock).
             replay_entries = run.ring.replay_after(cursor)
             # Apply include filter to replay entries (§4, §6).
@@ -815,10 +1001,32 @@ class RunEventsProducer:
                 ]
             return sub_id, replay_entries, run.active
 
-    def _release_subscriber_pools(self, sub: _Subscriber) -> None:
-        self._queue_pool.release(sub.queue_pool_index)
-        self._control_pool.release(sub.control_pool_index)
-        self._serialization_pool.release(sub.serialization_pool_index)
+    def _release_subscriber_reservations_locked(
+        self, run_id: str, sub_id: int, sub: _Subscriber
+    ) -> None:
+        """Release all budget reservations + settled charges for a subscriber.
+
+        Must be called under ``_global_lock``.  Per §2 "Subscriber disconnect":
+        reservation release + remaining settle releases.
+        """
+        snap = self.snapshot
+        # Release remaining settled queue charges.
+        queue_settled = self._sub_queue_settled.pop((run_id, sub_id), 0)
+        if queue_settled > 0:
+            self._budget.settle_release("subscriber_queue", queue_settled)
+        # Release remaining serialization slot settled charge (if any).
+        if sub.in_flight_frame_size > 0:
+            self._budget.settle_release("serialization", sub.in_flight_frame_size)
+            sub.in_flight_frame_size = 0
+        # Release pending lag frame charge (if any).
+        if sub.pending_lag_frame_size > 0:
+            self._budget.settle_release("control_frame", sub.pending_lag_frame_size)
+            sub.pending_lag_frame_size = 0
+        # Release reservations: queue + control + serialization + container.
+        self._budget.release_reservation("subscriber_queue", snap.max_subscriber_queue_bytes)
+        self._budget.release_reservation("control_frame", snap.max_event_bytes)
+        self._budget.release_reservation("serialization", snap.max_event_bytes)
+        self._budget.release_container(_SUBSCRIBER_CONTAINER_TOTAL)
 
     def remove_subscriber(self, run_id: str, sub_id: int) -> None:
         """Release a subscriber reservation (on disconnect or close-on-lag)."""
@@ -828,11 +1036,8 @@ class RunEventsProducer:
                 return
             sub = run.subscribers.pop(sub_id, None)
             if sub is not None:
-                self._release_subscriber_pools(sub)
+                self._release_subscriber_reservations_locked(run_id, sub_id, sub)
                 self._total_subscribers = max(0, self._total_subscribers - 1)
-                self._container_bytes_used = max(
-                    0, self._container_bytes_used - _CONTAINER_SIZE_CLASS_SUBSCRIBER
-                )
 
     # ── Category filtering helper ─────────────────────────────────────────
 
@@ -859,8 +1064,15 @@ class RunEventsProducer:
         return json.dumps(event_data, separators=(",", ":")).encode("utf-8")
 
     def _frame_size(self, event_name: str, data_bytes: bytes, event_id: Optional[int]) -> int:
-        """Compute the full SSE frame byte size for budget accounting."""
-        # Approximate: "event: {name}\nid: {id}\ndata: {json}\n\n"
+        """Compute the full SSE frame byte size for budget accounting.
+
+        The complete SSE wire frame includes:
+        - ``event: {name}\\n``
+        - optional ``id: {id}\\n``
+        - ``data: {json}\\n``
+        - terminating ``\\n``
+        """
+        # Approximate: "event: {name}\\nid: {id}\\ndata: {json}\\n\\n"
         size = len(b"event: ") + len(event_name.encode("utf-8"))
         if event_id is not None:
             size += len(b"\nid: ") + len(str(event_id).encode("ascii"))
@@ -875,24 +1087,59 @@ class RunEventsProducer:
         snapshot = self.snapshot
         data_bytes = self._serialize_event(event_name, event_data)
 
-        # Oversize check: if the serialized data exceeds max_event_bytes,
+        # Oversize check: if the complete SSE wire frame exceeds max_event_bytes,
         # replace with the oversize error event.
-        if len(data_bytes) > snapshot.max_event_bytes:
+        # We check the full frame size (payload + framing) per §2/§7.
+        prelim_frame_size = self._frame_size(event_name, data_bytes, 0)
+        if prelim_frame_size > snapshot.max_event_bytes:
             original_name = event_name
             event_name = "hermes.run_events.event.oversize"
             event_data = {
                 "original_event": original_name,
-                "size_bytes": len(data_bytes),
+                "size_bytes": prelim_frame_size,
                 "code": "event_oversize",
             }
             data_bytes = self._serialize_event(event_name, event_data)
 
-        # Add to the replay ring (assigns the monotonic ID).
         with self._global_lock:
             run = self._runs.get(run_id)
             if run is None:
                 return
-            event_id = run.ring.add(event_name, data_bytes, self._frame_size(event_name, data_bytes, 0))
+
+            # ── Phase 2: settle ring insertion ──
+            ring_frame_size = self._frame_size(event_name, data_bytes, 0)
+            event_id, evicted_ids = run.ring.add(event_name, data_bytes, ring_frame_size)
+            # Settle the new ring entry.
+            self._budget.settle("retained_run", ring_frame_size)
+            self._run_ring_settled[run_id] = self._run_ring_settled.get(run_id, 0) + ring_frame_size
+            # Settle-release evicted entries.
+            for _eid in evicted_ids:
+                # Evicted entries had the same frame_size at insertion.
+                # We use the ring's current_bytes delta instead, but for
+                # exact accounting we need to track per-entry.  Since ring
+                # entries store their size, we can derive from the ring's
+                # own accounting.  However, we track the aggregate here.
+                pass
+            # For evicted entries, the ring already decremented its
+            # _current_bytes.  We need to settle-release the same amount
+            # from our budget.  The ring doesn't expose per-eviction sizes,
+            # so we track via the aggregate: the net change to
+            # _run_ring_settled is (ring_frame_size - sum_of_evicted_sizes).
+            # Since the ring tracks _current_bytes precisely, we reconcile
+            # our settled tracker to match ring.current_bytes.
+            ring_current = run.ring.current_bytes
+            old_settled = self._run_ring_settled[run_id]
+            delta = ring_current - old_settled
+            if delta < 0:
+                # Ring shrank (evictions exceeded insertion) — settle-release.
+                self._budget.settle_release("retained_run", -delta)
+            elif delta > 0:
+                # This shouldn't happen since we already settled the new entry,
+                # but reconcile defensively.
+                self._budget.settle("retained_run", delta)
+            self._run_ring_settled[run_id] = ring_current
+
+            # Compute the frame size WITH event_id for queue accounting.
             frame = self._frame_size(event_name, data_bytes, event_id)
             category = _event_category(event_name)
 
@@ -905,12 +1152,6 @@ class RunEventsProducer:
                 if category != "meta" and sub.include_categories is not None:
                     if category not in sub.include_categories:
                         continue
-                # If the serialization slot is currently acquired (an event
-                # is in flight to the transport), this new event cannot be
-                # serialized yet.  If the queue has room, it's enqueued
-                # normally.  If the queue is full, queue-overflow lag fires.
-                # The serialization-timeout entry (§2) tracks this event as
-                # the "pending next event" when the slot is occupied.
                 # Enqueue with dual-limit check (current + candidate, §6).
                 if (
                     sub.queue_event_count + 1 > snapshot.max_subscriber_queue_events
@@ -921,11 +1162,17 @@ class RunEventsProducer:
                         run, sub_id, sub,
                         triggering_event_id=event_id,
                         triggering_event_name=event_name,
+                        triggering_frame_size=frame,
                     )
                     continue
-                sub.queue.append((event_id, event_name, data_bytes))
+                # Enqueue and settle the queue charge.
+                sub.queue.append((event_id, event_name, data_bytes, frame))
                 sub.queue_event_count += 1
                 sub.queue_byte_count += frame
+                self._budget.settle("subscriber_queue", frame)
+                self._sub_queue_settled[(run_id, sub_id)] = (
+                    self._sub_queue_settled.get((run_id, sub_id), 0) + frame
+                )
 
     def _close_on_lag(
         self,
@@ -934,6 +1181,7 @@ class RunEventsProducer:
         sub: _Subscriber,
         triggering_event_id: int,
         triggering_event_name: str,
+        triggering_frame_size: int = 0,
     ) -> None:
         """Freeze/seal a subscriber and request writer-joined lag recovery.
 
@@ -947,6 +1195,11 @@ class RunEventsProducer:
         sub.lag_pending = True
         # The triggering event is abandoned, as is the sealed queue.  Do not
         # capture the cursor while a write can still change ground truth.
+        # Settle-release all queue charges.
+        queue_settled = self._sub_queue_settled.pop((run.run_id, sub_id), 0)
+        if queue_settled > 0:
+            self._budget.settle_release("subscriber_queue", queue_settled)
+            self._sub_queue_settled[(run.run_id, sub_id)] = 0
         sub.queue.clear()
         sub.queue_event_count = 0
         sub.queue_byte_count = 0
@@ -967,14 +1220,14 @@ class RunEventsProducer:
             "dropped_events": latest_available - last_delivered,
         }
         lag_bytes = self._serialize_event("hermes.run_events.subscriber.lagged", lag_data)
-        # Write the lag frame into the subscriber's reserved control slot.
         lag_frame = self._format_control_frame(
             "hermes.run_events.subscriber.lagged", lag_bytes
         )
-        # Store in the control slot arena and also keep a reference for
-        # get_subscriber_frame to return.
-        self._control_pool.write(sub.control_pool_index, lag_frame)
+        # Settle the control frame charge (Phase 2, within reserved control_frame budget).
+        lag_frame_size = len(lag_frame)
+        self._budget.settle("control_frame", lag_frame_size)
         sub.pending_lag_frame = lag_frame
+        sub.pending_lag_frame_size = lag_frame_size
         sub.lag_pending = False
 
     def _format_control_frame(self, event_name: str, data_bytes: bytes) -> bytes:
@@ -1029,20 +1282,25 @@ class RunEventsProducer:
                 return None
             # Drain the queue — acquire serialization slot.
             if sub.queue:
-                event_id, event_name, data_bytes = sub.queue.popleft()
+                event_id, event_name, data_bytes, frame_size = sub.queue.popleft()
                 sub.queue_event_count -= 1
-                frame_size = self._frame_size(event_name, data_bytes, event_id)
                 sub.queue_byte_count -= frame_size
-                # Acquire slot (FREE → ACQUIRED).
+                # Settle-release the queue charge (item dequeued for delivery).
+                self._budget.settle_release("subscriber_queue", frame_size)
+                self._sub_queue_settled[(run_id, sub_id)] = max(
+                    0, self._sub_queue_settled.get((run_id, sub_id), 0) - frame_size
+                )
+                # Acquire slot (FREE → ACQUIRED) and settle serialization copy.
                 sub.slot_acquired = True
                 sub.slot_acquired_at = time.monotonic()
                 sub.in_flight_event_id = event_id
                 sub.in_flight_event_name = event_name
+                sub.in_flight_frame_size = frame_size
                 # NOTE: last_delivered_event_id is NOT advanced here.
                 # confirm_delivered() advances it after transport success.
                 frame = self._format_replayable_frame(event_name, event_id, data_bytes)
-                # Write the serialized copy into the serialization arena slot.
-                self._serialization_pool.write(sub.serialization_pool_index, frame)
+                # Phase 2: settle the serialized copy charge.
+                self._budget.settle("serialization", frame_size)
                 return frame
             return None  # no data right now
 
@@ -1061,11 +1319,13 @@ class RunEventsProducer:
             sub.slot_acquired_at = time.monotonic()
             sub.in_flight_event_id = entry.event_id
             sub.in_flight_event_name = entry.event_name
+            frame_size = self._frame_size(entry.event_name, entry.data, entry.event_id)
+            sub.in_flight_frame_size = frame_size
             frame = self._format_replayable_frame(
                 entry.event_name, entry.event_id, entry.data
             )
-            # Write the serialized copy into the serialization arena slot.
-            self._serialization_pool.write(sub.serialization_pool_index, frame)
+            # Phase 2: settle the serialized copy charge.
+            self._budget.settle("serialization", frame_size)
             return frame
 
     def confirm_delivered(self, run_id: str, sub_id: int) -> None:
@@ -1087,18 +1347,13 @@ class RunEventsProducer:
                 # A frozen subscriber still advances when the joined in-flight
                 # write succeeded; capture happens only after this transition.
                 sub.last_delivered_event_id = sub.in_flight_event_id
+                # Settle-release the serialization copy charge.
+                if sub.in_flight_frame_size > 0:
+                    self._budget.settle_release("serialization", sub.in_flight_frame_size)
                 sub.slot_acquired = False
                 sub.in_flight_event_id = 0
                 sub.in_flight_event_name = ""
-                # The serialization pool slot stays reserved for this
-                # subscriber's lifetime (one per subscriber, §2).  We only
-                # zero the arena region; the pool admission count is
-                # unchanged until the subscriber disconnects.
-                self._serialization_pool.write(
-                    sub.serialization_pool_index, b"\x00" * min(
-                        self._serialization_pool.slot_size, 64
-                    )
-                )
+                sub.in_flight_frame_size = 0
                 self._finalize_lag_locked(run, sub)
 
     def mark_write_failed(self, run_id: str, sub_id: int) -> None:
@@ -1114,16 +1369,15 @@ class RunEventsProducer:
             sub = run.subscribers.get(sub_id)
             if sub is None:
                 return
-            sub.slot_acquired = False
-            sub.in_flight_event_id = 0
-            sub.in_flight_event_name = ""
-            # Zero the serialization slot arena region (slot stays reserved).
-            self._serialization_pool.write(
-                sub.serialization_pool_index, b"\x00" * min(
-                    self._serialization_pool.slot_size, 64
-                )
-            )
-            self._finalize_lag_locked(run, sub)
+            if sub.slot_acquired:
+                # Settle-release the serialization copy charge.
+                if sub.in_flight_frame_size > 0:
+                    self._budget.settle_release("serialization", sub.in_flight_frame_size)
+                sub.slot_acquired = False
+                sub.in_flight_event_id = 0
+                sub.in_flight_event_name = ""
+                sub.in_flight_frame_size = 0
+                self._finalize_lag_locked(run, sub)
 
     def check_serialization_timeout(
         self, run_id: str, sub_id: int, now: Optional[float] = None
@@ -1131,16 +1385,16 @@ class RunEventsProducer:
         """Check if the subscriber's serialization slot has been held too long.
 
         Per §2 (serialization-timeout transition), this entry fires only when
-        the slot could not be acquired for a **next replayable event**.  If
-        the slot is simply occupied by a normal in-flight write and no
-        additional event exists beyond it, this is per-subscriber
-        backpressure, not a timeout — the method returns False.
+        the slot could not be acquired for a **next replayable event for this
+        subscriber** — specifically, when the subscriber's own queue is
+        non-empty (there is a real pending event this subscriber would
+        receive).  A filtered-out later global event that never enters this
+        subscriber's queue must NOT trigger timeout.
 
-        The invariant: the in-flight event's ID must be less than the run's
-        current max replayable ID.  If ``in_flight >= latest_available``,
-        there is no abandoned interval and the timeout must not fire — this
-        prevents the false/empty lag interval the round-3 reviewer
-        reproduced (first_dropped > latest_available, dropped_events=0).
+        The pending event (queue head) is the triggering event — a real
+        extant event preserved through join→capture as the abandoned-interval
+        head.  If the queue is empty, there is no pending event and the
+        timeout must not fire (per-subscriber backpressure, not lag).
         """
         if now is None:
             now = time.monotonic()
@@ -1151,24 +1405,27 @@ class RunEventsProducer:
             sub = run.subscribers.get(sub_id)
             if sub is None or sub.closed:
                 return False
-            # Only fire if the slot has been held longer than one heartbeat
-            # AND there exists at least one replayable event beyond the
-            # in-flight one.  Without a next event, this is just normal
-            # backpressure — no timeout, no false lag interval.
-            latest_available = run.ring.max_event_id
+            # Only fire if:
+            # 1. The slot has been held longer than one heartbeat.
+            # 2. There is a real pending next event FOR THIS SUBSCRIBER
+            #    in the queue (the subscriber-local pending candidate).
+            # A filtered-out later global event that never enters this
+            # subscriber's queue does not satisfy condition 2.
             if (
                 sub.slot_acquired
-                and sub.in_flight_event_id < latest_available
+                and len(sub.queue) > 0
                 and (now - sub.slot_acquired_at) > self.snapshot.heartbeat_seconds
             ):
                 # Serialization-timeout → close-on-lag (§2, §6).
-                # The triggering event is the first event beyond the
-                # in-flight one — the one that was waiting for slot
+                # The triggering event is the subscriber's queue head —
+                # the real pending event that was waiting for slot
                 # acquisition.
+                trigger_id, trigger_name, _, trigger_frame_size = sub.queue[0]
                 self._close_on_lag(
                     run, sub_id, sub,
-                    triggering_event_id=sub.in_flight_event_id + 1,
-                    triggering_event_name=sub.in_flight_event_name,
+                    triggering_event_id=trigger_id,
+                    triggering_event_name=trigger_name,
+                    triggering_frame_size=trigger_frame_size,
                 )
                 return True
             return False
@@ -1233,48 +1490,14 @@ class RunEventsProducer:
     # ── Diagnostics / testing ─────────────────────────────────────────────
 
     @property
-    def pool_capacities(self) -> Dict[str, int]:
-        return {
-            "retained_run_buffers": self._replay_pool.capacity,
-            "subscriber_queues": self._queue_pool.capacity,
-            "control_slot_pool": self._control_pool.capacity,
-            "serialization_pool": self._serialization_pool.capacity,
-            "container_budget": self._container_pool.capacity,
-        }
+    def budget_observability(self) -> Dict[str, int]:
+        """All 24 dual-ledger counters (§2 test interface).
 
-    @property
-    def pool_high_water_slots(self) -> Dict[str, int]:
-        """Maximum simultaneous slot occupancy per pool (observable §2).
-
-        Each high-water must never exceed the pool's ``slot_count``.  Tests
-        can assert this to prove the bounded memory formula is enforced.
-        """
-        return {
-            "retained_run_buffers": self._replay_pool.high_water_slots,
-            "subscriber_queues": self._queue_pool.high_water_slots,
-            "control_slot_pool": self._control_pool.high_water_slots,
-            "serialization_pool": self._serialization_pool.high_water_slots,
-        }
-
-    @property
-    def pool_allocated_slots(self) -> Dict[str, int]:
-        """Current slot occupancy per pool."""
-        return {
-            "retained_run_buffers": self._replay_pool.allocated_count,
-            "subscriber_queues": self._queue_pool.allocated_count,
-            "control_slot_pool": self._control_pool.allocated_count,
-            "serialization_pool": self._serialization_pool.allocated_count,
-        }
-
-    @property
-    def ring_high_water_bytes(self) -> Dict[str, int]:
-        """Observable ring byte high-water (§2 byte-budget enforcement).
-
-        Returns a dict of run_id → high_water_bytes.  Each ring's
-        high-water must never exceed ``max_replay_bytes``.
+        Returns the full set of current and high-water counters for all
+        five budget classes and the total.
         """
         with self._global_lock:
-            return {rid: r.ring.high_water_bytes for rid, r in self._runs.items()}
+            return self._budget.observability_snapshot()
 
     @property
     def total_subscribers(self) -> int:
@@ -1293,27 +1516,39 @@ class RunEventsProducer:
 
     @property
     def container_bytes_used(self) -> int:
-        """Observable container-budget charged-byte counter (§2)."""
-        return self._container_bytes_used
+        """Observable container-budget charged-byte counter (settled-current)."""
+        with self._global_lock:
+            return self._budget.classes["container"].current_charged_bytes
 
     @property
     def container_high_water(self) -> int:
-        """High-water mark of container budget usage (§2)."""
-        return self._container_high_water
+        """High-water mark of container budget usage (settled-current)."""
+        with self._global_lock:
+            return self._budget.classes["container"].current_high_water
 
     def charge_container(self, nbytes: int) -> None:
-        """Charge *nbytes* to the container budget (size-class accounting).
+        """Charge *nbytes* to the container budget (diagnostic/testing helper).
 
-        This is a diagnostic/testing helper.  Admission-time charges are
-        handled internally by :meth:`admit_run` and
-        :meth:`admit_subscriber_and_snapshot`.
+        Uses the dual-ledger atomic admission path (reserve + settle).
         """
         with self._global_lock:
-            self._container_bytes_used += nbytes
-            if self._container_bytes_used > self._container_high_water:
-                self._container_high_water = self._container_bytes_used
+            self._budget.reserve_and_settle_container(
+                nbytes,
+                self.snapshot.container_budget_bytes,
+                self.snapshot.total_feature_memory_budget_bytes,
+            )
 
     def release_container(self, nbytes: int) -> None:
         """Release *nbytes* from the container budget."""
         with self._global_lock:
-            self._container_bytes_used = max(0, self._container_bytes_used - nbytes)
+            self._budget.release_container(nbytes)
+
+    @property
+    def ring_high_water_bytes(self) -> Dict[str, int]:
+        """Observable ring byte high-water per run.
+
+        Returns a dict of run_id → high_water_bytes.  Each ring's
+        high-water must never exceed ``max_replay_bytes``.
+        """
+        with self._global_lock:
+            return {rid: r.ring.high_water_bytes for rid, r in self._runs.items()}

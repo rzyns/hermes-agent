@@ -370,16 +370,17 @@ class TestRunEvents:
                         break
                     await asyncio.sleep(0.01)
 
-                # Emit an additional event so the serialization-timeout has a
-                # valid pending next event (in_flight < latest_available).
-                # Per round-4 fix: the timeout must not fire when there is no
-                # event beyond the in-flight one.
+                events_resp = await cli.get(f"/v1/runs/{run_id}/events")
+                await asyncio.wait_for(write_started.wait(), timeout=1)
+
+                # Emit an additional event AFTER the subscriber is admitted
+                # and the first replay write is blocked.  This ensures the
+                # event goes into the subscriber's live queue (not the replay
+                # snapshot), making it the subscriber-local pending candidate
+                # required by the A1-r4 serialization-timeout check.
                 adapter._run_events_producer.emit_event(
                     run_id, "message.delta", {"text": "extra"}
                 )
-
-                events_resp = await cli.get(f"/v1/runs/{run_id}/events")
-                await asyncio.wait_for(write_started.wait(), timeout=1)
                 await asyncio.sleep(1.1)
 
                 subscribers = adapter._run_events_producer._runs[run_id].subscribers
