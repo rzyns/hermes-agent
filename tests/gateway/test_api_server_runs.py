@@ -24,6 +24,10 @@ from gateway.platforms.api_server import (
     cors_middleware,
     security_headers_middleware,
 )
+from gateway.platforms.run_events_producer import (
+    RunEventsCapabilitiesSnapshot,
+    RunEventsProducer,
+)
 from tools import approval as approval_mod
 
 
@@ -330,6 +334,56 @@ class TestRunEvents:
                 # Should contain run.completed
                 assert "run.completed" in body
                 assert "Hello!" in body
+
+    @pytest.mark.asyncio
+    async def test_serialization_watchdog_freezes_blocked_replay_write(self, adapter):
+        """The watchdog runs while the sole writer is blocked in transport I/O."""
+        snapshot = RunEventsCapabilitiesSnapshot(heartbeat_seconds=1)
+        adapter._run_events_producer = RunEventsProducer(snapshot)
+        app = _create_runs_app(adapter)
+        write_started = asyncio.Event()
+        release_write = asyncio.Event()
+        original_write = web.StreamResponse.write
+
+        async def blocked_write(response, data):
+            if b"id:" in data and b"subscriber.lagged" not in data:
+                write_started.set()
+                await release_write.wait()
+            return await original_write(response, data)
+
+        async with TestClient(TestServer(app)) as cli:
+            with (
+                patch.object(adapter, "_create_agent") as mock_create,
+                patch.object(web.StreamResponse, "write", new=blocked_write),
+            ):
+                mock_agent = MagicMock()
+                mock_agent.run_conversation.return_value = {"final_response": "Hello!"}
+                mock_agent.session_prompt_tokens = 0
+                mock_agent.session_completion_tokens = 0
+                mock_agent.session_total_tokens = 0
+                mock_create.return_value = mock_agent
+
+                start = await cli.post("/v1/runs", json={"input": "hello"})
+                run_id = (await start.json())["run_id"]
+                for _ in range(100):
+                    if adapter._run_statuses[run_id]["status"] == "completed":
+                        break
+                    await asyncio.sleep(0.01)
+
+                events_resp = await cli.get(f"/v1/runs/{run_id}/events")
+                await asyncio.wait_for(write_started.wait(), timeout=1)
+                await asyncio.sleep(1.1)
+
+                subscribers = adapter._run_events_producer._runs[run_id].subscribers
+                subscriber = next(iter(subscribers.values()))
+                assert subscriber.closed
+                assert subscriber.lag_pending
+                assert subscriber.pending_lag_frame is None
+
+                release_write.set()
+                body = await asyncio.wait_for(events_resp.text(), timeout=1)
+                assert "hermes.run_events.subscriber.lagged" in body
+                assert '\"last_delivered_event_id\":1' in body
 
 
     @pytest.mark.asyncio

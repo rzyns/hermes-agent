@@ -7071,27 +7071,48 @@ class APIServerAdapter(BasePlatformAdapter):
             except Exception:
                 return False
 
+        watchdog_task: Optional[asyncio.Task] = None
         try:
             # 1. Capabilities control frame (no id).
             if not await _write_frame(producer.format_capabilities_frame()):
                 return response
 
-            # 2. Replayed events (with id).  Replay frames do not use the
-            #    serialization slot — they are written once at stream start
-            #    before the live loop begins.  No confirm_delivered needed.
+            # One independent watchdog covers replay and live writes.  It can
+            # freeze the subscriber while the sole writer is awaiting the
+            # transport, without cancelling that in-flight write.
+            heartbeat_interval = snapshot.heartbeat_seconds
+            poll_interval = 0.05
+            last_heartbeat = time.monotonic()
+
+            async def _serialization_watchdog() -> None:
+                interval = max(0.01, min(float(heartbeat_interval) / 10.0, 0.25))
+                while True:
+                    await asyncio.sleep(interval)
+                    producer.check_serialization_timeout(run_id, sub_id)
+
+            watchdog_task = asyncio.create_task(_serialization_watchdog())
+
+            # 2. Replayed events use the exact same one-slot writer boundary
+            #    as live events.  Overflow can freeze the subscriber during
+            #    replay; the joined write then advances/fails before lag capture.
             for entry in replay_entries:
-                if not await _write_frame(producer.format_replay_frame(entry)):
+                frame = producer.acquire_replay_frame(run_id, sub_id, entry)
+                if frame is None:
+                    break
+                if not await _write_frame(frame):
+                    producer.mark_write_failed(run_id, sub_id)
+                    return response
+                producer.confirm_delivered(run_id, sub_id)
+                lag = producer.get_subscriber_frame(run_id, sub_id, timeout=0)
+                if lag is not None and b"subscriber.lagged" in lag:
+                    await _write_frame(lag)
+                    await _write_frame(b": stream closed\n\n")
                     return response
 
             # 3. Live event loop.
-            heartbeat_interval = snapshot.heartbeat_seconds
-            poll_interval = 0.05  # 50ms polling for subscriber queue frames
-            last_heartbeat = time.monotonic()
-
             while True:
-                # Check for serialization-timeout (§2): if a subscriber's
-                # slot has been held > heartbeat, fire close-on-lag.
-                producer.check_serialization_timeout(run_id, sub_id)
+                # The independent watchdog above remains runnable while this
+                # sole response writer is blocked inside response.write().
 
                 # Check for subscriber frames (data events or lag frames).
                 frame = producer.get_subscriber_frame(
@@ -7138,6 +7159,9 @@ class APIServerAdapter(BasePlatformAdapter):
                             producer.mark_write_failed(run_id, sub_id)
                             break
                         producer.confirm_delivered(run_id, sub_id)
+                        if b"subscriber.lagged" in frame:
+                            await _write_frame(b": stream closed\n\n")
+                            return response
                     # Emit terminal frame.
                     status_info = self._run_statuses.get(run_id, {})
                     terminal_status = status_info.get("status", "completed")
@@ -7153,6 +7177,12 @@ class APIServerAdapter(BasePlatformAdapter):
         except Exception as exc:
             logger.debug("[api_server] SSE stream error for run %s: %s", run_id, exc)
         finally:
+            if watchdog_task is not None:
+                watchdog_task.cancel()
+                try:
+                    await watchdog_task
+                except asyncio.CancelledError:
+                    pass
             producer.remove_subscriber(run_id, sub_id)
             self._run_stream_subscribers.discard(run_id)
             # Note: we do NOT pop _run_streams here — the producer retains

@@ -317,6 +317,65 @@ def parse_cursor(raw_cursor: Optional[str]) -> int:
     return cursor
 
 
+# ── Fixed admission pools (§2) ──────────────────────────────────────────────
+
+
+class _FixedPool:
+    """Fixed-capacity admission counter enforcing the §2 pool model.
+
+    The pool has a fixed number of admission slots, each of which guarantees
+    a maximum byte budget (``slot_size``).  The total worst-case memory for
+    this pool is ``slot_count × slot_size``, reserved at construction and
+    never grown.
+
+    The bounded memory formula (§2) is enforced through three layers:
+
+    1. **Pool admission** (this class): at most ``slot_count`` consumers can
+       hold a slot simultaneously.  Each slot guarantees up to ``slot_size``
+       bytes of payload capacity.  Admission is atomic and fail-closed.
+    2. **Per-structure byte caps**: the replay ring and subscriber queue
+       enforce their own ``max_bytes`` limits, bounded by the slot guarantee.
+    3. **Observable high-water**: ``high_water_slots`` tracks the maximum
+       simultaneous occupancy, so tests can prove the pool never exceeds
+       its reserved capacity.
+
+    The total bounded memory is the sum of all five pools plus the container
+    budget, matching the ``total_feature_memory_budget_bytes`` snapshot field.
+    """
+
+    __slots__ = (
+        "slot_count", "slot_size", "capacity",
+        "_free", "_allocated_count", "high_water_slots",
+    )
+
+    def __init__(self, slot_count: int, slot_size: int):
+        self.slot_count = slot_count
+        self.slot_size = slot_size
+        self.capacity = slot_count * slot_size
+        self._free: Deque[int] = deque(range(slot_count))
+        self._allocated_count: int = 0
+        self.high_water_slots: int = 0
+
+    def reserve(self) -> Optional[int]:
+        """Atomically reserve one slot. Returns the slot index, or None if full."""
+        if not self._free:
+            return None
+        index = self._free.popleft()
+        self._allocated_count += 1
+        self.high_water_slots = max(self.high_water_slots, self._allocated_count)
+        return index
+
+    def release(self, index: int) -> None:
+        """Release a slot back to the free pool."""
+        if index >= 0:
+            self._allocated_count = max(0, self._allocated_count - 1)
+            self._free.append(index)
+
+    @property
+    def allocated_count(self) -> int:
+        return self._allocated_count
+
+
 # ── Replay ring ─────────────────────────────────────────────────────────────
 
 
@@ -341,6 +400,7 @@ class _ReplayRing:
         self._max_bytes = max_bytes
         self._entries: Deque[_RingEntry] = deque()
         self._current_bytes: int = 0
+        self._high_water_bytes: int = 0
         self._next_event_id: int = 1
         self._lock = threading.Lock()
 
@@ -362,21 +422,36 @@ class _ReplayRing:
         with self._lock:
             return len(self._entries) == 0
 
+    @property
+    def current_bytes(self) -> int:
+        with self._lock:
+            return self._current_bytes
+
+    @property
+    def high_water_bytes(self) -> int:
+        with self._lock:
+            return self._high_water_bytes
+
     def add(self, event_name: str, data: bytes, frame_size: int) -> int:
-        """Add a replayable event to the ring and return its assigned event ID."""
+        """Add an event without ever exceeding the ring's fixed byte budget."""
         with self._lock:
             event_id = self._next_event_id
             self._next_event_id += 1
-            entry = _RingEntry(event_id, event_name, data, frame_size)
-            self._entries.append(entry)
-            self._current_bytes += frame_size
-            # Evict from the head while over budget.
+            # Admission is checked before construction/append.  A single frame
+            # larger than the ring cannot be retained, but still consumes its
+            # global monotonic ID.
+            if frame_size > self._max_bytes or self._max_events <= 0:
+                return event_id
             while self._entries and (
-                len(self._entries) > self._max_events
-                or self._current_bytes > self._max_bytes
+                len(self._entries) + 1 > self._max_events
+                or self._current_bytes + frame_size > self._max_bytes
             ):
                 evicted = self._entries.popleft()
                 self._current_bytes -= evicted.size
+            entry = _RingEntry(event_id, event_name, data, frame_size)
+            self._entries.append(entry)
+            self._current_bytes += frame_size
+            self._high_water_bytes = max(self._high_water_bytes, self._current_bytes)
             return event_id
 
     def replay_after(self, cursor: int) -> List[_RingEntry]:
@@ -413,6 +488,12 @@ class _Subscriber:
     include_categories: Optional[Set[str]] = None  # None = all
     # Lag frame to deliver (if any), allocated from control_slot_pool.
     pending_lag_frame: Optional[bytes] = None
+    # A freeze requests recovery; field capture waits until an acquired write
+    # joins via confirm_delivered/mark_write_failed.
+    lag_pending: bool = False
+    queue_pool_index: int = -1
+    control_pool_index: int = -1
+    serialization_pool_index: int = -1
 
 
 # ── Run state ───────────────────────────────────────────────────────────────
@@ -428,6 +509,7 @@ class _RunState:
     active: bool = True
     terminal_time: Optional[float] = None  # when the run ended
     retention_expiry: Optional[float] = None  # terminal_time + retention
+    replay_pool_index: int = -1
     _next_subscriber_id: int = 1
     _lock: threading.Lock = field(default_factory=threading.Lock)
 
@@ -450,6 +532,25 @@ class RunEventsProducer:
         self.snapshot = snapshot or DEFAULT_SNAPSHOT
         self._runs: Dict[str, _RunState] = {}
         self._global_lock = threading.Lock()
+        # Reserve all five fixed admission pools once (§2).  Each pool has a
+        # fixed slot count and per-slot byte budget; admission transfers
+        # existing slot indices atomically and no pool can grow later.  The
+        # bounded memory formula (§2) is enforced by pool admission +
+        # per-structure byte caps + container budget.
+        self._replay_pool = _FixedPool(
+            self.snapshot.max_retained_runs, self.snapshot.max_replay_bytes
+        )
+        self._queue_pool = _FixedPool(
+            self.snapshot.max_concurrent_subscribers,
+            self.snapshot.max_subscriber_queue_bytes,
+        )
+        self._control_pool = _FixedPool(
+            self.snapshot.max_concurrent_subscribers, self.snapshot.max_event_bytes
+        )
+        self._serialization_pool = _FixedPool(
+            self.snapshot.max_concurrent_subscribers, self.snapshot.max_event_bytes
+        )
+        self._container_pool = _FixedPool(1, self.snapshot.container_budget_bytes)
         self._total_subscribers: int = 0
         self._active_run_count: int = 0
         self._retained_run_count: int = 0
@@ -485,6 +586,10 @@ class RunEventsProducer:
                 > self.snapshot.container_budget_bytes
             ):
                 return False
+            # Reserve the replay slab before constructing run state.
+            replay_pool_index = self._replay_pool.reserve()
+            if replay_pool_index is None:
+                return False
             # Reserve.
             self._retained_run_count += 1
             self._active_run_count += 1
@@ -496,7 +601,11 @@ class RunEventsProducer:
                 self.snapshot.max_replay_events,
                 self.snapshot.max_replay_bytes,
             )
-            self._runs[run_id] = _RunState(run_id=run_id, ring=ring)
+            self._runs[run_id] = _RunState(
+                run_id=run_id,
+                ring=ring,
+                replay_pool_index=replay_pool_index,
+            )
             return True
 
     def mark_run_terminal(self, run_id: str) -> None:
@@ -522,6 +631,9 @@ class RunEventsProducer:
             if run.active:
                 self._active_run_count = max(0, self._active_run_count - 1)
             self._retained_run_count = max(0, self._retained_run_count - 1)
+            self._replay_pool.release(run.replay_pool_index)
+            for sub in run.subscribers.values():
+                self._release_subscriber_pools(sub)
             self._total_subscribers -= len(run.subscribers)
             # Release container budget for run metadata + subscriber metadata.
             release = _CONTAINER_SIZE_CLASS_RUN + len(run.subscribers) * _CONTAINER_SIZE_CLASS_SUBSCRIBER
@@ -607,12 +719,31 @@ class RunEventsProducer:
                 > self.snapshot.container_budget_bytes
             ):
                 return None
+            # Reserve all three subscriber slabs atomically before constructing
+            # subscriber-visible state.  Roll back partial reservations.
+            queue_pool_index = self._queue_pool.reserve()
+            control_pool_index = self._control_pool.reserve()
+            serialization_pool_index = self._serialization_pool.reserve()
+            if None in (queue_pool_index, control_pool_index, serialization_pool_index):
+                if queue_pool_index is not None:
+                    self._queue_pool.release(queue_pool_index)
+                if control_pool_index is not None:
+                    self._control_pool.release(control_pool_index)
+                if serialization_pool_index is not None:
+                    self._serialization_pool.release(serialization_pool_index)
+                return None
+            assert queue_pool_index is not None
+            assert control_pool_index is not None
+            assert serialization_pool_index is not None
             # Atomically: reserve subscriber slot + charge container + snapshot ring.
             sub_id = run._next_subscriber_id
             run._next_subscriber_id += 1
             sub = _Subscriber(
                 queue=deque(),
                 include_categories=include_categories,
+                queue_pool_index=queue_pool_index,
+                control_pool_index=control_pool_index,
+                serialization_pool_index=serialization_pool_index,
             )
             run.subscribers[sub_id] = sub
             self._total_subscribers += 1
@@ -630,13 +761,20 @@ class RunEventsProducer:
                 ]
             return sub_id, replay_entries, run.active
 
+    def _release_subscriber_pools(self, sub: _Subscriber) -> None:
+        self._queue_pool.release(sub.queue_pool_index)
+        self._control_pool.release(sub.control_pool_index)
+        self._serialization_pool.release(sub.serialization_pool_index)
+
     def remove_subscriber(self, run_id: str, sub_id: int) -> None:
         """Release a subscriber reservation (on disconnect or close-on-lag)."""
         with self._global_lock:
             run = self._runs.get(run_id)
             if run is None:
                 return
-            if run.subscribers.pop(sub_id, None) is not None:
+            sub = run.subscribers.pop(sub_id, None)
+            if sub is not None:
+                self._release_subscriber_pools(sub)
                 self._total_subscribers = max(0, self._total_subscribers - 1)
                 self._container_bytes_used = max(
                     0, self._container_bytes_used - _CONTAINER_SIZE_CLASS_SUBSCRIBER
@@ -737,47 +875,42 @@ class RunEventsProducer:
         triggering_event_id: int,
         triggering_event_name: str,
     ) -> None:
-        """Execute close-on-lag: freeze, capture, discard, emit lag, close.
+        """Freeze/seal a subscriber and request writer-joined lag recovery.
 
-        Must be called under ``self._global_lock``.
-
-        Join-then-capture quiescence (§6): ``last_delivered_event_id``
-        reflects only events whose transport write was confirmed via
-        ``confirm_delivered``.  An in-flight write (slot acquired but not
-        confirmed) is NOT counted as delivered — this is the join-then-
-        capture invariant.  The lag frame's gap fields describe the
-        global reconnect cursor interval.
+        Must be called under ``_global_lock``.  If a replayable transport write
+        is in flight, field capture is deliberately deferred until that write
+        reports success/failure.  This is the join-before-capture boundary.
         """
-        # 1. Freeze: detach from live routing, seal queue.
+        if sub.closed:
+            return
         sub.closed = True
-        # 2. Join in-flight write: in this synchronous model, the slot state
-        #    tells us whether a write is in-flight.  last_delivered_event_id
-        #    reflects only confirmed deliveries (confirm_delivered was called).
-        #    The in-flight event (if any) is NOT counted as delivered.
-        # 3. Capture fields (global reconnect cursor interval).
-        last_delivered = sub.last_delivered_event_id
-        latest_available = run.ring.max_event_id
-        first_dropped = last_delivered + 1
-        dropped = latest_available - last_delivered
-        # 4. Discard sealed queue without draining.
+        sub.lag_pending = True
+        # The triggering event is abandoned, as is the sealed queue.  Do not
+        # capture the cursor while a write can still change ground truth.
         sub.queue.clear()
         sub.queue_event_count = 0
         sub.queue_byte_count = 0
-        # Release the serialization slot if held (in-flight write abandoned).
-        sub.slot_acquired = False
-        sub.in_flight_event_id = 0
-        # 5. Emit lag frame from the control_slot_pool.
+        if not sub.slot_acquired:
+            self._finalize_lag_locked(run, sub)
+
+    def _finalize_lag_locked(self, run: _RunState, sub: _Subscriber) -> None:
+        """Capture lag fields after transport quiescence (lock already held)."""
+        if not sub.lag_pending or sub.slot_acquired:
+            return
+        last_delivered = sub.last_delivered_event_id
+        latest_available = run.ring.max_event_id
         lag_data = {
             "event": "hermes.run_events.subscriber.lagged",
             "last_delivered_event_id": last_delivered,
-            "first_dropped_event_id": first_dropped,
+            "first_dropped_event_id": last_delivered + 1,
             "latest_available_event_id": latest_available,
-            "dropped_events": dropped,
+            "dropped_events": latest_available - last_delivered,
         }
         lag_bytes = self._serialize_event("hermes.run_events.subscriber.lagged", lag_data)
         sub.pending_lag_frame = self._format_control_frame(
             "hermes.run_events.subscriber.lagged", lag_bytes
         )
+        sub.lag_pending = False
 
     def _format_control_frame(self, event_name: str, data_bytes: bytes) -> bytes:
         """Format a control frame (no SSE ``id``)."""
@@ -825,6 +958,10 @@ class RunEventsProducer:
                 return frame
             if sub.closed:
                 return None
+            # Exactly one serialized copy may be outstanding.  The sole writer
+            # awaits completion; no second dequeue may overwrite slot state.
+            if sub.slot_acquired:
+                return None
             # Drain the queue — acquire serialization slot.
             if sub.queue:
                 event_id, event_name, data_bytes = sub.queue.popleft()
@@ -840,6 +977,25 @@ class RunEventsProducer:
                 # confirm_delivered() advances it after transport success.
                 return self._format_replayable_frame(event_name, event_id, data_bytes)
             return None  # no data right now
+
+    def acquire_replay_frame(
+        self, run_id: str, sub_id: int, entry: _RingEntry
+    ) -> Optional[bytes]:
+        """Acquire the subscriber's one serialization slot for replay."""
+        with self._global_lock:
+            run = self._runs.get(run_id)
+            if run is None:
+                return None
+            sub = run.subscribers.get(sub_id)
+            if sub is None or sub.closed or sub.slot_acquired:
+                return None
+            sub.slot_acquired = True
+            sub.slot_acquired_at = time.monotonic()
+            sub.in_flight_event_id = entry.event_id
+            sub.in_flight_event_name = entry.event_name
+            return self._format_replayable_frame(
+                entry.event_name, entry.event_id, entry.data
+            )
 
     def confirm_delivered(self, run_id: str, sub_id: int) -> None:
         """Confirm that the in-flight frame was delivered to the transport.
@@ -857,13 +1013,13 @@ class RunEventsProducer:
             if sub is None:
                 return
             if sub.slot_acquired:
-                # Only advance if the subscriber isn't already closed
-                # (lag frame may have already been captured).
-                if not sub.closed:
-                    sub.last_delivered_event_id = sub.in_flight_event_id
+                # A frozen subscriber still advances when the joined in-flight
+                # write succeeded; capture happens only after this transition.
+                sub.last_delivered_event_id = sub.in_flight_event_id
                 sub.slot_acquired = False
                 sub.in_flight_event_id = 0
                 sub.in_flight_event_name = ""
+                self._finalize_lag_locked(run, sub)
 
     def mark_write_failed(self, run_id: str, sub_id: int) -> None:
         """Release the serialization slot without advancing last_delivered.
@@ -881,6 +1037,7 @@ class RunEventsProducer:
             sub.slot_acquired = False
             sub.in_flight_event_id = 0
             sub.in_flight_event_name = ""
+            self._finalize_lag_locked(run, sub)
 
     def check_serialization_timeout(
         self, run_id: str, sub_id: int, now: Optional[float] = None
@@ -970,6 +1127,50 @@ class RunEventsProducer:
         return expired
 
     # ── Diagnostics / testing ─────────────────────────────────────────────
+
+    @property
+    def pool_capacities(self) -> Dict[str, int]:
+        return {
+            "retained_run_buffers": self._replay_pool.capacity,
+            "subscriber_queues": self._queue_pool.capacity,
+            "control_slot_pool": self._control_pool.capacity,
+            "serialization_pool": self._serialization_pool.capacity,
+            "container_budget": self._container_pool.capacity,
+        }
+
+    @property
+    def pool_high_water_slots(self) -> Dict[str, int]:
+        """Maximum simultaneous slot occupancy per pool (observable §2).
+
+        Each high-water must never exceed the pool's ``slot_count``.  Tests
+        can assert this to prove the bounded memory formula is enforced.
+        """
+        return {
+            "retained_run_buffers": self._replay_pool.high_water_slots,
+            "subscriber_queues": self._queue_pool.high_water_slots,
+            "control_slot_pool": self._control_pool.high_water_slots,
+            "serialization_pool": self._serialization_pool.high_water_slots,
+        }
+
+    @property
+    def pool_allocated_slots(self) -> Dict[str, int]:
+        """Current slot occupancy per pool."""
+        return {
+            "retained_run_buffers": self._replay_pool.allocated_count,
+            "subscriber_queues": self._queue_pool.allocated_count,
+            "control_slot_pool": self._control_pool.allocated_count,
+            "serialization_pool": self._serialization_pool.allocated_count,
+        }
+
+    @property
+    def ring_high_water_bytes(self) -> Dict[str, int]:
+        """Observable ring byte high-water (§2 byte-budget enforcement).
+
+        Returns a dict of run_id → high_water_bytes.  Each ring's
+        high-water must never exceed ``max_replay_bytes``.
+        """
+        with self._global_lock:
+            return {rid: r.ring.high_water_bytes for rid, r in self._runs.items()}
 
     @property
     def total_subscribers(self) -> int:
