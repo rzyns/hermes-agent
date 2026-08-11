@@ -647,6 +647,11 @@ class _ReplayRing:
         with self._lock:
             return self._next_event_id - 1
 
+    def peek_next_event_id(self) -> int:
+        """Return the ID that will be assigned to the next added event."""
+        with self._lock:
+            return self._next_event_id
+
     @property
     def min_retained_id(self) -> int:
         """Smallest event ID in the ring, or 0 if empty."""
@@ -670,11 +675,12 @@ class _ReplayRing:
         with self._lock:
             return self._high_water_bytes
 
-    def add(self, event_name: str, data: bytes, frame_size: int) -> Tuple[int, List[int]]:
+    def add(self, event_name: str, data: bytes, frame_size: int) -> Tuple[int, List[int], int]:
         """Add an event, enforcing the ring's byte/event budget before append.
 
-        Returns ``(event_id, [evicted_event_ids])``.  The caller uses the
-        evicted list to settle-release the old frame charges.
+        Returns ``(event_id, [evicted_event_ids], evicted_bytes)``.  The caller
+        uses the evicted list and byte total to settle-release the old frame
+        charges *before* settling the new entry.
 
         The byte budget check uses ``current + frame_size`` and evicts
         entries until the new frame fits.  If a single frame is larger
@@ -685,10 +691,11 @@ class _ReplayRing:
             event_id = self._next_event_id
             self._next_event_id += 1
             evicted_ids: List[int] = []
+            evicted_bytes = 0
             # A single frame larger than the ring cannot be retained, but
             # still consumes its global monotonic ID.
             if frame_size > self._max_bytes or self._max_events <= 0:
-                return event_id, evicted_ids
+                return event_id, evicted_ids, evicted_bytes
             # Evict until the new frame fits within both event and byte caps.
             while self._entries and (
                 len(self._entries) + 1 > self._max_events
@@ -697,6 +704,7 @@ class _ReplayRing:
                 evicted = self._entries.popleft()
                 self._current_bytes -= evicted.size
                 evicted_ids.append(evicted.event_id)
+                evicted_bytes += evicted.size
             entry = _RingEntry(event_id, event_name, data, frame_size)
             self._entries.append(entry)
             self._current_bytes += frame_size
@@ -704,7 +712,7 @@ class _ReplayRing:
             # eviction loop guarantees current_bytes + frame_size <= max_bytes
             # before append, and current_bytes is always <= max_bytes.
             self._high_water_bytes = max(self._high_water_bytes, self._current_bytes)
-            return event_id, evicted_ids
+            return event_id, evicted_ids, evicted_bytes
 
     def replay_after(self, cursor: int) -> List[_RingEntry]:
         """Return entries with event_id > *cursor*, in order.
@@ -1087,60 +1095,51 @@ class RunEventsProducer:
         snapshot = self.snapshot
         data_bytes = self._serialize_event(event_name, event_data)
 
-        # Oversize check: if the complete SSE wire frame exceeds max_event_bytes,
-        # replace with the oversize error event.
-        # We check the full frame size (payload + framing) per §2/§7.
-        prelim_frame_size = self._frame_size(event_name, data_bytes, 0)
-        if prelim_frame_size > snapshot.max_event_bytes:
-            original_name = event_name
-            event_name = "hermes.run_events.event.oversize"
-            event_data = {
-                "original_event": original_name,
-                "size_bytes": prelim_frame_size,
-                "code": "event_oversize",
-            }
-            data_bytes = self._serialize_event(event_name, event_data)
-
         with self._global_lock:
             run = self._runs.get(run_id)
             if run is None:
                 return
 
-            # ── Phase 2: settle ring insertion ──
-            ring_frame_size = self._frame_size(event_name, data_bytes, 0)
-            event_id, evicted_ids = run.ring.add(event_name, data_bytes, ring_frame_size)
-            # Settle the new ring entry.
-            self._budget.settle("retained_run", ring_frame_size)
-            self._run_ring_settled[run_id] = self._run_ring_settled.get(run_id, 0) + ring_frame_size
-            # Settle-release evicted entries.
-            for _eid in evicted_ids:
-                # Evicted entries had the same frame_size at insertion.
-                # We use the ring's current_bytes delta instead, but for
-                # exact accounting we need to track per-entry.  Since ring
-                # entries store their size, we can derive from the ring's
-                # own accounting.  However, we track the aggregate here.
-                pass
-            # For evicted entries, the ring already decremented its
-            # _current_bytes.  We need to settle-release the same amount
-            # from our budget.  The ring doesn't expose per-eviction sizes,
-            # so we track via the aggregate: the net change to
-            # _run_ring_settled is (ring_frame_size - sum_of_evicted_sizes).
-            # Since the ring tracks _current_bytes precisely, we reconcile
-            # our settled tracker to match ring.current_bytes.
-            ring_current = run.ring.current_bytes
-            old_settled = self._run_ring_settled[run_id]
-            delta = ring_current - old_settled
-            if delta < 0:
-                # Ring shrank (evictions exceeded insertion) — settle-release.
-                self._budget.settle_release("retained_run", -delta)
-            elif delta > 0:
-                # This shouldn't happen since we already settled the new entry,
-                # but reconcile defensively.
-                self._budget.settle("retained_run", delta)
-            self._run_ring_settled[run_id] = ring_current
+            # ── Assign the event ID before any sizing (B2 fix) ──
+            # The real event ID is needed for exact wire-frame sizing.  IDs
+            # are assigned by the ring; peek now so oversize validation and
+            # all charge values use the actual rendered ``id:`` field width.
+            event_id = run.ring.peek_next_event_id()
 
-            # Compute the frame size WITH event_id for queue accounting.
-            frame = self._frame_size(event_name, data_bytes, event_id)
+            # Oversize check: if the complete SSE wire frame (with the real
+            # event ID) exceeds max_event_bytes, replace with the oversize
+            # error event (§2/§7).
+            prelim_frame_size = self._frame_size(event_name, data_bytes, event_id)
+            if prelim_frame_size > snapshot.max_event_bytes:
+                original_name = event_name
+                event_name = "hermes.run_events.event.oversize"
+                event_data = {
+                    "original_event": original_name,
+                    "size_bytes": prelim_frame_size,
+                    "code": "event_oversize",
+                }
+                data_bytes = self._serialize_event(event_name, event_data)
+
+            # ── Phase 2: settle ring insertion (B1 fix) ──
+            # Compute the real wire frame size with the actual assigned ID.
+            ring_frame_size = self._frame_size(event_name, data_bytes, event_id)
+            event_id, evicted_ids, evicted_bytes = run.ring.add(
+                event_name, data_bytes, ring_frame_size,
+            )
+            # Settle-release evicted entries BEFORE settling the replacement.
+            # This ordering guarantees the settled-current counter never
+            # transiently exceeds the reservation ledger, so the settled
+            # high-water stays ≤ the reservation high-water at every instant.
+            if evicted_bytes > 0:
+                self._budget.settle_release("retained_run", evicted_bytes)
+            self._budget.settle("retained_run", ring_frame_size)
+            self._run_ring_settled[run_id] = (
+                self._run_ring_settled.get(run_id, 0) - evicted_bytes + ring_frame_size
+            )
+
+            # Compute the frame size WITH event_id for queue accounting
+            # (consistent with the ring charge — same actual ID).
+            frame = ring_frame_size  # already sized with the real event_id
             category = _event_category(event_name)
 
             # Distribute to all subscribers' queues.

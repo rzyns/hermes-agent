@@ -1286,6 +1286,178 @@ class TestRegressionDualLedgerBudget:
         assert obs["total_reserved_high_water_bytes"] == expected
 
 
+# ===========================================================================
+# Round-6 regression tests: replay insertion accounting (B1 + B2)
+# ===========================================================================
+
+
+class TestRegressionReplaySettlementOrdering:
+    """B1: replay insertion must respect the instantaneous invariant.
+
+    The replay-ring settle-release of evicted entries must happen BEFORE
+    settling the replacement, so the settled-current counter (and its
+    monotonic high-water) never transiently exceeds the reservation ledger.
+    """
+
+    def test_settled_high_water_never_exceeds_reserved_during_eviction(self):
+        """Filling the ring to the eviction boundary must leave settled
+        high-waters within reservation high-waters.
+
+        This is the exact B1 reproduction from the principal review:
+        300 events with ~4 KiB payloads into a 1 MiB ring.
+        """
+        producer = _make_producer(max_replay_events=300, max_replay_bytes=1_048_576)
+        producer.admit_run("r1")
+        for i in range(300):
+            producer.emit_event("r1", "tool.started", {"i": i, "x": "a" * 4031})
+        obs = producer.budget_observability
+        # Class-level high-water invariant.
+        assert obs["retained_run_high_water_bytes"] <= obs["reserved_retained_run_high_water_bytes"]
+        # Total high-water invariant.
+        assert obs["total_feature_high_water_bytes"] <= obs["total_reserved_high_water_bytes"]
+
+    def test_settled_current_never_exceeds_reserved_after_eviction(self):
+        """Even after many evictions, the current settled ring bytes
+        must not exceed the reservation."""
+        producer = _make_producer(max_replay_events=10, max_replay_bytes=200)
+        producer.admit_run("r1")
+        for i in range(50):
+            producer.emit_event("r1", "tool.started", {"i": i})
+        obs = producer.budget_observability
+        assert obs["current_retained_run_charged_bytes"] <= obs["reserved_retained_run_bytes"]
+
+    def test_ring_settled_matches_ring_current_bytes(self):
+        """The producer's settled tracker must exactly match ring.current_bytes
+        after evictions, proving no aggregate drift."""
+        producer = _make_producer(max_replay_events=5, max_replay_bytes=300)
+        producer.admit_run("r1")
+        for i in range(20):
+            producer.emit_event("r1", "tool.started", {"i": i})
+        ring = producer._runs["r1"].ring
+        settled = producer._run_ring_settled["r1"]
+        assert settled == ring.current_bytes
+
+    def test_evicted_bytes_settle_released_before_settle(self):
+        """When an event evicts existing entries, the evicted bytes must be
+        settle-released before the new entry is settled.
+
+        We verify by checking that at no point during a fill-evict cycle
+        does the settled high-water exceed the reservation high-water.
+        """
+        producer = _make_producer(max_replay_events=3, max_replay_bytes=150)
+        producer.admit_run("r1")
+        for i in range(10):
+            producer.emit_event("r1", "tool.started", {"i": i})
+            obs = producer.budget_observability
+            # Invariant must hold at every step, not just at the end.
+            assert obs["retained_run_high_water_bytes"] <= obs["reserved_retained_run_high_water_bytes"], (
+                f"step {i}: settled HW {obs['retained_run_high_water_bytes']} "
+                f"> reserved HW {obs['reserved_retained_run_high_water_bytes']}"
+            )
+
+
+class TestRegressionReplayRealIdSizing:
+    """B2: replay sizing must use the actual assigned event ID, not placeholder 0.
+
+    Multi-digit IDs require more wire bytes than a single-digit placeholder.
+    The stored size, ring admission, oversize boundary, and settlement must all
+    use the real ID's rendered frame.
+    """
+
+    def test_entry_size_equals_wire_frame_length(self):
+        """Every retained ring entry's .size must equal len(format_replay_frame).
+
+        This is the exact B2 assertion: after 12 events, ring.current_bytes
+        must equal the sum of actual wire frame lengths.
+        """
+        producer = _make_producer(max_replay_events=20)
+        producer.admit_run("r1")
+        for i in range(12):
+            producer.emit_event("r1", "tool.started", {"i": i})
+        ring = producer._runs["r1"].ring
+        entries = ring.replay_after(0)
+        actual_wire = sum(len(producer.format_replay_frame(e)) for e in entries)
+        assert ring.current_bytes == actual_wire, (
+            f"ring.current_bytes={ring.current_bytes} != actual_wire={actual_wire}"
+        )
+        # Per-entry check.
+        for e in entries:
+            assert e.size == len(producer.format_replay_frame(e)), (
+                f"entry {e.event_id}: size={e.size} != wire={len(producer.format_replay_frame(e))}"
+            )
+
+    def test_large_id_oversize_replacement_fires(self):
+        """An event whose actual-ID wire frame exceeds max_event_bytes must
+        be replaced with the oversize error event, even if the placeholder-ID
+        frame was within the limit.
+
+        Specifically: a payload whose frame with id=0 is exactly max_event_bytes
+        but whose frame with id=10 is 1 byte larger must trigger oversize at
+        event 10.  This fails on ea166aead8 because the check used id=0.
+        """
+        # Craft a payload so that:
+        #   frame(id=0)  = 100  (within limit)
+        #   frame(id=10) = 101  (over limit)
+        # Framing = 'event: tool.started\\nid: {id}\\ndata: {json}\\n\\n'
+        # = 33 + len(str(id)) + len(payload)
+        # With id=0:  33 + 1 + payload_len = 100 → payload_len = 66
+        import json as _json
+        payload = _json.dumps({"x": "0" * 58}, separators=(",", ":"))
+        assert len(payload) == 66, len(payload)
+        producer = _make_producer(max_event_bytes=100, max_replay_events=20)
+        producer.admit_run("r1")
+        for i in range(12):
+            producer.emit_event("r1", "tool.started", {"x": "0" * 58})
+        ring = producer._runs["r1"].ring
+        entries = ring.replay_after(0)
+        # Event 10 must be oversize-replaced.
+        ev10 = [e for e in entries if e.event_id == 10]
+        assert len(ev10) == 1
+        assert ev10[0].event_name == "hermes.run_events.event.oversize", (
+            f"event 10 should be oversize-replaced, got {ev10[0].event_name}"
+        )
+        # All entries must still have size == wire frame.
+        for e in entries:
+            assert e.size == len(producer.format_replay_frame(e))
+
+    def test_ring_byte_cap_uses_real_wire_bytes(self):
+        """With a tight ring byte cap, the actual retained wire bytes must
+        stay within max_replay_bytes.  This fails on ea166aead8 because
+        placeholder-ID sizing undercounts multi-digit IDs.
+        """
+        producer = _make_producer(max_replay_events=20, max_replay_bytes=129)
+        producer.admit_run("r1")
+        for i in range(12):
+            producer.emit_event("r1", "tool.started", {"i": i})
+        ring = producer._runs["r1"].ring
+        entries = ring.replay_after(0)
+        actual_wire = sum(len(producer.format_replay_frame(e)) for e in entries)
+        assert actual_wire <= 129, (
+            f"actual wire bytes {actual_wire} > max_replay_bytes 129"
+        )
+        # Charged bytes must also match actual.
+        assert ring.current_bytes == actual_wire
+
+    def test_id_width_transition_boundaries(self):
+        """At ID-width transitions (9→10, 99→100), entry size must equal
+        the actual wire frame length."""
+        producer = _make_producer(max_replay_events=200)
+        producer.admit_run("r1")
+        for i in range(150):
+            producer.emit_event("r1", "tool.started", {"i": i})
+        ring = producer._runs["r1"].ring
+        entries = ring.replay_after(0)
+        for e in entries:
+            actual = len(producer.format_replay_frame(e))
+            assert e.size == actual, (
+                f"entry {e.event_id}: stored size={e.size} != wire={actual}"
+            )
+        # The transition IDs (10, 100) must be present and correct.
+        ids = {e.event_id for e in entries}
+        assert 10 in ids
+        assert 100 in ids
+
+
 class TestRegressionTerminalFinalId:
     """Blocker 4: terminal frame uses actual final replayable event ID."""
 
