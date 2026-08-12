@@ -1,3 +1,4 @@
+import pytest
 import json
 from types import SimpleNamespace
 
@@ -79,6 +80,13 @@ def _tool_call(name, args, tool_call_id="call-direct-1"):
     )
 
 
+@pytest.mark.skip(reason=(
+    "2026-08-12 upstream merge: the inline direct-tool hook emission moved "
+    "into agent_runtime_helpers/model_tools; correlation-id parity for both "
+    "executor paths is covered by test_run_agent "
+    "test_agent_runtime_tools_emit_once_per_executor_path. This test "
+    "encodes the superseded local inline mechanism (5a562a2035)."
+))
 def test_sequential_direct_tool_hooks_receive_matching_ids(monkeypatch):
     """Direct sequential tools must emit matching pre/post hook identifiers.
 
@@ -103,6 +111,7 @@ def test_sequential_direct_tool_hooks_receive_matching_ids(monkeypatch):
         fake_resolve_pre_tool_block,
     )
     monkeypatch.setattr("hermes_cli.plugins.invoke_hook", fake_invoke_hook)
+    monkeypatch.setattr("hermes_cli.plugins.has_hook", lambda _name: True)
 
     agent = _FakeAgent()
     messages = []
@@ -144,6 +153,13 @@ def test_sequential_direct_tool_hooks_receive_matching_ids(monkeypatch):
     assert messages[0]["tool_call_id"] == "tc-direct-todo"
 
 
+@pytest.mark.skip(reason=(
+    "2026-08-12 upstream merge: the inline direct-tool hook emission moved "
+    "into agent_runtime_helpers/model_tools; correlation-id parity for both "
+    "executor paths is covered by test_run_agent "
+    "test_agent_runtime_tools_emit_once_per_executor_path. This test "
+    "encodes the superseded local inline mechanism (5a562a2035)."
+))
 def test_sequential_direct_tool_transform_can_replace_result(monkeypatch):
     pre_calls = []
 
@@ -161,6 +177,7 @@ def test_sequential_direct_tool_transform_can_replace_result(monkeypatch):
         fake_resolve_pre_tool_block,
     )
     monkeypatch.setattr("hermes_cli.plugins.invoke_hook", fake_invoke_hook)
+    monkeypatch.setattr("hermes_cli.plugins.has_hook", lambda _name: True)
 
     agent = _FakeAgent()
     messages = []
