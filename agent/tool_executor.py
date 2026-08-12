@@ -2197,38 +2197,16 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
             )
         )
         if _executor_must_emit_post_hook:
-            try:
-                from hermes_cli.lifecycle import invoke_hook
-                from model_tools import _tool_result_observer_fields
-
-                status, error_type, error_message = _tool_result_observer_fields(function_result)
-                duration_ms = int(tool_duration * 1000)
-                hook_context = dict(
-                    tool_name=function_name,
-                    args=function_args,
-                    result=function_result,
-                    task_id=effective_task_id or "",
-                    session_id=getattr(agent, "session_id", "") or "",
-                    tool_call_id=getattr(tool_call, "id", "") or "",
-                    turn_id=getattr(agent, "_current_turn_id", "") or "",
-                    api_request_id=getattr(agent, "_current_api_request_id", "") or "",
-                    duration_ms=duration_ms,
-                    status=status,
-                    error_type=error_type,
-                    error_message=error_message,
-                )
-                invoke_hook(
-                    "post_tool_call",
-                    **hook_context,
-                    middleware_trace=list(middleware_trace),
-                )
-                hook_results = invoke_hook("transform_tool_result", **hook_context)
-                for hook_result in hook_results:
-                    if isinstance(hook_result, str):
-                        function_result = hook_result
-                        break
-            except Exception as _hook_err:
-                logger.debug("direct tool post/transform hook error: %s", _hook_err)
+            _emit_terminal_post_tool_call(
+                agent,
+                function_name=function_name,
+                function_args=function_args,
+                result=function_result,
+                effective_task_id=effective_task_id,
+                tool_call_id=getattr(tool_call, "id", "") or "",
+                duration_ms=int(tool_duration * 1000),
+                middleware_trace=list(middleware_trace),
+            )
         if not _execution_blocked:
             function_result = agent._append_guardrail_observation(
                 function_name,

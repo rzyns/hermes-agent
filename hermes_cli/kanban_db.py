@@ -17289,6 +17289,13 @@ def reconcile_orphaned_running(
     for row in rows:
         tid = row["id"]
         pid = row["worker_pid"]
+        claim_lock = row["claim_lock"]
+        if claim_lock and pid and str(claim_lock).split(":", 1)[0] == _claimer_id().split(":", 1)[0]:
+            # A host-local claim with a recorded pid belongs to
+            # detect_crashed_workers, which classifies the exit and can
+            # trigger self-heal repair. Reconcile only handles cards no
+            # other recovery path can see (2026-08-12 merge composition).
+            continue
         if pid and _pid_alive(pid):
             # The recorded worker may still be doing real work — never
             # requeue beside a live process. Retry next tick.

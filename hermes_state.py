@@ -1048,7 +1048,15 @@ def apply_wal_with_fallback(
             # Caller mandates WAL — fail loudly instead of degrading to DELETE.
             raise WalUnsupportedError(str(exc)) from exc
         _log_wal_fallback_once(db_label, exc)
-        _set_journal_mode_no_wait(conn, "DELETE")
+        try:
+            _set_journal_mode_no_wait(conn, "DELETE")
+        except sqlite3.OperationalError as fallback_exc:
+            # 2026-08-12 merge: keep the local diagnostic contract — a
+            # double-failure names the database and both errors.
+            raise sqlite3.OperationalError(
+                f"{db_label}: PRAGMA journal_mode=WAL failed with {exc}; "
+                f"fallback PRAGMA journal_mode=DELETE also failed with {fallback_exc}"
+            ) from fallback_exc
         return "delete"
 
 
@@ -6826,7 +6834,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                        title_updated_at = ?,
                        title_revision_count = COALESCE(title_revision_count, 0) + 1
                    WHERE id = ?
-                     AND title_source = 'auto'""",
+                     AND title_source IN ('auto', 'llm')""",
                 (title, now, session_id),
             )
             return cursor.rowcount
@@ -6867,7 +6875,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                        WHERE id = ?
                          AND (
                            title IS NULL OR title = '' OR
-                           (title_source = 'auto' AND COALESCE(title_revision_count, 0) <= 1)
+                           (title_source IN ('auto', 'llm') AND COALESCE(title_revision_count, 0) <= 1)
                          )""",
                     (title, now, session_id),
                 )

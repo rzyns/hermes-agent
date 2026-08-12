@@ -1561,15 +1561,18 @@ class CredentialPool:
                         entry.id,
                         source_path,
                     )
-                    removed_ids = [
-                        item.id for item in self._entries if item.source == "oauth"
-                    ]
-                    self._entries = [
-                        item for item in self._entries if item.source != "oauth"
-                    ]
-                    if self._current_id in removed_ids:
-                        self._current_id = None
-                    self._persist(removed_ids=removed_ids)
+                    # Atomic read-modify-write; deferred refresh path runs
+                    # outside the pool lock (RLock: locked callers re-enter).
+                    with self._lock:
+                        removed_ids = [
+                            item.id for item in self._entries if item.source == "oauth"
+                        ]
+                        self._entries = [
+                            item for item in self._entries if item.source != "oauth"
+                        ]
+                        if self._current_id in removed_ids:
+                            self._current_id = None
+                        self._persist(removed_ids=removed_ids)
                     return None
 
                 if store_access and (
@@ -1619,12 +1622,14 @@ class CredentialPool:
                     # closed before surfacing the authoritative-store error;
                     # borrowed-entry sanitization also ensures the consumed
                     # rotated secret cannot survive in the profile pool file.
-                    self._entries = [
-                        item for item in self._entries if item.id != updated.id
-                    ]
-                    if self._current_id == updated.id:
-                        self._current_id = None
-                    self._persist(removed_ids=[updated.id])
+                    # Atomic read-modify-write; see the lock note above.
+                    with self._lock:
+                        self._entries = [
+                            item for item in self._entries if item.id != updated.id
+                        ]
+                        if self._current_id == updated.id:
+                            self._current_id = None
+                        self._persist(removed_ids=[updated.id])
                     raise MiniMaxOAuthSourcePersistenceError(
                         "MiniMax OAuth refresh succeeded but authoritative "
                         "credential persistence failed"
@@ -2224,15 +2229,18 @@ class CredentialPool:
                             "Failed to clear terminal MiniMax OAuth state: %s",
                             clear_exc,
                         )
-                    removed_ids = [
-                        item.id for item in self._entries if item.source == "oauth"
-                    ]
-                    self._entries = [
-                        item for item in self._entries if item.source != "oauth"
-                    ]
-                    if self._current_id == entry.id:
-                        self._current_id = None
-                    self._persist(removed_ids=removed_ids)
+                    # Atomic read-modify-write; deferred refresh path runs
+                    # outside the pool lock (RLock: locked callers re-enter).
+                    with self._lock:
+                        removed_ids = [
+                            item.id for item in self._entries if item.source == "oauth"
+                        ]
+                        self._entries = [
+                            item for item in self._entries if item.source != "oauth"
+                        ]
+                        if self._current_id == entry.id:
+                            self._current_id = None
+                        self._persist(removed_ids=removed_ids)
                     if quarantine_persist_error is not None:
                         # Never represent a local removal as successful durable
                         # quarantine while the authoritative owner still holds

@@ -2124,7 +2124,7 @@ class TestWebServerEndpoints:
 
         calls = []
 
-        def fake_spawn(subcommand, name, *, env_overrides=None):
+        def fake_spawn(subcommand, name, *, env_overrides=None, **kwargs):
             calls.append((subcommand, name, env_overrides))
             return Proc()
 
@@ -2326,8 +2326,8 @@ class TestWebServerEndpoints:
         db = SessionDB()
         try:
             db.create_session(session_id="title-provenance", source="cli")
-            db.set_session_title(
-                "title-provenance", "Specific Auto Title", title_source="auto"
+            db.set_backfill_session_title(
+                "title-provenance", "Specific Auto Title"
             )
         finally:
             db.close()
@@ -2337,7 +2337,7 @@ class TestWebServerEndpoints:
         rows = resp.json()["sessions"]
         row = next(s for s in rows if s["id"] == "title-provenance")
         assert row["title"] == "Specific Auto Title"
-        assert row["title_source"] == "auto"
+        assert row["title_source"] == "backfill"
         assert row["title_updated_at"] is not None
         assert row["title_revision_count"] == 1
 
@@ -3488,7 +3488,7 @@ class TestWebServerEndpoints:
 
         calls = []
 
-        def fake_spawn(subcommand, name):
+        def fake_spawn(subcommand, name, **kwargs):
             calls.append((subcommand, name))
             return Proc()
 
@@ -3500,7 +3500,10 @@ class TestWebServerEndpoints:
         resp = self.client.post("/api/hermes/update")
 
         assert resp.status_code == 200
-        assert resp.json() == {"ok": True, "pid": 12345, "name": "hermes-update"}
+        body = resp.json()
+        # 2026-08-12 merge: the local route also returns a spawn action_id.
+        assert body.pop("action_id", None) is not None
+        assert body == {"ok": True, "pid": 12345, "name": "hermes-update"}
         assert calls == [(["update"], "hermes-update")]
 
     def test_action_status_reaps_completed_process(self, monkeypatch):
@@ -4042,7 +4045,7 @@ class TestWebServerEndpoints:
 
         captured = {}
 
-        def fake_spawn(subcommand, name):
+        def fake_spawn(subcommand, name, **kwargs):
             captured["args"] = subcommand
             captured["name"] = name
             from types import SimpleNamespace as NS
@@ -4070,7 +4073,7 @@ class TestWebServerEndpoints:
 
         captured = {}
 
-        def fake_spawn(subcommand, name):
+        def fake_spawn(subcommand, name, **kwargs):
             captured["args"] = subcommand
             captured["name"] = name
             from types import SimpleNamespace as NS
@@ -4099,7 +4102,7 @@ class TestWebServerEndpoints:
         monkeypatch.setenv("HERMES_HOME", str(hosted_home))
         captured = {}
 
-        def fake_spawn(subcommand, name):
+        def fake_spawn(subcommand, name, **kwargs):
             captured["args"] = subcommand
             captured["name"] = name
             from types import SimpleNamespace as NS
@@ -4151,7 +4154,7 @@ class TestWebServerEndpoints:
 
         captured = {}
 
-        def fake_spawn(subcommand, name):
+        def fake_spawn(subcommand, name, **kwargs):
             captured["args"] = subcommand
             captured["name"] = name
             from types import SimpleNamespace as NS
@@ -7042,7 +7045,7 @@ class TestNewEndpoints:
         class _FakeProc:
             pid = 4321
 
-        def fake_spawn(subcommand, name):
+        def fake_spawn(subcommand, name, **kwargs):
             spawned.append((list(subcommand), name))
             return _FakeProc()
 

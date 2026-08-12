@@ -305,7 +305,7 @@ def _detect_environment(env: str) -> bool:
     freeze whichever context asked first and leak it to the others.
     """
     cache_key = _env_cache_key(env)
-    if cache_key in _ENV_DETECT_CACHE:
+    if env != "kanban" and cache_key in _ENV_DETECT_CACHE:
         return _ENV_DETECT_CACHE[cache_key]
 
     result = True
@@ -325,7 +325,19 @@ def _detect_environment(env: str) -> bool:
         if is_delegated_child_context():
             result = False
         elif child_env_lookup("HERMES_KANBAN_TASK") or child_env_lookup("HERMES_KANBAN_BOARD"):
-            result = True
+            # ...but only when this execution actually owns the dispatcher's
+            # task. A cron job fired in-process from a worker sees the
+            # worker's vars without being that worker (2026-08-12 merge:
+            # upstream's ownership check composed onto the local
+            # delegated-child gate).
+            try:
+                from agent.delegation_context import (
+                    is_dispatcher_owned_worker_context,
+                )
+
+                result = is_dispatcher_owned_worker_context()
+            except Exception:
+                result = True
         else:
             try:
                 from tools.kanban_tools import _profile_has_kanban_toolset
@@ -349,7 +361,8 @@ def _detect_environment(env: str) -> bool:
             "/package/admin/s6-overlay"
         )
 
-    _ENV_DETECT_CACHE[cache_key] = result
+    if env != "kanban":
+        _ENV_DETECT_CACHE[cache_key] = result
     return result
 
 
