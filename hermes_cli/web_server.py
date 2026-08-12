@@ -106,7 +106,9 @@ try:
         WebSocket, WebSocketDisconnect,
     )
     from fastapi.middleware.cors import CORSMiddleware
-    from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, Response
+    from fastapi.responses import (
+        FileResponse, HTMLResponse, JSONResponse, Response, StreamingResponse,
+    )
     from fastapi.staticfiles import StaticFiles
     from pydantic import BaseModel, SecretStr, field_validator
     from starlette.concurrency import run_in_threadpool
@@ -122,7 +124,9 @@ except ImportError:
             WebSocket, WebSocketDisconnect,
         )
         from fastapi.middleware.cors import CORSMiddleware
-        from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, Response
+        from fastapi.responses import (
+            FileResponse, HTMLResponse, JSONResponse, Response, StreamingResponse,
+        )
         from fastapi.staticfiles import StaticFiles
         from pydantic import BaseModel, SecretStr, field_validator
         from starlette.concurrency import run_in_threadpool
@@ -422,10 +426,16 @@ _QUERY_TOKEN_API_PATHS: frozenset[str] = frozenset({"/api/files/download"})
 
 
 def _has_valid_query_token(request: Request, path: str) -> bool:
-    if path not in _QUERY_TOKEN_API_PATHS:
-        return False
-    token = request.query_params.get("token", "")
-    return bool(token) and hmac.compare_digest(token.encode(), _SESSION_TOKEN.encode())
+    # Static allowlist for download links and other query-token paths.
+    if path in _QUERY_TOKEN_API_PATHS:
+        token = request.query_params.get("token", "")
+        return bool(token) and hmac.compare_digest(token.encode(), _SESSION_TOKEN.encode())
+    # SSE run-events proxy: EventSource cannot set headers, so accept ?token=
+    # for the dynamic /api/runs/{run_id}/events path.
+    if path.startswith("/api/runs/") and path.endswith("/events"):
+        token = request.query_params.get("token", "")
+        return bool(token) and hmac.compare_digest(token.encode(), _SESSION_TOKEN.encode())
+    return False
 
 
 def _require_token(request: Request) -> None:
@@ -456,6 +466,29 @@ def _require_token(request: Request) -> None:
         raise HTTPException(status_code=401, detail="Unauthorized")
     if not _has_valid_session_token(request):
         raise HTTPException(status_code=401, detail="Unauthorized")
+
+
+def _require_token_or_query(request: Request) -> None:
+    """Like :func:`_require_token` but also accepts ``?token=`` query auth.
+
+    Used by endpoints that browsers reach via ``EventSource`` (which cannot
+    set custom headers).  In loopback mode the browser appends
+    ``?token=<_SESSION_TOKEN>``; in gated mode the session cookie authenticates
+    and this function defers to the gate exactly like ``_require_token``.
+    """
+    if getattr(request.app.state, "auth_required", False):
+        if getattr(request.state, "session", None) is not None:
+            return
+        raise HTTPException(status_code=401, detail="Unauthorized")
+    if _has_valid_session_token(request):
+        return
+    # EventSource cannot set headers — accept ?token= as a fallback.
+    qtoken = request.query_params.get("token", "")
+    if qtoken and _SESSION_TOKEN and hmac.compare_digest(
+        qtoken.encode(), _SESSION_TOKEN.encode()
+    ):
+        return
+    raise HTTPException(status_code=401, detail="Unauthorized")
 
 
 # Accepted Host header values for loopback binds. DNS rebinding attacks
@@ -3003,6 +3036,245 @@ async def get_ssh_ownership(request: Request):
     if not _SSH_OWNER_NONCE:
         raise HTTPException(status_code=404, detail="SSH ownership is not active")
     return {"ok": True, "sshOwnerNonce": _SSH_OWNER_NONCE, "protocolVersion": 1}
+
+
+# ---------------------------------------------------------------------------
+# SSE run-events proxy — forwards GET /api/runs/{run_id}/events to the
+# api_server adapter's GET /v1/runs/{run_id}/events endpoint.
+#
+# The dashboard (FastAPI, default port 9119) and the api_server adapter
+# (aiohttp, default port 8642) are separate processes.  The browser cannot
+# reach the api_server directly when the dashboard is remote (the api_server
+# binds loopback by default and has no dashboard auth), so this proxy:
+#   1. Resolves the api_server base URL + API_SERVER_KEY from config/env.
+#   2. Opens an httpx streaming GET to the upstream SSE endpoint, injecting
+#      the bearer token server-side (never exposed to the browser).
+#   3. Streams the raw SSE bytes back to the browser as text/event-stream.
+#
+# The browser uses native EventSource, which sends Last-Event-ID on reconnect
+# automatically.  We forward that header upstream so the replay ring resumes
+# correctly.  When the api_server is absent or errors, the proxy degrades
+# gracefully — the dashboard never breaks for non-streaming use.
+# ---------------------------------------------------------------------------
+
+# How long to wait for the upstream connection before declaring the api_server
+# unreachable.  Kept short so a missing api_server degrades instantly.
+_RUN_EVENTS_UPSTREAM_CONNECT_TIMEOUT = 3.0
+# Idle read timeout — generous because SSE is idle between events (heartbeats
+# at 15s keep it alive).  None = no idle timeout (stream until upstream closes
+# or the browser disconnects).
+_RUN_EVENTS_UPSTREAM_READ_TIMEOUT: Optional[float] = None
+
+
+def _resolve_api_server_base_url() -> Optional[str]:
+    """Resolve the api_server's HTTP base URL (e.g. ``http://127.0.0.1:8642``).
+
+    Reads host/port from config.yaml (``platforms.api_server`` /
+    ``gateway.api_server``) with env-var overrides (``API_SERVER_HOST`` /
+    ``API_SERVER_PORT``), falling back to the adapter defaults
+    (127.0.0.1:8642).  Returns ``None`` only if config cannot be read at all.
+    """
+    host = os.getenv("API_SERVER_HOST", "")
+    port_raw = os.getenv("API_SERVER_PORT", "")
+    if not host or not port_raw:
+        # Fall back to config.yaml
+        try:
+            from hermes_cli.config import read_user_config_raw
+            cfg = read_user_config_raw()
+            gw_block = cfg.get("gateway") if isinstance(cfg.get("gateway"), dict) else {}
+            gw_api = gw_block.get("api_server") if isinstance(gw_block.get("api_server"), dict) else {}
+            plat_block = cfg.get("platforms") if isinstance(cfg.get("platforms"), dict) else {}
+            plat_api = plat_block.get("api_server") if isinstance(plat_block.get("api_server"), dict) else {}
+            merged: Dict[str, Any] = {}
+            merged.update(gw_api or {})
+            merged.update(plat_api or {})
+            if not host:
+                host = str(merged.get("host", ""))
+            if not port_raw:
+                port_raw = str(merged.get("port", ""))
+        except Exception:
+            _log.debug("run-events proxy: could not read config.yaml for api_server host/port")
+    # Defaults matching the adapter (gateway/platforms/api_server.py)
+    if not host:
+        host = "127.0.0.1"
+    if not port_raw:
+        port_raw = "8642"
+    try:
+        port = int(port_raw)
+    except (ValueError, TypeError):
+        port = 8642
+    return f"http://{host}:{port}"
+
+
+def _resolve_api_server_key() -> str:
+    """Resolve the API_SERVER_KEY for authenticating to the api_server."""
+    try:
+        from agent.secret_scope import get_secret as _scoped_get_secret, UnscopedSecretError
+        try:
+            key = _scoped_get_secret("API_SERVER_KEY", "")
+        except UnscopedSecretError:
+            key = os.getenv("API_SERVER_KEY", "")
+        return key or ""
+    except Exception:
+        return os.getenv("API_SERVER_KEY", "")
+
+
+@app.get("/api/runs/{run_id}/events")
+async def proxy_run_events(
+    request: Request,
+    run_id: str,
+):
+    """SSE proxy: forward ``/api/runs/{run_id}/events`` to the api_server.
+
+    The browser connects with native EventSource.  We inject the
+    API_SERVER_KEY bearer token upstream (never exposed to the browser),
+    forward ``Last-Event-ID`` / ``include`` / ``after`` query params, and
+    stream raw SSE bytes back.  When the api_server is unreachable, we return
+    a synthetic SSE error frame so EventSource fires its ``onerror`` and the
+    UI degrades gracefully.
+
+    Auth: EventSource cannot set custom headers, so in loopback mode the
+    browser appends ``?token=<_SESSION_TOKEN>`` and we validate it here (the
+    generic ``_require_token`` only checks headers).  Gated (OAuth) mode
+    authenticates via the session cookie, which EventSource sends
+    automatically.
+    """
+    _require_token_or_query(request)
+
+    try:
+        import httpx
+    except ImportError:
+        return _run_events_unavailable_frame("httpx is not available")
+
+    base = _resolve_api_server_base_url()
+    if not base:
+        return _run_events_unavailable_frame("api_server base URL could not be resolved")
+
+    api_key = _resolve_api_server_key()
+    upstream_url = f"{base}/v1/runs/{urllib.parse.quote(run_id, safe='')}/events"
+
+    # Forward query params (include, after) and Last-Event-ID header.
+    params: Dict[str, str] = {}
+    for key in ("include", "after"):
+        val = request.query_params.get(key)
+        if val is not None:
+            params[key] = val
+    headers: Dict[str, str] = {"Accept": "text/event-stream"}
+    if api_key:
+        headers["Authorization"] = f"Bearer {api_key}"
+    last_event_id = request.headers.get("Last-Event-ID")
+    if last_event_id:
+        headers["Last-Event-ID"] = last_event_id
+
+    async def _stream():
+        try:
+            async with httpx.AsyncClient(
+                timeout=httpx.Timeout(
+                    connect=_RUN_EVENTS_UPSTREAM_CONNECT_TIMEOUT,
+                    read=_RUN_EVENTS_UPSTREAM_READ_TIMEOUT,
+                    write=10.0,
+                    pool=5.0,
+                ),
+            ) as client:
+                async with client.stream(
+                    "GET", upstream_url, params=params, headers=headers,
+                ) as upstream:
+                    if upstream.status_code != 200:
+                        body = await upstream.aread()
+                        # Emit a synthetic error frame so the browser's named
+                        # event listeners fire instead of a silent failure.
+                        err_payload = json.dumps({
+                            "proxy_error": True,
+                            "upstream_status": upstream.status_code,
+                            "upstream_body": body.decode("utf-8", "replace")[:1000],
+                        })
+                        yield f"event: hermes.run_events.proxy_error\ndata: {err_payload}\n\n".encode()
+                        yield b": stream closed\n\n"
+                        return
+                    async for chunk in upstream.aiter_raw():
+                        if chunk:
+                            yield chunk
+        except httpx.ConnectError:
+            yield _run_events_unavailable_bytes("api_server is not reachable")
+        except httpx.ReadTimeout:
+            yield _run_events_unavailable_bytes("api_server read timed out")
+        except Exception as exc:
+            yield _run_events_unavailable_bytes(f"proxy error: {type(exc).__name__}")
+
+    return StreamingResponse(
+        _stream(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache, no-transform",
+            "X-Accel-Buffering": "no",
+            "Connection": "keep-alive",
+        },
+    )
+
+
+def _run_events_unavailable_bytes(reason: str) -> bytes:
+    """Build a synthetic SSE error frame for upstream unavailability."""
+    payload = json.dumps({"proxy_error": True, "reason": reason})
+    return f"event: hermes.run_events.proxy_error\ndata: {payload}\n\n: stream closed\n\n".encode()
+
+
+def _run_events_unavailable_frame(reason: str):
+    """Return a StreamingResponse carrying a single unavailable frame."""
+    async def _single():
+        yield _run_events_unavailable_bytes(reason)
+    return StreamingResponse(
+        _single(),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache, no-transform", "X-Accel-Buffering": "no"},
+    )
+
+
+@app.get("/api/runs/capabilities")
+async def get_run_events_capabilities(request: Request):
+    """Forward ``/v1/capabilities`` and extract the ``run_events`` block.
+
+    Lets the UI discover whether the api_server advertises run-events SSE and
+    what limits apply, without a live stream.  Returns a compact JSON object.
+    """
+    _require_token(request)
+
+    try:
+        import httpx
+    except ImportError:
+        return JSONResponse({"available": False, "reason": "httpx is not available"})
+
+    base = _resolve_api_server_base_url()
+    if not base:
+        return JSONResponse({"available": False, "reason": "api_server base URL could not be resolved"})
+
+    api_key = _resolve_api_server_key()
+    headers: Dict[str, str] = {}
+    if api_key:
+        headers["Authorization"] = f"Bearer {api_key}"
+
+    try:
+        async with httpx.AsyncClient(
+            timeout=httpx.Timeout(_RUN_EVENTS_UPSTREAM_CONNECT_TIMEOUT),
+        ) as client:
+            resp = await client.get(f"{base}/v1/capabilities", headers=headers)
+            if resp.status_code != 200:
+                return JSONResponse(
+                    {"available": False, "reason": f"upstream status {resp.status_code}"},
+                    status_code=502,
+                )
+            data = resp.json()
+            run_events = (data or {}).get("run_events") or {}
+            features = (data or {}).get("features") or {}
+            endpoints = (data or {}).get("endpoints") or {}
+            return JSONResponse({
+                "available": bool(features.get("run_events_sse")),
+                "run_events": run_events,
+                "endpoint": endpoints.get("run_events"),
+            })
+    except httpx.ConnectError:
+        return JSONResponse({"available": False, "reason": "api_server is not reachable"})
+    except Exception as exc:
+        return JSONResponse({"available": False, "reason": f"{type(exc).__name__}: {exc}"})
 
 
 @app.get("/api/health")
