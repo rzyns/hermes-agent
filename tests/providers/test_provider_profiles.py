@@ -265,6 +265,14 @@ class TestOpenRouterProfile:
         p = get_provider_profile("openrouter")
         body = p.build_extra_body(session_id="test-session-123")
         assert body["session_id"] == "test-session-123"
+    def test_sticky_session_id_normalizes_cron_timestamp(self):
+        """Cron re-fires of the same job keep the same sticky routing key."""
+        p = get_provider_profile("openrouter")
+        first = p.build_extra_body(session_id="cron_job42_20260801_090000")
+        second = p.build_extra_body(session_id="cron_job42_20260802_090000")
+        assert first["session_id"] == "cron_job42"
+        assert first["session_id"] == second["session_id"]
+
 
     def test_extra_body_no_prefs(self):
         p = get_provider_profile("openrouter")
@@ -468,6 +476,22 @@ class TestOpenRouterProfile:
             session_id="sess-xyz",
         )
         assert tl["extra_headers"]["x-grok-conv-id"] == "sess-xyz"
+    def test_grok_conv_id_normalizes_cron_timestamp(self):
+        """Cron re-fires of the same job must pin to the same xAI backend,
+        same as the body.session_id sticky key (#78941)."""
+        p = get_provider_profile("openrouter")
+        _, first = p.build_api_kwargs_extras(
+            model="x-ai/grok-4", session_id="cron_job42_20260801_090000",
+        )
+        _, second = p.build_api_kwargs_extras(
+            model="x-ai/grok-4", session_id="cron_job42_20260802_090000",
+        )
+        assert first["extra_headers"]["x-grok-conv-id"] == "cron_job42"
+        assert (
+            first["extra_headers"]["x-grok-conv-id"]
+            == second["extra_headers"]["x-grok-conv-id"]
+        )
+
 
     def test_non_grok_model_no_affinity_header(self):
         """OpenRouter + non-Grok model => no x-grok-conv-id header."""
@@ -630,6 +654,14 @@ class TestNousProfile:
             "tags": nous_portal_tags(),
             "provider": preferences,
         }
+    def test_sticky_session_id_normalizes_cron_timestamp(self):
+        """Cron re-fires of the same job keep the same sticky routing key."""
+        p = get_provider_profile("nous")
+        first = p.build_extra_body(session_id="cron_job42_20260801_090000")
+        second = p.build_extra_body(session_id="cron_job42_20260802_090000")
+        assert first["session_id"] == "cron_job42"
+        assert first["session_id"] == second["session_id"]
+
 
     def test_tags_include_conversation_when_session_id(self):
         from agent.portal_tags import conversation_tag

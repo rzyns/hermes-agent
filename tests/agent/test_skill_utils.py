@@ -482,16 +482,20 @@ class TestParseFrontmatterBOM:
         assert "\ufeff" in body
 
     def test_bom_platform_gating_regression(self):
-        # The concrete harm: a macOS-only skill must stay hidden on non-macOS
+        # The concrete harm: a macOS-only skill must be gated identically
         # whether or not the file carries a BOM. Empty frontmatter (the bug)
-        # reads as "no platform restriction" and leaks the skill everywhere.
-        with patch("agent.skill_utils.sys.platform", "win32"), patch(
-            "agent.skill_utils.is_termux", return_value=False
-        ):
+        # reads as "no platform restriction" and leaks the skill everywhere,
+        # i.e. it would answer True on every host. Compare against the real
+        # host's verdict instead of faking Windows — the fake only stood in
+        # for "some non-macOS host", which the CI host already is.
+        import sys
+
+        expected = sys.platform == "darwin"
+        with patch("agent.skill_utils.is_termux", return_value=False):
             plain_fm, _ = parse_frontmatter(self.SKILL)
             bom_fm, _ = parse_frontmatter("\ufeff" + self.SKILL)
-            assert skill_matches_platform(plain_fm) is False
-            assert skill_matches_platform(bom_fm) is False
+            assert skill_matches_platform(plain_fm) is expected
+            assert skill_matches_platform(bom_fm) is expected
 
     def test_bom_config_vars_preserved(self):
         # metadata.hermes.config drives secure setup-on-load; it must survive

@@ -734,7 +734,9 @@ class TestCodexOAuthContextLength:
 
         assert ctx == live_context
         mock_get.assert_called_once()
-        remaining = _yaml.safe_load(cache_file.read_text()).get("context_lengths", {})
+        remaining = _yaml.safe_load(cache_file.read_text(encoding="utf-8")).get(
+            "context_lengths", {}
+        )
         assert remaining.get(stale_key) == live_context
         assert remaining.get(other_key) == 128_000
 
@@ -977,7 +979,7 @@ class TestNousPortalContextResolution:
         )
         assert ctx == 1_000_000, "OR fallback should still serve the request"
         assert not cache_file.exists() or not yaml.safe_load(
-            cache_file.read_text()
+            cache_file.read_text(encoding="utf-8")
         ).get("context_lengths", {}), (
             "OR-fallback values must NOT be persisted — a single portal blip "
             "would otherwise freeze the wrong value in via step-1 cache hit"
@@ -1019,7 +1021,9 @@ class TestNousPortalContextResolution:
             f"Stale OR-derived cache entry should not have leaked through; got {ctx}"
         )
 
-        remaining = yaml.safe_load(cache_file.read_text()).get("context_lengths", {})
+        remaining = yaml.safe_load(cache_file.read_text(encoding="utf-8")).get(
+            "context_lengths", {}
+        )
         assert remaining.get(stale_key) == 262_144, (
             "Portal value should have overwritten the stale entry on disk"
         )
@@ -1560,6 +1564,33 @@ class TestStripProviderPrefix:
     def test_no_colon_returns_unchanged(self):
         assert _strip_provider_prefix("gpt-4o") == "gpt-4o"
         assert _strip_provider_prefix("anthropic/claude-sonnet-4") == "anthropic/claude-sonnet-4"
+    def test_registered_profile_name_and_alias_are_stripped(self, monkeypatch):
+        import providers
+        from providers import ProviderProfile
+
+        monkeypatch.setattr(providers, "_REGISTRY", {})
+        monkeypatch.setattr(providers, "_ALIASES", {})
+        monkeypatch.setattr(providers, "_PROVIDER_LIST_CACHE", None)
+        monkeypatch.setattr(providers, "_discovered", True)
+        providers.register_provider(
+            ProviderProfile(name="fake-provider", aliases=("fake-alias",))
+        )
+
+        assert _strip_provider_prefix("fake-provider:org/model") == "org/model"
+        assert _strip_provider_prefix("fake-alias:org/model") == "org/model"
+
+    def test_bundled_plugin_provider_prefix_is_stripped(self):
+        assert _strip_provider_prefix("fireworks:accounts/fireworks/models/foo") == (
+            "accounts/fireworks/models/foo"
+        )
+
+    def test_unknown_provider_prefix_is_unchanged(self):
+        assert _strip_provider_prefix("not-a-provider:org/model") == (
+            "not-a-provider:org/model"
+        )
+
+    def test_ollama_model_tag_is_unchanged(self):
+        assert _strip_provider_prefix("qwen3.5:27b") == "qwen3.5:27b"
 
     @patch("agent.model_metadata.fetch_model_metadata")
     def test_ollama_model_tag_not_mangled_in_context_lookup(self, mock_fetch):
@@ -1919,7 +1950,7 @@ class TestContextLengthCache:
         """``context_lengths:`` with no value parses as None — must behave
         like an empty cache instead of crashing every caller (#47135)."""
         cache_file = tmp_path / "cache.yaml"
-        cache_file.write_text("context_lengths:\n")
+        cache_file.write_text("context_lengths:\n", encoding="utf-8")
         with patch("agent.model_metadata._get_context_cache_path", return_value=cache_file):
             assert get_cached_context_length("test/model", "http://x") is None
             # save must also survive the null key and repair the file
@@ -1947,7 +1978,7 @@ class TestContextLengthCache:
         with patch("agent.model_metadata._get_context_cache_path", return_value=cache_file):
             save_context_length("model", "http://x", 32768)
             save_context_length("model", "http://x", 32768)
-            with open(cache_file) as f:
+            with open(cache_file, encoding="utf-8") as f:
                 data = yaml.safe_load(f)
             assert len(data["context_lengths"]) == 1
 
@@ -2073,7 +2104,7 @@ class TestMoAContextLength:
             payload["custom_providers"] = custom_providers
         if providers is not None:
             payload["providers"] = providers
-        with open(os.path.join(home, "config.yaml"), "w") as f:
+        with open(os.path.join(home, "config.yaml"), "w", encoding="utf-8") as f:
             yaml.safe_dump(payload, f)
 
     def test_moa_resolves_from_aggregator(self, tmp_path, monkeypatch):

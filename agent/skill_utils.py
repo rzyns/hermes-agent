@@ -299,8 +299,10 @@ def _env_cache_key(env: str) -> str:
 def _detect_environment(env: str) -> bool:
     """Return True when the named runtime environment is currently active.
 
-    Cached per process. Unknown env names return True (fail-open: never hide a
-    skill because of a tag we don't understand).
+    Cached per process, EXCEPT ``kanban``: that verdict is context-dependent
+    (a delegate_task child or an in-process cron job sees the worker's
+    HERMES_KANBAN_* vars without owning them), so caching it process-wide would
+    freeze whichever context asked first and leak it to the others.
     """
     cache_key = _env_cache_key(env)
     if cache_key in _ENV_DETECT_CACHE:

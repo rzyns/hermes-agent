@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from typing import Any, Callable, Iterable
 
-from agent.title_generator import build_title_context, generate_title
+from agent.title_generator import generate_title
 
 TitleGenerator = Callable[[str], str | None]
 
@@ -39,8 +39,17 @@ def _candidate_sessions(
     return candidates
 
 
+def _first_user_message(history) -> str:
+    for msg in history or []:
+        if isinstance(msg, dict) and msg.get("role") == "user":
+            content = msg.get("content")
+            if isinstance(content, str) and content.strip():
+                return content
+    return ""
+
+
 def _default_title_generator(context: str) -> str | None:
-    return generate_title("", "", title_context=context)
+    return generate_title(context)
 
 
 def retitle_sessions(
@@ -84,7 +93,7 @@ def retitle_sessions(
         }
         try:
             history = db.get_messages_as_conversation(session_id)
-            context = build_title_context(history, session=session)
+            context = _first_user_message(history)
             new_title = generator(context)
             item["new_title"] = new_title
             if apply and new_title:
