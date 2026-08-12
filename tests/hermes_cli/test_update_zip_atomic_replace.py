@@ -35,3 +35,5 @@ def test_atomic_replace_swaps_content_on_success(tmp_path: Path) -> None:
     # No staging/backup siblings left behind.
     assert not (dst.parent / "ui-tui.hermes-update-staging").exists()
     assert not (dst.parent / "ui-tui.hermes-update-old").exists()
+
+

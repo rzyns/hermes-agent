@@ -3199,7 +3199,7 @@ def _cmd_request_review(args: argparse.Namespace) -> int:
                 file=sys.stderr,
             )
             return 1
-        ok, reason = kb.request_review(
+        ok, reason = kb.request_review_phase(
             conn,
             tid,
             summary=summary,

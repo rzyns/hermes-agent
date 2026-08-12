@@ -75,3 +75,5 @@ def test_clear_plugin_bytecode_removes_nested_caches(tmp_path):
     assert removed == 2
     assert not top.exists()
     assert not nested.exists()
+
+

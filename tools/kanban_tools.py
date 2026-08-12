@@ -1269,7 +1269,7 @@ def _handle_request_review(args: dict, **kw) -> str:
                     "Provide acceptance evidence matching the card before "
                     "requesting review."
                 )
-            ok, fail_reason = kb.request_review(
+            ok, fail_reason = kb.request_review_phase(
                 conn, tid,
                 summary=summary,
                 metadata=metadata,

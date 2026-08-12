@@ -1195,6 +1195,16 @@ class TestDeliverResultErrorReturns:
 
 
 class TestRunJobSessionPersistence:
+    @pytest.fixture(autouse=True)
+    def _disable_cron_preflight(self, monkeypatch):
+        # Upstream's job-config preflight (2026-08-12 merge) blocks delivery
+        # targets without gateway credentials. These local tests deliberately
+        # run without credentials; the features under test execute after
+        # preflight, so bypass it here.
+        monkeypatch.setattr(
+            "cron.scheduler._preflight_job_config", lambda job, cfg: None
+        )
+
     def test_run_job_passes_session_db_and_cron_platform(self, tmp_path):
         job = {
             "id": "test-job",
@@ -2840,6 +2850,14 @@ class TestRunJobModelResolution:
 
 
 class TestRunJobSkillBacked:
+    @pytest.fixture(autouse=True)
+    def _disable_cron_preflight(self, monkeypatch):
+        # See TestRunJobSessionPersistence: upstream preflight (2026-08-12
+        # merge) double-loads skill_view for readiness checks.
+        monkeypatch.setattr(
+            "cron.scheduler._preflight_job_config", lambda job, cfg: None
+        )
+
     def test_run_job_preserves_skill_env_passthrough_into_worker_thread(self, tmp_path):
         job = {
             "id": "skill-env-job",
@@ -3734,7 +3752,7 @@ class TestParallelTick:
         monkeypatch.setenv("HERMES_CRON_MAX_PARALLEL", "1")
         call_times = []
 
-        def mock_run_job(job, *, defer_agent_teardown=None):
+        def mock_run_job(job, *, defer_agent_teardown=None, **kwargs):
             import time
             call_times.append(("start", job["id"], time.monotonic()))
             time.sleep(0.05)

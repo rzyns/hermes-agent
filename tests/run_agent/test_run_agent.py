@@ -5689,14 +5689,18 @@ class TestRunConversation:
             "assistant",
             "user",
         ]
-        checkpoint = replay[-2]["content"]
-        assert "interrupted by a user correction" in checkpoint
+        # Scaffold rides on the user correction (api_content → content), never
+        # as the assistant placeholder's own reply (#81841).
+        placeholder = replay[-2]["content"]
+        correction = replay[-1]["content"]
+        assert "interrupted by a user correction" not in (placeholder or "")
+        assert "interrupted by a user correction" in correction
+        assert correction.endswith("No, use Postgres instead.")
         # Displayed chain-of-thought must NOT be replayed: an assistant turn
         # inlining its own reasoning trips Anthropic's output classifier and
         # bricks the session with deterministic empty responses (July 2026).
-        assert "I should implement this with SQLite." not in checkpoint
-        assert "Reasoning shown before the interruption" not in checkpoint
-        assert replay[-1]["content"] == "No, use Postgres instead."
+        assert "I should implement this with SQLite." not in correction
+        assert "Reasoning shown before the interruption" not in correction
         assert agent._pending_redirect is None
         assert any(
             snapshot[-1].get("content") == "No, use Postgres instead."
@@ -5776,14 +5780,21 @@ class TestRunConversation:
         assert calls == 2
         assert results["result"]["completed"] is True
         assert results["result"]["final_response"] == "Corrected answer."
-        checkpoint = results["result"]["messages"][-3]
-        assert "interrupted by a user correction" in checkpoint["content"]
+        placeholder = results["result"]["messages"][-3]
+        correction = results["result"]["messages"][-2]
+        assert placeholder["role"] == "assistant"
+        assert "interrupted by a user correction" not in (
+            placeholder.get("content") or ""
+        )
+        assert "interrupted by a user correction" in (
+            correction.get("api_content") or ""
+        )
         # Displayed reasoning is display-only — replaying it as assistant
         # content trips Anthropic's output classifier (July 2026 brickings).
-        assert "Following the original approach." not in checkpoint["content"]
-        assert results["result"]["messages"][-2]["content"] == (
-            "Use the corrected approach."
+        assert "Following the original approach." not in (
+            correction.get("api_content") or ""
         )
+        assert correction["content"] == "Use the corrected approach."
 
     def test_interrupt_before_any_stream_keeps_sentinel(self, agent):
         """An interrupt with no streamed text falls back to the metadata sentinel."""
@@ -6876,7 +6887,10 @@ class TestRunConversation:
         ok_resp = _mock_response(content="done", finish_reason="stop")
         agent.client.chat.completions.create.side_effect = [exc, ok_resp]
 
-        mock_compress = MagicMock()
+        mock_compress = MagicMock(return_value=(
+            [{"role": "user", "content": "hello"}],
+            "You are helpful.",
+        ))
         with (
             patch.object(agent, "_persist_session"),
             patch.object(agent, "_save_trajectory"),
@@ -6890,7 +6904,7 @@ class TestRunConversation:
         assert result["completed"] is True
         assert second_call["max_tokens"] <= 936
         assert agent.context_compressor.context_length == 200_000
-        mock_compress.assert_not_called()
+        mock_compress.assert_called_once()
 
     def test_output_cap_retry_with_large_api_only_content(self, agent):
         """When a large system prompt makes api_messages huge while persisted
@@ -6920,7 +6934,10 @@ class TestRunConversation:
         ok_resp = _mock_response(content="done", finish_reason="stop")
         agent.client.chat.completions.create.side_effect = [exc, ok_resp]
 
-        mock_compress = MagicMock()
+        mock_compress = MagicMock(return_value=(
+            [{"role": "user", "content": "hello"}],
+            "You are helpful.",
+        ))
         with (
             patch.object(agent, "_persist_session"),
             patch.object(agent, "_save_trajectory"),
@@ -6936,7 +6953,7 @@ class TestRunConversation:
         # near 199927 — this test fails on it.
         assert second_call["max_tokens"] <= 936
         assert agent.context_compressor.context_length == 200_000
-        mock_compress.assert_not_called()
+        mock_compress.assert_called_once()
 
     def test_output_cap_retry_request_pressure_lower_bound(self, agent):
         """When the provider reports a large available_tokens but local request
@@ -7543,6 +7560,7 @@ class TestCredentialPoolRecovery:
                 status_code,
                 error_context=None,
                 api_key_hint=None,
+                **kwargs,
             ):
                 assert status_code == 402
                 assert error_context is None
@@ -7571,6 +7589,7 @@ class TestCredentialPoolRecovery:
                 status_code,
                 error_context=None,
                 api_key_hint=None,
+                **kwargs,
             ):
                 assert status_code == 400
                 assert error_context == {"reason": "out_of_extra_usage"}
@@ -7603,7 +7622,7 @@ class TestCredentialPoolRecovery:
 
             def mark_exhausted_and_rotate(
                 self, *, status_code, error_context=None, api_key_hint=None
-            ):
+            , **kwargs):
                 assert status_code == 429
                 assert error_context is None
                 assert api_key_hint == agent.api_key
@@ -7711,7 +7730,7 @@ class TestCredentialPoolRecovery:
 
             def mark_exhausted_and_rotate(
                 self, *, status_code, error_context=None, api_key_hint=None
-            ):
+            , **kwargs):
                 assert status_code == 401
                 assert error_context is None
                 assert api_key_hint == agent.api_key
@@ -7738,7 +7757,7 @@ class TestCredentialPoolRecovery:
 
             def mark_exhausted_and_rotate(
                 self, *, status_code, error_context=None, api_key_hint=None
-            ):
+            , **kwargs):
                 assert error_context is None
                 return None  # no more credentials
 
@@ -7820,7 +7839,7 @@ class TestCredentialPoolRecovery:
 
             def mark_exhausted_and_rotate(
                 self, *, status_code, error_context=None, api_key_hint=None
-            ):
+            , **kwargs):
                 captured["status_code"] = status_code
                 captured["error_context"] = error_context
                 captured["api_key_hint"] = api_key_hint

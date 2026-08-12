@@ -89,3 +89,4 @@ def test_validate_critical_files_syntax_tolerates_missing_files(tmp_path):
 # release; if a future ``hermes update`` would brick users, this test fails
 # in CI first.
 # ---------------------------------------------------------------------------
+

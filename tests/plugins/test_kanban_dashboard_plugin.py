@@ -3612,7 +3612,7 @@ def test_patch_review_lifecycle_preserves_handoff_and_reopens(client):
 def test_reopening_parent_retracts_review_and_blocks_approval(client):
     with kb.connect() as conn:
         parent_id = kb.create_task(conn, title="parent", assignee="planner")
-        assert kb.complete_task(conn, parent_id)
+        assert kb.complete_task(conn, parent_id, result="done")
         child_id = kb.create_task(
             conn,
             title="child in review",
@@ -3627,7 +3627,7 @@ def test_reopening_parent_retracts_review_and_blocks_approval(client):
         )
         implementation = kb.claim_task(conn, child_id)
         assert implementation is not None
-        assert kb.request_review(
+        assert kb.request_review_phase(
             conn,
             child_id,
             summary="ready",
@@ -3657,7 +3657,7 @@ def test_reopening_parent_retracts_review_and_blocks_approval(client):
 
     response = client.patch(
         f"/api/plugins/kanban/tasks/{parent_id}",
-        json={"status": "done"},
+        json={"status": "done", "result": "reopen cycle complete"},
     )
     assert response.status_code == 200, response.text
 
@@ -3681,14 +3681,14 @@ def test_reopening_parent_retracts_review_and_blocks_approval(client):
 def test_reopening_parent_recursively_retracts_done_and_running_descendants(client):
     with kb.connect() as conn:
         parent_id = kb.create_task(conn, title="root", assignee="planner")
-        assert kb.complete_task(conn, parent_id)
+        assert kb.complete_task(conn, parent_id, result="done")
         child_id = kb.create_task(
             conn,
             title="accepted child",
             assignee="builder",
             parents=[parent_id],
         )
-        assert kb.complete_task(conn, child_id)
+        assert kb.complete_task(conn, child_id, result="done")
         grandchild_id = kb.create_task(
             conn,
             title="running grandchild",
@@ -3717,7 +3717,7 @@ def test_reopening_parent_recursively_retracts_done_and_running_descendants(clie
 
     response = client.patch(
         f"/api/plugins/kanban/tasks/{parent_id}",
-        json={"status": "done"},
+        json={"status": "done", "result": "reopen cycle complete"},
     )
     assert response.status_code == 200, response.text
     with kb.connect() as conn:
@@ -3732,7 +3732,7 @@ def test_dashboard_reclaim_of_active_review_preserves_review_phase(client):
         task_id = kb.create_task(conn, title="active review", assignee="reviewer")
         implementation = kb.claim_task(conn, task_id)
         assert implementation is not None
-        assert kb.request_review(
+        assert kb.request_review_phase(
             conn,
             task_id,
             summary="ready",

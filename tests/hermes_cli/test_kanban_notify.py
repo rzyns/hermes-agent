@@ -79,7 +79,7 @@ async def test_notifier_wakes_origin_for_review_and_keeps_subscription(kanban_ho
         )
         task = kb.claim_task(conn, task_id, claimer="builder:1")
         assert task is not None
-        assert kb.request_review(
+        assert kb.request_review_phase(
             conn,
             task_id,
             summary="Implementation and tests ready.",

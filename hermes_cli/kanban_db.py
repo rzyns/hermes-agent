@@ -6326,22 +6326,27 @@ def recompute_ready(
                     )
                     if failures >= effective_limit:
                         continue
+                    resume_status = _resume_status_from_events(conn, task_id)
                     conn.execute(
-                        "UPDATE tasks SET status = 'ready', "
+                        "UPDATE tasks SET status = ?, "
                         "dep_wait_fingerprint = NULL "
                         "WHERE id = ? AND status = 'blocked'",
-                        (task_id,),
+                        (resume_status, task_id),
                     )
                 else:
                     if external_blockers:
                         continue
+                    resume_status = _resume_status_from_events(conn, task_id)
                     conn.execute(
-                        "UPDATE tasks SET status = 'ready', "
+                        "UPDATE tasks SET status = ?, "
                         "dep_wait_fingerprint = NULL "
                         "WHERE id = ? AND status = 'todo'",
-                        (task_id,),
+                        (resume_status, task_id),
                     )
-                _append_event(conn, task_id, "promoted", None)
+                _append_event(
+                    conn, task_id, "promoted",
+                    {"status": resume_status} if resume_status != "ready" else None,
+                )
                 promoted += 1
     return promoted
 
@@ -12551,6 +12556,8 @@ class DispatchResult:
     """Outcome of a single ``dispatch`` pass."""
 
     reclaimed: int = 0
+
+    reconciled_orphans: list[str] = field(default_factory=list)
     promoted: int = 0
     requeued_transients: list[str] = field(default_factory=list)
     """Due transient blocks returned to ready/todo this tick."""
@@ -14450,6 +14457,7 @@ def dispatch_once(
     default_assignee: Optional[str] = None,
     max_in_progress_per_profile: Optional[int] = None,
     retry_enabled: bool = False,
+    reconcile_orphans: bool = True,
 ) -> DispatchResult:
     """Run one dispatcher tick under the board's single-writer lock.
 
@@ -14485,6 +14493,7 @@ def dispatch_once(
             default_assignee=default_assignee,
             max_in_progress_per_profile=max_in_progress_per_profile,
             retry_enabled=retry_enabled,
+            reconcile_orphans=reconcile_orphans,
         )
     with _dispatch_tick_lock(db_path) as held:
         if not held:
@@ -14502,6 +14511,7 @@ def dispatch_once(
             default_assignee=default_assignee,
             max_in_progress_per_profile=max_in_progress_per_profile,
             retry_enabled=retry_enabled,
+            reconcile_orphans=reconcile_orphans,
         )
         # Still under the dispatch lock: opportunistically truncate the WAL
         # at a coarse interval so it cannot grow unbounded between restarts.
@@ -14523,6 +14533,7 @@ def _dispatch_once_locked(
     default_assignee: Optional[str] = None,
     max_in_progress_per_profile: Optional[int] = None,
     retry_enabled: bool = False,
+    reconcile_orphans: bool = True,
 ) -> DispatchResult:
     """Run one dispatcher tick.
 
@@ -14563,6 +14574,11 @@ def _dispatch_once_locked(
 
     result = DispatchResult()
     result.reclaimed = release_stale_claims(conn)
+    if reconcile_orphans:
+        # Orphaned-card reconciliation: requeue 'running' cards whose claim
+        # bookkeeping is broken (no valid claim, dead/gone worker) that the
+        # TTL/crash/stale paths can never see. See reconcile_orphaned_running.
+        result.reconciled_orphans = reconcile_orphaned_running(conn)
     result.stale = detect_stale_running(
         conn, stale_timeout_seconds=stale_timeout_seconds,
     )
@@ -17332,14 +17348,178 @@ def reconcile_orphaned_running(
 def review_dispatch_enabled() -> bool:
     """Return whether first-class review tasks should dispatch automatically.
 
-    The default is true because Hermes ships the ``sdlc-review`` skill and the
+    Fork default is FALSE (2026-08-12 merge decision): this install runs the
+    local review doctrine (reviewer cards / sibling gates), so upstream review
+    auto-dispatch must be an explicit operator opt-in. Upstream default note:
     review lifecycle includes a supported reviewer-owned changes-requested
     transition. Operators can disable it for human-only review boards.
     """
     try:
         from hermes_cli.config import load_config
         return bool(
-            (load_config() or {}).get("kanban", {}).get("review_dispatch", True)
+            (load_config() or {}).get("kanban", {}).get("review_dispatch", False)
         )
     except Exception:
-        return True
+        return False
+
+
+def request_review_phase(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    summary: Optional[str] = None,
+    metadata: Optional[dict] = None,
+    reviewer: Optional[str] = None,
+    expected_run_id: Optional[int] = None,
+    force: bool = False,
+    with_reason: bool = False,
+):
+    """Transition implementation work into the first-class review phase.
+
+    Unlike :func:`block_task`, this transition never touches block recurrence
+    accounting.  The current implementer and resolved reviewer are recorded on
+    the event so an autonomous reviewer can route requested changes back to the
+    right profile.  Supplying ``reviewer`` reassigns the task before it is
+    exposed to the review dispatcher.  On re-review, omitting it reuses the
+    reviewer provenance persisted by the latest ``changes_requested`` event.
+
+    When the task is ``running`` under a live claim, a caller that supplies no
+    ``expected_run_id`` must pass ``force=True`` (explicit human/CLI override)
+    — otherwise the request is refused instead of silently clearing the live
+    worker's ``claim_lock``/``worker_pid``. Workers prove ownership by passing
+    their own run id as ``expected_run_id`` (unchanged).
+
+    Returns ``bool`` by default. With ``with_reason=True`` returns
+    ``(ok, reason)`` mirroring :func:`request_changes` — ``reason`` is a
+    diagnostic string on failure, ``None`` on success.
+    """
+
+    def _ret(ok: bool, reason: Optional[str] = None):
+        return (ok, reason) if with_reason else ok
+
+    summary = redact_review_value(summary)
+    metadata = redact_review_value(metadata)
+    with write_txn(conn):
+        if not _parents_satisfied(conn, task_id):
+            return _ret(False, "parent dependencies are not satisfied")
+        trow = conn.execute(
+            "SELECT assignee, status, claim_lock, current_run_id "
+            "FROM tasks WHERE id = ?", (task_id,),
+        ).fetchone()
+        if trow is None:
+            return _ret(False, "task not found")
+        # Refuse to clear a live worker's claim without proof of ownership
+        # (expected_run_id) or an explicit human override (force=True).
+        if (
+            expected_run_id is None
+            and not force
+            and trow["status"] == "running"
+            and trow["claim_lock"] is not None
+        ):
+            return _ret(
+                False,
+                "task is running under a live claim; pass expected_run_id "
+                "(worker ownership) or force=True (explicit operator "
+                "override) instead of clearing the live run's claim",
+            )
+        implementer = trow["assignee"]
+        if reviewer is None:
+            changes_run = conn.execute(
+                "SELECT id FROM task_runs "
+                "WHERE task_id = ? AND outcome = 'changes_requested' "
+                "ORDER BY id DESC LIMIT 1",
+                (task_id,),
+            ).fetchone()
+            changes_event = None
+            if changes_run is not None:
+                changes_event = conn.execute(
+                    "SELECT payload FROM task_events "
+                    "WHERE task_id = ? AND run_id = ? "
+                    "AND kind = 'changes_requested' "
+                    "ORDER BY id DESC LIMIT 1",
+                    (task_id, int(changes_run["id"])),
+                ).fetchone()
+            try:
+                changes_payload = (
+                    json.loads(changes_event["payload"])
+                    if changes_event and changes_event["payload"]
+                    else {}
+                )
+            except (json.JSONDecodeError, TypeError):
+                changes_payload = {}
+            prior_reviewer = (
+                changes_payload.get("reviewer")
+                if isinstance(changes_payload, dict)
+                else None
+            )
+            if changes_run is not None:
+                if not isinstance(prior_reviewer, str) or not prior_reviewer.strip():
+                    return _ret(
+                        False,
+                        "re-review has no durable reviewer provenance (the "
+                        "latest changes_requested event is missing or "
+                        "malformed); pass reviewer= explicitly",
+                    )
+                reviewer = prior_reviewer
+        reviewer = _canonical_assignee(reviewer) if reviewer is not None else None
+        assignee_sql = ", assignee = ?" if reviewer is not None else ""
+        params: tuple[Any, ...]
+        if expected_run_id is None:
+            params = (reviewer, task_id) if reviewer is not None else (task_id,)
+            run_guard = ""
+        else:
+            params = (
+                (reviewer, task_id, int(expected_run_id))
+                if reviewer is not None
+                else (task_id, int(expected_run_id))
+            )
+            run_guard = " AND current_run_id = ?"
+        cur = conn.execute(
+            """
+            UPDATE tasks
+               SET status        = 'review',
+                   claim_lock    = NULL,
+                   claim_expires = NULL,
+                   worker_pid    = NULL
+            """ + assignee_sql + """
+             WHERE id = ?
+               AND status IN ('running', 'ready')
+            """ + run_guard,
+            params,
+        )
+        if cur.rowcount != 1:
+            return _ret(
+                False,
+                "task is not in running/ready (or expected_run_id did not "
+                "match the current run)",
+            )
+        run_id = _end_run(
+            conn,
+            task_id,
+            outcome="review_requested",
+            status="review",
+            summary=summary,
+            metadata=metadata,
+        )
+        if run_id is None and (summary or metadata):
+            run_id = _synthesize_ended_run(
+                conn,
+                task_id,
+                outcome="review_requested",
+                summary=summary,
+                metadata=metadata,
+            )
+        lines = (summary or "").strip().splitlines()
+        event_summary = lines[0][:400] if lines else ""
+        _append_event(
+            conn,
+            task_id,
+            "review_requested",
+            {
+                "summary": event_summary or None,
+                "implementer": implementer,
+                "reviewer": reviewer,
+            },
+            run_id=run_id,
+        )
+    return _ret(True)

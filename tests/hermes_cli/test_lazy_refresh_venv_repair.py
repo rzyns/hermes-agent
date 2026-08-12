@@ -108,3 +108,13 @@ def test_refresh_repairs_venv_after_lazy_failure(tmp_path, monkeypatch, capsys):
     assert "Venv repair succeeded" in out
     assert "import probes" in out
     assert "Backends keep their previously-installed version" not in out
+
+
+
+
+
+
+
+
+
+

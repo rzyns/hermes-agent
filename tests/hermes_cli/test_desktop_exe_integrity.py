@@ -317,3 +317,5 @@ def test_build_only_fails_when_pack_produces_corrupt_exe(tmp_path, monkeypatch, 
     mock_stamp.assert_not_called()
     out = capsys.readouterr().out
     assert "integrity check" in out
+
+

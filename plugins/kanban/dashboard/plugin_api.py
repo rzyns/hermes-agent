@@ -1340,7 +1340,7 @@ def update_task(task_id: str, payload: UpdateTaskBody, board: Optional[str] = Qu
                 # request_review so it is NOT a
                 # block (never trips unblock-loop detection). Only valid from
                 # running/ready — a False return becomes the 409 toast below.
-                ok = kanban_db.request_review(
+                ok = kanban_db.request_review_phase(
                     conn, task_id, summary=payload.summary,
                     metadata=payload.metadata,
                     reviewer=(payload.assignee or None),
@@ -1843,7 +1843,7 @@ def bulk_update(payload: BulkTaskBody, board: Optional[str] = Query(None)):
                         ok = kanban_db.block_task(conn, tid)
                     elif s == "review":
                         # Non-block review handoff (mirror of PATCH /tasks/{id}).
-                        ok = kanban_db.request_review(
+                        ok = kanban_db.request_review_phase(
                             conn, tid, summary=payload.summary,
                             metadata=payload.metadata,
                             reviewer=(payload.assignee or None),
