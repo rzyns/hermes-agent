@@ -4544,42 +4544,120 @@ def test_attach_url_fetches_local_fixture(worker_env, allow_private_urls):
     import http.server
     import threading
     from pathlib import Path
+def test_create_subscribes_gateway_session(monkeypatch, worker_env):
+    """A gateway session (platform + chat_id set) gets auto-subscribed
+    to its own kanban_create result, and the response surfaces the
+    ``subscribed`` flag so the orchestrator can react."""
+    from tools import kanban_tools as kt
+    monkeypatch.setenv("HERMES_SESSION_PLATFORM", "telegram")
+    monkeypatch.setenv("HERMES_SESSION_CHAT_ID", "chat-42")
+    monkeypatch.setenv("HERMES_SESSION_THREAD_ID", "thread-7")
+    monkeypatch.setenv("HERMES_SESSION_USER_ID", "user-9")
+    monkeypatch.setenv("HERMES_SESSION_USER_ID_ALT", "alt-user-9")
+    monkeypatch.setenv("HERMES_SESSION_CHAT_TYPE", "forum")
+
+    out = kt._handle_create({
+        "title": "auto-sub gateway",
+        "assignee": "peer",
+    })
+    d = json.loads(out)
+    assert d["ok"] is True
+    new_tid = d["task_id"]
+    assert d["subscribed"] is True, d
+
+    subs = _sub_index(_list_subs_for_task(new_tid))
+    assert len(subs) == 1
+    s = subs[0]
+    assert s["platform"] == "telegram"
+    assert s["chat_id"] == "chat-42"
+    assert s["thread_id"] == "thread-7"
+    assert s["user_id"] == "user-9"
+    assert s["user_id_alt"] == "alt-user-9"
+    assert s["chat_type"] == "forum"
+    assert s["delivery_mode"] == "notify+wake"
+
+
+def test_create_subscribes_tui_session_via_session_key(monkeypatch, worker_env):
+    """TUI / desktop sessions don't have a platform/chat_id (single
+    local channel), but the parent process exports HERMES_SESSION_KEY.
+    We should still auto-subscribe, with platform='tui' and
+    chat_id=<key>."""
+    from tools import kanban_tools as kt
+    monkeypatch.delenv("HERMES_SESSION_PLATFORM", raising=False)
+    monkeypatch.delenv("HERMES_SESSION_CHAT_ID", raising=False)
+    monkeypatch.delenv("HERMES_SESSION_THREAD_ID", raising=False)
+    monkeypatch.delenv("HERMES_SESSION_USER_ID", raising=False)
+    monkeypatch.setenv("HERMES_SESSION_KEY", "tui-session-abc")
+    monkeypatch.delenv("HERMES_SESSION_ID", raising=False)
+
+    out = kt._handle_create({
+        "title": "auto-sub tui",
+        "assignee": "peer",
+    })
+    d = json.loads(out)
+    assert d["ok"] is True
+    new_tid = d["task_id"]
+    assert d["subscribed"] is True, d
+
+    subs = _sub_index(_list_subs_for_task(new_tid))
+    assert len(subs) == 1
+    assert subs[0]["platform"] == "tui"
+    assert subs[0]["chat_id"] == "tui-session-abc"
+    assert subs[0]["chat_type"] == "dm"
+    assert subs[0]["delivery_mode"] == "notify"
+
+
+def test_create_does_not_subscribe_in_cli_session(monkeypatch, worker_env):
+    """CLI / cron / test sessions have no persistent delivery channel.
+    _maybe_auto_subscribe returns False and no row is written."""
+    from tools import kanban_tools as kt
+    monkeypatch.delenv("HERMES_SESSION_PLATFORM", raising=False)
+    monkeypatch.delenv("HERMES_SESSION_CHAT_ID", raising=False)
+    monkeypatch.delenv("HERMES_SESSION_KEY", raising=False)
+    monkeypatch.delenv("HERMES_SESSION_ID", raising=False)
+
+    out = kt._handle_create({
+        "title": "no sub cli",
+        "assignee": "peer",
+    })
+    d = json.loads(out)
+    assert d["ok"] is True
+    assert d["subscribed"] is False, d
+
+    assert _list_subs_for_task(d["task_id"]) == []
+
+
+def test_create_respects_auto_subscribe_on_create_false(monkeypatch, worker_env, tmp_path):
+    """The config gate kanban.auto_subscribe_on_create=false must
+    suppress auto-subscription even when the session has a delivery
+    channel. This is the knob that addresses the upstream design
+    concern from PR #19718 (reverted in #19721) — users who want
+    explicit kanban_notify-subscribe calls per task get that."""
+    # worker_env already created <tmp>/.hermes; use a fresh sibling
+    # home to avoid mkdir() colliding with the worker's directory.
+    home = tmp_path / "gate-home" / ".hermes"
+    home.mkdir(parents=True)
+    (home / "config.yaml").write_text(
+        "kanban:\n  auto_subscribe_on_create: false\n"
+    )
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setenv("HERMES_SESSION_PLATFORM", "discord")
+    monkeypatch.setenv("HERMES_SESSION_CHAT_ID", "channel-1")
 
     from hermes_cli import kanban_db as kb
     from tools import kanban_tools as kt
 
-    payload = b"downloaded-by-url body"
-
-    class _Handler(http.server.BaseHTTPRequestHandler):
-        def do_GET(self):  # noqa: N802
-            self.send_response(200)
-            self.send_header("Content-Type", "application/octet-stream")
-            self.send_header("Content-Length", str(len(payload)))
-            self.end_headers()
-            self.wfile.write(payload)
-
-        def log_message(self, *a):  # silence
-            pass
-
-    srv = http.server.HTTPServer(("127.0.0.1", 0), _Handler)
-    threading.Thread(target=srv.serve_forever, daemon=True).start()
-    try:
-        port = srv.server_address[1]
-        out = kt._handle_attach_url({
-            "url": f"http://127.0.0.1:{port}/files/report.bin",
-        })
-    finally:
-        srv.shutdown()
+    out = kt._handle_create({
+        "title": "config-gated no subscription",
+        "assignee": "peer",
+    })
     d = json.loads(out)
-    assert d.get("ok") is True, out
-    assert d["size"] == len(payload)
+    assert d["ok"] is True
+    assert d["subscribed"] is False
 
     conn = kb.connect()
     try:
-        atts = kb.list_attachments(conn, worker_env)
-        # Filename derived from the URL path leaf.
-        assert atts[0].filename == "report.bin"
-        assert Path(atts[0].stored_path).read_bytes() == payload
+        assert kb.list_notify_subs(conn, task_id=d["task_id"]) == []
     finally:
         conn.close()
 

@@ -233,6 +233,12 @@ DEFAULT_CONFIG = {
         # from gateway_timeout (which kills the turn) and
         # gateway_notify_interval ("still working" heartbeats). 0 = disable.
         "session_stall_timeout": 300,
+        # Long-lived reconnect-loop escalation (seconds). A platform that has
+        # been continuously failing/reconnecting for this long gets
+        # needs_attention flagged in gateway runtime status (visible in
+        # `hermes status` / fleet monitoring). Retries never stop — this is a
+        # signal, not a circuit breaker. 0 = disable.
+        "reconnect_attention_after": 7200,
         # Freshness window for the gateway auto-continue note (seconds).
         # After a gateway crash/restart/SIGTERM mid-run, the next user
         # message gets a "[System note: your previous turn was
@@ -1633,6 +1639,7 @@ DEFAULT_CONFIG = {
 
     "voice": {
         "record_key": "ctrl+b",
+        "submit_mode": "direct",       # TUI: direct submits immediately; draft leaves an editable transcript
         "max_recording_seconds": 120,
         "auto_tts": False,
         "beep_enabled": True,         # Play record start/stop beeps in CLI voice mode
@@ -2211,6 +2218,16 @@ DEFAULT_CONFIG = {
     "security": {
         "allow_private_urls": False,  # Allow requests to private/internal IPs (for OpenWrt, proxies, VPNs)
         "redact_secrets": True,
+        # Human approval presentation transport. "builtin" preserves the
+        # current CLI/TUI/gateway/ACP surfaces. A plugin transport is used only
+        # when named explicitly here. Transport timeout/error/invalid response
+        # denies unless transport_fallback is explicitly set to "builtin".
+        # This is presentation only: plugins cannot detect, suppress, or
+        # auto-approve commands outside a correlated human response.
+        "approval": {
+            "transport": "builtin",
+            "transport_fallback": "deny",
+        },
         # Writes to agent-instruction files (AGENTS.md/CLAUDE.md/SOUL.md/
         # .cursorrules, project-local .hermes config) always require human
         # approval — even under auto-approve/yolo. Extra patterns are
@@ -2244,6 +2261,14 @@ DEFAULT_CONFIG = {
     },
 
     "cron": {
+        # Allow cron-spawned agents to use the cronjob toolset (create/edit/
+        # remove scheduled jobs from within a cron run — the "cron-librarian"
+        # pattern). Off by default: the cronjob toolset is policy-denied in
+        # cron context to prevent unattended scheduling loops. Jobs created
+        # this way are user-owned in the same flat jobs table as every other
+        # job. Interactive toolsets (messaging/clarify) stay denied in cron
+        # context regardless of this setting.
+        "allow_agent_scheduling": False,
         # Pre-dispatch configuration validation (T1-26): before constructing
         # any agent machinery for a job, verify the provider API key resolves
         # (unless a fallback chain is configured), attached skills are ready
@@ -2327,6 +2352,11 @@ DEFAULT_CONFIG = {
         # recent .md files and prunes older ones. 0 or negative disables
         # pruning (for operators who manage cleanup externally). Default 50.
         "output_retention": 50,
+        # Timeout (seconds) for a no-agent cron script. Also overridable via
+        # HERMES_CRON_SCRIPT_TIMEOUT. Keep this in sync with
+        # cron.scheduler._DEFAULT_SCRIPT_TIMEOUT so config set recognizes the
+        # same setting the scheduler reads.
+        "script_timeout_seconds": 3600,
         # Timeout (seconds) for SessionDB() init inside cron jobs.
         # SessionDB opens/migrates state.db synchronously and has no timeout
         # of its own against a wedged sqlite3.connect. An unbounded hang here
@@ -3236,6 +3266,17 @@ DEFAULT_CONFIG = {
         #   false   - always keep GPU acceleration on, even over a remote display.
         # Bridged to the HERMES_DESKTOP_DISABLE_GPU env var the Electron app reads.
         "disable_gpu": "auto",
+        # Linux keychain backend for secure token storage (Chromium's
+        # --password-store switch, which safeStorage needs before it can
+        # encrypt remote gateway tokens):
+        #   "auto"  - detect the session keychain: KWallet via KDE session env
+        #             vars, GNOME Keyring / any org.freedesktop.secrets
+        #             provider (e.g. KeePassXC) via D-Bus (default).
+        #   "gnome-libsecret" / "kwallet" / "kwallet5" / "kwallet6" / "basic"
+        #           - force a specific backend ("basic" = unencrypted store).
+        # Ignored on macOS/Windows. Bridged to the HERMES_DESKTOP_PASSWORD_STORE
+        # env var the Electron app reads, so an explicit env var still wins.
+        "password_store": "auto",
         # macOS only: optional persistent code-signing identity (a cert in the
         # login keychain — a self-signed "Code Signing" cert from Keychain
         # Access works; no Apple Developer account needed) used to re-sign

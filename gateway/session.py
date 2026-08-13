@@ -2756,6 +2756,11 @@ class SessionStore:
                     "origin_json": _origin_json,
                     "display_name": source.chat_name,
                     "parent_session_id": prev_session_id,
+                    "model_config": (
+                        {"_reset_from": prev_session_id}
+                        if prev_session_id
+                        else None
+                    ),
                 }
 
         if _needs_save:
@@ -3251,6 +3256,7 @@ class SessionStore:
                 "origin_json": _reset_origin_json,
                 "display_name": old_entry.display_name,
                 "parent_session_id": db_end_session_id,
+                "model_config": {"_reset_from": db_end_session_id},
             }
 
         if self._db and db_end_session_id:
@@ -3422,6 +3428,14 @@ class SessionStore:
                 if entry.session_id == session_id:
                     return entry
         return None
+
+    def lookup_by_session_key(self, session_key: str) -> Optional[SessionEntry]:
+        """Return the persisted routing entry for an exact session key."""
+        if not session_key:
+            return None
+        with self._lock:
+            self._ensure_loaded_locked()
+            return self._entries.get(session_key)
 
     def peek_session_id(self, session_key: str) -> Optional[str]:
         """Return the persisted session_id currently bound to a session key.
