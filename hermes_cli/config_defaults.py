@@ -2462,6 +2462,14 @@ DEFAULT_CONFIG = {
         # to the TTL/crash/stale recovery paths. Set false to keep orphans
         # frozen for manual forensics.
         "reconcile_orphans": True,
+        # Notify subscriptions survive a task reaching ``done`` (completion
+        # is reversible — controllers reopen done work for review
+        # corrections), and are normally removed on archive. On boards that
+        # never archive, the notifier GC purges subscriptions for tasks
+        # that have been ``done`` with no new activity for this many days,
+        # so stale rows don't accumulate and get scanned on every notifier
+        # tick forever. Set 0 to disable the sweep.
+        "done_sub_retention_days": 30,
     },
 
     # execute_code settings — controls the tool used for programmatic tool calls.
@@ -2555,6 +2563,62 @@ DEFAULT_CONFIG = {
         #     openrouter:
         #       url: https://example.com/my-curation.json
         "providers": {},
+    },
+
+    # Per-model metadata overrides — manually declare context_window,
+    # max_output_tokens, capabilities, or model family for any
+    # provider+model. Recognized fields: context_window,
+    # max_output_tokens, supports_tools, supports_vision,
+    # supports_reasoning, model_family.
+    #
+    # Semantics:
+    #   1. Explicit (model_overrides.<provider>.<model_id>): wins over
+    #      models.dev, OpenRouter, and hardcoded defaults for the fields
+    #      it sets. NOTE: an explicit model.context_length (global) and a
+    #      custom_providers per-model context_length are user settings at
+    #      other layers and are consulted in the resolution chain order
+    #      documented in agent/model_metadata.py.
+    #   2. Fill-gap defaults (model_overrides.<provider>._default and
+    #      model_overrides._default): apply ONLY to models the catalog
+    #      does not know. They never displace catalog data for known
+    #      models, so a _default cannot accidentally clamp every model
+    #      of a provider.
+    #
+    # An unknown model id (not in models.dev) starts from safe defaults
+    # (200K context, tools on, vision/reasoning off) and the override
+    # patches the fields it sets — overriding a model the catalog
+    # doesn't know yet is the supported self-unblock path (#84482,
+    # #8731).
+    #
+    # Provider keys accept the Hermes provider id (as used elsewhere in
+    # this file) or the models.dev provider id; model ids match
+    # case-insensitively.
+    #
+    # Example:
+    #   model_overrides:
+    #     upstage:
+    #       solar-pro4:
+    #         context_window: 524288
+    #       syn-pro:
+    #         context_window: 65536
+    #     custom:my-local-vllm:
+    #       my-llava-model:
+    #         context_window: 8192
+    #         supports_vision: true
+    #         supports_reasoning: false
+    #         supports_tools: true
+    #     _default:            # fill-gap only: models not in the catalog
+    #       context_window: 128000
+    "model_overrides": {},
+
+    # models.dev registry — provider/model metadata (context windows,
+    # capabilities, pricing, modalities).  The agent fetches this on startup
+    # and serves from cache; a background daemon refreshes stale data.
+    # Override ``url`` to point at a mirror (e.g. a self-hosted copy behind
+    # a corporate proxy).  ETag conditional GET ensures refreshes are
+    # cheap (304 = no download).
+    "models_dev": {
+        "url": "",  # empty = default https://models.dev/api.json
     },
 
     # Network settings — workarounds for connectivity issues.

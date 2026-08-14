@@ -11034,9 +11034,17 @@ def _prepare_agent_startup(args) -> None:
 
     try:
         try:
-            from hermes_cli.plugins import start_background_plugin_discovery
+            if _preserve_protocol_stdout:
+                # The restore below must run after plugin code has finished:
+                # a background plugin that reassigns sys.stdout could otherwise
+                # race the restore and move ACP protocol output back to stderr.
+                from hermes_cli.plugins import discover_plugins
 
-            start_background_plugin_discovery()
+                discover_plugins()
+            else:
+                from hermes_cli.plugins import start_background_plugin_discovery
+
+                start_background_plugin_discovery()
         except Exception:
             logger.warning(
                 "plugin discovery failed at CLI startup",
