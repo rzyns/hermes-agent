@@ -460,6 +460,73 @@ def test_resolve_provider_alias_qwen(monkeypatch):
     monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
     assert rp.resolve_provider("qwen-portal") == "qwen-oauth"
     assert rp.resolve_provider("qwen-cli") == "qwen-oauth"
+class TestCustomProviderPoolLoopbackNoKeyExemption:
+    """Regression for issue #86864: legacy custom_providers configs often
+    used short/placeholder api_keys ('123', 'm') for local no-auth
+    services like Ollama -- fine for the endpoint itself, but
+    has_usable_secret's 4-char floor now rejects them with a misleading
+    "No usable credentials found" error and no migration path. Every
+    OTHER resolution path in this file already substitutes
+    "no-key-required" for a loopback endpoint with no usable secret; the
+    credential-pool path was the one gap.
+    """
+
+    @staticmethod
+    def _pool_with(api_key: str):
+        entry = SimpleNamespace(runtime_api_key=api_key, access_token="")
+
+        class _Pool:
+            def has_credentials(self):
+                return True
+
+            def select(self):
+                return entry
+
+        return _Pool()
+
+    def test_short_placeholder_key_exempted_for_loopback_endpoint(self, monkeypatch):
+        """The exact reported repro: a 3-char legacy placeholder key
+        ('123') for a local Ollama endpoint must resolve to the same
+        "no-key-required" placeholder every other local no-auth path uses,
+        not the raw unusable value."""
+        monkeypatch.setattr(rp, "get_custom_provider_pool_key", lambda base_url, provider_name=None: "custom:local-ollama")
+        monkeypatch.setattr(rp, "load_pool", lambda pool_key: self._pool_with("123"))
+
+        result = rp._try_resolve_from_custom_pool("http://localhost:11434/v1", "custom", None)
+
+        assert result is not None
+        assert result["api_key"] == "no-key-required"
+
+    def test_single_char_placeholder_key_also_exempted(self, monkeypatch):
+        monkeypatch.setattr(rp, "get_custom_provider_pool_key", lambda base_url, provider_name=None: "custom:local")
+        monkeypatch.setattr(rp, "load_pool", lambda pool_key: self._pool_with("m"))
+
+        result = rp._try_resolve_from_custom_pool("http://127.0.0.1:11434/v1", "custom", None)
+
+        assert result["api_key"] == "no-key-required"
+
+    def test_short_key_not_exempted_for_non_loopback_endpoint(self, monkeypatch):
+        """Sanity: the exemption is scoped to loopback hosts only -- a
+        remote endpoint with a genuinely-too-short key must NOT get a
+        free pass. The short value passes through unchanged, so the
+        downstream has_usable_secret() gate still catches it."""
+        monkeypatch.setattr(rp, "get_custom_provider_pool_key", lambda base_url, provider_name=None: "custom:remote")
+        monkeypatch.setattr(rp, "load_pool", lambda pool_key: self._pool_with("xy"))
+
+        result = rp._try_resolve_from_custom_pool("https://api.remote-vendor.example/v1", "custom", None)
+
+        assert result["api_key"] == "xy"
+
+    def test_usable_loopback_key_passes_through_unchanged(self, monkeypatch):
+        """Sanity: a genuinely usable key for a loopback endpoint (a real
+        API key happens to be configured for a local proxy, say) must not
+        be silently overwritten."""
+        monkeypatch.setattr(rp, "get_custom_provider_pool_key", lambda base_url, provider_name=None: "custom:local")
+        monkeypatch.setattr(rp, "load_pool", lambda pool_key: self._pool_with("sk-genuinely-long-real-key-12345"))
+
+        result = rp._try_resolve_from_custom_pool("http://localhost:11434/v1", "custom", None)
+
+        assert result["api_key"] == "sk-genuinely-long-real-key-12345"
 
 
 def test_qwen_oauth_auto_fallthrough_on_auth_failure(monkeypatch):
@@ -3644,3 +3711,35 @@ def test_resolve_named_custom_runtime_pool_result_includes_extra_headers(monkeyp
     assert resolved["source"] == "pool:lmstudio-pool"
     assert resolved["provider"] == "custom"
     assert resolved["requested_provider"] == "custom:lmstudio"
+
+def test_minimax_oauth_pool_forces_anthropic_messages_despite_stale_config(monkeypatch):
+    """MiniMax OAuth credentials must not inherit stale chat_completions config."""
+
+    monkeypatch.setattr(rp, "resolve_provider", lambda *a, **k: "minimax-oauth")
+    monkeypatch.setattr(
+        rp,
+        "_get_model_config",
+        lambda: {
+            "provider": "minimax-oauth",
+            "default": "MiniMax-M2.7",
+            "api_mode": "chat_completions",
+        },
+    )
+    monkeypatch.setattr(rp, "_resolve_named_custom_runtime", lambda **k: None)
+    monkeypatch.setattr(rp, "_resolve_explicit_runtime", lambda **k: None)
+    import hermes_cli.auth as auth_mod
+    monkeypatch.setattr(
+        auth_mod,
+        "resolve_minimax_oauth_runtime_credentials",
+        lambda: {
+            "api_key": "oauth-token",
+            "source": "manual:minimax_oauth",
+            "base_url": "https://api.minimax.io/anthropic",
+        },
+    )
+
+    resolved = rp.resolve_runtime_provider(requested="minimax-oauth")
+
+    assert resolved["provider"] == "minimax-oauth"
+    assert resolved["api_mode"] == "anthropic_messages"
+    assert resolved["base_url"] == "https://api.minimax.io/anthropic"

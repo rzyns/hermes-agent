@@ -28,6 +28,7 @@ import {
   setSessions,
   setSidebarSessionSourceIds
 } from '@/store/session'
+import { forgetSessionUnread } from '@/store/session-unread'
 import type { HermesConfigRecord, SessionInfo } from '@/types/hermes'
 
 import { EmptyState, ListRow, SectionHeading, SettingsContent, SettingsSkeleton, ToggleRow } from './primitives'
@@ -93,6 +94,9 @@ export function SessionsSettings() {
 
       try {
         await deleteSession(session.id, session.profile)
+        // Permanent delete bypasses removeSession, so retire the persisted
+        // unread state here too rather than leaving it to rot.
+        forgetSessionUnread([session.id, session._lineage_root_id], session.profile)
         setLocalSessions(prev => prev.filter(s => s.id !== session.id))
         triggerHaptic('warning')
       } catch (err) {

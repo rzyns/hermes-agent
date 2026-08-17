@@ -357,6 +357,21 @@ Inspect recent attempts with `hermes cron runs [job-id] --limit 20` (alias:
 `history`). Terminal history is bounded; active attempts are never pruned. The
 ledger is included in quick backups.
 
+### Repeated-failure review nudge
+
+Each job tracks a `failure_streak` — consecutive runs where the agent failed
+(delivery failures don't count). When a *recurring* job's streak reaches the
+threshold, the failure message delivered to chat gains a review nudge telling
+you the job has failed N runs in a row and suggesting you fix, pause
+(`hermes cron pause <job>`), or remove it. Any successful run resets the
+streak, and `hermes cron list` shows the streak alongside a failing job's last
+run. One-shot jobs never nudge.
+
+```yaml
+cron:
+  failure_nudge_threshold: 3   # default; 0 disables the nudge
+```
+
 ## Delivery options
 
 When scheduling jobs, you specify where the output goes:
@@ -545,6 +560,16 @@ cron:
 
 Or set the `HERMES_CRON_SCRIPT_TIMEOUT` environment variable. The resolution order is: env var → config.yaml → 3600s default.
 
+Cron also bounds post-run session and agent-resource cleanup. This happens after the LLM turn returns, so it is separate from the inactivity timeout. The default is 10 seconds per cleanup operation. If a storage or client finalizer stops returning, the scheduler logs an error, releases the job's in-flight guard, and allows later runs to dispatch instead of skipping that job forever.
+
+```yaml
+# ~/.hermes/config.yaml
+cron:
+  cleanup_timeout_seconds: 10
+```
+
+Set `cleanup_timeout_seconds: 0` only to restore the legacy unbounded cleanup behavior.
+
 ## No-agent mode (script-only jobs)
 
 For recurring jobs that don't need LLM reasoning — classic watchdogs, disk/memory alerts, heartbeats, CI pings — pass `no_agent=True` at creation time. The scheduler runs your script on schedule and delivers its stdout directly, skipping the agent entirely:
@@ -636,11 +661,30 @@ cronjob(
 
 Outputs are concatenated in the order listed.
 
+**Continuity: carry the previous run's output**
+
+Set `continuity=true` and the job injects its *own* most recent output into each run. Recurring jobs normally start every run with amnesia — a news scout re-reports the same stories, a monitor re-alerts on the same condition. With continuity on, the job wakes up seeing what it reported last time and can dedupe and continue where it left off:
+
+```python
+cronjob(
+    action="create",
+    prompt="Scan HN and arXiv for new agent-tooling papers. Report only items NOT already covered in your previous run's output.",
+    schedule="every 6h",
+    continuity=True,
+    name="Agent Tooling Scout",
+)
+```
+
+The first run has no previous output, so the prompt runs as-is. On later runs the previous output is prepended with continuity framing ("avoid repeating what was already reported"). It combines freely with upstream jobs (`context_from=["<other_job_id>"]` plus `continuity=true`), and `continuity=false` on update turns it off while preserving other `context_from` entries. Internally the flag is stored as the reserved `self` entry in `context_from`.
+
+From the CLI: `hermes cron create "every 6h" "Scan for news" --continuity`, and `hermes cron edit <job_id> --continuity` / `--no-continuity` to toggle it on an existing job. The same toggle appears in the dashboard's cron editor and the desktop Bot Mode routine dialog.
+
 **When to use it:**
 
 - Multi-stage pipelines (collect → filter → format → deliver)
 - Dependent tasks where step N's work depends on step N−1's output
 - Fan-out/fan-in patterns where one job aggregates results from several others
+- Recurring scouts/monitors that should dedupe against their own previous report (`continuity=true`)
 
 ## Provider recovery
 

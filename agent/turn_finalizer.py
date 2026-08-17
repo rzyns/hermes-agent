@@ -22,12 +22,13 @@ keep the exact logger name (``"agent.conversation_loop"``).
 
 from __future__ import annotations
 
-import os
+import logging
 from typing import Any
 
 from agent.delegation_context import child_env_lookup, is_delegated_child_context
 from agent.codex_responses_adapter import _summarize_user_message_for_log
 from agent.message_content import flatten_message_text
+from agent.message_metadata import append_message, stamp_message_timestamp
 from hermes_cli.observability.budget_telemetry import (
     build_overhead_envelope,
     merge_telemetry_into_payload,
@@ -116,6 +117,67 @@ _VERIFICATION_CONTINUATION_FLAGS = (
     "_verification_stop_synthetic",
     "_pre_verify_synthetic",
 )
+
+
+def _record_kanban_budget_exhausted(
+    kanban_task: str,
+    api_call_count: int,
+    max_iterations: int,
+    logger: logging.Logger,
+    *,
+    expected_run_id: int | None = None,
+    overhead_envelope: dict[str, Any] | None = None,
+) -> None:
+    """Record a terminal ``timed_out`` outcome for a kanban worker that
+    exhausted its iteration budget.
+
+    This is a bounded fallback (#87096): the CAS invariant in ``_end_run``
+    (``WHERE ended_at IS NULL``) guarantees idempotence — if another path
+    already closed the run this is a no-op — so it is safe to call from
+    multiple exit paths.
+    """
+    try:
+        from hermes_cli import kanban_db as _kb
+        _conn = _kb.connect()
+        try:
+            event_payload_extra: dict[str, Any] = {
+                "budget_used": api_call_count,
+                "budget_max": max_iterations,
+            }
+            if overhead_envelope is not None:
+                event_payload_extra["overhead_envelope"] = overhead_envelope
+            _kb._record_task_failure(
+                _conn,
+                kanban_task,
+                error=(
+                    f"Iteration budget exhausted "
+                    f"({api_call_count}/{max_iterations}) — "
+                    "task could not complete within the allowed "
+                    "iterations"
+                ),
+                outcome="timed_out",
+                release_claim=True,
+                end_run=True,
+                expected_run_id=expected_run_id,
+                event_payload_extra=event_payload_extra,
+            )
+            logger.info(
+                "recorded budget-exhausted failure for task %s (%d/%d)",
+                kanban_task,
+                api_call_count,
+                max_iterations,
+            )
+        finally:
+            try:
+                _conn.close()
+            except Exception:
+                pass
+    except Exception:
+        logger.warning(
+            "Failed to record budget-exhausted failure for task %s",
+            kanban_task,
+            exc_info=True,
+        )
 
 
 def _drop_verification_continuation_scaffolding(messages) -> None:
@@ -260,44 +322,35 @@ def finalize_turn(
         # rather than ``kanban_block`` so this counts toward the dispatcher's
         # consecutive-failure circuit breaker (#29747 gap 2).
         if _kanban_task and not is_delegated_child_context():
-            try:
-                from hermes_cli import kanban_db as _kb
-                _event_payload_extra = {
-                    "overhead_envelope": _overhead_envelope,
-                }
-                _conn = _kb.connect()
-                try:
-                    _kb._record_task_failure(
-                        _conn,
-                        _kanban_task,
-                        error=(
-                            f"Iteration budget exhausted "
-                            f"({api_call_count}/{agent.max_iterations}) — "
-                            "task could not complete within the allowed "
-                            "iterations"
-                        ),
-                        outcome="timed_out",
-                        release_claim=True,
-                        end_run=True,
-                        expected_run_id=_kanban_run_id,
-                        event_payload_extra=_event_payload_extra,
-                    )
-
-                    logger.info(
-                        "recorded budget-exhausted failure for task %s (%d/%d)",
-                        _kanban_task, api_call_count, agent.max_iterations,
-                    )
-                finally:
-                    try:
-                        _conn.close()
-                    except Exception:
-                        pass
-            except Exception:
-                logger.warning(
-                    "Failed to record budget-exhausted failure for task %s",
-                    _kanban_task,
-                    exc_info=True,
-                )
+            _record_kanban_budget_exhausted(
+                _kanban_task,
+                api_call_count,
+                agent.max_iterations,
+                logger,
+                expected_run_id=_kanban_run_id,
+                overhead_envelope=_overhead_envelope,
+            )
+    elif budget_exhausted and not (
+        final_response is not None
+        and str(_turn_exit_reason).startswith("text_response(")
+    ):
+        # Bounded fallback (#87096): budget was exhausted but none of the
+        # normal fallback paths were eligible (interrupted / failed /
+        # anomalous exit_reason). If running as a kanban worker we must
+        # still record a terminal outcome so the task does not remain in
+        # an ambiguous lifecycle state. The worker's run is closed via
+        # ``_record_task_failure`` (compare-and-swap receipt path) which
+        # is a no-op if another path closed it — the CAS invariant in
+        # ``_end_run`` (``WHERE ended_at IS NULL``) guarantees idempotence.
+        if _kanban_task and not is_delegated_child_context():
+            _record_kanban_budget_exhausted(
+                _kanban_task,
+                api_call_count,
+                agent.max_iterations,
+                logger,
+                expected_run_id=_kanban_run_id,
+                overhead_envelope=_overhead_envelope,
+            )
 
     # Determine if conversation completed successfully
     normal_text_response = str(_turn_exit_reason).startswith("text_response(")
@@ -423,7 +476,10 @@ def finalize_turn(
             if _tail_role != "assistant":
                 # Tail is not an assistant row — append the final response
                 # so the durable turn closes with the answer (#43849/#44100).
-                messages.append({"role": "assistant", "content": final_response})
+                append_message(
+                    messages,
+                    {"role": "assistant", "content": final_response},
+                )
             elif isinstance(_tail, dict) and _tail.get("content") != final_response and _is_pure_tool_call_tail(_tail):
                 # The tail IS an assistant row, but a *pure tool-call turn*:
                 # tool_calls with no text of its own. The role check alone
@@ -440,6 +496,10 @@ def finalize_turn(
                 # candidate collapse — the provisional answer was persisted and
                 # reused as the terminal response, #65919 §7).
                 _tail["content"] = final_response
+                # The normal assistant builder already stamps this row. Cover
+                # legacy/exceptional pure-tool tails before they become a
+                # delivered final response.
+                stamp_message_timestamp(_tail)
                 # The row may have already been flushed to SQLite by the
                 # incremental tool-call persist (conversation_loop.py:4990),
                 # which stamps ``_DB_PERSISTED_MARKER`` so subsequent flushes
@@ -808,8 +868,8 @@ def finalize_turn(
             "health (`hermes doctor`), then send your message again"
         )
         # Machine-readable cause for the gateway/desktop: exactly
-        # 'session_persistence_failed:<locked|disk|unknown>'. Never clobber a
-        # failure_reason another path already stamped on this result.
+        # 'session_persistence_failed:<locked|compression|turn_lease|corrupt|disk|unknown>'.
+        # Never clobber a failure_reason another path already stamped.
         if "failure_reason" not in result:
             _cause = getattr(agent, "_last_persistence_error_cause", None)
             result["failure_reason"] = (
