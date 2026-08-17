@@ -35,6 +35,10 @@ import {
   DialogFooter,
   DialogHeader,
   DialogTitle,
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuItem,
+  DropdownMenuTrigger,
   EmptyState,
   GlyphSpinner,
   haptic,
@@ -2051,7 +2055,7 @@ function useRoster() {
       if (typeof host.agents === 'function') {
         try {
           const union = await host.agents()
-          return mergeMultiSourceRoster(local, union)
+          return mergeMultiSourceRoster(local, union, liveActiveConnectionId())
         } catch {
           /* older build or roster failure — single-source list stands */
         }
@@ -2068,25 +2072,82 @@ function useRoster() {
   })
 }
 
+/** Registry connection id of the LIVE active gateway (feature-detected;
+ *  null on older desktops or the local/legacy primary path). Live beats the
+ *  roster's primaryConnectionId when the user has activated a non-primary
+ *  source's agent — profiles.list answers from THAT source, so the merge
+ *  must classify against it, not the registry's primary. */
+function liveActiveConnectionId() {
+  if (typeof host.activeConnectionId !== 'function') {
+    return null
+  }
+
+  try {
+    return host.activeConnectionId()
+  } catch {
+    return null
+  }
+}
+
 /** Merge the union agent roster (host.agents) over the active gateway's
- *  profiles.list. Local-source rows are matched by profile name and only
- *  ANNOTATED (handle, connectionId) — their rich fields stay authoritative.
- *  Rows from other sources become new roster entries tagged with their
- *  source label so BotRow can badge them and route open/warm through
+ *  profiles.list. Rows from the ACTIVE gateway are matched by connection id
+ *  and only ANNOTATED (handle, connectionId) — their rich fields stay
+ *  authoritative and they are NOT duplicated. The active id prefers the LIVE
+ *  host.activeConnectionId() (the gateway may be a non-primary source after
+ *  the user opens another connection's agent), falls back to the roster's
+ *  primaryConnectionId, then to the legacy kind==='local' rule on older
+ *  desktops. Rows from other sources become new roster entries tagged with
+ *  their source label so BotRow can badge them and route open/warm through
  *  ensureAgent/warmAgent. Pure — exercised directly by the tests. */
-function mergeMultiSourceRoster(local, union) {
-  const profiles = Array.isArray(local?.profiles) ? local.profiles.slice() : []
+function mergeMultiSourceRoster(local, union, liveActiveId = null) {
+  // Keep the first rich local row for every profile. profiles.list is normally
+  // unique, but a duplicated backend response must not turn one agent into an
+  // unbounded list of visually identical Bots rows.
+  const profiles = []
+  const localByName = new Map()
+
+  for (const profile of Array.isArray(local?.profiles) ? local.profiles : []) {
+    const name = String(profile?.name || '').trim()
+
+    if (!name || localByName.has(name)) {
+      continue
+    }
+
+    localByName.set(name, profile)
+    profiles.push(profile)
+  }
+
   const agents = Array.isArray(union?.agents) ? union.agents : []
+  const primaryId = String(liveActiveId || union?.primaryConnectionId || '').trim()
 
   if (!agents.length) {
     return { ...local, profiles }
   }
 
-  const localByName = new Map(profiles.map(p => [p.name, p]))
+  // host.agents is an Electron/main-process capability. Defend the plugin
+  // boundary too: older shells or reconnect races can still hand us repeated
+  // identities even after the core roster deduplicates them.
+  const seenAgentIdentities = new Set()
 
   for (const agent of agents) {
-    const isLocalSource = agent.connectionKind === 'local'
-    const row = isLocalSource ? localByName.get(agent.profile) : null
+    const profile = String(agent?.profile || '').trim()
+    const connectionId = String(agent?.connectionId || '').trim()
+    const identity = `${connectionId}\0${profile}`
+
+    if (!profile || seenAgentIdentities.has(identity)) {
+      continue
+    }
+
+    seenAgentIdentities.add(identity)
+
+    // The union enumerates EVERY registered connection, including the active
+    // gateway that already answered profiles.list. Without this the active
+    // gateway's own agents (connectionKind 'remote' on a remote-primary
+    // desktop) would be appended as phantom duplicates — every bot listed
+    // twice. Older Electron builds predate primaryConnectionId; fall back to
+    // the legacy local-source rule so single-source behavior stays intact.
+    const isPrimarySource = primaryId ? connectionId === primaryId : agent.connectionKind === 'local'
+    const row = isPrimarySource ? localByName.get(profile) : null
 
     if (row) {
       // Annotate in place: the @name-device handle only differs from the
@@ -2096,16 +2157,16 @@ function mergeMultiSourceRoster(local, union) {
       continue
     }
 
-    if (isLocalSource) {
-      // Union saw a local profile profiles.list didn't return (older
-      // backend mid-refresh) — skip rather than invent a thin row.
+    if (isPrimarySource) {
+      // Union saw a primary-source profile profiles.list didn't return
+      // (older backend mid-refresh) — skip rather than invent a thin row.
       continue
     }
 
     profiles.push({
-      name: agent.profile,
+      name: profile,
       handle: agent.handle,
-      connectionId: agent.connectionId,
+      connectionId,
       connectionKind: agent.connectionKind,
       connectionLabel: agent.connectionLabel,
       remoteSource: true
@@ -2113,6 +2174,15 @@ function mergeMultiSourceRoster(local, union) {
   }
 
   return { ...local, profiles }
+}
+
+/** React list key for a roster row. Names alone are NOT unique in a
+ *  multi-source roster (two connections can both expose 'default'); duplicate
+ *  keys make React reconciliation repeat whole blocks of the list on every
+ *  poll repaint. Annotated ACTIVE-source rows keep the plain-name key so
+ *  existing rows don't remount when a desktop gains the union roster. */
+function botRowKey(bot) {
+  return `${bot.remoteSource ? bot.connectionId ?? '' : ''}:${bot.name}`
 }
 
 /** The @handle users tag a bot with. Multi-source rosters precompute the
@@ -2221,13 +2291,18 @@ function createCanonicalChat(name) {
 async function openBotCanonicalChat(name, pinned) {
   let id = pinned
 
-  if (!id) {
-    return createCanonicalChat(name)
-  }
-
   try {
     const res = await host.request('session.list', { profile: name, limit: 100 })
     const rows = res?.sessions ?? []
+
+    if (!id && rows.length) {
+      // A CLI/A2A exchange may have created the canonical Bot Chat before the
+      // desktop saved ui_meta.chat. Reuse its explicit title first; for older
+      // bot installs retain the documented grandfathering behavior and adopt
+      // the most recent existing session rather than minting another one.
+      id = rows.find(session => session.title === 'Bot Chat')?.id || rows[0].id
+      saveBotMeta(name, { chat: id })
+    }
 
     if (!rows.length) {
       saveBotMeta(name, { chat: null })
@@ -2239,7 +2314,12 @@ async function openBotCanonicalChat(name, pinned) {
       saveBotMeta(name, { chat: id })
     }
   } catch {
-    // Gateway hiccup — try the stored pin as-is.
+    // Gateway hiccup — try the stored pin as-is. Without a pin we cannot
+    // safely discover a pre-existing canonical chat, so create one as the
+    // fallback rather than leaving the click inert.
+    if (!id) {
+      return createCanonicalChat(name)
+    }
   }
 
   try {
@@ -2837,21 +2917,20 @@ function messagingProtocolSection(name, roster) {
     'into it, like a DM. To message a teammate, run:',
     '',
     '```',
-    'hermes -p <agent-name> chat --in ~ -c "Bot Chat" -Q -q "Message from \uD83E\uDD16 ' + handle + ' (@' + handle + '): your message"',
+    'hermes -p <agent-name> chat --in ~ -c "Bot Chat" --create-if-missing -Q -q "Message from \uD83E\uDD16 ' + handle + ' (@' + handle + '): your message"',
     '',
     'Run the send with background=true and notify_on_complete=true on the',
     'terminal tool, then finish your turn — the reply arrives later as a',
     'background process notification. Never block waiting for it.',
     '```',
     '',
-    '(`--in ~ -c "Bot Chat"` resumes their canonical conversation in the home',
-    'workspace. `-Q` keeps output clean. Always open with the',
+    '(`--in ~ -c "Bot Chat" --create-if-missing` resumes their canonical',
+    'conversation in the home workspace, creating it if the target has no',
+    '"Bot Chat" yet. `-Q` keeps output clean. Always open with the',
     '"Message from \uD83E\uDD16 ' + handle + ' (@' + handle + '):" prefix so they know',
     'who is talking (the @handle lets the app show your avatar to them).',
     'Their reply prints to stdout — relay the relevant part back to the',
-    'user, and say which agent it came from. In the rare case the target',
-    'has no "Bot Chat" yet, send once WITHOUT -c, then',
-    '`hermes -p <agent-name> sessions rename <session-id> "Bot Chat"`.)',
+    'user, and say which agent it came from.)',
     '',
     'If a message in YOUR chat starts with "Message from \uD83E\uDD16 <name>", it is',
     'a teammate messaging you, not the user. Answer it directly — your reply',
@@ -5930,7 +6009,7 @@ function ActiveNowStrip({ roster, activeProfile, gatewayState, metaByName, onOpe
               children: label
             })
           ]
-        }, bot.name)
+        }, botRowKey(bot))
       })
     ]
   })
@@ -6016,6 +6095,169 @@ function GroupDialog({ bot, onClose }) {
               children: `Remove from “${current}”`
             })
           : null
+      ]
+    })
+  })
+}
+
+/** Discord-style group chat creation: pick 2+ bots via checkboxes (with
+ *  search), name the group, create. Assignment is the existing per-bot
+ *  `group` meta field, so the room appears in the roster and syncs
+ *  cross-machine via ui_meta exactly like Move-to-group. */
+function CreateGroupChatDialog({ open, roster, onClose, onCreated }) {
+  const allMeta = useValue($botMeta)
+  const [query, setQuery] = useState('')
+  const [checked, setChecked] = useState({})
+  const [name, setName] = useState('')
+
+  // Reset per open so a cancelled draft doesn't leak into the next one.
+  useEffect(() => {
+    if (open) {
+      setQuery('')
+      setChecked({})
+      setName('')
+    }
+  }, [open])
+
+  const selected = roster.filter(bot => checked[bot.name])
+  const visible = filterBots(roster, allMeta, query)
+  const atCap = selected.length >= GROUP_CHAT_MAX_MEMBERS
+  const placeholder = selected.length
+    ? selected.map(bot => displayName(bot, allMeta[bot.name])).join(', ')
+    : 'Group name'
+  const canCreate = selected.length >= 2 && Boolean(name.trim() || selected.length)
+
+  const create = () => {
+    const groupName = (name.trim() || placeholder).slice(0, 64)
+
+    if (selected.length < 2 || !groupName) {
+      return
+    }
+
+    for (const bot of selected) {
+      void saveBotMeta(bot.name, { group: groupName })
+    }
+
+    host.notify({ kind: 'info', message: `“${groupName}” created with ${selected.length} bots` })
+    onClose()
+    onCreated?.(groupName)
+  }
+
+  return jsx(Dialog, {
+    open,
+    onOpenChange: value => {
+      if (!value) {
+        onClose()
+      }
+    },
+    children: jsxs(DialogContent, {
+      className: 'max-w-md',
+      children: [
+        jsxs(DialogHeader, {
+          children: [
+            jsx(DialogTitle, { children: 'New Group Chat' }),
+            jsx(DialogDescription, {
+              children: `Pick 2–${GROUP_CHAT_MAX_MEMBERS} bots. The room lives in the Bots roster and syncs to every machine.`
+            })
+          ]
+        }),
+        jsx(SearchField, {
+          'aria-label': 'Search bots to add',
+          autoFocus: true,
+          containerClassName: 'w-full',
+          inputClassName: 'w-full',
+          placeholder: 'Search bots to add…',
+          value: query,
+          onChange: setQuery
+        }),
+        selected.length
+          ? jsx('div', {
+              className: 'flex flex-wrap gap-1',
+              children: selected.map(bot =>
+                jsxs('button', {
+                  type: 'button',
+                  className:
+                    'flex items-center gap-1 rounded-full bg-(--chrome-action-hover) py-0.5 pl-2 pr-1.5 text-[0.6875rem] text-(--ui-text-secondary) transition-colors hover:text-foreground',
+                  title: 'Remove from selection',
+                  onClick: () => setChecked(prev => ({ ...prev, [bot.name]: false })),
+                  children: [displayName(bot, allMeta[bot.name]), jsx(Codicon, { name: 'close', className: 'text-[0.6rem]' })]
+                }, botRowKey(bot))
+              )
+            })
+          : null,
+        jsx(ScrollArea, {
+          className: 'max-h-64 min-h-0',
+          children: jsx('div', {
+            className: 'grid gap-0.5 pr-2',
+            children: visible.length
+              ? visible.map(bot => {
+                  const meta = allMeta[bot.name]
+                  const { shape, color, image } = botAppearance(bot.name, meta)
+                  const isChecked = Boolean(checked[bot.name])
+                  const disabled = !isChecked && atCap
+                  const currentGroup = (meta?.group || '').trim()
+
+                  return jsxs('label', {
+                    className: cn(
+                      'flex cursor-pointer items-center gap-2 rounded-md px-1.5 py-1 transition-colors hover:bg-(--chrome-action-hover)',
+                      disabled && 'cursor-not-allowed opacity-50'
+                    ),
+                    children: [
+                      jsx(BotFace, {
+                        shape,
+                        color,
+                        image: image && !isBackfilledFacePng(image) ? image : null,
+                        size: 24,
+                        name: bot.name
+                      }),
+                      jsxs('div', {
+                        className: 'min-w-0 flex-1',
+                        children: [
+                          jsx('div', { className: 'truncate text-xs text-foreground', children: displayName(bot, meta) }),
+                          jsx('div', {
+                            className: 'truncate text-[0.625rem] text-(--ui-text-quaternary)',
+                            children: currentGroup ? `@${bot.name} · in “${currentGroup}”` : `@${bot.name}`
+                          })
+                        ]
+                      }),
+                      jsx(Checkbox, {
+                        checked: isChecked,
+                        disabled,
+                        onCheckedChange: value => setChecked(prev => ({ ...prev, [bot.name]: Boolean(value) }))
+                      })
+                    ]
+                  }, botRowKey(bot))
+                })
+              : jsx('div', {
+                  className: 'px-1.5 py-3 text-center text-xs text-(--ui-text-tertiary)',
+                  children: query.trim() ? `No bots match “${query.trim()}”` : 'No bots yet — create agents first.'
+                })
+          })
+        }),
+        jsx('form', {
+          onSubmit: event => {
+            event.preventDefault()
+            create()
+          },
+          children: jsx(Input, {
+            'aria-label': 'Group name',
+            maxLength: 64,
+            placeholder,
+            value: name,
+            onChange: event => setName(event.target.value)
+          })
+        }),
+        jsxs(DialogFooter, {
+          children: [
+            jsx(Button, { variant: 'secondary', onClick: onClose, children: 'Cancel' }),
+            jsx(Button, {
+              disabled: !canCreate,
+              title: selected.length < 2 ? 'Pick at least 2 bots' : undefined,
+              onClick: create,
+              children: `Create Group${selected.length ? ` (${selected.length})` : ''}`
+            })
+          ]
+        })
       ]
     })
   })
@@ -6149,6 +6391,7 @@ function BotsPane() {
   const gatewayUp = gatewayState === 'open'
   const activeProfile = (useValue(host.state.profile) || 'default').trim() || 'default'
   const [createOpen, setCreateOpen] = useState(false)
+  const [groupCreateOpen, setGroupCreateOpen] = useState(false)
   const [editing, setEditing] = useState(null)
   const [deleting, setDeleting] = useState(null)
   const [grouping, setGrouping] = useState(null)
@@ -6257,15 +6500,36 @@ function BotsPane() {
                   children: jsx(Codicon, { name: hideBotChats ? 'eye-closed' : 'eye' })
                 })
               }),
-              jsx(Tip, {
-                label: 'New Agent',
-                children: jsx('button', {
-                  type: 'button',
-                  className:
-                    'flex size-6 items-center justify-center rounded-md text-(--ui-text-tertiary) transition-colors hover:bg-(--chrome-action-hover) hover:text-foreground',
-                  onClick: () => setCreateOpen(true),
-                  children: jsx(Codicon, { name: 'add' })
-                })
+              jsxs(DropdownMenu, {
+                children: [
+                  jsx(Tip, {
+                    label: 'New…',
+                    children: jsx(DropdownMenuTrigger, {
+                      asChild: true,
+                      children: jsx('button', {
+                        type: 'button',
+                        'aria-label': 'New agent or group chat',
+                        className:
+                          'flex size-6 items-center justify-center rounded-md text-(--ui-text-tertiary) transition-colors hover:bg-(--chrome-action-hover) hover:text-foreground',
+                        children: jsx(Codicon, { name: 'add' })
+                      })
+                    })
+                  }),
+                  jsxs(DropdownMenuContent, {
+                    align: 'end',
+                    children: [
+                      jsxs(DropdownMenuItem, {
+                        onSelect: () => setCreateOpen(true),
+                        children: [jsx(Codicon, { name: 'hubot', className: 'mr-1.5' }), 'New Agent']
+                      }),
+                      jsxs(DropdownMenuItem, {
+                        disabled: roster.length < 2,
+                        onSelect: () => setGroupCreateOpen(true),
+                        children: [jsx(Codicon, { name: 'organization', className: 'mr-1.5' }), 'New Group Chat']
+                      })
+                    ]
+                  })
+                ]
               })
             ]
           })
@@ -6389,7 +6653,7 @@ function BotsPane() {
                           }, `group:${section.group}`)
                         : null,
                       ...section.bots.map(bot =>
-                        jsx(BotRow, { bot, onDelete: setDeleting, onEdit: setEditing, onGroup: setGrouping }, bot.name)
+                        jsx(BotRow, { bot, onDelete: setDeleting, onEdit: setEditing, onGroup: setGrouping }, botRowKey(bot))
                       )
                     ])
                   })
@@ -6410,6 +6674,12 @@ function BotsPane() {
           void refetch()
         },
         roster
+      }),
+      jsx(CreateGroupChatDialog, {
+        open: groupCreateOpen,
+        roster,
+        onClose: () => setGroupCreateOpen(false),
+        onCreated: groupName => $groupChatWorkspace.set(groupName)
       }),
       jsx(EditProfileDialog, {
         bot: editing,
@@ -6463,6 +6733,54 @@ export default {
   register(ctx) {
     pluginCtx = ctx
     startFaceClock()
+
+    // @-mention autocomplete: typing "@rese…" in ANY composer offers the
+    // roster's handles (issue #88060). Reads the roster straight from the
+    // query cache — useRoster keeps it ≤5s stale and the popover must answer
+    // synchronously per keystroke. Multi-source rosters contribute their
+    // precomputed @name-device handles via botHandle. The active profile is
+    // excluded (a bot doesn't @ itself); 'default' surfaces as @hermes.
+    ctx.register({
+      id: 'mention-completions',
+      area: COMPOSER_AREAS.atCompletions,
+      data: {
+        provide: query => {
+          const roster = queryClient.getQueryData(ROSTER_KEY)
+          const profiles = Array.isArray(roster?.profiles) ? roster.profiles : []
+
+          if (!profiles.length) {
+            return []
+          }
+
+          const active = (host.state.profile.get() || 'default').trim() || 'default'
+          const q = (query || '').toLowerCase()
+          const items = []
+
+          for (const profile of profiles) {
+            if (!profile?.name || profile.name === active) {
+              continue
+            }
+
+            const handle = botHandle(profile.name, profile)
+
+            if (q && !handle.toLowerCase().startsWith(q)) {
+              continue
+            }
+
+            const display = displayName(profile, $botMeta.get()[profile.name])
+            const source = profile.connectionLabel ? ` · ${profile.connectionLabel}` : ''
+
+            items.push({
+              insert: `@${handle}`,
+              display: `@${handle}`,
+              meta: `Bot · ${display}${source}`
+            })
+          }
+
+          return items.slice(0, 8)
+        }
+      }
+    })
 
     // Keyframes for the pet bob — injected because plugin classes aren't in
     // the app's precompiled CSS. Idempotent across hot reloads.
@@ -6682,8 +7000,8 @@ export default {
           const note =
             '\n\n[@mention handoff — for each mentioned agent (' + mentioned.map(botHandle).join(', ') + '): ' +
             'COMPOSE a message from you (' + senderName + ') to that agent conveying what the user wants — do not forward this text verbatim (avoid double quotes in your composed message). Send it with exactly one terminal call, run with background=true AND notify_on_complete=true (the recipient may take minutes; the user must not be blocked):\n' +
-            mentioned.map(n => '`hermes -p ' + shellQuote(n) + ' chat --in ~ -c "Bot Chat" -Q -q "Message from \uD83E\uDD16 ' + shellDoubleQuote(senderName) + ' (@' + shellDoubleQuote(botHandle(active)) + '): <your composed message>"`').join('\n') +
-            '\nAfter dispatching, tell the user the message was sent and END YOUR TURN — do not wait or poll; when the background process completes, its notification carries the reply — relay it then, attributed to that agent. If it fails with "No session found matching \'Bot Chat\'", send once without the -c flag, then run `hermes -p <agent> sessions rename <session_id from the output> "Bot Chat"`. ' +
+            mentioned.map(n => '`hermes -p ' + shellQuote(n) + ' chat --in ~ -c "Bot Chat" --create-if-missing -Q -q "Message from \uD83E\uDD16 ' + shellDoubleQuote(senderName) + ' (@' + shellDoubleQuote(botHandle(active)) + '): <your composed message>"`').join('\n') +
+            '\nAfter dispatching, tell the user the message was sent and END YOUR TURN — do not wait or poll; when the background process completes, its notification carries the reply — relay it then, attributed to that agent. ' +
             'Relay the reply back to the user, attributed to that agent.]'
 
           return { ...draft, text: text + note }

@@ -422,6 +422,9 @@ class TestTickProfilePartition:
 
         monkeypatch.setattr(sched, "get_due_jobs", lambda: [profile_a, profile_b, parallel_job])
         monkeypatch.setattr(sched, "advance_next_runs", lambda *_a, **_kw: None)
+        monkeypatch.setattr(
+            sched, "claim_job_for_fire", lambda _job_id, **_kwargs: True
+        )
 
         calls: list[tuple[str, str]] = []
         order_lock = threading.Lock()
@@ -467,6 +470,9 @@ class TestTickProfilePartition:
 
         monkeypatch.setattr(sched, "get_due_jobs", lambda: [profile_job, parallel_job])
         monkeypatch.setattr(sched, "advance_next_runs", lambda *_a, **_kw: None)
+        monkeypatch.setattr(
+            sched, "claim_job_for_fire", lambda _job_id, **_kwargs: True
+        )
         monkeypatch.setattr(sched, "save_job_output", lambda _jid, _o: None)
         monkeypatch.setattr(sched, "mark_job_run", lambda *_a, **_kw: None)
         monkeypatch.setattr(sched, "_deliver_result", lambda *_a, **_kw: None)
