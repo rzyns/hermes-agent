@@ -10,6 +10,7 @@ probe), not specific config snapshots.
 """
 
 import os
+import sys
 from unittest.mock import mock_open, patch
 
 import pytest

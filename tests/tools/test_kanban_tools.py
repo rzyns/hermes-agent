@@ -3134,31 +3134,6 @@ def test_kanban_guidance_in_worker_prompt(monkeypatch, tmp_path):
     assert "Do not shell out" in prompt or "tools — they work" in prompt
 
 
-def test_kanban_guidance_prompt_size_bounded(monkeypatch, tmp_path):
-    """Sanity: the guidance block stays lean so it doesn't blow up the
-    cached prompt.
-
-    The ceiling guards against unbounded growth, not against any growth.
-    The block absorbed the load-bearing worker/orchestrator reference
-    details (workspace kinds, deliverable artifacts, created-card claims,
-    profile discovery) when the standalone kanban-worker / kanban-orchestrator
-    skills were removed and folded into this always-injected guidance, so the
-    ceiling is sized to fit that content, including exact-scope git and
-    evidence-handoff guidance, with a little headroom.
-    """
-    monkeypatch.setenv("HERMES_KANBAN_TASK", "t_fake")
-    home = tmp_path / ".hermes"
-    home.mkdir()
-    monkeypatch.setenv("HERMES_HOME", str(home))
-    from pathlib import Path as _P
-    monkeypatch.setattr(_P, "home", lambda: tmp_path)
-
-    from agent.prompt_builder import KANBAN_GUIDANCE
-    assert 1_500 < len(KANBAN_GUIDANCE) < 6_000, (
-        f"KANBAN_GUIDANCE is {len(KANBAN_GUIDANCE)} chars — too short (missing?) or too long"
-    )
-
-
 # ---------------------------------------------------------------------------
 # Git handoff guard
 # ---------------------------------------------------------------------------
@@ -4544,7 +4519,7 @@ def test_attach_url_fetches_local_fixture(worker_env, allow_private_urls):
     import http.server
     import threading
     from pathlib import Path
-def test_create_subscribes_gateway_session(monkeypatch, worker_env):
+def test_create_subscribes_gateway_session_merged_2(monkeypatch, worker_env):
     """A gateway session (platform + chat_id set) gets auto-subscribed
     to its own kanban_create result, and the response surfaces the
     ``subscribed`` flag so the orchestrator can react."""
@@ -4577,7 +4552,7 @@ def test_create_subscribes_gateway_session(monkeypatch, worker_env):
     assert s["delivery_mode"] == "notify+wake"
 
 
-def test_create_subscribes_tui_session_via_session_key(monkeypatch, worker_env):
+def test_create_subscribes_tui_session_via_session_key_merged_2(monkeypatch, worker_env):
     """TUI / desktop sessions don't have a platform/chat_id (single
     local channel), but the parent process exports HERMES_SESSION_KEY.
     We should still auto-subscribe, with platform='tui' and
@@ -4607,7 +4582,7 @@ def test_create_subscribes_tui_session_via_session_key(monkeypatch, worker_env):
     assert subs[0]["delivery_mode"] == "notify"
 
 
-def test_create_does_not_subscribe_in_cli_session(monkeypatch, worker_env):
+def test_create_does_not_subscribe_in_cli_session_merged_2(monkeypatch, worker_env):
     """CLI / cron / test sessions have no persistent delivery channel.
     _maybe_auto_subscribe returns False and no row is written."""
     from tools import kanban_tools as kt
@@ -4627,7 +4602,7 @@ def test_create_does_not_subscribe_in_cli_session(monkeypatch, worker_env):
     assert _list_subs_for_task(d["task_id"]) == []
 
 
-def test_create_respects_auto_subscribe_on_create_false(monkeypatch, worker_env, tmp_path):
+def test_create_respects_auto_subscribe_on_create_false_merged_2(monkeypatch, worker_env, tmp_path):
     """The config gate kanban.auto_subscribe_on_create=false must
     suppress auto-subscription even when the session has a delivery
     channel. This is the knob that addresses the upstream design

@@ -90,6 +90,7 @@ def test_list_authenticated_providers_enumerates_dict_format_models(monkeypatch)
                 "kimi-k2.5:cloud": {"context_length": 200000},
                 "glm-5.1:cloud": {"context_length": 202752},
             },
+            "discover_models": False,
         }
     }
 
@@ -529,7 +530,8 @@ def test_section3_probes_no_key_endpoint_with_singular_default_model(monkeypatch
         probed["api_key"] = api_key
         return ["live-model-1", "live-model-2", "live-model-3"]
 
-    monkeypatch.setattr("hermes_cli.models.fetch_api_models", _fake_fetch)
+    monkeypatch.setattr("hermes_cli.models.should_use_ollama_native_catalog", lambda *a, **k: False)
+    monkeypatch.setattr("hermes_cli.models.cached_fetch_api_models", _fake_fetch)
 
     user_providers = {
         "local-ollama": {

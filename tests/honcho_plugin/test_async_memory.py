@@ -377,6 +377,9 @@ class _CaptureSyncManager:
         self.flushed_session_keys.append(session.key)
         return True
 
+    def save(self, session):
+        return self._flush_session(session)
+
 
 class TestHonchoProviderSessionSwitch:
     def _make_ready_provider(self) -> tuple[HonchoMemoryProvider, _CaptureSyncManager]:

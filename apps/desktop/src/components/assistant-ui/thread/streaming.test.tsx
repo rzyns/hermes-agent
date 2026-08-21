@@ -1,9 +1,11 @@
 import { AssistantRuntimeProvider, type ThreadMessage, useExternalStoreRuntime } from '@assistant-ui/react'
 import { act, fireEvent, render, screen, waitFor, within } from '@testing-library/react'
 import { useEffect, useState } from 'react'
-import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
+import { beforeEach, describe, expect, it, vi } from 'vitest'
 
 import { $reasoningCollapsedByDefault } from '@/store/reasoning-disclosure'
+
+import { stubThreadEnvironment, stubThreadViewportSize, ThreadRuntime } from '../test-utils'
 
 import { Thread } from '.'
 
@@ -45,52 +47,12 @@ class TestResizeObserver {
   }
 }
 
+stubThreadEnvironment()
+
+// This suite drives the virtualizer, so it needs an observer that reports.
 vi.stubGlobal('ResizeObserver', TestResizeObserver)
-vi.stubGlobal('requestAnimationFrame', (callback: FrameRequestCallback) =>
-  window.setTimeout(() => callback(performance.now()), 0)
-)
-vi.stubGlobal('cancelAnimationFrame', (id: number) => window.clearTimeout(id))
-vi.stubGlobal('CSS', { escape: (str: string) => str })
 
-afterEach(async () => {
-  // use-stick-to-bottom resolves one final requestAnimationFrame after its
-  // scroll promise settles. Let that real-timer shim drain after RTL unmounts
-  // the thread so the callback cannot escape into Vitest environment teardown.
-  await act(async () => {
-    await new Promise(resolve => window.setTimeout(resolve, 0))
-    await new Promise(resolve => window.setTimeout(resolve, 0))
-  })
-})
-
-Element.prototype.scrollTo = function scrollTo() {}
-
-Element.prototype.animate = function animate() {
-  return {
-    cancel: () => {},
-    finished: Promise.resolve()
-  } as unknown as Animation
-}
-
-// jsdom returns 0 for offset*; some layout code reads those to size the
-// viewport. Fall through to client* (which tests can override) or a sane
-// default so message rows render with non-zero dimensions.
-function stubOffsetDimension(
-  prop: 'offsetHeight' | 'offsetWidth',
-  clientProp: 'clientHeight' | 'clientWidth',
-  fallback: number
-) {
-  const previous = Object.getOwnPropertyDescriptor(HTMLElement.prototype, prop)
-
-  Object.defineProperty(HTMLElement.prototype, prop, {
-    configurable: true,
-    get() {
-      return previous?.get?.call(this) || (this as HTMLElement)[clientProp] || fallback
-    }
-  })
-}
-
-stubOffsetDimension('offsetWidth', 'clientWidth', 800)
-stubOffsetDimension('offsetHeight', 'clientHeight', 600)
+stubThreadViewportSize()
 
 async function wait(ms: number) {
   await act(async () => {
@@ -341,19 +303,11 @@ function StreamingHarness({ onControls }: { onControls?: (controls: StreamingCon
   )
 }
 
-function TodoHarness({ message }: { message: ThreadMessage }) {
-  const runtime = useExternalStoreRuntime<ThreadMessage>({
-    messages: [message],
-    isRunning: message.status?.type === 'running',
-    onNew: async () => {}
-  })
-
-  return (
-    <AssistantRuntimeProvider runtime={runtime}>
-      <Thread />
-    </AssistantRuntimeProvider>
-  )
-}
+const TodoHarness = ({ message }: { message: ThreadMessage }) => (
+  <ThreadRuntime messages={[message]}>
+    <Thread />
+  </ThreadRuntime>
+)
 
 function MessageHarness({ message }: { message: ThreadMessage }) {
   const runtime = useExternalStoreRuntime<ThreadMessage>({

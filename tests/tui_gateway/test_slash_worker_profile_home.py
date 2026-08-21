@@ -1,5 +1,6 @@
 """Tests for TUI gateway slash_worker profile_home propagation (#40677)."""
 
+import sys
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
@@ -39,7 +40,7 @@ def test_slash_worker_accepts_profile_home():
 def test_slash_worker_without_profile_home():
     """_SlashWorker works without profile_home parameter (backward compatible)."""
     with patch.dict("sys.modules", {
-        "hermes_constants": MagicMock(get_hermes_home=MagicMock(return_value="/tmp/hermes_test")),
+        "hermes_constants": MagicMock(get_hermes_home=MagicMock(return_value=Path("/tmp/hermes_test"))),
     }):
         with patch("subprocess.Popen") as mock_popen:
             mock_popen.return_value.stdout = MagicMock()
@@ -69,7 +70,7 @@ def test_slash_worker_without_profile_home():
 def test_slash_worker_with_none_profile_home():
     """_SlashWorker with explicit profile_home=None works."""
     with patch.dict("sys.modules", {
-        "hermes_constants": MagicMock(get_hermes_home=MagicMock(return_value="/tmp/hermes_test")),
+        "hermes_constants": MagicMock(get_hermes_home=MagicMock(return_value=Path("/tmp/hermes_test"))),
     }):
         with patch("subprocess.Popen") as mock_popen:
             mock_popen.return_value.stdout = MagicMock()
@@ -99,7 +100,7 @@ def test_slash_worker_with_none_profile_home():
 def test_slash_worker_inherits_argv_correctly():
     """_SlashWorker passes correct argv to Popen."""
     with patch.dict("sys.modules", {
-        "hermes_constants": MagicMock(get_hermes_home=MagicMock(return_value="/tmp/hermes_test")),
+        "hermes_constants": MagicMock(get_hermes_home=MagicMock(return_value=Path("/tmp/hermes_test"))),
     }):
         with patch("subprocess.Popen") as mock_popen:
             mock_popen.return_value.stdout = MagicMock()

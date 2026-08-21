@@ -1985,7 +1985,7 @@ def test_bulk_empty_ids_400(client):
     assert r.status_code == 400
 
 
-def test_bulk_status_done_forwards_completion_summary(client):
+def test_bulk_status_done_forwards_completion_summary_merged_2(client):
     a = client.post("/api/plugins/kanban/tasks", json={"title": "a"}).json()["task"]
     b = client.post("/api/plugins/kanban/tasks", json={"title": "b"}).json()["task"]
 
@@ -2015,7 +2015,7 @@ def test_bulk_status_done_forwards_completion_summary(client):
         conn.close()
 
 
-def test_bulk_status_running_rejected(client):
+def test_bulk_status_running_rejected_merged_2(client):
     """Bulk updates must match single-task PATCH: direct 'running' is invalid."""
     t = client.post("/api/plugins/kanban/tasks", json={"title": "x"}).json()["task"]
 
@@ -2040,7 +2040,7 @@ def test_bulk_status_running_rejected(client):
     assert statuses.get(t["id"]) != "running"
 
 
-def test_dashboard_done_actions_prompt_for_completion_summary():
+def test_dashboard_done_actions_prompt_for_completion_summary_merged_2():
     """Behavioral coverage for the migrated ``requestDialog`` flow.
 
     Replaces the prior bundle-string-only assertion (which only proved the
@@ -2152,7 +2152,7 @@ def test_dashboard_confirm_dispatches_expected_delete(client):
     assert r2.status_code == 404
 
 
-def test_dashboard_surfaces_ready_blocked_error_inline():
+def test_dashboard_surfaces_ready_blocked_error_inline_merged_2():
     """Regression for #26744: failed status transitions must be surfaced
     inline, not swallowed.  The drag/drop banner and the drawer's action
     row each render the parsed API ``detail`` so operators see *why*
@@ -2180,7 +2180,7 @@ def test_dashboard_surfaces_ready_blocked_error_inline():
     assert "setPatchErr(null)" in bundle
 
 
-def test_dashboard_dependency_selects_use_value_change_handler():
+def test_dashboard_dependency_selects_use_value_change_handler_merged_2():
     """Regression for the dependency selects in the task drawer: the
     add-parent / add-child dropdowns must wire through the shared
     selectChangeHandler helper so their value actually lands on the
@@ -2206,7 +2206,7 @@ def test_dashboard_dependency_selects_use_value_change_handler():
     assert child_select in bundle
 
 
-def test_bulk_archive(client):
+def test_bulk_archive_merged_2(client):
     a = client.post("/api/plugins/kanban/tasks", json={"title": "a"}).json()["task"]
     b = client.post("/api/plugins/kanban/tasks", json={"title": "b"}).json()["task"]
     r = client.post("/api/plugins/kanban/tasks/bulk",
@@ -2220,7 +2220,7 @@ def test_bulk_archive(client):
     assert b["id"] not in ids
 
 
-def test_bulk_reassign(client):
+def test_bulk_reassign_merged_2(client):
     a = client.post("/api/plugins/kanban/tasks",
                     json={"title": "a", "assignee": "old"}).json()["task"]
     b = client.post("/api/plugins/kanban/tasks",
@@ -2233,7 +2233,7 @@ def test_bulk_reassign(client):
         assert t["assignee"] == "new"
 
 
-def test_bulk_unassign_via_empty_string(client):
+def test_bulk_unassign_via_empty_string_merged_2(client):
     a = client.post("/api/plugins/kanban/tasks",
                     json={"title": "a", "assignee": "x"}).json()["task"]
     r = client.post("/api/plugins/kanban/tasks/bulk",
@@ -2243,7 +2243,7 @@ def test_bulk_unassign_via_empty_string(client):
     assert t["assignee"] is None
 
 
-def test_bulk_partial_failure_doesnt_abort_siblings(client):
+def test_bulk_partial_failure_doesnt_abort_siblings_merged_2(client):
     """One bad id in the middle of a batch must not prevent others from
     applying."""
     a = client.post("/api/plugins/kanban/tasks", json={"title": "a"}).json()["task"]
@@ -2263,7 +2263,7 @@ def test_bulk_partial_failure_doesnt_abort_siblings(client):
         assert t["priority"] == 7
 
 
-def test_bulk_empty_ids_400(client):
+def test_bulk_empty_ids_400_merged_2(client):
     r = client.post("/api/plugins/kanban/tasks/bulk", json={"ids": []})
     assert r.status_code == 400
 

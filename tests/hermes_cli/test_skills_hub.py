@@ -1,13 +1,14 @@
 import json
-from io import StringIO
 from pathlib import Path
+from hermes_cli.skills_hub import do_check, do_install, do_inspect, do_list, do_update, handle_skills_slash, inspect_skill
+from io import StringIO
 from unittest.mock import patch
 
 import pytest
 from rich.console import Console
 
 from cli import ChatConsole
-from hermes_cli.skills_hub import do_check, do_install, do_inspect, do_list, do_update, handle_skills_slash, inspect_skill
+from hermes_cli.skills_hub import do_check, do_install, do_list, do_update, handle_skills_slash
 
 
 class _DummyLockFile:
@@ -33,28 +34,6 @@ def hub_env(monkeypatch, tmp_path):
     monkeypatch.setattr(hub, "INDEX_CACHE_DIR", hub_dir / "index-cache")
 
     return hub_dir
-
-
-def test_resolve_install_target_uses_dynamic_skills_dir_without_module_constant(monkeypatch, tmp_path):
-    """Regression for installs after skills_hub path constants became dynamic.
-
-    PEP 562 ``__getattr__`` helps external ``from tools.skills_hub import
-    SKILLS_DIR`` callers, but unqualified ``SKILLS_DIR`` inside this module is
-    still a normal global lookup. The install path resolver must use the
-    per-call helper directly so a fresh process with no monkeypatched module
-    constant can install skills.
-    """
-    import tools.skills_hub as hub
-
-    monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
-    monkeypatch.delitem(hub.__dict__, "SKILLS_DIR", raising=False)
-
-    target = hub._resolve_install_target_path(
-        "research/long-research",
-        "long-research",
-    )
-
-    assert target == tmp_path / ".hermes" / "skills" / "research" / "long-research"
 
 
 # ---------------------------------------------------------------------------
@@ -127,104 +106,6 @@ def _capture_update(monkeypatch, results) -> tuple[str, list[tuple[str, str, boo
 # ---------------------------------------------------------------------------
 
 
-def test_do_list_initializes_hub_dir(monkeypatch, hub_env):
-    import tools.skills_sync as skills_sync
-    import tools.skills_tool as skills_tool
-
-    monkeypatch.setattr(skills_tool, "_find_all_skills", lambda **_kwargs: [])
-    monkeypatch.setattr(skills_sync, "_read_manifest", lambda: {})
-
-    hub_dir = hub_env
-    assert not hub_dir.exists()
-
-    _capture()
-
-    assert hub_dir.exists()
-    assert (hub_dir / "lock.json").exists()
-    assert (hub_dir / "quarantine").is_dir()
-    assert (hub_dir / "index-cache").is_dir()
-
-
-def test_do_list_distinguishes_hub_builtin_and_local(three_source_env):
-    output = _capture()
-
-    assert "hub-skill" in output
-    assert "builtin-skill" in output
-    assert "local-skill" in output
-    assert "1 hub-installed, 1 builtin, 1 local" in output
-
-
-def test_do_list_filter_local(three_source_env):
-    output = _capture(source_filter="local")
-
-    assert "local-skill" in output
-    assert "builtin-skill" not in output
-    assert "hub-skill" not in output
-
-
-def test_do_list_filter_hub(three_source_env):
-    output = _capture(source_filter="hub")
-
-    assert "hub-skill" in output
-    assert "builtin-skill" not in output
-    assert "local-skill" not in output
-
-
-def test_do_list_filter_builtin(three_source_env):
-    output = _capture(source_filter="builtin")
-
-    assert "builtin-skill" in output
-    assert "hub-skill" not in output
-    assert "local-skill" not in output
-
-
-def test_do_list_renders_status_column(three_source_env, monkeypatch):
-    """Every list row should carry an enabled/disabled status (new in PR that
-    answered Mr Mochizuki's 'I just want to see what's live' question)."""
-    from agent import skill_utils
-
-    monkeypatch.setattr(skill_utils, "get_disabled_skill_names", lambda platform=None: set())
-    output = _capture()
-
-    assert "Status" in output
-    assert "enabled" in output.lower()
-    # Summary counts enabled skills.
-    assert "3 enabled, 0 disabled" in output
-
-
-def test_do_list_marks_disabled_skills(three_source_env, monkeypatch):
-    from agent import skill_utils
-
-    # Simulate `skills.disabled: [hub-skill]` in config.
-    monkeypatch.setattr(
-        skill_utils, "get_disabled_skill_names",
-        lambda platform=None: {"hub-skill"},
-    )
-    output = _capture()
-
-    # Row still appears (no --enabled-only), but marked disabled
-    assert "hub-skill" in output
-    assert "disabled" in output.lower()
-    assert "2 enabled, 1 disabled" in output
-
-
-def test_do_list_enabled_only_hides_disabled(three_source_env, monkeypatch):
-    from agent import skill_utils
-
-    monkeypatch.setattr(
-        skill_utils, "get_disabled_skill_names",
-        lambda platform=None: {"hub-skill"},
-    )
-    sink = StringIO()
-    console = Console(file=sink, force_terminal=False, color_system=None)
-    do_list(enabled_only=True, console=console)
-    output = sink.getvalue()
-
-    assert "hub-skill" not in output
-    assert "builtin-skill" in output
-    assert "local-skill" in output
-    assert "enabled only" in output.lower()
-    assert "2 enabled shown" in output
 
 
 def test_do_list_platform_env_is_ignored(three_source_env, monkeypatch):
@@ -246,33 +127,6 @@ def test_do_list_platform_env_is_ignored(three_source_env, monkeypatch):
     assert seen["platform"] is None
 
 
-def test_do_check_reports_available_updates(monkeypatch):
-    output = _capture_check(monkeypatch, [
-        {"name": "hub-skill", "source": "skills.sh", "status": "update_available"},
-        {"name": "other-skill", "source": "github", "status": "up_to_date"},
-    ])
-
-    assert "hub-skill" in output
-    assert "update_available" in output
-    assert "up_to_date" in output
-
-
-def test_do_check_handles_no_installed_updates(monkeypatch):
-    output = _capture_check(monkeypatch, [])
-
-    assert "No hub-installed skills to check" in output
-
-
-def test_do_update_reinstalls_outdated_skills(monkeypatch):
-    output, installs = _capture_update(monkeypatch, [
-        {"name": "hub-skill", "identifier": "skills-sh/example/repo/hub-skill", "status": "update_available"},
-        {"name": "other-skill", "identifier": "github/example/other-skill", "status": "up_to_date"},
-    ])
-
-    assert installs == [("skills-sh/example/repo/hub-skill", "category", True)]
-    assert "Updated 1 skill" in output
-
-
 # ---------------------------------------------------------------------------
 # Cross-registry hijack regression tests
 #
@@ -282,61 +136,6 @@ def test_do_update_reinstalls_outdated_skills(monkeypatch):
 # ---------------------------------------------------------------------------
 
 
-def test_do_update_pins_install_to_locked_source(monkeypatch):
-    """do_update must forward the lockfile's `source` to do_install.
-
-    Without the pin, a bare identifier like "reddit" reaches
-    _resolve_short_name()'s fuzzy catalog search inside do_install and can
-    resolve to a same-named skill in another registry.
-    """
-    import tools.skills_hub as hub
-    import hermes_cli.skills_hub as cli_hub
-
-    sink = StringIO()
-    console = Console(file=sink, force_terminal=False, color_system=None)
-    calls = []
-
-    monkeypatch.setattr(hub, "check_for_skill_updates", lambda **_kwargs: [
-        {"name": "reddit", "identifier": "reddit", "source": "clawhub",
-         "status": "update_available"},
-    ])
-    monkeypatch.setattr(hub, "HubLockFile", lambda: type("L", (), {
-        "get_installed": lambda self, name: {"install_path": "category/" + name}
-    })())
-    monkeypatch.setattr(
-        cli_hub, "do_install",
-        lambda identifier, category="", force=False, console=None, source_id=None:
-            calls.append({"identifier": identifier, "source_id": source_id}),
-    )
-
-    do_update(console=console)
-
-    assert calls == [{"identifier": "reddit", "source_id": "clawhub"}]
-
-
-def test_do_install_refuses_unknown_pinned_source(monkeypatch, hub_env):
-    """A pinned source with no matching adapter must abort, not fall back.
-
-    Falling back to the full source router is what allowed a foreign registry
-    to satisfy the install.
-    """
-    import tools.skills_hub as hub
-
-    sink = StringIO()
-    console = Console(file=sink, force_terminal=False, color_system=None)
-    resolved = []
-
-    monkeypatch.setattr(hub, "create_source_router", lambda auth=None: [])
-    monkeypatch.setattr(hub, "GitHubAuth", lambda: object())
-    monkeypatch.setattr(
-        "hermes_cli.skills_hub._resolve_short_name",
-        lambda name, sources, c: resolved.append(name) or "",
-    )
-
-    do_install("reddit", source_id="clawhub", console=console)
-
-    assert resolved == [], "must not attempt a fuzzy resolve when the pin is unsatisfiable"
-    assert "provenance" in sink.getvalue()
 
 
 def test_check_for_skill_updates_does_not_fall_back_across_registries():
@@ -390,389 +189,101 @@ def test_check_for_skill_updates_does_not_fall_back_across_registries():
     assert "bundle" not in results[0], "must not carry a foreign registry's bundle"
 
 
-def test_handle_skills_slash_search_accepts_chatconsole_without_status_errors():
-    results = [type("R", (), {
-        "name": "kubernetes",
-        "description": "Cluster orchestration",
-        "source": "skills.sh",
-        "trust_level": "community",
-        "identifier": "skills-sh/example/kubernetes",
-    })()]
+def test_resolve_does_not_pair_catalog_meta_with_foreign_same_name_bundle():
+    """Inspect metadata from one registry must not ship with another registry's files.
 
-    with patch("tools.skills_hub.unified_search", return_value=results), \
-         patch("tools.skills_hub.create_source_router", return_value={}), \
-         patch("tools.skills_hub.GitHubAuth"):
-        handle_skills_slash("/skills search kubernetes", console=ChatConsole())
-
-
-def test_do_install_scans_with_resolved_identifier(monkeypatch, tmp_path, hub_env):
-    import tools.skills_guard as guard
-    import tools.skills_hub as hub
-
-    canonical_identifier = "skills-sh/anthropics/skills/frontend-design"
-
-    class _ResolvedSource:
-        def inspect(self, identifier):
-            return type("Meta", (), {
-                "extra": {},
-                "identifier": canonical_identifier,
-            })()
-
-        def fetch(self, identifier):
-            return type("Bundle", (), {
-                "name": "frontend-design",
-                "files": {"SKILL.md": "# Frontend Design"},
-                "source": "skills.sh",
-                "identifier": canonical_identifier,
-                "trust_level": "trusted",
-                "metadata": {},
-            })()
-    q_path = tmp_path / "skills" / ".hub" / "quarantine" / "frontend-design"
-    q_path.mkdir(parents=True)
-    (q_path / "SKILL.md").write_text("# Frontend Design")
-
-    scanned = {}
-
-    def _scan_skill(skill_path, source="community"):
-        scanned["source"] = source
-        return guard.ScanResult(
-            skill_name="frontend-design",
-            source=source,
-            trust_level="trusted",
-            verdict="safe",
-        )
-
-    monkeypatch.setattr(hub, "ensure_hub_dirs", lambda: None)
-    monkeypatch.setattr(hub, "create_source_router", lambda auth: [_ResolvedSource()])
-    monkeypatch.setattr(hub, "quarantine_bundle", lambda bundle: q_path)
-    monkeypatch.setattr(hub, "HubLockFile", lambda: type("Lock", (), {"get_installed": lambda self, name: None})())
-    monkeypatch.setattr(guard, "scan_skill", _scan_skill)
-    monkeypatch.setattr(guard, "format_scan_report", lambda result: "scan ok")
-    monkeypatch.setattr(guard, "should_allow_install", lambda result, force=False: (False, "stop after scan"))
-
-    sink = StringIO()
-    console = Console(file=sink, force_terminal=False, color_system=None)
-
-    do_install("skils-sh/anthropics/skills/frontend-design", console=console, skip_confirm=True)
-
-    assert scanned["source"] == canonical_identifier
-
-
-def test_looks_like_direct_github_identifier_classifies_source_boundaries():
-    from hermes_cli.skills_hub import _looks_like_direct_github_identifier
-
-    assert _looks_like_direct_github_identifier("rzyns/hermes-stuff/plan")
-    assert _looks_like_direct_github_identifier("rzyns/hermes-stuff/skills/plan")
-    assert _looks_like_direct_github_identifier("https://github.com/rzyns/hermes-stuff/tree/main/skills/plan")
-    assert _looks_like_direct_github_identifier("https://github.com/rzyns/hermes-stuff/blob/main/skills/plan/SKILL.md")
-
-    assert not _looks_like_direct_github_identifier("plan")
-    assert not _looks_like_direct_github_identifier("skills-sh/rzyns/hermes-stuff/plan")
-    assert not _looks_like_direct_github_identifier("official/plan")
-    assert not _looks_like_direct_github_identifier("https://example.com/rzyns/hermes-stuff/tree/main/skills/plan")
-    assert not _looks_like_direct_github_identifier("https://github.com/rzyns/hermes-stuff")
-
-
-def test_resolve_source_prefers_matching_github_tap_over_registry_collision():
-    from tools.skills_hub import SkillBundle, SkillMeta
+    skills.sh can inspect ``owner/repo/skills/skillopt`` while ClawHub used to
+    fetch by last path segment ``skillopt`` and return a different author's
+    SKILL.md. The header then showed the requested identifier and the preview
+    showed the wrong skill.
+    """
     from hermes_cli.skills_hub import _resolve_source_meta_and_bundle
-
-    class _RegistrySource:
-        def source_id(self):
-            return "hermes-index"
-
-        def inspect(self, identifier):
-            return SkillMeta(
-                name="plan",
-                description="Unrelated registry plan",
-                source="hermes-index",
-                identifier="registry/plan",
-                trust_level="community",
-            )
-
-        def fetch(self, identifier):
-            return SkillBundle(
-                name="plan",
-                files={"SKILL.md": "# wrong"},
-                source="hermes-index",
-                identifier="registry/plan",
-                trust_level="community",
-            )
-
-    class _MatchingGitHubTapSource:
-        taps = [{"repo": "rzyns/hermes-stuff", "path": "skills/"}]
-
-        def source_id(self):
-            return "github"
-
-        def inspect(self, identifier):
-            if identifier != "rzyns/hermes-stuff/plan":
-                return None
-            return SkillMeta(
-                name="plan",
-                description="Repo plan",
-                source="github",
-                identifier="rzyns/hermes-stuff/skills/plan",
-                trust_level="community",
-                repo="rzyns/hermes-stuff",
-                path="skills/plan",
-            )
-
-        def fetch(self, identifier):
-            if identifier != "rzyns/hermes-stuff/plan":
-                return None
-            return SkillBundle(
-                name="plan",
-                files={"SKILL.md": "# right", "references/kanban-artifact-planning.md": "# ref"},
-                source="github",
-                identifier="rzyns/hermes-stuff/skills/plan",
-                trust_level="community",
-            )
-
-    meta, bundle, matched = _resolve_source_meta_and_bundle(
-        "rzyns/hermes-stuff/plan",
-        [_RegistrySource(), _MatchingGitHubTapSource()],
-    )
-
-    assert matched.source_id() == "github"
-    assert meta.identifier == "rzyns/hermes-stuff/skills/plan"
-    assert bundle.identifier == "rzyns/hermes-stuff/skills/plan"
-    assert "references/kanban-artifact-planning.md" in bundle.files
-
-
-def test_resolve_source_does_not_fall_back_for_github_tree_url_collision():
     from tools.skills_hub import SkillBundle, SkillMeta
-    from hermes_cli.skills_hub import _resolve_source_meta_and_bundle
 
-    class _UnavailableGitHubSource:
-        def source_id(self):
-            return "github"
-
-        def inspect(self, identifier):
-            return None
-
-        def fetch(self, identifier):
-            return None
-
-    class _RegistryCollisionSource:
-        def source_id(self):
-            return "clawhub"
-
+    class CatalogSource:
         def inspect(self, identifier):
             return SkillMeta(
-                name="plan", description="Wrong registry plan", source="clawhub",
-                identifier="plan", trust_level="community",
+                name="skillopt",
+                description="kanban-based pipelines",
+                source="skills.sh",
+                identifier="skills-sh/latipun7/agent-skill-collections/skills/skillopt",
+                trust_level="community",
             )
 
         def fetch(self, identifier):
-            return SkillBundle(
-                name="plan", files={"SKILL.md": "# wrong"}, source="clawhub",
-                identifier="plan", trust_level="community",
-            )
-
-    meta, bundle, matched = _resolve_source_meta_and_bundle(
-        "https://github.com/rzyns/hermes-stuff/tree/main/skills/plan",
-        [_UnavailableGitHubSource(), _RegistryCollisionSource()],
-    )
-
-    assert meta is None
-    assert bundle is None
-    assert matched is None
-
-
-def test_resolve_source_does_not_fall_back_when_direct_github_ref_unavailable():
-    from tools.skills_hub import SkillBundle, SkillMeta
-    from hermes_cli.skills_hub import _resolve_source_meta_and_bundle
-
-    class _UnavailableGitHubSource:
-        def source_id(self):
-            return "github"
-
-        def inspect(self, identifier):
             return None
 
-        def fetch(self, identifier):
-            return None
-
-    class _RegistryCollisionSource:
-        def source_id(self):
-            return "clawhub"
-
+    class ForeignSlugSource:
         def inspect(self, identifier):
             return SkillMeta(
-                name="plan",
-                description="Wrong registry plan",
+                name="skillopt",
+                description="Train, evaluate, and improve Agent skill files",
                 source="clawhub",
-                identifier="plan",
+                identifier="skillopt",
                 trust_level="community",
             )
 
         def fetch(self, identifier):
             return SkillBundle(
-                name="plan",
-                files={"SKILL.md": "# wrong"},
+                name="skillopt",
+                files={"SKILL.md": "# Train, evaluate, and improve Agent skill files\n"},
                 source="clawhub",
-                identifier="plan",
+                identifier="skillopt",
                 trust_level="community",
             )
 
     meta, bundle, matched = _resolve_source_meta_and_bundle(
-        "rzyns/hermes-stuff/plan",
-        [_UnavailableGitHubSource(), _RegistryCollisionSource()],
+        "latipun7/agent-skill-collections/skills/skillopt",
+        [CatalogSource(), ForeignSlugSource()],
     )
 
-    assert meta is None
-    assert bundle is None
-    assert matched is None
+    assert bundle is not None
+    assert bundle.source == "clawhub"
+    assert meta is not None
+    assert meta.source == "clawhub"
+    assert meta.identifier == "skillopt"
+    assert "kanban-based" not in (meta.description or "")
+    assert matched is not None
+    assert matched.__class__ is ForeignSlugSource
 
 
-def test_do_install_github_tree_url_persists_identifier_and_ref_metadata(monkeypatch, tmp_path, hub_env):
-    import tools.skills_hub as hub
-    import tools.skills_guard as guard
-    from tools.skills_hub import SkillBundle, SkillMeta
+def test_resolve_keeps_catalog_meta_when_later_sources_do_not_fetch():
+    from hermes_cli.skills_hub import _resolve_source_meta_and_bundle
+    from tools.skills_hub import SkillMeta
 
-    tree_url = "https://github.com/rzyns/hermes-stuff/tree/main/skills/plan"
-
-    class _GitHubTreeSource:
-        def source_id(self):
-            return "github"
-
+    class CatalogSource:
         def inspect(self, identifier):
-            assert identifier == tree_url
             return SkillMeta(
-                name="plan",
-                description="Repo plan skill",
-                source="github",
-                identifier=tree_url,
+                name="skillopt",
+                description="kanban-based pipelines",
+                source="skills.sh",
+                identifier="skills-sh/latipun7/agent-skill-collections/skills/skillopt",
                 trust_level="community",
-                repo="rzyns/hermes-stuff",
-                path="skills/plan",
-                extra={"ref": "main"},
             )
 
         def fetch(self, identifier):
-            assert identifier == tree_url
-            return SkillBundle(
-                name="plan",
-                files={
-                    "SKILL.md": "---\nname: plan\n---\n",
-                    "references/kanban-artifact-planning.md": "# ref",
-                },
-                source="github",
-                identifier=tree_url,
-                trust_level="community",
-                metadata={"repo": "rzyns/hermes-stuff", "path": "skills/plan", "ref": "main"},
-            )
+            return None
 
-    RealHubLockFile = hub.HubLockFile
-    monkeypatch.setattr(hub, "HubLockFile", lambda: RealHubLockFile(hub.LOCK_FILE))
-    monkeypatch.setattr(hub, "create_source_router", lambda auth: [_GitHubTreeSource()])
-    monkeypatch.setattr(
-        guard, "scan_skill",
-        lambda skill_path, source="community": guard.ScanResult(
-            skill_name="plan", source=source, trust_level="community", verdict="safe",
-        ),
-    )
-    monkeypatch.setattr(guard, "format_scan_report", lambda result: "scan ok")
-    monkeypatch.setattr(guard, "should_allow_install", lambda result, force=False: (True, "ok"))
-
-    sink = StringIO()
-    console = Console(file=sink, force_terminal=False, color_system=None)
-    do_install(tree_url, console=console, skip_confirm=True)
-
-    assert (tmp_path / "skills" / "plan" / "SKILL.md").is_file()
-    assert (tmp_path / "skills" / "plan" / "references" / "kanban-artifact-planning.md").is_file()
-    entry = json.loads((hub_env / "lock.json").read_text())["installed"]["plan"]
-    assert entry["identifier"] == tree_url
-    assert entry["metadata"] == {"repo": "rzyns/hermes-stuff", "path": "skills/plan", "ref": "main"}
-    assert entry["files"] == ["SKILL.md", "references/kanban-artifact-planning.md"]
-
-
-def test_do_install_scans_official_bundles_with_source_provenance(
-    monkeypatch, tmp_path, hub_env
-):
-    import tools.skills_guard as guard
-    import tools.skills_hub as hub
-
-    class _OfficialSource:
+    class QuietSource:
         def inspect(self, identifier):
-            return type("Meta", (), {
-                "extra": {},
-                "identifier": "official/agent/prunus-gaia",
-            })()
+            return None
 
         def fetch(self, identifier):
-            return type("Bundle", (), {
-                "name": "prunus-gaia",
-                "files": {"SKILL.md": "# Prunus Gaia"},
-                "source": "official",
-                "identifier": "official/agent/prunus-gaia",
-                "trust_level": "builtin",
-                "metadata": {},
-            })()
+            return None
 
-    q_path = tmp_path / "skills" / ".hub" / "quarantine" / "prunus-gaia"
-    q_path.mkdir(parents=True)
-    (q_path / "SKILL.md").write_text("# Prunus Gaia")
-
-    scanned = {}
-
-    def _scan_skill(skill_path, source="community"):
-        scanned["source"] = source
-        return guard.ScanResult(
-            skill_name="prunus-gaia",
-            source=source,
-            trust_level="builtin",
-            verdict="safe",
-        )
-
-    monkeypatch.setattr(hub, "ensure_hub_dirs", lambda: None)
-    monkeypatch.setattr(hub, "create_source_router", lambda auth: [_OfficialSource()])
-    monkeypatch.setattr(hub, "quarantine_bundle", lambda bundle: q_path)
-    monkeypatch.setattr(hub, "HubLockFile", lambda: type("Lock", (), {"get_installed": lambda self, name: None})())
-    monkeypatch.setattr(guard, "scan_skill", _scan_skill)
-    monkeypatch.setattr(guard, "format_scan_report", lambda result: "scan ok")
-    monkeypatch.setattr(guard, "should_allow_install", lambda result, force=False: (False, "stop after scan"))
-
-    sink = StringIO()
-    console = Console(file=sink, force_terminal=False, color_system=None)
-
-    do_install("official/agent/prunus-gaia", console=console, skip_confirm=True)
-
-    assert scanned["source"] == "official"
-
-
-def test_do_install_preserves_nested_official_optional_path(
-    monkeypatch, tmp_path, hub_env
-):
-    class _OfficialNestedSource:
-        def inspect(self, identifier):
-            return type("Meta", (), {
-                "extra": {},
-                "identifier": "official/mlops/training/trl-fine-tuning",
-            })()
-
-        def fetch(self, identifier):
-            return type("Bundle", (), {
-                "name": "trl-fine-tuning",
-                "files": {"SKILL.md": "# TRL"},
-                "source": "official",
-                "identifier": "official/mlops/training/trl-fine-tuning",
-                "trust_level": "builtin",
-                "metadata": {},
-            })()
-
-    installs = _install_mocks(monkeypatch, tmp_path, _OfficialNestedSource)
-
-    sink = StringIO()
-    console = Console(file=sink, force_terminal=False, color_system=None)
-    do_install(
-        "official/mlops/training/trl-fine-tuning",
-        console=console,
-        skip_confirm=True,
+    meta, bundle, matched = _resolve_source_meta_and_bundle(
+        "latipun7/agent-skill-collections/skills/skillopt",
+        [CatalogSource(), QuietSource()],
     )
 
-    assert installs == [{"name": "trl-fine-tuning", "category": "mlops/training"}]
+    assert bundle is None
+    assert meta is not None
+    assert meta.source == "skills.sh"
+    assert meta.identifier.endswith("latipun7/agent-skill-collections/skills/skillopt")
+    assert matched is not None
+    assert matched.__class__ is CatalogSource
+
+
 
 
 # ---------------------------------------------------------------------------
@@ -842,145 +353,15 @@ def _install_mocks(monkeypatch, tmp_path, source_factory, category_hint=""):
     return install_calls
 
 
-def test_url_install_uses_name_override_on_non_interactive_surface(monkeypatch, tmp_path, hub_env):
-    installs = _install_mocks(monkeypatch, tmp_path, _make_url_bundle_fetcher())
-
-    sink = StringIO()
-    console = Console(file=sink, force_terminal=False, color_system=None)
-    do_install(
-        "https://example.com/SKILL.md",
-        console=console, skip_confirm=True,
-        name_override="my-url-skill",
-    )
-
-    assert installs == [{"name": "my-url-skill", "category": ""}]
 
 
-def test_url_install_rejects_invalid_name_override(monkeypatch, tmp_path, hub_env):
-    installs = _install_mocks(monkeypatch, tmp_path, _make_url_bundle_fetcher())
-
-    sink = StringIO()
-    console = Console(file=sink, force_terminal=False, color_system=None)
-    do_install(
-        "https://example.com/SKILL.md",
-        console=console, skip_confirm=True,
-        name_override="SKILL",  # rejected by _is_valid_installed_skill_name
-    )
-
-    assert installs == []  # did NOT install
-    assert "Invalid --name" in sink.getvalue()
-
-
-def test_url_install_actionable_error_on_non_interactive_with_no_name(monkeypatch, tmp_path, hub_env):
-    installs = _install_mocks(monkeypatch, tmp_path, _make_url_bundle_fetcher())
-
-    sink = StringIO()
-    console = Console(file=sink, force_terminal=False, color_system=None)
-    do_install(
-        "https://example.com/SKILL.md",
-        console=console, skip_confirm=True,
-        # No name_override — should error out with a retry hint.
-    )
-
-    assert installs == []
-    out = sink.getvalue()
-    assert "Cannot install from URL" in out
-    assert "--name <your-name>" in out
-
-
-def test_url_install_prompts_interactively_when_tty(monkeypatch, tmp_path, hub_env):
-    installs = _install_mocks(monkeypatch, tmp_path, _make_url_bundle_fetcher())
-
-    # Simulate user typing "my-interactive" to name prompt, then "" to category.
-    answers = iter(["my-interactive", ""])
-    monkeypatch.setattr("builtins.input", lambda prompt="": next(answers))
-
-    sink = StringIO()
-    console = Console(file=sink, force_terminal=False, color_system=None)
-    do_install(
-        "https://example.com/SKILL.md",
-        console=console, skip_confirm=False,  # interactive
-        force=True,  # skip the final confirm prompt (tested elsewhere)
-    )
-
-    assert installs == [{"name": "my-interactive", "category": ""}]
-
-
-def test_url_install_prompts_category_and_uses_typed_value(monkeypatch, tmp_path, hub_env):
-    import tools.skills_hub as hub
-    installs = _install_mocks(
-        monkeypatch, tmp_path,
-        _make_url_bundle_fetcher(name="sharethis-chat", awaiting_name=False),
-    )
-
-    # Stage an existing category bucket so _existing_categories finds it.
-    (hub.SKILLS_DIR / "productivity" / "notion").mkdir(parents=True)
-    (hub.SKILLS_DIR / "productivity" / "notion" / "SKILL.md").write_text("# notion")
-
-    # Name is already resolved (from frontmatter) → only category prompt fires.
-    answers = iter(["productivity"])
-    monkeypatch.setattr("builtins.input", lambda prompt="": next(answers))
-
-    sink = StringIO()
-    console = Console(file=sink, force_terminal=False, color_system=None)
-    do_install(
-        "https://example.com/sharethis-chat/SKILL.md",
-        console=console, skip_confirm=False, force=True,
-    )
-
-    assert installs == [{"name": "sharethis-chat", "category": "productivity"}]
-    assert "Existing: productivity" in sink.getvalue()
-
-
-def test_url_install_cancel_name_prompt_aborts(monkeypatch, tmp_path, hub_env):
-    installs = _install_mocks(monkeypatch, tmp_path, _make_url_bundle_fetcher())
-
-    # Empty input with no default → name prompt returns None → abort.
-    monkeypatch.setattr("builtins.input", lambda prompt="": "")
-
-    sink = StringIO()
-    console = Console(file=sink, force_terminal=False, color_system=None)
-    do_install(
-        "https://example.com/SKILL.md",
-        console=console, skip_confirm=False, force=True,
-    )
-
-    assert installs == []
-    assert "Installation cancelled" in sink.getvalue()
 
 
 # ── _existing_categories ────────────────────────────────────────────────────
 
 
-def test_existing_categories_skips_top_level_skills(monkeypatch, tmp_path, hub_env):
-    import tools.skills_hub as hub
-    from hermes_cli.skills_hub import _existing_categories
-
-    # Category bucket with nested skill.
-    (hub.SKILLS_DIR / "productivity" / "notion").mkdir(parents=True)
-    (hub.SKILLS_DIR / "productivity" / "notion" / "SKILL.md").write_text("# notion")
-
-    # Flat skill at top level (NOT a category).
-    (hub.SKILLS_DIR / "my-flat-skill").mkdir()
-    (hub.SKILLS_DIR / "my-flat-skill" / "SKILL.md").write_text("# flat")
-
-    # Empty dir (NOT a category — no SKILL.md below).
-    (hub.SKILLS_DIR / "empty-dir").mkdir()
-
-    # Hidden dir (ignored).
-    (hub.SKILLS_DIR / ".hub").mkdir(exist_ok=True)
-
-    cats = _existing_categories()
-    assert cats == ["productivity"]
 
 
-def test_existing_categories_returns_empty_when_skills_dir_missing(monkeypatch, tmp_path, hub_env):
-    # hub_env creates tmp_path/skills/.hub — we point SKILLS_DIR at a missing sibling.
-    import tools.skills_hub as hub
-    monkeypatch.setattr(hub, "SKILLS_DIR", tmp_path / "does-not-exist")
-
-    from hermes_cli.skills_hub import _existing_categories
-    assert _existing_categories() == []
 
 
 # ---------------------------------------------------------------------------
@@ -988,303 +369,6 @@ def test_existing_categories_returns_empty_when_skills_dir_missing(monkeypatch, 
 # ---------------------------------------------------------------------------
 
 
-def test_browse_skills_dedup_uses_identifier_not_name(monkeypatch):
-    """browse_skills() must not collapse browse-sh skills that share a task name.
-
-    Airbnb and Booking.com both publish a 'search-listings' skill. Before the
-    fix, both were keyed by name so only one survived deduplication. After the
-    fix, each unique identifier produces a distinct result.
-    """
-    from tools.skills_hub import SkillMeta
-    from hermes_cli.skills_hub import browse_skills
-
-    airbnb = SkillMeta(
-        name="search-listings", description="Airbnb search", source="browse-sh",
-        identifier="browse-sh/airbnb.com/search-listings-ddgioa", trust_level="community",
-    )
-    booking = SkillMeta(
-        name="search-listings", description="Booking.com search", source="browse-sh",
-        identifier="browse-sh/booking.com/search-listings-xyzab", trust_level="community",
-    )
-
-    mock_src = type("S", (), {
-        "source_id": lambda self: "browse-sh",
-        "search": lambda self, q, limit=500: [airbnb, booking],
-    })()
-
-    # browse_skills() imports create_source_router locally from tools.skills_hub,
-    # so the patch must target the source module, not hermes_cli.skills_hub.
-    with patch("tools.skills_hub.create_source_router", return_value=[mock_src]):
-        result = browse_skills(page=1, page_size=50)
-
-    names = [item["name"] for item in result["items"]]
-    assert names.count("search-listings") == 2, (
-        "browse_skills() must not deduplicate browse-sh skills with the same name "
-        "but different identifiers"
-    )
-
-# ---------------------------------------------------------------------------
-# Local-filesystem inspect fallback -- Phase 1 Direction E
-# ---------------------------------------------------------------------------
-
-
-def _make_local_skill_dir(skills_dir: Path, name: str, description: str = "") -> Path:
-    """Create a minimal local skill directory with SKILL.md and frontmatter."""
-    skill_dir = skills_dir / name
-    skill_dir.mkdir(parents=True, exist_ok=True)
-    frontmatter = f"""---
-name: {name}
-description: {description or "A local test skill"}
----
-
-# {name}
-
-Full content for {name}.
-"""
-    (skill_dir / "SKILL.md").write_text(frontmatter, encoding="utf-8")
-    return skill_dir
-
-
-def test_do_inspect_falls_back_to_local_skill_when_hub_miss(monkeypatch, tmp_path, hub_env):
-    """RED: `do_inspect` cannot inspect a local-only skill that `do_list` shows.
-
-    This test proves the missing fallback: when hub/tap sources have no record
-    of a skill name, `do_inspect` should scan the same local filesystem that
-    `do_list` uses and render the skill's metadata + SKILL.md preview.
-    """
-    import tools.skills_hub as hub
-    import tools.skills_sync as skills_sync
-    import tools.skills_tool as skills_tool
-
-    # Stage a local-only skill in the (monkeypatched) skills directory.
-    local_skill_dir = _make_local_skill_dir(
-        hub.SKILLS_DIR, "local-only-inspect-skill",
-        description="A purely local skill for inspect fallback"
-    )
-
-    # No hub-installed skills, no builtins.
-    monkeypatch.setattr(hub, "HubLockFile", lambda: _DummyLockFile([]))
-    monkeypatch.setattr(skills_sync, "_read_manifest", lambda: {})
-
-    # Prevent do_inspect from trying real network sources (which time out).
-    monkeypatch.setattr(hub, "create_source_router", lambda auth: [])
-
-    # _find_all_skills must use the real scanner so the local skill is visible.
-    # hub_env patches tools.skills_hub.SKILLS_DIR but _find_all_skills lives in
-    # tools.skills_tool and imports its own SKILLS_DIR -- patch that too.
-    monkeypatch.setattr(skills_tool, "SKILLS_DIR", hub.SKILLS_DIR)
-    monkeypatch.setattr(skills_tool, "_get_disabled_skill_names", lambda: set())
-
-    # Run do_list first to confirm the skill is visible locally.
-    list_output = _capture(source_filter="local")
-    assert "local-only-inspect-skill" in list_output, (
-        "Setup error: local skill must be visible to do_list before inspect fallback works"
-    )
-
-    # Now run do_inspect on the local-only skill.
-    sink = StringIO()
-    console = Console(file=sink, force_terminal=False, color_system=None)
-    do_inspect("local-only-inspect-skill", console=console)
-
-    output = sink.getvalue()
-    assert "local-only-inspect-skill" in output, (
-        "Expected do_inspect to find and render the local-only skill"
-    )
-    assert "Full content for local-only-inspect-skill" in output, (
-        "Expected SKILL.md preview to be rendered from local filesystem"
-    )
-
-
-def test_do_inspect_prefers_hub_when_both_exist(monkeypatch, tmp_path, hub_env):
-    """GREEN-slice: when a skill exists both locally and in hub, hub resolution wins."""
-    import tools.skills_hub as hub
-    import tools.skills_sync as skills_sync
-    import tools.skills_tool as skills_tool
-
-    # Stage a local skill with the same name as a hub skill.
-    _make_local_skill_dir(
-        hub.SKILLS_DIR, "hub-and-local-skill",
-        description="Local copy"
-    )
-    monkeypatch.setattr(skills_tool, "SKILLS_DIR", hub.SKILLS_DIR)
-    monkeypatch.setattr(skills_tool, "_get_disabled_skill_names", lambda: set())
-
-    # Hub source resolves successfully.
-    canonical = "github/example/hub-and-local-skill"
-
-    class _HubSource:
-        def inspect(self, identifier):
-            return hub.SkillMeta(
-                name="hub-and-local-skill",
-                description="Hub canonical description",
-                source="github",
-                identifier=canonical,
-                trust_level="trusted",
-            )
-
-        def fetch(self, identifier):
-            return hub.SkillBundle(
-                name="hub-and-local-skill",
-                files={"SKILL.md": "Hub SKILL.md content"},
-                source="github",
-                identifier=canonical,
-                trust_level="trusted",
-            )
-
-    monkeypatch.setattr(hub, "HubLockFile", lambda: _DummyLockFile([]))
-    monkeypatch.setattr(skills_sync, "_read_manifest", lambda: {})
-    monkeypatch.setattr(hub, "create_source_router", lambda auth: [_HubSource()])
-
-    sink = StringIO()
-    console = Console(file=sink, force_terminal=False, color_system=None)
-    do_inspect(canonical, console=console)
-
-    output = sink.getvalue()
-    assert "Hub canonical description" in output
-    assert "Hub SKILL.md content" in output
-    assert "github" in output
-
-
-def test_do_inspect_errors_cleanly_for_truly_missing_skill(monkeypatch, tmp_path, hub_env):
-    """GREEN-slice: a skill that exists neither locally nor in hub emits a clear error."""
-    import tools.skills_hub as hub
-    import tools.skills_sync as skills_sync
-    import tools.skills_tool as skills_tool
-
-    monkeypatch.setattr(hub, "HubLockFile", lambda: _DummyLockFile([]))
-    monkeypatch.setattr(skills_sync, "_read_manifest", lambda: {})
-    monkeypatch.setattr(skills_tool, "SKILLS_DIR", hub.SKILLS_DIR)
-    monkeypatch.setattr(skills_tool, "_get_disabled_skill_names", lambda: set())
-    monkeypatch.setattr(hub, "create_source_router", lambda auth: [])
-
-    sink = StringIO()
-    console = Console(file=sink, force_terminal=False, color_system=None)
-    do_inspect("completely-missing-skill", console=console)
-
-    output = sink.getvalue()
-    assert "Error" in output
-    assert "completely-missing-skill" in output
-
-
-def test_inspect_skill_returns_local_fallback_dict(monkeypatch, tmp_path, hub_env):
-    """GREEN-slice: programmatic `inspect_skill` also falls back to local filesystem."""
-    import tools.skills_hub as hub
-    import tools.skills_sync as skills_sync
-    import tools.skills_tool as skills_tool
-
-    _make_local_skill_dir(
-        hub.SKILLS_DIR, "prog-local-skill",
-        description="Programmatic local fallback"
-    )
-    monkeypatch.setattr(skills_tool, "SKILLS_DIR", hub.SKILLS_DIR)
-    monkeypatch.setattr(skills_tool, "_get_disabled_skill_names", lambda: set())
-    monkeypatch.setattr(hub, "HubLockFile", lambda: _DummyLockFile([]))
-    monkeypatch.setattr(skills_sync, "_read_manifest", lambda: {})
-    monkeypatch.setattr(hub, "create_source_router", lambda auth: [])
-
-    result = inspect_skill("prog-local-skill")
-    assert result is not None
-    assert result["name"] == "prog-local-skill"
-    assert result["source"] == "local"
-    assert "Programmatic local fallback" in result["description"]
-    assert "skill_md_preview" in result
-
-
-def test_inspect_skill_returns_none_for_truly_missing(monkeypatch, tmp_path, hub_env):
-    """GREEN-slice: programmatic `inspect_skill` returns None when skill is absent everywhere."""
-    import tools.skills_hub as hub
-    import tools.skills_sync as skills_sync
-    import tools.skills_tool as skills_tool
-
-    monkeypatch.setattr(skills_tool, "SKILLS_DIR", hub.SKILLS_DIR)
-    monkeypatch.setattr(skills_tool, "_get_disabled_skill_names", lambda: set())
-    monkeypatch.setattr(hub, "HubLockFile", lambda: _DummyLockFile([]))
-    monkeypatch.setattr(skills_sync, "_read_manifest", lambda: {})
-    monkeypatch.setattr(hub, "create_source_router", lambda auth: [])
-
-    result = inspect_skill("no-such-skill-anywhere")
-    assert result is None
-
-
-# ---------------------------------------------------------------------------
-# Local-filesystem inspect fallback -- FALSE-ERROR REPAIR
-# ---------------------------------------------------------------------------
-
-
-def test_do_inspect_local_fallback_does_not_print_false_error(monkeypatch, tmp_path, hub_env):
-    """RED: `do_inspect` on a local-only short name must NOT print a false
-    `Error: No skill named ... found in any source` before successfully
-    rendering the local skill.
-
-    This is the blocker from review t_b1408cf0.
-    """
-    import tools.skills_hub as hub
-    import tools.skills_sync as skills_sync
-    import tools.skills_tool as skills_tool
-
-    # Stage a local-only skill.
-    _make_local_skill_dir(
-        hub.SKILLS_DIR, "false-error-local-skill",
-        description="A local skill that should not trigger a false error"
-    )
-    monkeypatch.setattr(skills_tool, "SKILLS_DIR", hub.SKILLS_DIR)
-    monkeypatch.setattr(skills_tool, "_get_disabled_skill_names", lambda: set())
-    monkeypatch.setattr(hub, "HubLockFile", lambda: _DummyLockFile([]))
-    monkeypatch.setattr(skills_sync, "_read_manifest", lambda: {})
-    monkeypatch.setattr(hub, "create_source_router", lambda auth: [])
-
-    sink = StringIO()
-    console = Console(file=sink, force_terminal=False, color_system=None)
-    do_inspect("false-error-local-skill", console=console)
-
-    output = sink.getvalue()
-    # The fix: no false "Error:" and no "No skill named ... found" noise.
-    assert "Error:" not in output, (
-        "do_inspect must not print a false error when local fallback succeeds"
-    )
-    assert "No skill named" not in output, (
-        "do_inspect must not print the not-found message when local fallback succeeds"
-    )
-    # But the skill must still be rendered.
-    assert "false-error-local-skill" in output
-    assert "A local skill that should not trigger a false error" in output
-
-def test_do_browse_reports_live_per_source_progress():
-    """do_browse must pass an on_source_done callback so the status line ticks
-    off each source as it resolves, instead of showing a frozen spinner while
-    a slow source blocks. The page is still rendered once, after the full
-    result set is merged and trust-sorted."""
-    from hermes_cli.skills_hub import do_browse
-    from tools.skills_hub import SkillMeta
-
-    meta = SkillMeta(
-        name="demo", description="d", source="official",
-        identifier="official/demo", trust_level="builtin",
-    )
-
-    captured = {}
-
-    def fake_parallel(sources, query="", per_source_limits=None,
-                      source_filter="all", overall_timeout=30,
-                      on_source_done=None):
-        # Simulate two sources completing — the callback must be wired through.
-        assert on_source_done is not None, "do_browse must pass on_source_done"
-        on_source_done("official", 1)
-        on_source_done("clawhub", 0)
-        captured["called"] = True
-        return [meta], {"official": 1, "clawhub": 0}, []
-
-    sink = StringIO()
-    console = Console(file=sink, force_terminal=False, color_system=None, width=120)
-
-    with patch("tools.skills_hub.create_source_router", return_value=[]), \
-         patch("tools.skills_hub.GitHubAuth"), \
-         patch("tools.skills_hub.parallel_search_sources", side_effect=fake_parallel):
-        do_browse(page=1, page_size=20, console=console)
-
-    assert captured.get("called"), "parallel_search_sources was not invoked"
-    # The rendered page still shows the (single) merged result.
-    assert "demo" in sink.getvalue()
 
 
 # ---------------------------------------------------------------------------
@@ -1302,56 +386,6 @@ _LONG_RESULT = type("R", (), {
     "trust_level": "community",
     "identifier": _LONG_SLUG,
 })()
-
-
-def test_do_search_identifier_column_does_not_truncate_long_slug():
-    """The Identifier column must use overflow='fold', not the default ellipsis.
-
-    Renders into a deliberately narrow Console; the full slug (including the
-    trailing -1uezib hash) must still appear in the output. Before the fix,
-    Rich would render `browse-sh/weather…` and lose the hash.
-    """
-    from hermes_cli.skills_hub import do_search
-
-    sink = StringIO()
-    # Narrow width forces Rich to apply overflow rules — exactly the scenario
-    # the issue reports. width=40 is too small for the slug; we want the slug
-    # wrapped (not ellipsis-truncated).
-    console = Console(file=sink, force_terminal=False, color_system=None, width=40)
-
-    with patch("tools.skills_hub.unified_search", return_value=[_LONG_RESULT]), \
-         patch("tools.skills_hub.create_source_router", return_value={}), \
-         patch("tools.skills_hub.GitHubAuth"):
-        do_search("weather", console=console)
-
-    output = sink.getvalue()
-
-    # The fix is working when the Identifier column wraps the slug across
-    # multiple lines (folded chunks) rather than emitting ONE line with an
-    # ellipsis. Extract every chunk that appears in the rightmost cell of
-    # the table by walking lines that look like table rows ("│ ... │") and
-    # taking the last `│...│` cell. Concatenating those chunks must yield
-    # the full slug.
-    chunks = []
-    for line in output.splitlines():
-        # Table data rows start and end with the box-drawing vertical bar.
-        if not line.startswith("│") or not line.rstrip().endswith("│"):
-            continue
-        # Last `│ ... │` cell on the row is the Identifier column.
-        last_cell = line.rstrip().rsplit("│", 2)[-2].strip()
-        if last_cell:
-            chunks.append(last_cell)
-    reconstructed = "".join(chunks)
-    assert _LONG_SLUG in reconstructed, (
-        f"Expected full slug {_LONG_SLUG!r} to be recoverable from the "
-        f"folded Identifier column; got chunks {chunks!r}\n"
-        f"Full output:\n{output}"
-    )
-    # And the truncating ellipsis must NOT appear in the Identifier column.
-    # Rich uses U+2026 HORIZONTAL ELLIPSIS for the default overflow="ellipsis".
-    assert "\u2026" not in reconstructed, (
-        f"Identifier column still ellipsis-truncated: {reconstructed!r}"
-    )
 
 
 def test_do_search_json_flag_emits_full_identifiers(capsys):
@@ -1458,3 +492,1033 @@ def test_do_update_unmodified_skill_updates_normally(monkeypatch, tmp_path):
 
     assert installs == ["someone/hub-skill"]
     assert "Updated 1 skill(s)" in sink.getvalue()
+
+
+def test_resolve_install_target_uses_dynamic_skills_dir_without_module_constant(monkeypatch, tmp_path):
+    """Regression for installs after skills_hub path constants became dynamic.
+
+    PEP 562 ``__getattr__`` helps external ``from tools.skills_hub import
+    SKILLS_DIR`` callers, but unqualified ``SKILLS_DIR`` inside this module is
+    still a normal global lookup. The install path resolver must use the
+    per-call helper directly so a fresh process with no monkeypatched module
+    constant can install skills.
+    """
+    import tools.skills_hub as hub
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
+    monkeypatch.delitem(hub.__dict__, "SKILLS_DIR", raising=False)
+
+    target = hub._resolve_install_target_path(
+        "research/long-research",
+        "long-research",
+    )
+
+    assert target == tmp_path / ".hermes" / "skills" / "research" / "long-research"
+
+def test_do_list_initializes_hub_dir(monkeypatch, hub_env):
+    import tools.skills_sync as skills_sync
+    import tools.skills_tool as skills_tool
+
+    monkeypatch.setattr(skills_tool, "_find_all_skills", lambda **_kwargs: [])
+    monkeypatch.setattr(skills_sync, "_read_manifest", lambda: {})
+
+    hub_dir = hub_env
+    assert not hub_dir.exists()
+
+    _capture()
+
+    assert hub_dir.exists()
+    assert (hub_dir / "lock.json").exists()
+    assert (hub_dir / "quarantine").is_dir()
+    assert (hub_dir / "index-cache").is_dir()
+
+def test_do_list_distinguishes_hub_builtin_and_local(three_source_env):
+    output = _capture()
+
+    assert "hub-skill" in output
+    assert "builtin-skill" in output
+    assert "local-skill" in output
+    assert "1 hub-installed, 1 builtin, 1 local" in output
+
+def test_do_list_filter_local(three_source_env):
+    output = _capture(source_filter="local")
+
+    assert "local-skill" in output
+    assert "builtin-skill" not in output
+    assert "hub-skill" not in output
+
+def test_do_list_filter_hub(three_source_env):
+    output = _capture(source_filter="hub")
+
+    assert "hub-skill" in output
+    assert "builtin-skill" not in output
+    assert "local-skill" not in output
+
+def test_do_list_filter_builtin(three_source_env):
+    output = _capture(source_filter="builtin")
+
+    assert "builtin-skill" in output
+    assert "hub-skill" not in output
+    assert "local-skill" not in output
+
+def test_do_list_renders_status_column(three_source_env, monkeypatch):
+    """Every list row should carry an enabled/disabled status (new in PR that
+    answered Mr Mochizuki's 'I just want to see what's live' question)."""
+    from agent import skill_utils
+
+    monkeypatch.setattr(skill_utils, "get_disabled_skill_names", lambda platform=None: set())
+    output = _capture()
+
+    assert "Status" in output
+    assert "enabled" in output.lower()
+    # Summary counts enabled skills.
+    assert "3 enabled, 0 disabled" in output
+
+def test_do_list_marks_disabled_skills(three_source_env, monkeypatch):
+    from agent import skill_utils
+
+    # Simulate `skills.disabled: [hub-skill]` in config.
+    monkeypatch.setattr(
+        skill_utils, "get_disabled_skill_names",
+        lambda platform=None: {"hub-skill"},
+    )
+    output = _capture()
+
+    # Row still appears (no --enabled-only), but marked disabled
+    assert "hub-skill" in output
+    assert "disabled" in output.lower()
+    assert "2 enabled, 1 disabled" in output
+
+def test_do_list_enabled_only_hides_disabled(three_source_env, monkeypatch):
+    from agent import skill_utils
+
+    monkeypatch.setattr(
+        skill_utils, "get_disabled_skill_names",
+        lambda platform=None: {"hub-skill"},
+    )
+    sink = StringIO()
+    console = Console(file=sink, force_terminal=False, color_system=None)
+    do_list(enabled_only=True, console=console)
+    output = sink.getvalue()
+
+    assert "hub-skill" not in output
+    assert "builtin-skill" in output
+    assert "local-skill" in output
+    assert "enabled only" in output.lower()
+    assert "2 enabled shown" in output
+
+def test_do_check_reports_available_updates(monkeypatch):
+    output = _capture_check(monkeypatch, [
+        {"name": "hub-skill", "source": "skills.sh", "status": "update_available"},
+        {"name": "other-skill", "source": "github", "status": "up_to_date"},
+    ])
+
+    assert "hub-skill" in output
+    assert "update_available" in output
+    assert "up_to_date" in output
+
+def test_do_check_handles_no_installed_updates(monkeypatch):
+    output = _capture_check(monkeypatch, [])
+
+    assert "No hub-installed skills to check" in output
+
+def test_do_update_reinstalls_outdated_skills(monkeypatch):
+    output, installs = _capture_update(monkeypatch, [
+        {"name": "hub-skill", "identifier": "skills-sh/example/repo/hub-skill", "status": "update_available"},
+        {"name": "other-skill", "identifier": "github/example/other-skill", "status": "up_to_date"},
+    ])
+
+    assert installs == [("skills-sh/example/repo/hub-skill", "category", True)]
+    assert "Updated 1 skill" in output
+
+def test_do_update_pins_install_to_locked_source(monkeypatch):
+    """do_update must forward the lockfile's `source` to do_install.
+
+    Without the pin, a bare identifier like "reddit" reaches
+    _resolve_short_name()'s fuzzy catalog search inside do_install and can
+    resolve to a same-named skill in another registry.
+    """
+    import tools.skills_hub as hub
+    import hermes_cli.skills_hub as cli_hub
+
+    sink = StringIO()
+    console = Console(file=sink, force_terminal=False, color_system=None)
+    calls = []
+
+    monkeypatch.setattr(hub, "check_for_skill_updates", lambda **_kwargs: [
+        {"name": "reddit", "identifier": "reddit", "source": "clawhub",
+         "status": "update_available"},
+    ])
+    monkeypatch.setattr(hub, "HubLockFile", lambda: type("L", (), {
+        "get_installed": lambda self, name: {"install_path": "category/" + name}
+    })())
+    monkeypatch.setattr(
+        cli_hub, "do_install",
+        lambda identifier, category="", force=False, console=None, source_id=None:
+            calls.append({"identifier": identifier, "source_id": source_id}),
+    )
+
+    do_update(console=console)
+
+    assert calls == [{"identifier": "reddit", "source_id": "clawhub"}]
+
+def test_do_install_refuses_unknown_pinned_source(monkeypatch, hub_env):
+    """A pinned source with no matching adapter must abort, not fall back.
+
+    Falling back to the full source router is what allowed a foreign registry
+    to satisfy the install.
+    """
+    import tools.skills_hub as hub
+
+    sink = StringIO()
+    console = Console(file=sink, force_terminal=False, color_system=None)
+    resolved = []
+
+    monkeypatch.setattr(hub, "create_source_router", lambda auth=None: [])
+    monkeypatch.setattr(hub, "GitHubAuth", lambda: object())
+    monkeypatch.setattr(
+        "hermes_cli.skills_hub._resolve_short_name",
+        lambda name, sources, c: resolved.append(name) or "",
+    )
+
+    do_install("reddit", source_id="clawhub", console=console)
+
+    assert resolved == [], "must not attempt a fuzzy resolve when the pin is unsatisfiable"
+    assert "provenance" in sink.getvalue()
+
+def test_handle_skills_slash_search_accepts_chatconsole_without_status_errors():
+    results = [type("R", (), {
+        "name": "kubernetes",
+        "description": "Cluster orchestration",
+        "source": "skills.sh",
+        "trust_level": "community",
+        "identifier": "skills-sh/example/kubernetes",
+    })()]
+
+    with patch("tools.skills_hub.unified_search", return_value=results), \
+         patch("tools.skills_hub.create_source_router", return_value={}), \
+         patch("tools.skills_hub.GitHubAuth"):
+        handle_skills_slash("/skills search kubernetes", console=ChatConsole())
+
+def test_do_install_scans_with_resolved_identifier(monkeypatch, tmp_path, hub_env):
+    import tools.skills_guard as guard
+    import tools.skills_hub as hub
+
+    canonical_identifier = "skills-sh/anthropics/skills/frontend-design"
+
+    class _ResolvedSource:
+        def inspect(self, identifier):
+            return type("Meta", (), {
+                "extra": {},
+                "identifier": canonical_identifier,
+            })()
+
+        def fetch(self, identifier):
+            return type("Bundle", (), {
+                "name": "frontend-design",
+                "files": {"SKILL.md": "# Frontend Design"},
+                "source": "skills.sh",
+                "identifier": canonical_identifier,
+                "trust_level": "trusted",
+                "metadata": {},
+            })()
+    q_path = tmp_path / "skills" / ".hub" / "quarantine" / "frontend-design"
+    q_path.mkdir(parents=True)
+    (q_path / "SKILL.md").write_text("# Frontend Design")
+
+    scanned = {}
+
+    def _scan_skill(skill_path, source="community"):
+        scanned["source"] = source
+        return guard.ScanResult(
+            skill_name="frontend-design",
+            source=source,
+            trust_level="trusted",
+            verdict="safe",
+        )
+
+    monkeypatch.setattr(hub, "ensure_hub_dirs", lambda: None)
+    monkeypatch.setattr(hub, "create_source_router", lambda auth: [_ResolvedSource()])
+    monkeypatch.setattr(hub, "quarantine_bundle", lambda bundle: q_path)
+    monkeypatch.setattr(hub, "HubLockFile", lambda: type("Lock", (), {"get_installed": lambda self, name: None})())
+    monkeypatch.setattr(guard, "scan_skill", _scan_skill)
+    monkeypatch.setattr(guard, "format_scan_report", lambda result: "scan ok")
+    monkeypatch.setattr(guard, "should_allow_install", lambda result, force=False: (False, "stop after scan"))
+
+    sink = StringIO()
+    console = Console(file=sink, force_terminal=False, color_system=None)
+
+    do_install("skils-sh/anthropics/skills/frontend-design", console=console, skip_confirm=True)
+
+    assert scanned["source"] == canonical_identifier
+
+def test_looks_like_direct_github_identifier_classifies_source_boundaries():
+    from hermes_cli.skills_hub import _looks_like_direct_github_identifier
+
+    assert _looks_like_direct_github_identifier("rzyns/hermes-stuff/plan")
+    assert _looks_like_direct_github_identifier("rzyns/hermes-stuff/skills/plan")
+    assert _looks_like_direct_github_identifier("https://github.com/rzyns/hermes-stuff/tree/main/skills/plan")
+    assert _looks_like_direct_github_identifier("https://github.com/rzyns/hermes-stuff/blob/main/skills/plan/SKILL.md")
+
+    assert not _looks_like_direct_github_identifier("plan")
+    assert not _looks_like_direct_github_identifier("skills-sh/rzyns/hermes-stuff/plan")
+    assert not _looks_like_direct_github_identifier("official/plan")
+    assert not _looks_like_direct_github_identifier("https://example.com/rzyns/hermes-stuff/tree/main/skills/plan")
+    assert not _looks_like_direct_github_identifier("https://github.com/rzyns/hermes-stuff")
+
+def test_resolve_source_prefers_matching_github_tap_over_registry_collision():
+    from tools.skills_hub import SkillBundle, SkillMeta
+    from hermes_cli.skills_hub import _resolve_source_meta_and_bundle
+
+    class _RegistrySource:
+        def source_id(self):
+            return "hermes-index"
+
+        def inspect(self, identifier):
+            return SkillMeta(
+                name="plan",
+                description="Unrelated registry plan",
+                source="hermes-index",
+                identifier="registry/plan",
+                trust_level="community",
+            )
+
+        def fetch(self, identifier):
+            return SkillBundle(
+                name="plan",
+                files={"SKILL.md": "# wrong"},
+                source="hermes-index",
+                identifier="registry/plan",
+                trust_level="community",
+            )
+
+    class _MatchingGitHubTapSource:
+        taps = [{"repo": "rzyns/hermes-stuff", "path": "skills/"}]
+
+        def source_id(self):
+            return "github"
+
+        def inspect(self, identifier):
+            if identifier != "rzyns/hermes-stuff/plan":
+                return None
+            return SkillMeta(
+                name="plan",
+                description="Repo plan",
+                source="github",
+                identifier="rzyns/hermes-stuff/skills/plan",
+                trust_level="community",
+                repo="rzyns/hermes-stuff",
+                path="skills/plan",
+            )
+
+        def fetch(self, identifier):
+            if identifier != "rzyns/hermes-stuff/plan":
+                return None
+            return SkillBundle(
+                name="plan",
+                files={"SKILL.md": "# right", "references/kanban-artifact-planning.md": "# ref"},
+                source="github",
+                identifier="rzyns/hermes-stuff/skills/plan",
+                trust_level="community",
+            )
+
+    meta, bundle, matched = _resolve_source_meta_and_bundle(
+        "rzyns/hermes-stuff/plan",
+        [_RegistrySource(), _MatchingGitHubTapSource()],
+    )
+
+    assert matched.source_id() == "github"
+    assert meta.identifier == "rzyns/hermes-stuff/skills/plan"
+    assert bundle.identifier == "rzyns/hermes-stuff/skills/plan"
+    assert "references/kanban-artifact-planning.md" in bundle.files
+
+def test_resolve_source_does_not_fall_back_for_github_tree_url_collision():
+    from tools.skills_hub import SkillBundle, SkillMeta
+    from hermes_cli.skills_hub import _resolve_source_meta_and_bundle
+
+    class _UnavailableGitHubSource:
+        def source_id(self):
+            return "github"
+
+        def inspect(self, identifier):
+            return None
+
+        def fetch(self, identifier):
+            return None
+
+    class _RegistryCollisionSource:
+        def source_id(self):
+            return "clawhub"
+
+        def inspect(self, identifier):
+            return SkillMeta(
+                name="plan", description="Wrong registry plan", source="clawhub",
+                identifier="plan", trust_level="community",
+            )
+
+        def fetch(self, identifier):
+            return SkillBundle(
+                name="plan", files={"SKILL.md": "# wrong"}, source="clawhub",
+                identifier="plan", trust_level="community",
+            )
+
+    meta, bundle, matched = _resolve_source_meta_and_bundle(
+        "https://github.com/rzyns/hermes-stuff/tree/main/skills/plan",
+        [_UnavailableGitHubSource(), _RegistryCollisionSource()],
+    )
+
+    assert meta is None
+    assert bundle is None
+    assert matched is None
+
+def test_resolve_source_does_not_fall_back_when_direct_github_ref_unavailable():
+    from tools.skills_hub import SkillBundle, SkillMeta
+    from hermes_cli.skills_hub import _resolve_source_meta_and_bundle
+
+    class _UnavailableGitHubSource:
+        def source_id(self):
+            return "github"
+
+        def inspect(self, identifier):
+            return None
+
+        def fetch(self, identifier):
+            return None
+
+    class _RegistryCollisionSource:
+        def source_id(self):
+            return "clawhub"
+
+        def inspect(self, identifier):
+            return SkillMeta(
+                name="plan",
+                description="Wrong registry plan",
+                source="clawhub",
+                identifier="plan",
+                trust_level="community",
+            )
+
+        def fetch(self, identifier):
+            return SkillBundle(
+                name="plan",
+                files={"SKILL.md": "# wrong"},
+                source="clawhub",
+                identifier="plan",
+                trust_level="community",
+            )
+
+    meta, bundle, matched = _resolve_source_meta_and_bundle(
+        "rzyns/hermes-stuff/plan",
+        [_UnavailableGitHubSource(), _RegistryCollisionSource()],
+    )
+
+    assert meta is None
+    assert bundle is None
+    assert matched is None
+
+def test_do_install_github_tree_url_persists_identifier_and_ref_metadata(monkeypatch, tmp_path, hub_env):
+    import tools.skills_hub as hub
+    import tools.skills_guard as guard
+    from tools.skills_hub import SkillBundle, SkillMeta
+
+    tree_url = "https://github.com/rzyns/hermes-stuff/tree/main/skills/plan"
+
+    class _GitHubTreeSource:
+        def source_id(self):
+            return "github"
+
+        def inspect(self, identifier):
+            assert identifier == tree_url
+            return SkillMeta(
+                name="plan",
+                description="Repo plan skill",
+                source="github",
+                identifier=tree_url,
+                trust_level="community",
+                repo="rzyns/hermes-stuff",
+                path="skills/plan",
+                extra={"ref": "main"},
+            )
+
+        def fetch(self, identifier):
+            assert identifier == tree_url
+            return SkillBundle(
+                name="plan",
+                files={
+                    "SKILL.md": "---\nname: plan\n---\n",
+                    "references/kanban-artifact-planning.md": "# ref",
+                },
+                source="github",
+                identifier=tree_url,
+                trust_level="community",
+                metadata={"repo": "rzyns/hermes-stuff", "path": "skills/plan", "ref": "main"},
+            )
+
+    RealHubLockFile = hub.HubLockFile
+    monkeypatch.setattr(hub, "HubLockFile", lambda: RealHubLockFile(hub.LOCK_FILE))
+    monkeypatch.setattr(hub, "create_source_router", lambda auth: [_GitHubTreeSource()])
+    monkeypatch.setattr(
+        guard, "scan_skill",
+        lambda skill_path, source="community": guard.ScanResult(
+            skill_name="plan", source=source, trust_level="community", verdict="safe",
+        ),
+    )
+    monkeypatch.setattr(guard, "format_scan_report", lambda result: "scan ok")
+    monkeypatch.setattr(guard, "should_allow_install", lambda result, force=False: (True, "ok"))
+
+    sink = StringIO()
+    console = Console(file=sink, force_terminal=False, color_system=None)
+    do_install(tree_url, console=console, skip_confirm=True)
+
+    assert (tmp_path / "skills" / "plan" / "SKILL.md").is_file()
+    assert (tmp_path / "skills" / "plan" / "references" / "kanban-artifact-planning.md").is_file()
+    entry = json.loads((hub_env / "lock.json").read_text())["installed"]["plan"]
+    assert entry["identifier"] == tree_url
+    assert entry["metadata"] == {"repo": "rzyns/hermes-stuff", "path": "skills/plan", "ref": "main"}
+    assert entry["files"] == ["SKILL.md", "references/kanban-artifact-planning.md"]
+
+def test_do_install_scans_official_bundles_with_source_provenance(
+    monkeypatch, tmp_path, hub_env
+):
+    import tools.skills_guard as guard
+    import tools.skills_hub as hub
+
+    class _OfficialSource:
+        def inspect(self, identifier):
+            return type("Meta", (), {
+                "extra": {},
+                "identifier": "official/agent/prunus-gaia",
+            })()
+
+        def fetch(self, identifier):
+            return type("Bundle", (), {
+                "name": "prunus-gaia",
+                "files": {"SKILL.md": "# Prunus Gaia"},
+                "source": "official",
+                "identifier": "official/agent/prunus-gaia",
+                "trust_level": "builtin",
+                "metadata": {},
+            })()
+
+    q_path = tmp_path / "skills" / ".hub" / "quarantine" / "prunus-gaia"
+    q_path.mkdir(parents=True)
+    (q_path / "SKILL.md").write_text("# Prunus Gaia")
+
+    scanned = {}
+
+    def _scan_skill(skill_path, source="community"):
+        scanned["source"] = source
+        return guard.ScanResult(
+            skill_name="prunus-gaia",
+            source=source,
+            trust_level="builtin",
+            verdict="safe",
+        )
+
+    monkeypatch.setattr(hub, "ensure_hub_dirs", lambda: None)
+    monkeypatch.setattr(hub, "create_source_router", lambda auth: [_OfficialSource()])
+    monkeypatch.setattr(hub, "quarantine_bundle", lambda bundle: q_path)
+    monkeypatch.setattr(hub, "HubLockFile", lambda: type("Lock", (), {"get_installed": lambda self, name: None})())
+    monkeypatch.setattr(guard, "scan_skill", _scan_skill)
+    monkeypatch.setattr(guard, "format_scan_report", lambda result: "scan ok")
+    monkeypatch.setattr(guard, "should_allow_install", lambda result, force=False: (False, "stop after scan"))
+
+    sink = StringIO()
+    console = Console(file=sink, force_terminal=False, color_system=None)
+
+    do_install("official/agent/prunus-gaia", console=console, skip_confirm=True)
+
+    assert scanned["source"] == "official"
+
+def test_do_install_preserves_nested_official_optional_path(
+    monkeypatch, tmp_path, hub_env
+):
+    class _OfficialNestedSource:
+        def inspect(self, identifier):
+            return type("Meta", (), {
+                "extra": {},
+                "identifier": "official/mlops/training/trl-fine-tuning",
+            })()
+
+        def fetch(self, identifier):
+            return type("Bundle", (), {
+                "name": "trl-fine-tuning",
+                "files": {"SKILL.md": "# TRL"},
+                "source": "official",
+                "identifier": "official/mlops/training/trl-fine-tuning",
+                "trust_level": "builtin",
+                "metadata": {},
+            })()
+
+    installs = _install_mocks(monkeypatch, tmp_path, _OfficialNestedSource)
+
+    sink = StringIO()
+    console = Console(file=sink, force_terminal=False, color_system=None)
+    do_install(
+        "official/mlops/training/trl-fine-tuning",
+        console=console,
+        skip_confirm=True,
+    )
+
+    assert installs == [{"name": "trl-fine-tuning", "category": "mlops/training"}]
+
+def test_url_install_uses_name_override_on_non_interactive_surface(monkeypatch, tmp_path, hub_env):
+    installs = _install_mocks(monkeypatch, tmp_path, _make_url_bundle_fetcher())
+
+    sink = StringIO()
+    console = Console(file=sink, force_terminal=False, color_system=None)
+    do_install(
+        "https://example.com/SKILL.md",
+        console=console, skip_confirm=True,
+        name_override="my-url-skill",
+    )
+
+    assert installs == [{"name": "my-url-skill", "category": ""}]
+
+def test_url_install_rejects_invalid_name_override(monkeypatch, tmp_path, hub_env):
+    installs = _install_mocks(monkeypatch, tmp_path, _make_url_bundle_fetcher())
+
+    sink = StringIO()
+    console = Console(file=sink, force_terminal=False, color_system=None)
+    do_install(
+        "https://example.com/SKILL.md",
+        console=console, skip_confirm=True,
+        name_override="SKILL",  # rejected by _is_valid_installed_skill_name
+    )
+
+    assert installs == []  # did NOT install
+    assert "Invalid --name" in sink.getvalue()
+
+def test_url_install_actionable_error_on_non_interactive_with_no_name(monkeypatch, tmp_path, hub_env):
+    installs = _install_mocks(monkeypatch, tmp_path, _make_url_bundle_fetcher())
+
+    sink = StringIO()
+    console = Console(file=sink, force_terminal=False, color_system=None)
+    do_install(
+        "https://example.com/SKILL.md",
+        console=console, skip_confirm=True,
+        # No name_override — should error out with a retry hint.
+    )
+
+    assert installs == []
+    out = sink.getvalue()
+    assert "Cannot install from URL" in out
+    assert "--name <your-name>" in out
+
+def test_url_install_prompts_interactively_when_tty(monkeypatch, tmp_path, hub_env):
+    installs = _install_mocks(monkeypatch, tmp_path, _make_url_bundle_fetcher())
+
+    # Simulate user typing "my-interactive" to name prompt, then "" to category.
+    answers = iter(["my-interactive", ""])
+    monkeypatch.setattr("builtins.input", lambda prompt="": next(answers))
+
+    sink = StringIO()
+    console = Console(file=sink, force_terminal=False, color_system=None)
+    do_install(
+        "https://example.com/SKILL.md",
+        console=console, skip_confirm=False,  # interactive
+        force=True,  # skip the final confirm prompt (tested elsewhere)
+    )
+
+    assert installs == [{"name": "my-interactive", "category": ""}]
+
+def test_url_install_prompts_category_and_uses_typed_value(monkeypatch, tmp_path, hub_env):
+    import tools.skills_hub as hub
+    installs = _install_mocks(
+        monkeypatch, tmp_path,
+        _make_url_bundle_fetcher(name="sharethis-chat", awaiting_name=False),
+    )
+
+    # Stage an existing category bucket so _existing_categories finds it.
+    (hub.SKILLS_DIR / "productivity" / "notion").mkdir(parents=True)
+    (hub.SKILLS_DIR / "productivity" / "notion" / "SKILL.md").write_text("# notion")
+
+    # Name is already resolved (from frontmatter) → only category prompt fires.
+    answers = iter(["productivity"])
+    monkeypatch.setattr("builtins.input", lambda prompt="": next(answers))
+
+    sink = StringIO()
+    console = Console(file=sink, force_terminal=False, color_system=None)
+    do_install(
+        "https://example.com/sharethis-chat/SKILL.md",
+        console=console, skip_confirm=False, force=True,
+    )
+
+    assert installs == [{"name": "sharethis-chat", "category": "productivity"}]
+    assert "Existing: productivity" in sink.getvalue()
+
+def test_url_install_cancel_name_prompt_aborts(monkeypatch, tmp_path, hub_env):
+    installs = _install_mocks(monkeypatch, tmp_path, _make_url_bundle_fetcher())
+
+    # Empty input with no default → name prompt returns None → abort.
+    monkeypatch.setattr("builtins.input", lambda prompt="": "")
+
+    sink = StringIO()
+    console = Console(file=sink, force_terminal=False, color_system=None)
+    do_install(
+        "https://example.com/SKILL.md",
+        console=console, skip_confirm=False, force=True,
+    )
+
+    assert installs == []
+    assert "Installation cancelled" in sink.getvalue()
+
+def test_existing_categories_skips_top_level_skills(monkeypatch, tmp_path, hub_env):
+    import tools.skills_hub as hub
+    from hermes_cli.skills_hub import _existing_categories
+
+    # Category bucket with nested skill.
+    (hub.SKILLS_DIR / "productivity" / "notion").mkdir(parents=True)
+    (hub.SKILLS_DIR / "productivity" / "notion" / "SKILL.md").write_text("# notion")
+
+    # Flat skill at top level (NOT a category).
+    (hub.SKILLS_DIR / "my-flat-skill").mkdir()
+    (hub.SKILLS_DIR / "my-flat-skill" / "SKILL.md").write_text("# flat")
+
+    # Empty dir (NOT a category — no SKILL.md below).
+    (hub.SKILLS_DIR / "empty-dir").mkdir()
+
+    # Hidden dir (ignored).
+    (hub.SKILLS_DIR / ".hub").mkdir(exist_ok=True)
+
+    cats = _existing_categories()
+    assert cats == ["productivity"]
+
+def test_existing_categories_returns_empty_when_skills_dir_missing(monkeypatch, tmp_path, hub_env):
+    # hub_env creates tmp_path/skills/.hub — we point SKILLS_DIR at a missing sibling.
+    import tools.skills_hub as hub
+    monkeypatch.setattr(hub, "SKILLS_DIR", tmp_path / "does-not-exist")
+
+    from hermes_cli.skills_hub import _existing_categories
+    assert _existing_categories() == []
+
+def test_browse_skills_dedup_uses_identifier_not_name(monkeypatch):
+    """browse_skills() must not collapse browse-sh skills that share a task name.
+
+    Airbnb and Booking.com both publish a 'search-listings' skill. Before the
+    fix, both were keyed by name so only one survived deduplication. After the
+    fix, each unique identifier produces a distinct result.
+    """
+    from tools.skills_hub import SkillMeta
+    from hermes_cli.skills_hub import browse_skills
+
+    airbnb = SkillMeta(
+        name="search-listings", description="Airbnb search", source="browse-sh",
+        identifier="browse-sh/airbnb.com/search-listings-ddgioa", trust_level="community",
+    )
+    booking = SkillMeta(
+        name="search-listings", description="Booking.com search", source="browse-sh",
+        identifier="browse-sh/booking.com/search-listings-xyzab", trust_level="community",
+    )
+
+    mock_src = type("S", (), {
+        "source_id": lambda self: "browse-sh",
+        "search": lambda self, q, limit=500: [airbnb, booking],
+    })()
+
+    # browse_skills() imports create_source_router locally from tools.skills_hub,
+    # so the patch must target the source module, not hermes_cli.skills_hub.
+    with patch("tools.skills_hub.create_source_router", return_value=[mock_src]):
+        result = browse_skills(page=1, page_size=50)
+
+    names = [item["name"] for item in result["items"]]
+    assert names.count("search-listings") == 2, (
+        "browse_skills() must not deduplicate browse-sh skills with the same name "
+        "but different identifiers"
+    )
+
+def _make_local_skill_dir(skills_dir: Path, name: str, description: str = "") -> Path:
+    """Create a minimal local skill directory with SKILL.md and frontmatter."""
+    skill_dir = skills_dir / name
+    skill_dir.mkdir(parents=True, exist_ok=True)
+    frontmatter = f"""---
+name: {name}
+description: {description or "A local test skill"}
+---
+
+# {name}
+
+Full content for {name}.
+"""
+    (skill_dir / "SKILL.md").write_text(frontmatter, encoding="utf-8")
+    return skill_dir
+
+def test_do_inspect_falls_back_to_local_skill_when_hub_miss(monkeypatch, tmp_path, hub_env):
+    """RED: `do_inspect` cannot inspect a local-only skill that `do_list` shows.
+
+    This test proves the missing fallback: when hub/tap sources have no record
+    of a skill name, `do_inspect` should scan the same local filesystem that
+    `do_list` uses and render the skill's metadata + SKILL.md preview.
+    """
+    import tools.skills_hub as hub
+    import tools.skills_sync as skills_sync
+    import tools.skills_tool as skills_tool
+
+    # Stage a local-only skill in the (monkeypatched) skills directory.
+    local_skill_dir = _make_local_skill_dir(
+        hub.SKILLS_DIR, "local-only-inspect-skill",
+        description="A purely local skill for inspect fallback"
+    )
+
+    # No hub-installed skills, no builtins.
+    monkeypatch.setattr(hub, "HubLockFile", lambda: _DummyLockFile([]))
+    monkeypatch.setattr(skills_sync, "_read_manifest", lambda: {})
+
+    # Prevent do_inspect from trying real network sources (which time out).
+    monkeypatch.setattr(hub, "create_source_router", lambda auth: [])
+
+    # _find_all_skills must use the real scanner so the local skill is visible.
+    # hub_env patches tools.skills_hub.SKILLS_DIR but _find_all_skills lives in
+    # tools.skills_tool and imports its own SKILLS_DIR -- patch that too.
+    monkeypatch.setattr(skills_tool, "SKILLS_DIR", hub.SKILLS_DIR)
+    monkeypatch.setattr(skills_tool, "_get_disabled_skill_names", lambda: set())
+
+    # Run do_list first to confirm the skill is visible locally.
+    list_output = _capture(source_filter="local")
+    assert "local-only-inspect-skill" in list_output, (
+        "Setup error: local skill must be visible to do_list before inspect fallback works"
+    )
+
+    # Now run do_inspect on the local-only skill.
+    sink = StringIO()
+    console = Console(file=sink, force_terminal=False, color_system=None)
+    do_inspect("local-only-inspect-skill", console=console)
+
+    output = sink.getvalue()
+    assert "local-only-inspect-skill" in output, (
+        "Expected do_inspect to find and render the local-only skill"
+    )
+    assert "Full content for local-only-inspect-skill" in output, (
+        "Expected SKILL.md preview to be rendered from local filesystem"
+    )
+
+def test_do_inspect_prefers_hub_when_both_exist(monkeypatch, tmp_path, hub_env):
+    """GREEN-slice: when a skill exists both locally and in hub, hub resolution wins."""
+    import tools.skills_hub as hub
+    import tools.skills_sync as skills_sync
+    import tools.skills_tool as skills_tool
+
+    # Stage a local skill with the same name as a hub skill.
+    _make_local_skill_dir(
+        hub.SKILLS_DIR, "hub-and-local-skill",
+        description="Local copy"
+    )
+    monkeypatch.setattr(skills_tool, "SKILLS_DIR", hub.SKILLS_DIR)
+    monkeypatch.setattr(skills_tool, "_get_disabled_skill_names", lambda: set())
+
+    # Hub source resolves successfully.
+    canonical = "github/example/hub-and-local-skill"
+
+    class _HubSource:
+        def inspect(self, identifier):
+            return hub.SkillMeta(
+                name="hub-and-local-skill",
+                description="Hub canonical description",
+                source="github",
+                identifier=canonical,
+                trust_level="trusted",
+            )
+
+        def fetch(self, identifier):
+            return hub.SkillBundle(
+                name="hub-and-local-skill",
+                files={"SKILL.md": "Hub SKILL.md content"},
+                source="github",
+                identifier=canonical,
+                trust_level="trusted",
+            )
+
+    monkeypatch.setattr(hub, "HubLockFile", lambda: _DummyLockFile([]))
+    monkeypatch.setattr(skills_sync, "_read_manifest", lambda: {})
+    monkeypatch.setattr(hub, "create_source_router", lambda auth: [_HubSource()])
+
+    sink = StringIO()
+    console = Console(file=sink, force_terminal=False, color_system=None)
+    do_inspect(canonical, console=console)
+
+    output = sink.getvalue()
+    assert "Hub canonical description" in output
+    assert "Hub SKILL.md content" in output
+    assert "github" in output
+
+def test_do_inspect_errors_cleanly_for_truly_missing_skill(monkeypatch, tmp_path, hub_env):
+    """GREEN-slice: a skill that exists neither locally nor in hub emits a clear error."""
+    import tools.skills_hub as hub
+    import tools.skills_sync as skills_sync
+    import tools.skills_tool as skills_tool
+
+    monkeypatch.setattr(hub, "HubLockFile", lambda: _DummyLockFile([]))
+    monkeypatch.setattr(skills_sync, "_read_manifest", lambda: {})
+    monkeypatch.setattr(skills_tool, "SKILLS_DIR", hub.SKILLS_DIR)
+    monkeypatch.setattr(skills_tool, "_get_disabled_skill_names", lambda: set())
+    monkeypatch.setattr(hub, "create_source_router", lambda auth: [])
+
+    sink = StringIO()
+    console = Console(file=sink, force_terminal=False, color_system=None)
+    do_inspect("completely-missing-skill", console=console)
+
+    output = sink.getvalue()
+    assert "Error" in output
+    assert "completely-missing-skill" in output
+
+def test_inspect_skill_returns_local_fallback_dict(monkeypatch, tmp_path, hub_env):
+    """GREEN-slice: programmatic `inspect_skill` also falls back to local filesystem."""
+    import tools.skills_hub as hub
+    import tools.skills_sync as skills_sync
+    import tools.skills_tool as skills_tool
+
+    _make_local_skill_dir(
+        hub.SKILLS_DIR, "prog-local-skill",
+        description="Programmatic local fallback"
+    )
+    monkeypatch.setattr(skills_tool, "SKILLS_DIR", hub.SKILLS_DIR)
+    monkeypatch.setattr(skills_tool, "_get_disabled_skill_names", lambda: set())
+    monkeypatch.setattr(hub, "HubLockFile", lambda: _DummyLockFile([]))
+    monkeypatch.setattr(skills_sync, "_read_manifest", lambda: {})
+    monkeypatch.setattr(hub, "create_source_router", lambda auth: [])
+
+    result = inspect_skill("prog-local-skill")
+    assert result is not None
+    assert result["name"] == "prog-local-skill"
+    assert result["source"] == "local"
+    assert "Programmatic local fallback" in result["description"]
+    assert "skill_md_preview" in result
+
+def test_inspect_skill_returns_none_for_truly_missing(monkeypatch, tmp_path, hub_env):
+    """GREEN-slice: programmatic `inspect_skill` returns None when skill is absent everywhere."""
+    import tools.skills_hub as hub
+    import tools.skills_sync as skills_sync
+    import tools.skills_tool as skills_tool
+
+    monkeypatch.setattr(skills_tool, "SKILLS_DIR", hub.SKILLS_DIR)
+    monkeypatch.setattr(skills_tool, "_get_disabled_skill_names", lambda: set())
+    monkeypatch.setattr(hub, "HubLockFile", lambda: _DummyLockFile([]))
+    monkeypatch.setattr(skills_sync, "_read_manifest", lambda: {})
+    monkeypatch.setattr(hub, "create_source_router", lambda auth: [])
+
+    result = inspect_skill("no-such-skill-anywhere")
+    assert result is None
+
+def test_do_inspect_local_fallback_does_not_print_false_error(monkeypatch, tmp_path, hub_env):
+    """RED: `do_inspect` on a local-only short name must NOT print a false
+    `Error: No skill named ... found in any source` before successfully
+    rendering the local skill.
+
+    This is the blocker from review t_b1408cf0.
+    """
+    import tools.skills_hub as hub
+    import tools.skills_sync as skills_sync
+    import tools.skills_tool as skills_tool
+
+    # Stage a local-only skill.
+    _make_local_skill_dir(
+        hub.SKILLS_DIR, "false-error-local-skill",
+        description="A local skill that should not trigger a false error"
+    )
+    monkeypatch.setattr(skills_tool, "SKILLS_DIR", hub.SKILLS_DIR)
+    monkeypatch.setattr(skills_tool, "_get_disabled_skill_names", lambda: set())
+    monkeypatch.setattr(hub, "HubLockFile", lambda: _DummyLockFile([]))
+    monkeypatch.setattr(skills_sync, "_read_manifest", lambda: {})
+    monkeypatch.setattr(hub, "create_source_router", lambda auth: [])
+
+    sink = StringIO()
+    console = Console(file=sink, force_terminal=False, color_system=None)
+    do_inspect("false-error-local-skill", console=console)
+
+    output = sink.getvalue()
+    # The fix: no false "Error:" and no "No skill named ... found" noise.
+    assert "Error:" not in output, (
+        "do_inspect must not print a false error when local fallback succeeds"
+    )
+    assert "No skill named" not in output, (
+        "do_inspect must not print the not-found message when local fallback succeeds"
+    )
+    # But the skill must still be rendered.
+    assert "false-error-local-skill" in output
+    assert "A local skill that should not trigger a false error" in output
+
+def test_do_browse_reports_live_per_source_progress():
+    """do_browse must pass an on_source_done callback so the status line ticks
+    off each source as it resolves, instead of showing a frozen spinner while
+    a slow source blocks. The page is still rendered once, after the full
+    result set is merged and trust-sorted."""
+    from hermes_cli.skills_hub import do_browse
+    from tools.skills_hub import SkillMeta
+
+    meta = SkillMeta(
+        name="demo", description="d", source="official",
+        identifier="official/demo", trust_level="builtin",
+    )
+
+    captured = {}
+
+    def fake_parallel(sources, query="", per_source_limits=None,
+                      source_filter="all", overall_timeout=30,
+                      on_source_done=None):
+        # Simulate two sources completing — the callback must be wired through.
+        assert on_source_done is not None, "do_browse must pass on_source_done"
+        on_source_done("official", 1)
+        on_source_done("clawhub", 0)
+        captured["called"] = True
+        return [meta], {"official": 1, "clawhub": 0}, []
+
+    sink = StringIO()
+    console = Console(file=sink, force_terminal=False, color_system=None, width=120)
+
+    with patch("tools.skills_hub.create_source_router", return_value=[]), \
+         patch("tools.skills_hub.GitHubAuth"), \
+         patch("tools.skills_hub.parallel_search_sources", side_effect=fake_parallel):
+        do_browse(page=1, page_size=20, console=console)
+
+    assert captured.get("called"), "parallel_search_sources was not invoked"
+    # The rendered page still shows the (single) merged result.
+    assert "demo" in sink.getvalue()
+
+def test_do_search_identifier_column_does_not_truncate_long_slug():
+    """The Identifier column must use overflow='fold', not the default ellipsis.
+
+    Renders into a deliberately narrow Console; the full slug (including the
+    trailing -1uezib hash) must still appear in the output. Before the fix,
+    Rich would render `browse-sh/weather…` and lose the hash.
+    """
+    from hermes_cli.skills_hub import do_search
+
+    sink = StringIO()
+    # Narrow width forces Rich to apply overflow rules — exactly the scenario
+    # the issue reports. width=40 is too small for the slug; we want the slug
+    # wrapped (not ellipsis-truncated).
+    console = Console(file=sink, force_terminal=False, color_system=None, width=40)
+
+    with patch("tools.skills_hub.unified_search", return_value=[_LONG_RESULT]), \
+         patch("tools.skills_hub.create_source_router", return_value={}), \
+         patch("tools.skills_hub.GitHubAuth"):
+        do_search("weather", console=console)
+
+    output = sink.getvalue()
+
+    # The fix is working when the Identifier column wraps the slug across
+    # multiple lines (folded chunks) rather than emitting ONE line with an
+    # ellipsis. Extract every chunk that appears in the rightmost cell of
+    # the table by walking lines that look like table rows ("│ ... │") and
+    # taking the last `│...│` cell. Concatenating those chunks must yield
+    # the full slug.
+    chunks = []
+    for line in output.splitlines():
+        # Table data rows start and end with the box-drawing vertical bar.
+        if not line.startswith("│") or not line.rstrip().endswith("│"):
+            continue
+        # Last `│ ... │` cell on the row is the Identifier column.
+        last_cell = line.rstrip().rsplit("│", 2)[-2].strip()
+        if last_cell:
+            chunks.append(last_cell)
+    reconstructed = "".join(chunks)
+    assert _LONG_SLUG in reconstructed, (
+        f"Expected full slug {_LONG_SLUG!r} to be recoverable from the "
+        f"folded Identifier column; got chunks {chunks!r}\n"
+        f"Full output:\n{output}"
+    )
+    # And the truncating ellipsis must NOT appear in the Identifier column.
+    # Rich uses U+2026 HORIZONTAL ELLIPSIS for the default overflow="ellipsis".
+    assert "\u2026" not in reconstructed, (
+        f"Identifier column still ellipsis-truncated: {reconstructed!r}"
+    )

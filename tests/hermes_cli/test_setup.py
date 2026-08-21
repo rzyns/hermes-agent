@@ -196,7 +196,8 @@ def test_setup_gateway_skips_service_install_when_systemctl_missing(monkeypatch,
 
     out = capsys.readouterr().out
     assert "Messaging platforms configured!" in out
-    assert "Start the gateway to bring your bots online:" in out
+    assert "No supported service manager found on this host." in out
+    assert "Run the gateway in the foreground with: hermes gateway" in out
     assert "hermes gateway" in out
 
 

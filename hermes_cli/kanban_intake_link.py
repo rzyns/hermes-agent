@@ -307,7 +307,7 @@ def create_intake_link(
     # But create_task returns the id and already checks idempotency.
     # So we pass workspace_path=None here, then patch it after.
     title = _make_title(url)
-    
+
     # Create as scratch first; the concrete durable path is derived from the
     # task id below and applied atomically via ``set_workspace`` once known.
     # ``create_task`` now rejects a ``dir`` kind without an absolute path,

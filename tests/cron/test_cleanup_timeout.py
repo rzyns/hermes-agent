@@ -124,6 +124,9 @@ def test_dispatch_guard_releases_after_sessiondb_finalization_hang(tmp_path):
              patch("cron.scheduler._cron_cleanup_timeout_seconds", return_value=0.02), \
              patch.object(sched, "get_due_jobs", return_value=[job]), \
              patch.object(sched, "advance_next_runs"), \
+             patch.object(sched, "claim_job_for_fire", return_value=True), \
+             patch.object(sched, "create_execution", return_value={"id": "exec-cleanup"}), \
+             patch.object(sched, "finish_execution"), \
              patch.object(sched, "save_job_output", return_value="/tmp/out"), \
              patch.object(sched, "mark_job_run"), \
              patch.object(sched, "_deliver_result", return_value=None):

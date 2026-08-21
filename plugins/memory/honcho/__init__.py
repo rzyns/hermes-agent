@@ -1545,12 +1545,6 @@ class HonchoMemoryProvider(MemoryProvider):
                 return
             try:
                 session = self._manager.get_or_create(session_key)
-                for chunk in self._chunk_message(clean_user_content, msg_limit):
-                    session.add_message("user", chunk)
-                for chunk in self._chunk_message(clean_assistant_content, msg_limit):
-                    session.add_message("assistant", chunk)
-                self._manager._flush_session(session)
-                session = self._manager.get_or_create(self._session_key)
                 if clean_user_content:
                     for chunk in self._chunk_message(clean_user_content, msg_limit):
                         session.add_message("user", chunk)

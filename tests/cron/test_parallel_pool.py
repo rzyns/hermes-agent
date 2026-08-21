@@ -402,6 +402,9 @@ class TestTickBatchAdvance:
         monkeypatch.setattr(
             sched, "advance_next_runs",
             lambda ids: advance_calls.append(list(ids)) or len(list(ids)))
+        monkeypatch.setattr(sched, "claim_job_for_fire", lambda *_a, **_kw: True)
+        monkeypatch.setattr(sched, "create_execution", lambda job_id, **_kw: {"id": f"exec-{job_id}"})
+        monkeypatch.setattr(sched, "finish_execution", lambda *_a, **_kw: None)
         monkeypatch.setattr(sched, "run_job", lambda j, **_kw: (True, "out", "resp", None))
         monkeypatch.setattr(sched, "save_job_output", lambda *_a, **_kw: "/tmp/out")
         monkeypatch.setattr(sched, "mark_job_run", lambda *_a, **_kw: None)

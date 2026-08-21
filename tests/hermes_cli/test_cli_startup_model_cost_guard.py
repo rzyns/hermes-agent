@@ -1,6 +1,5 @@
 from argparse import Namespace
 import sys
-import types
 
 import pytest
 
@@ -62,7 +61,7 @@ def fake_cli(monkeypatch):
     def fake_cli_main(**kwargs):
         captured.update(kwargs)
 
-    monkeypatch.setitem(sys.modules, "cli", types.SimpleNamespace(main=fake_cli_main))
+    monkeypatch.setattr("hermes_cli.main._load_root_cli_main", lambda: fake_cli_main)
     return captured
 
 

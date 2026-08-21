@@ -901,8 +901,8 @@ def test_local_browser_provider_is_saved_explicitly(monkeypatch):
 
 
 def test_fresh_install_browser_default_is_free_local_not_paid_nous():
-    """On a fresh install the browser picker must default to the free local
-    backend, never the paid Nous Subscription gateway.
+    """On a fresh install the browser picker must default to the free Browser
+    Use backend, never the paid Nous Subscription gateway.
 
     Regression: the Nous row used to sort first, so the menu cursor defaulted
     to index 0 (Nous) and pressing Enter walked users straight into a Nous
@@ -913,8 +913,8 @@ def test_fresh_install_browser_default_is_free_local_not_paid_nous():
     providers = TOOL_CATEGORIES["browser"]["providers"]
     assert providers[0]["name"] == "Local Browser"
     assert providers[0]["browser_provider"] == "local"
-    # Nothing active/configured → cursor defaults to index 0 (the free local row).
-    assert _detect_active_provider_index(providers, {}) == 0
+    # Nothing active/configured → Browser Use is the effective free default.
+    assert _detect_active_provider_index(providers, {}) == 3
 
 
 def test_fresh_install_tts_default_is_free_edge_not_paid_nous():
@@ -1098,10 +1098,11 @@ def test_first_install_nous_auto_configures_managed_defaults(monkeypatch):
 
     tools_command(first_install=True, config=config)
 
-    assert config["web"]["backend"] == "firecrawl"
-    assert config["tts"]["provider"] == "openai"
-    assert config["browser"]["cloud_provider"] == "browser-use"
-    assert config["image_gen"]["use_gateway"] is True
+    assert config["web"]["backend"] == "nous"
+    assert config["tts"]["provider"] == "nous"
+    assert config["browser"]["cloud_provider"] == "nous"
+    assert config["image_gen"]["provider"] == "nous"
+    assert "use_gateway" not in config["image_gen"]
     assert configured == []
 
 
@@ -1158,8 +1159,8 @@ def test_first_install_nous_auto_configures_video_gen(monkeypatch):
 
     tools_command(first_install=True, config=config)
 
-    assert config["video_gen"]["provider"] == "fal"
-    assert config["video_gen"]["use_gateway"] is True
+    assert config["video_gen"]["provider"] == "nous"
+    assert "use_gateway" not in config["video_gen"]
     # video_gen should NOT appear in the manual configure list — it's auto-configured
     assert "video_gen" not in configured
 
@@ -1266,7 +1267,8 @@ def test_computer_use_skips_configuration_when_cua_driver_already_installed():
         return "/usr/local/bin/cua-driver" if name == "cua-driver" else None
 
     with patch.dict("os.environ", {"HERMES_CUA_DRIVER_CMD": ""}), \
-         patch("shutil.which", side_effect=fake_which):
+         patch("shutil.which", side_effect=fake_which), \
+         patch("hermes_cli.tools_config._cua_driver_contract_status", return_value={"ready": True}):
         assert _toolset_needs_configuration_prompt("computer_use", {}) is False
 
 
@@ -1276,7 +1278,8 @@ def test_computer_use_respects_custom_cua_driver_command():
         return "/opt/bin/custom-cua" if name == "custom-cua" else None
 
     with patch.dict("os.environ", {"HERMES_CUA_DRIVER_CMD": "custom-cua"}), \
-         patch("shutil.which", side_effect=fake_which):
+         patch("shutil.which", side_effect=fake_which), \
+         patch("hermes_cli.tools_config._cua_driver_contract_status", return_value={"ready": True}):
         assert _toolset_needs_configuration_prompt("computer_use", {}) is False
 
 
@@ -1286,12 +1289,13 @@ def test_computer_use_blank_custom_driver_command_falls_back_to_default():
         return "/usr/local/bin/cua-driver" if name == "cua-driver" else None
 
     with patch.dict("os.environ", {"HERMES_CUA_DRIVER_CMD": "   "}), \
-         patch("shutil.which", side_effect=fake_which):
+         patch("shutil.which", side_effect=fake_which), \
+         patch("hermes_cli.tools_config._cua_driver_contract_status", return_value={"ready": True}):
         assert _toolset_needs_configuration_prompt("computer_use", {}) is False
 
 
 def test_computer_use_post_setup_respects_custom_driver_command_when_installed():
-    """post_setup already-installed checks should version-probe the resolved override."""
+    """post_setup checks the runtime contract of the resolved override."""
     def fake_which(name: str, path=None):
         return "/opt/bin/custom-cua" if name == "custom-cua" else None
 
@@ -1306,7 +1310,7 @@ def test_computer_use_post_setup_respects_custom_driver_command_when_installed()
     run.assert_called_once()
     # Probe the resolved absolute path so thin GUI PATHs cannot reintroduce a
     # bare-command miss after HERMES_CUA_DRIVER_CMD was looked up via which().
-    assert run.call_args.args[0] == ["/opt/bin/custom-cua", "--version"]
+    assert run.call_args.args[0] == ["/opt/bin/custom-cua", "manifest"]
 
 
 def test_computer_use_post_setup_missing_override_does_not_accept_default_binary():
@@ -1329,7 +1333,7 @@ def test_computer_use_post_setup_missing_override_does_not_accept_default_binary
 
     run.assert_not_called()
     assert "custom-cua" in seen
-    assert "curl" in seen
+    assert "curl" not in seen
 
 
 class TestAgentBrowserPostSetup:
@@ -1750,6 +1754,26 @@ class TestImagegenModelPicker:
         assert isinstance(config["image_gen"], dict)
         assert config["image_gen"]["model"] == "fal-ai/flux-2/klein/9b"
 
+    def test_plugin_picker_falls_back_when_default_is_missing_from_catalog(self):
+        """A stale cross-provider model must not become an unindexable row."""
+        from hermes_cli.tools_config import _configure_imagegen_model_for_plugin
+
+        catalog = {
+            "openai/gpt-5.4-image-2": {"strengths": "quality"},
+            "google/gemini-3-pro-image": {"strengths": "fallback"},
+        }
+        config = {"image_gen": {"model": "gpt-image-2-medium"}}
+        with (
+            patch(
+                "hermes_cli.tools_config._plugin_image_gen_catalog",
+                return_value=(catalog, "also-missing"),
+            ),
+            patch("hermes_cli.tools_config._prompt_choice", return_value=0),
+        ):
+            _configure_imagegen_model_for_plugin("openrouter", config)
+
+        assert config["image_gen"]["model"] == "openai/gpt-5.4-image-2"
+
 
 def test_save_platform_tools_normalizes_numeric_entries():
     """YAML may parse bare numeric toolset names as int. They should be
@@ -1787,7 +1811,7 @@ def test_save_platform_tools_clears_no_mcp_sentinel():
     assert "no_mcp" not in saved
 
 
-def test_save_platform_tools_preserves_mcp_server_names():
+def test_save_platform_tools_preserves_mcp_server_names_merged_2():
     """Non-sentinel passthrough entries (MCP server names) must still survive
     the save — we only clear `no_mcp`, not every non-configurable entry.
     """
@@ -1956,7 +1980,10 @@ def test_reconfigure_provider_syncs_use_gateway(monkeypatch, provider, config_ke
     )
     config = {}
     _reconfigure_provider(provider, config)
-    assert config[config_key]["use_gateway"] is expected
+    selector = {"tts": "provider", "browser": "cloud_provider", "web": "backend"}[config_key]
+    concrete = provider.get("tts_provider") or provider.get("browser_provider") or provider.get("web_backend")
+    assert config[config_key][selector] == ("nous" if expected else concrete)
+    assert "use_gateway" not in config[config_key]
 
 
 def test_reconfigure_browser_provider_overwrites_stale_use_gateway():
@@ -1964,7 +1991,8 @@ def test_reconfigure_browser_provider_overwrites_stale_use_gateway():
     config = {"browser": {"cloud_provider": "managed-browser", "use_gateway": True}}
     provider = {"name": "Browserbase", "browser_provider": "browserbase", "env_vars": []}
     _reconfigure_provider(provider, config)
-    assert config["browser"]["use_gateway"] is False
+    assert config["browser"]["cloud_provider"] == "browserbase"
+    assert "use_gateway" not in config["browser"]
 
 
 @pytest.mark.parametrize("provider_name,post_setup_key", [
@@ -2017,7 +2045,7 @@ def test_configure_managed_provider_blocks_when_not_entitled(monkeypatch):
 
 
 def test_configure_managed_provider_enables_when_entitled(monkeypatch):
-    """Once entitled, selecting the managed backend sets use_gateway=True."""
+    """Once entitled, selecting the managed backend stores the Nous provider."""
     monkeypatch.setattr(
         "hermes_cli.nous_subscription.ensure_nous_portal_access",
         lambda **kwargs: True,
@@ -2032,8 +2060,8 @@ def test_configure_managed_provider_enables_when_entitled(monkeypatch):
 
     _configure_provider(provider, config)
 
-    assert config["web"]["backend"] == "firecrawl"
-    assert config["web"]["use_gateway"] is True
+    assert config["web"]["backend"] == "nous"
+    assert "use_gateway" not in config["web"]
 
 
 def test_configure_non_managed_provider_skips_portal_gate(monkeypatch):
@@ -2054,7 +2082,7 @@ def test_configure_non_managed_provider_skips_portal_gate(monkeypatch):
 
     assert called["gate"] is False
     assert config["web"]["backend"] == "tavily"
-    assert config["web"]["use_gateway"] is False
+    assert "use_gateway" not in config["web"]
 
 
 def test_apply_provider_selection_web_sets_backend():
@@ -2065,7 +2093,7 @@ def test_apply_provider_selection_web_sets_backend():
     apply_provider_selection("web", "Firecrawl Self-Hosted", config)
 
     assert config["web"]["backend"] == "firecrawl"
-    assert config["web"]["use_gateway"] is False
+    assert "use_gateway" not in config["web"]
 
 
 def test_apply_provider_selection_tts_sets_provider():
@@ -2076,7 +2104,7 @@ def test_apply_provider_selection_tts_sets_provider():
     apply_provider_selection("tts", "Microsoft Edge TTS", config)
 
     assert config["tts"]["provider"] == "edge"
-    assert config["tts"]["use_gateway"] is False
+    assert "use_gateway" not in config["tts"]
 
 
 def test_apply_provider_selection_unknown_provider_raises_keyerror():

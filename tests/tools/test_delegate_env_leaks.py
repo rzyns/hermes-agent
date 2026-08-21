@@ -6,6 +6,7 @@ seed, and the parent process env must remain unchanged while children run.
 """
 
 import os
+from pathlib import Path
 import threading
 import time
 from unittest.mock import MagicMock, patch
@@ -381,8 +382,8 @@ def test_delegated_child_budget_exhaustion_does_not_record_parent_failure(
     from hermes_cli import kanban_db as _kb
 
     # Set up a real temp kanban board so any mistaken mutation would have
-    # somewhere to land.
-    db_path = tmp_path / "test_kanban.db"
+    # somewhere to land, within the profile's guarded Kanban root.
+    db_path = Path(os.environ["HERMES_HOME"]) / "test_kanban.db"
     monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
     monkeypatch.setenv("HERMES_KANBAN_BOARD", "default")
     monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)

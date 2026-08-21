@@ -164,7 +164,7 @@ class TestHandleFunctionCall:
             assert kwargs_by_hook[hook_name]["error_type"] == "tool_error"
             assert kwargs_by_hook[hook_name]["error_message"] == "exit 1"
 
-    def test_no_listener_skips_post_and_transform_emit(self):
+    def test_no_listener_skips_post_and_transform_emit_merged_2(self):
         """When no plugin is registered for post_tool_call /
         transform_tool_result, the emit path must short-circuit on
         ``has_hook`` and never build/dispatch a payload — so the

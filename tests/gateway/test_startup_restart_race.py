@@ -246,7 +246,9 @@ async def test_startup_aborts_after_registered_adapter_restart(tmp_path, monkeyp
     assert result is True
     assert telegram.connected is True
     assert telegram.disconnected is True
-    assert slack.connected is False
+    # Platform connects now launch concurrently. Slack may finish before the
+    # Telegram status callback requests restart, but shutdown must still reap it.
+    assert slack.disconnected is True
     assert runner._running is False
     assert runner.adapters == {}
     assert runner._update_runtime_status.call_args_list[-1].args[0] == "stopped"
@@ -254,10 +256,7 @@ async def test_startup_aborts_after_registered_adapter_restart(tmp_path, monkeyp
         call.args[:1] == ("running",)
         for call in runner._update_runtime_status.call_args_list
     )
-    assert not any(
-        call.args[:2] == (Platform.SLACK.value, "connected")
-        for call in runner._update_platform_runtime_status.call_args_list
-    )
+
 
 
 @pytest.mark.asyncio

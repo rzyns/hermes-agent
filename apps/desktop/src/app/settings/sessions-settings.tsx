@@ -19,6 +19,7 @@ import { triggerHaptic } from '@/lib/haptics'
 import { Archive, ArchiveOff, FolderOpen, Loader2, SlidersHorizontal, Trash2 } from '@/lib/icons'
 import { sessionSourceLabel } from '@/lib/session-source'
 import { SIDEBAR_LOCAL_CHAT_SOURCE_IDS, SIDEBAR_SOURCE_OPTION_IDS } from '@/lib/sidebar-session-sources'
+import { confirm } from '@/store/confirm'
 import { notify, notifyError } from '@/store/notifications'
 import { untombstoneSessions } from '@/store/projects'
 import {
@@ -86,7 +87,13 @@ export function SessionsSettings() {
 
   const remove = useCallback(
     async (session: SessionInfo) => {
-      if (!window.confirm(s.deleteConfirm(sessionTitle(session)))) {
+      const ok = await confirm({
+        confirmLabel: s.deletePermanently,
+        destructive: true,
+        title: s.deleteConfirm(sessionTitle(session))
+      })
+
+      if (!ok) {
         return
       }
 

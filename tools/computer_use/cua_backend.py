@@ -2465,6 +2465,8 @@ def _extract_tool_result(mcp_result: Any) -> Dict[str, Any]:
             if b64:
                 images.append(b64)
                 mime = _mcp_field(part, "mime_type", "mimeType") or ""
+                if not isinstance(mime, str):
+                    mime = ""
                 image_mime_types.append(mime)
     if text_chunks:
         joined = "\n".join(t for t in text_chunks if t)

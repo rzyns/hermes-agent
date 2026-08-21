@@ -121,8 +121,8 @@ def test_cli_invalid_max_in_progress_silently_disables(isolated_kanban_home, mon
         )
         args = argparse.Namespace(dry_run=True, max=None, failure_limit=2, json=False)
         kb_cli._cmd_dispatch(args)
-        assert captured.get("max_in_progress") is None, (
-            f"invalid max_in_progress={bad_val!r} should fall through to None, "
+        assert captured.get("max_in_progress") == 8, (
+            f"invalid max_in_progress={bad_val!r} should fall back to the default, "
             f"got {captured.get('max_in_progress')!r}"
         )
 

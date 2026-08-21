@@ -95,6 +95,18 @@ def _patch_update_deps(monkeypatch, tmp_path, run_side_effect):
         hermes_main, "_run_pre_update_backup", lambda *a, **k: None
     )
     monkeypatch.setattr(
+        hermes_main, "_validate_critical_files_syntax", lambda *a, **k: (True, None, None)
+    )
+    monkeypatch.setattr(hermes_main, "_refresh_bootstrap_cache_scripts", lambda *a, **k: None)
+    monkeypatch.setattr(hermes_main, "_abort_dependency_sync_if_self_locked", lambda *a, **k: None)
+    monkeypatch.setattr("hermes_cli.update_cmd._editable_install_is_current", lambda *a, **k: True)
+    monkeypatch.setattr(hermes_main, "_verify_core_dependencies_installed", lambda *a, **k: None)
+    monkeypatch.setattr(hermes_main, "_verify_console_scripts_installed", lambda *a, **k: None)
+    monkeypatch.setattr(hermes_main, "_restore_active_tool_dependencies", lambda *a, **k: None)
+    monkeypatch.setattr("hermes_cli.managed_uv.update_managed_uv", lambda *a, **k: None)
+    monkeypatch.setattr("hermes_cli.managed_uv.ensure_uv", lambda *a, **k: None)
+    monkeypatch.setattr(hermes_main, "_purge_stale_hermes_modules", lambda *a, **k: None)
+    monkeypatch.setattr(
         hermes_main, "_pause_windows_gateways_for_update", lambda: None
     )
     monkeypatch.setattr(

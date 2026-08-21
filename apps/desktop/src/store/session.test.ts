@@ -15,6 +15,7 @@ vi.mock('@/hermes', () => ({
   setSessionUnreadRemote: (id: string, unread: boolean, profile?: null | string) => setUnreadRemote(id, unread, profile)
 }))
 
+
 import {
   $activeSessionId,
   $connection,
