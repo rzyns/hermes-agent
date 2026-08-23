@@ -5975,11 +5975,43 @@ function rotateGroupSpeakers(members, round) {
   return [...members.slice(shift), ...members.slice(0, shift)]
 }
 
-/** Transcript form of a room speaker's profile name. The primary profile is
- *  literally named "default" — render it as Hermes (matching displayName and
- *  the @hermes handle) so the main agent never loses its name in rooms. */
+/** Transcript form of a room speaker's profile name. Friendly identity wins:
+ *  a Bot Mode title or a core profile display_name (e.g. default renamed to
+ *  "Lucy") labels the speaker everywhere this helper feeds — the "X is
+ *  thinking…" working line, the activity feed, and transcript lines — so a
+ *  renamed bot never shows up as its raw profile id or a stale "Hermes"
+ *  (community report, Aug 21 2026: renamed default still read "Hermes is
+ *  thinking…" in group rooms). The untitled primary profile is literally
+ *  named "default" — render it as Hermes (matching displayName and the
+ *  @hermes handle) so the main agent never loses its name in rooms. */
 function groupSpeakerLabel(name) {
-  return (name || '').trim().toLowerCase() === 'default' ? 'Hermes' : name
+  const trimmed = (name || '').trim()
+
+  if (!trimmed) {
+    return trimmed
+  }
+
+  // Bot Mode title (edit dialog) — same first rung as displayName().
+  const title = String($botMeta.get()?.[trimmed]?.title || '').trim()
+
+  if (title) {
+    return title
+  }
+
+  // Core profile display_name (`hermes profile rename …` / dashboard) from
+  // the ACTIVE gateway's roster row. Source-scoped remote speakers carry
+  // their device suffix separately and keep their raw name here.
+  const roster = $lastRoster.get()
+  const row = Array.isArray(roster)
+    ? roster.find(bot => bot?.name === trimmed && !bot?.remoteSource && !bot?.sourceScoped)
+    : null
+  const renamed = typeof row?.display_name === 'string' ? row.display_name.trim() : ''
+
+  if (renamed) {
+    return renamed
+  }
+
+  return trimmed.toLowerCase() === 'default' ? 'Hermes' : trimmed
 }
 
 /** Room-log line as a member sees it: `Name (user): …` / `Name: …` /
@@ -14059,6 +14091,58 @@ export default {
             })
           : null
 
+      // Proactive reclaim refresh: when the gateway reaps the runtime behind
+      // the OPEN bot chat (idle TTL, LRU cap, WS-orphan reap — the mass-reap
+      // shape hits every background bot at once), re-resume the canonical
+      // chat immediately instead of letting the user's next send eat the
+      // stale-id error + recovery retry. Matched on the STORED id (the
+      // claim's ids are stored ids; the payload carries both). Best-effort:
+      // a failed re-resume (backend still down) leaves the lazy recovery on
+      // next send as the backstop. Feature-detected — older shells have no
+      // host.onEvent.
+      const stopReclaimSync =
+        typeof host.onEvent === 'function'
+          ? host.onEvent('session.reclaimed', event => {
+              const payload = event?.payload || {}
+              const stored = String(payload.stored_session_id || '')
+              const claim = $openBotChat.get()
+
+              if (!stored || !claim) {
+                return
+              }
+
+              const owned = [claim.openedSessionId, claim.openedRegistryId].filter(Boolean)
+
+              if (!owned.includes(stored)) {
+                return
+              }
+
+              const bot = selectedRosterBot($lastRoster.get(), $selectedRosterKey.get())
+
+              if (!bot) {
+                return
+              }
+
+              const generation = botOpenGeneration
+              void openBotCanonicalChat(bot)
+                .then(opened => {
+                  // A user action while the re-resume ran owns the center now.
+                  if (!opened || generation !== botOpenGeneration) {
+                    return
+                  }
+
+                  $openBotChat.set({
+                    key: claim.key,
+                    openedRegistryId: opened.registryId,
+                    openedSessionId: opened.openedId
+                  })
+                })
+                .catch(() => {
+                  /* backend still down — next send recovers via the ladder */
+                })
+            })
+          : null
+
       $botsPaneVisible.set(Boolean($sidebarVisible.get()))
       $botChatFocused.set(sessionOwnsWorkspace())
       $botsHomeFronted.set(Boolean(homeVisibleStore.get()))
@@ -14077,6 +14161,7 @@ export default {
           stopGroupSync()
           stopHomeVisibleSync()
           stopFocusSync?.()
+          stopReclaimSync?.()
           $botsHomeFronted.set(false)
           closeBotsHomeWorkspace()
         })
