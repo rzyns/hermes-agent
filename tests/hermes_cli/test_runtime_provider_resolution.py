@@ -3743,3 +3743,57 @@ def test_minimax_oauth_pool_forces_anthropic_messages_despite_stale_config(monke
     assert resolved["provider"] == "minimax-oauth"
     assert resolved["api_mode"] == "anthropic_messages"
     assert resolved["base_url"] == "https://api.minimax.io/anthropic"
+
+def test_resolve_runtime_provider_opencode_free_keyless_despite_exhausted_pool(monkeypatch):
+    """OpenCode Free is keyless: an exhausted credential pool must not raise
+    a missing-credential error. The provider resolves with the keyless
+    placeholder + empty-Authorization headers so the request goes out
+    anonymously."""
+    class _ExhaustedPool:
+        def has_credentials(self):
+            return True
+
+        def select(self):
+            return None
+
+    monkeypatch.setattr(rp, "resolve_provider", lambda *a, **k: "opencode-free")
+    monkeypatch.setattr(
+        rp,
+        "_get_model_config",
+        lambda: {"provider": "opencode-free", "default": "x-preview-f-free"},
+    )
+    monkeypatch.setattr(rp, "load_pool", lambda provider: _ExhaustedPool())
+
+    resolved = rp.resolve_runtime_provider(
+        requested="opencode-free", target_model="x-preview-f-free"
+    )
+
+    assert resolved["provider"] == "opencode-free"
+    assert resolved["api_key"] == "opencode-zen-free-keyless"
+    assert resolved["base_url"] == "https://opencode.ai/zen/v1"
+    assert resolved["api_mode"] == "chat_completions"
+    assert resolved["default_headers"]["Authorization"] == ""
+
+
+def test_resolve_runtime_provider_opencode_free_missing_env_still_resolves(monkeypatch):
+    """OpenCode Free resolves keylessly with no env var configured at all —
+    the provider declares no credentials."""
+    class _NoPool:
+        def has_credentials(self):
+            return False
+
+    monkeypatch.setattr(rp, "resolve_provider", lambda *a, **k: "opencode-free")
+    monkeypatch.setattr(
+        rp,
+        "_get_model_config",
+        lambda: {"provider": "opencode-free", "default": "x-preview-f-free"},
+    )
+    monkeypatch.setattr(rp, "load_pool", lambda provider: _NoPool())
+
+    resolved = rp.resolve_runtime_provider(
+        requested="opencode-free", target_model="x-preview-f-free"
+    )
+
+    assert resolved["provider"] == "opencode-free"
+    assert resolved["api_key"] == "opencode-zen-free-keyless"
+    assert resolved["base_url"] == "https://opencode.ai/zen/v1"

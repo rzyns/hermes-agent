@@ -27,6 +27,7 @@ from typing import Any
 
 from agent.delegation_context import child_env_lookup, is_delegated_child_context
 from agent.codex_responses_adapter import _summarize_user_message_for_log
+from agent.context_compressor import _DB_PERSISTED_MARKER
 from agent.message_content import flatten_message_text
 from agent.message_metadata import append_message, stamp_message_timestamp
 from hermes_cli.observability.budget_telemetry import (
@@ -507,7 +508,7 @@ def finalize_turn(
                 # re-writes the filled content to the durable store —
                 # otherwise ``/resume`` reloads ``content=""`` and the bug
                 # resurfaces cross-session.
-                _tail.pop("_db_persisted", None)
+                _tail.pop(_DB_PERSISTED_MARKER, None)
                 # The bounded flush-scan cursor (run_agent.py) skips the
                 # identity-matched prefix of its previous snapshot on the
                 # assumption that no live dict loses the marker in place —
