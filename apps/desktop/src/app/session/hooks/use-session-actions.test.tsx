@@ -33,6 +33,7 @@ import {
   $selectedStoredSessionId,
   $sessions,
   $turnStartedAt,
+  $yoloActive,
   setActiveSessionId,
   setActiveSessionStoredIdRotation,
   setAwaitingResponse,
@@ -47,14 +48,15 @@ import {
   setResumeFailedSessionId,
   setSelectedStoredSessionId,
   setSessions,
-  setTurnStartedAt
+  setTurnStartedAt,
+  setYoloActive
 } from '@/store/session'
 import type { SessionProfileRoute } from '@/store/session-request-router'
 import { $sessionTiles } from '@/store/session-states'
 
 import sessionResumeActiveTurn from '../../../../../../tests/fixtures/session-resume-active-turn.json'
 import { deferred } from '../../../test/deferred'
-import { sessionRoute } from '../../routes'
+import { NEW_CHAT_ROUTE, sessionRoute } from '../../routes'
 import type { ClientSessionState } from '../../types'
 
 import { useSessionActions } from './use-session-actions'
@@ -116,12 +118,14 @@ function storedSession(overrides: Partial<SessionInfo> = {}): SessionInfo {
 
 function Harness({
   activeSessionId = null,
+  getRouteToken = () => 'token',
   navigate = vi.fn(),
   onReady,
   requestGateway,
   selectedStoredSessionId = null
 }: {
   activeSessionId?: null | string
+  getRouteToken?: () => string
   navigate?: ReturnType<typeof vi.fn>
   onReady: (handle: HarnessHandle) => void
   requestGateway: <T>(method: string, params?: Record<string, unknown>) => Promise<T>
@@ -135,7 +139,7 @@ function Harness({
     busyRef: ref(false),
     creatingSessionRef: ref(false),
     ensureSessionState: () => ({}) as ClientSessionState,
-    getRouteToken: () => 'token',
+    getRouteToken,
     getRoutedStoredSessionId: () => null,
     navigate: navigate as never,
     requestGateway,
@@ -542,7 +546,9 @@ describe('createBackendSessionForSend profile routing', () => {
     $currentModel.set('')
     $currentProvider.set('')
     $currentReasoningEffort.set('')
+    setYoloActive(false)
     setNewChatWorkspaceTarget(undefined)
+    vi.clearAllMocks()
     vi.restoreAllMocks()
   })
 
@@ -642,6 +648,87 @@ describe('createBackendSessionForSend profile routing', () => {
       expect.objectContaining({ profile: 'backend-default', source: 'desktop' })
     )
     expect(ambientRequest).not.toHaveBeenCalledWith('session.create', expect.anything())
+  })
+
+  it('closes a drifted route-aware session through its captured connection', async () => {
+    const route = {
+      connectionId: 'source-a',
+      mode: 'remote' as const,
+      profile: 'default',
+      targetProfile: 'backend-default'
+    }
+
+    const ambientRequest = vi.fn(async () => ({}) as never)
+
+    const getRouteToken = vi
+      .fn()
+      .mockReturnValueOnce(`${NEW_CHAT_ROUTE}::`)
+      .mockReturnValue(`${sessionRoute('stored-other')}::`)
+
+    vi.mocked(requestGatewayForAgent).mockImplementation(async (_connectionId, _profile, method) =>
+      (method === 'session.create'
+        ? { session_id: RUNTIME_SESSION_ID, stored_session_id: null }
+        : {}) as never
+    )
+
+    $newChatProfile.set(route.profile)
+    $newChatRoute.set({ ...route })
+
+    let handle: HarnessHandle | null = null
+    render(
+      <Harness
+        getRouteToken={getRouteToken}
+        onReady={value => (handle = value)}
+        requestGateway={ambientRequest}
+      />
+    )
+    await waitFor(() => expect(handle).not.toBeNull())
+
+    await act(async () => {
+      await handle!.createBackendSessionForSend()
+    })
+
+    expect(requestGatewayForAgent).toHaveBeenCalledWith('source-a', 'default', 'session.close', {
+      session_id: RUNTIME_SESSION_ID
+    })
+    expect(ambientRequest).not.toHaveBeenCalledWith('session.close', expect.anything())
+  })
+
+  it('applies armed YOLO through the captured route-aware connection', async () => {
+    const route = {
+      connectionId: 'source-a',
+      mode: 'remote' as const,
+      profile: 'default',
+      targetProfile: 'backend-default'
+    }
+
+    const ambientRequest = vi.fn(async () => ({}) as never)
+
+    vi.mocked(requestGatewayForAgent).mockImplementation(async (_connectionId, _profile, method) =>
+      (method === 'session.create'
+        ? { session_id: RUNTIME_SESSION_ID, stored_session_id: null }
+        : { value: '1' }) as never
+    )
+
+    $newChatProfile.set(route.profile)
+    $newChatRoute.set({ ...route })
+    setYoloActive(true)
+
+    let handle: HarnessHandle | null = null
+    render(<Harness onReady={value => (handle = value)} requestGateway={ambientRequest} />)
+    await waitFor(() => expect(handle).not.toBeNull())
+
+    await act(async () => {
+      await handle!.createBackendSessionForSend()
+    })
+
+    expect(requestGatewayForAgent).toHaveBeenCalledWith('source-a', 'default', 'config.set', {
+      key: 'yolo',
+      session_id: RUNTIME_SESSION_ID,
+      value: '1'
+    })
+    expect($yoloActive.get()).toBe(true)
+    expect(ambientRequest).not.toHaveBeenCalledWith('config.set', expect.anything())
   })
 
   it('freezes the visible selector state before profile readiness and sends fast: false explicitly', async () => {

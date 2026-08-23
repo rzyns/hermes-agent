@@ -221,6 +221,7 @@ async function desktopSessionCreateParams(
 
   const profileOptions = target && !('connectionId' in target) ? target : null
   const capturedRoute = target && 'connectionId' in target ? target : null
+
   const profile = profileOptions
     ? profileOptions.profile?.trim() || null
     : capturedRoute?.profile || $newChatProfile.get() || normalizeProfileKey($activeGatewayProfile.get())
@@ -489,14 +490,17 @@ export function useSessionActions({
         const capturedRoute = $newChatRoute.get()
         const params = await desktopSessionCreateParams(cwd, capturedRoute)
 
-        const created = capturedRoute
-          ? await requestGatewayForAgent<SessionCreateResponse>(
-              capturedRoute.connectionId,
-              capturedRoute.profile,
-              'session.create',
-              params
-            )
-          : await requestGateway<SessionCreateResponse>('session.create', params)
+        const requestCreatedSession = <T,>(method: string, requestParams?: Record<string, unknown>): Promise<T> =>
+          capturedRoute
+            ? requestGatewayForAgent<T>(
+                capturedRoute.connectionId,
+                capturedRoute.profile,
+                method,
+                requestParams
+              )
+            : requestGateway<T>(method, requestParams)
+
+        const created = await requestCreatedSession<SessionCreateResponse>('session.create', params)
 
         const stored = created.stored_session_id ?? null
 
@@ -518,7 +522,7 @@ export function useSessionActions({
 
         if (drift) {
           console.warn('[submit-drift-abort]', drift, { phase: 'mid-create' })
-          await requestGateway('session.close', { session_id: created.session_id }).catch(() => undefined)
+          await requestCreatedSession('session.close', { session_id: created.session_id }).catch(() => undefined)
 
           return null
         }
@@ -556,7 +560,7 @@ export function useSessionActions({
         // User may have armed YOLO on the new-chat draft before the runtime
         // session existed — apply it to the freshly created session.
         if (yoloArmed) {
-          await setSessionYolo(requestGateway, created.session_id, true).catch(() => undefined)
+          await setSessionYolo(requestCreatedSession, created.session_id, true).catch(() => undefined)
         }
 
         return created.session_id
