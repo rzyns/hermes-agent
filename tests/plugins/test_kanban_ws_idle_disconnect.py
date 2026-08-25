@@ -141,13 +141,12 @@ async def test_stream_events_reuses_connection_and_closes_after_disconnect(
         "payload": '{"status": "running"}',
         "created_at": 1234,
     }
-    probe_conn = _TrackingConnection()
     conn = _TrackingConnection(rows_by_poll=[[], [event_row]])
     connect_threads: list[int] = []
 
     def _connect(*, board=None):
         connect_threads.append(threading.get_ident())
-        return probe_conn if len(connect_threads) == 1 else conn
+        return conn
 
     monkeypatch.setattr(mod.kanban_db, "connect", _connect)
 
@@ -167,12 +166,10 @@ async def test_stream_events_reuses_connection_and_closes_after_disconnect(
     await mod.stream_events(ws)
 
     assert ws.accepted
-    assert len(connect_threads) == 2
-    assert probe_conn.execute_calls == 0
-    assert probe_conn.close_calls == 1
+    assert len(connect_threads) == 1
     assert conn.execute_calls == 2
     assert conn.close_calls == 1
-    assert len(set([connect_threads[1], *conn.thread_ids])) == 1
+    assert len(set([connect_threads[0], *conn.thread_ids])) == 1
     assert ws.sent == [{
         "events": [{
             "id": 7,
@@ -193,7 +190,6 @@ async def test_stream_events_closes_connection_when_cancelled(monkeypatch):
 
     loop = asyncio.get_running_loop()
     first_fetch_done = asyncio.Event()
-    probe_conn = _TrackingConnection()
     conn = _TrackingConnection(
         on_execute=lambda: loop.call_soon_threadsafe(first_fetch_done.set),
     )
@@ -201,7 +197,7 @@ async def test_stream_events_closes_connection_when_cancelled(monkeypatch):
 
     def _connect(*, board=None):
         connect_threads.append(threading.get_ident())
-        return probe_conn if len(connect_threads) == 1 else conn
+        return conn
 
     monkeypatch.setattr(mod.kanban_db, "connect", _connect)
 
@@ -224,9 +220,7 @@ async def test_stream_events_closes_connection_when_cancelled(monkeypatch):
     task.cancel()
     await task
 
-    assert len(connect_threads) == 2
-    assert probe_conn.execute_calls == 0
-    assert probe_conn.close_calls == 1
+    assert len(connect_threads) == 1
     assert conn.execute_calls == 1
     assert conn.close_calls == 1
-    assert len(set([connect_threads[1], *conn.thread_ids])) == 1
+    assert len(set([connect_threads[0], *conn.thread_ids])) == 1

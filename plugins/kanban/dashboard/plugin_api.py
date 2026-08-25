@@ -3685,7 +3685,15 @@ async def stream_events(ws: WebSocket):
     # contract, this avoids repeatedly creating and deleting the WAL/SHM
     # sidecars while an idle dashboard polls for events.
     event_conn: Optional[sqlite3.Connection] = None
-    event_executor: Optional[ThreadPoolExecutor] = None
+    event_executor = ThreadPoolExecutor(
+        max_workers=1,
+        thread_name_prefix="kanban-events",
+    )
+
+    def _open_event_conn() -> None:
+        nonlocal event_conn
+        if event_conn is None:
+            event_conn = kanban_db.connect(board=ws_board)
 
     def _close_event_conn() -> None:
         nonlocal event_conn
@@ -3718,8 +3726,10 @@ async def stream_events(ws: WebSocket):
             # KanbanDbCorruptError for integrity failures. Invalid-header guard
             # failures can surface as sqlite3.DatabaseError before backup
             # metadata exists; those are still surfaced as degraded to the UI.
-            probe_conn = kanban_db.connect(board=ws_board)
-            probe_conn.close()
+            await asyncio.get_running_loop().run_in_executor(
+                event_executor,
+                _open_event_conn,
+            )
         except kanban_db.KanbanDbCorruptError as exc:
             log.warning("Kanban WS degraded handshake: %s", exc.reason)
             await ws.send_json(_degraded_board_payload(
@@ -3738,9 +3748,8 @@ async def stream_events(ws: WebSocket):
         # ------------------------------------------------------------------
 
         def _fetch_new(cursor_val: int) -> tuple[int, list[dict]]:
-            nonlocal event_conn
-            if event_conn is None:
-                event_conn = kanban_db.connect(board=ws_board)
+            _open_event_conn()
+            assert event_conn is not None
             rows = event_conn.execute(
                 "SELECT id, task_id, run_id, kind, payload, created_at "
                 "FROM task_events WHERE id > ? ORDER BY id ASC LIMIT 200",
@@ -3780,11 +3789,6 @@ async def stream_events(ws: WebSocket):
             except asyncio.TimeoutError:
                 pass  # no client message — poll the DB
 
-            if event_executor is None:
-                event_executor = ThreadPoolExecutor(
-                    max_workers=1,
-                    thread_name_prefix="kanban-events",
-                )
             cursor, events = await asyncio.get_running_loop().run_in_executor(
                 event_executor,
                 _fetch_new,
@@ -3808,13 +3812,12 @@ async def stream_events(ws: WebSocket):
         except Exception:
             pass
     finally:
-        if event_executor is not None:
-            try:
-                await asyncio.get_running_loop().run_in_executor(
-                    event_executor,
-                    _close_event_conn,
-                )
-            except Exception as exc:
-                log.warning("Kanban event stream connection cleanup failed: %s", exc)
-            finally:
-                event_executor.shutdown(wait=True, cancel_futures=True)
+        try:
+            await asyncio.get_running_loop().run_in_executor(
+                event_executor,
+                _close_event_conn,
+            )
+        except Exception as exc:
+            log.warning("Kanban event stream connection cleanup failed: %s", exc)
+        finally:
+            event_executor.shutdown(wait=True, cancel_futures=True)
