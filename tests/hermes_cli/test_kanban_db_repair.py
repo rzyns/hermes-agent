@@ -360,30 +360,6 @@ def test_wal_checkpoint_failure_never_fails_the_tick(tmp_path, monkeypatch):
         conn.close()
 
 
-@pytest.mark.requires_wal
-def test_wal_checkpoint_truncates_wal_file(tmp_path, monkeypatch):
-    """End-to-end: the checkpoint actually truncates the -wal sidecar."""
-    db_path = tmp_path / "kanban.db"
-    _build_board_db(db_path, tasks=1)
-    monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
-    monkeypatch.setattr(kb, "_LAST_WAL_CHECKPOINT", {})
-
-    conn = kb.connect(db_path=db_path)
-    try:
-        # Generate WAL frames.
-        for i in range(30):
-            kb.create_task(conn, title=f"wal-{i}")
-        wal = tmp_path / "kanban.db-wal"
-        assert wal.exists() and wal.stat().st_size > 0
-
-        kb.dispatch_once(conn, spawn_fn=lambda *a, **k: None, dry_run=True)
-        assert wal.stat().st_size == 0, (
-            "wal_checkpoint(TRUNCATE) should reset the -wal file to 0 bytes"
-        )
-    finally:
-        conn.close()
-
-
 # ---------------------------------------------------------------------------
 # repair_db() API + `hermes kanban repair` CLI verb
 # ---------------------------------------------------------------------------

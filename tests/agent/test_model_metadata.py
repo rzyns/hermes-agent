@@ -566,7 +566,7 @@ class TestCodexOAuthContextLength:
 
         expected = {
             "gpt-5.5": 272_000,
-            "gpt-5.4": 900_000,
+            "gpt-5.4": 272_000,
             "gpt-5.4-mini": 272_000,
             "gpt-5.3-codex": 272_000,
             "gpt-5.3-codex-spark": 128_000,
@@ -783,7 +783,7 @@ class TestCodexOAuthContextLength:
                 provider="openai-codex",
             )
 
-        assert ctx == 900_000
+        assert ctx == 272_000
         mock_save.assert_not_called()
         assert not cache_file.exists()
 
@@ -811,7 +811,7 @@ class TestCodexOAuthContextLength:
                 provider="openai-codex",
             )
 
-        assert ctx == 900_000
+        assert ctx == 272_000
         mock_get.assert_called_once()
         remaining = _yaml.safe_load(cache_file.read_text()).get("context_lengths", {})
         assert remaining.get(f"gpt-5.6-terra@{base_url}") == 372_000

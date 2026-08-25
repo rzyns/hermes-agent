@@ -4821,7 +4821,11 @@ class TestCronDeliveryTargets:
         self._patch_connected(monkeypatch, ["telegram"])
         monkeypatch.setenv("MATRIX_HOME_ROOM", "!room:matrix.org")
 
-        ids = {t["id"] for t in cron_delivery_targets()}
+        ids = {
+            t["id"]
+            for t in cron_delivery_targets()
+            if not t["id"].startswith("bot-chat:")
+        }
 
         assert ids == {"telegram"}
         assert "matrix" not in ids
@@ -4835,7 +4839,13 @@ class TestCronDeliveryTargets:
 
         monkeypatch.setattr(gateway_config, "load_gateway_config", _boom)
 
-        assert cron_delivery_targets() == []
+        # Bot Chat delivery is machine-local and independent of gateway config.
+        gateway_targets = [
+            t
+            for t in cron_delivery_targets()
+            if not t["id"].startswith("bot-chat:")
+        ]
+        assert gateway_targets == []
 
 
 class TestHomeTargetEnvVarRegistry:

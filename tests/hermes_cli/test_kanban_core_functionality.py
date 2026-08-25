@@ -4269,7 +4269,15 @@ def test_gateway_dispatcher_retries_corrupt_board_after_quarantine(
 
     async def _to_thread(fn, *args, **kwargs):
         result = fn(*args, **kwargs)
-        if getattr(fn, "__name__", "") == "_tick_once":
+        # Process-service offloads scrub ContextVars through
+        # _run_in_fresh_context(actual_fn, ...); inspect the wrapped callable so
+        # the test still counts dispatcher ticks rather than the scrub wrapper.
+        target = (
+            args[0]
+            if args and getattr(fn, "__name__", "") == "_run_in_fresh_context"
+            else fn
+        )
+        if getattr(target, "__name__", "") == "_tick_once":
             calls["tick"] += 1
             if calls["tick"] >= 3:
                 runner._running = False

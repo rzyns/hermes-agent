@@ -399,7 +399,9 @@ def _run_one_file_once(
     # One root for each subprocess removes the shared directory that the race
     # needs. The parent deletes the root after the attempt.
     env = os.environ.copy()
-    temproot = tempfile.mkdtemp(prefix="hermes-pytest-tmproot-")
+    # Keep this prefix short: pytest appends the user and full test name, and
+    # Linux AF_UNIX paths are capped at 107 pathname bytes plus the NUL.
+    temproot = tempfile.mkdtemp(prefix="hpt-")
     env["PYTEST_DEBUG_TEMPROOT"] = temproot
 
     subproc_start = time.monotonic()

@@ -155,7 +155,7 @@ test('primary desktop backend arms the port watcher before boot progress can yie
   const primarySpawn = source.indexOf('hermesProcess = spawn(')
   assert.notEqual(primarySpawn, -1, 'primary backend spawn block should exist')
 
-  const watcher = source.indexOf('waitForDashboardPortAnnouncement(hermesProcess, { readyFile })', primarySpawn)
+  const watcher = source.indexOf('waitForDashboardPortAnnouncement(hermesProcess, {', primarySpawn)
   const yieldingProgress = source.indexOf("await advanceBootProgress('backend.port'", primarySpawn)
 
   assert.notEqual(watcher, -1, 'primary backend must create a waitForDashboardPortAnnouncement watcher')
@@ -242,4 +242,48 @@ test('waitForDashboardReadyFile rejects when the child exits before file readine
   } finally {
     tmp.cleanup()
   }
+})
+
+// ---------------------------------------------------------------------------
+// describeOutputTail (#93608): the child's real stderr reaches the exit error
+// ---------------------------------------------------------------------------
+
+test('exit-before-announcement error carries the buffered output tail (stdout path)', async () => {
+  const child = makeFakeChild()
+
+  const wait = waitForDashboardPortAnnouncement(child, {
+    describeOutputTail: () => '\nRecent backend output:\nModuleNotFoundError: hermes_cli'
+  })
+
+  child.emit('exit', 1, null)
+
+  await assert.rejects(wait, /exited before port announcement \(1\)[\s\S]*ModuleNotFoundError: hermes_cli/)
+})
+
+test('exit-before-announcement error carries the buffered output tail (ready-file path)', async () => {
+  const child = makeFakeChild()
+  const readyFile = path.join(os.tmpdir(), `hermes-ready-${process.pid}-${Date.now()}.json`)
+
+  const wait = waitForDashboardPortAnnouncement(child, {
+    describeOutputTail: () => '\nRecent backend output:\nTraceback (most recent call last)',
+    readyFile
+  })
+
+  child.emit('exit', null, 'SIGSEGV')
+
+  await assert.rejects(wait, /exited before port announcement \(SIGSEGV\)[\s\S]*Traceback/)
+})
+
+test('exit-before-announcement error stays clean when no output was buffered', async () => {
+  const child = makeFakeChild()
+
+  const wait = waitForDashboardPortAnnouncement(child, {})
+
+  child.emit('exit', 137, null)
+
+  await assert.rejects(wait, error => {
+    assert.match((error as Error).message, /exited before port announcement \(137\)$/)
+
+    return true
+  })
 })
