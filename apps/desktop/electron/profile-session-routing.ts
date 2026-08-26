@@ -144,9 +144,17 @@ export function buildSidebarSessionSliceParams(searchParams: URLSearchParams): S
     })
 
   const recents = slice('recents_limit', '20', { profile })
+  // Mirror the renderer's either/or: an explicit source allowlist replaces the
+  // default exclusion taxonomy (see sidebarSessionSourceFilter). Forwarding
+  // only the exclude half left a custom allowlist silently unscoped on remote
+  // backends: rows came back unfiltered, and the client-side net then hid
+  // them AFTER they had already consumed the remote page window.
+  const recentsSources = searchParams.get('recents_sources')
   const recentsExclude = searchParams.get('recents_exclude')
 
-  if (recentsExclude) {
+  if (recentsSources) {
+    recents.set('sources', recentsSources)
+  } else if (recentsExclude) {
     recents.set('exclude_sources', recentsExclude)
   }
 

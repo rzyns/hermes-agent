@@ -33,6 +33,23 @@ test('remote sidebar slices all follow the selected profile', () => {
   assert.equal(slices.messaging.get('exclude_sources'), 'desktop,cron')
 })
 
+test('an explicit recents source allowlist reaches remote backends and replaces the exclude taxonomy', () => {
+  const slices = buildSidebarSessionSliceParams(
+    new URLSearchParams({
+      recents_profile: 'work-vps',
+      recents_sources: 'cli,webui',
+      // The renderer sends either sources or exclude, never both — but if a
+      // hand-built URL carries both, the allowlist wins, matching
+      // sidebarSessionSourceFilter's either/or contract.
+      recents_exclude: 'cron,signal'
+    })
+  )
+
+  assert.equal(slices.recents.get('sources'), 'cli,webui')
+  assert.equal(slices.recents.get('exclude_sources'), null)
+  assert.equal(slices.cron.get('source'), 'cron')
+})
+
 test('remote sidebar slices preserve the explicit all-profiles scope', () => {
   const slices = buildSidebarSessionSliceParams(new URLSearchParams({ recents_profile: 'all' }))
 
