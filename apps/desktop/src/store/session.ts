@@ -6,15 +6,7 @@ import type { ContextSuggestion } from '@/app/types'
 import type { HermesConnection } from '@/global'
 import type { ChatMessage } from '@/lib/chat-messages'
 import { activeConnectionScopeSuffix, rescopeConnectionScopedStores } from '@/lib/connection-scoped'
-import { normalizeSidebarSourceIds } from '@/lib/sidebar-session-sources'
-import {
-  persistBoolean,
-  persistString,
-  persistStringArray,
-  storedBoolean,
-  storedString,
-  storedStringArray
-} from '@/lib/storage'
+import { persistBoolean, persistString, storedBoolean, storedString } from '@/lib/storage'
 import { syncCronModelImpactConnection } from '@/store/cron-model-impact-scope'
 import type { SessionInfo, UsageStats } from '@/types/hermes'
 
@@ -36,7 +28,6 @@ const COMPOSER_PROVIDER_KEY = 'hermes.desktop.composer.provider'
 const COMPOSER_MODEL_SOURCE_KEY = 'hermes.desktop.composer.model-source'
 const COMPOSER_EFFORT_KEY = 'hermes.desktop.composer.reasoning-effort'
 const COMPOSER_FAST_KEY = 'hermes.desktop.composer.fast'
-const SIDEBAR_SESSION_SOURCE_IDS_KEY = 'hermes.desktop.sidebar.session-source-ids'
 
 // The last chat the user had open, so a relaunch lands back on it instead of an
 // empty new-chat. Stored (not runtime) id — the route is keyed by stored id.
@@ -745,9 +736,6 @@ export const $currentProvider = atom(storedString(COMPOSER_PROVIDER_KEY) ?? '')
 export const $currentReasoningEffort = atom(storedString(COMPOSER_EFFORT_KEY) ?? '')
 export const $currentServiceTier = atom('')
 export const $currentFastMode = atom(storedBoolean(COMPOSER_FAST_KEY, false))
-export const $sidebarSessionSourceIds = atom<string[]>(
-  normalizeSidebarSourceIds(storedStringArray(SIDEBAR_SESSION_SOURCE_IDS_KEY))
-)
 // Effective approval-bypass state mirrored from the gateway (session.info).
 // Persistence lives in the backend config (approvals.mode), so this is a plain
 // reflection of the truth the gateway reports rather than its own store.
@@ -987,15 +975,6 @@ export const setCurrentServiceTier = (next: Updater<string>) => updateAtom($curr
 export const setCurrentFastMode = (next: Updater<boolean>) => {
   updateAtom($currentFastMode, next)
   persistBoolean(COMPOSER_FAST_KEY, $currentFastMode.get())
-}
-
-export const setSidebarSessionSourceIds = (next: Updater<string[]>) => {
-  const current = $sidebarSessionSourceIds.get()
-  const value = typeof next === 'function' ? (next as (current: string[]) => string[])(current) : next
-  const normalized = normalizeSidebarSourceIds(value)
-
-  $sidebarSessionSourceIds.set(normalized)
-  persistStringArray(SIDEBAR_SESSION_SOURCE_IDS_KEY, normalized)
 }
 
 export const setYoloActive = (next: Updater<boolean>) => updateAtom($yoloActive, next)

@@ -20,6 +20,8 @@ import {
 } from '@/components/ui/dropdown-menu'
 import { useI18n } from '@/i18n'
 import { desktopGit } from '@/lib/desktop-git'
+import { sessionSourceLabel } from '@/lib/session-source'
+import { SIDEBAR_SOURCE_OPTION_IDS } from '@/lib/sidebar-session-sources'
 import { cn } from '@/lib/utils'
 import {
   $sidebarCardRows,
@@ -31,6 +33,7 @@ import {
   $sidebarProjectFilter,
   $sidebarRowMeta,
   $sidebarShowArchived,
+  $sidebarSourceFilter,
   $sidebarStatusFilter,
   $sidebarViewCustomized,
   $sidebarWorkspaceNodeOpen,
@@ -47,6 +50,7 @@ import {
   toggleSidebarProfileFilter,
   toggleSidebarProjectFilter,
   toggleSidebarRowMeta,
+  toggleSidebarSourceFilter,
   toggleSidebarStatusFilter
 } from '@/store/layout'
 import {
@@ -112,6 +116,27 @@ const STATUS_FILTERS: Option<SessionStatusBucket>[] = [
   { dot: cn(sessionDotClassName('idle'), 'bg-(--ui-text-quaternary)'), id: 'idle', label: 'Idle' }
 ]
 
+const SOURCE_FILTER_ICONS: Record<string, string> = {
+  acp: 'code',
+  api_server: 'plug',
+  cli: 'terminal',
+  codex: 'hubot',
+  desktop: 'device-desktop',
+  gateway: 'server',
+  local: 'home',
+  'profile-delegate': 'organization',
+  tui: 'terminal',
+  webui: 'globe'
+}
+
+// The local-ish surfaces only: messaging platforms have their own sidebar
+// sections and kanban worker runs belong on the board, so neither is offered.
+const SOURCE_FILTERS: Option[] = SIDEBAR_SOURCE_OPTION_IDS.map(id => ({
+  icon: SOURCE_FILTER_ICONS[id] ?? 'plug',
+  id,
+  label: sessionSourceLabel(id) ?? id
+}))
+
 function OptionGlyph({ option }: { option: Option }) {
   if (option.dot) {
     return <span aria-hidden="true" className={cn('shrink-0', option.dot)} />
@@ -155,6 +180,7 @@ export function SidebarFilterMenu({ className }: { className?: string }) {
   const rowMeta = useStore($sidebarRowMeta)
   const cardRows = useStore($sidebarCardRows)
   const statusFilter = useStore($sidebarStatusFilter)
+  const sourceFilter = useStore($sidebarSourceFilter)
   const projectFilter = useStore($sidebarProjectFilter)
   const profileFilter = useStore($sidebarProfileFilter)
   const showAllProfiles = useStore($showAllProfiles)
@@ -295,6 +321,25 @@ export function SidebarFilterMenu({ className }: { className?: string }) {
                   checked={statusFilter.includes(option.id)}
                   key={option.id}
                   onCheck={() => toggleSidebarStatusFilter(option.id)}
+                  option={option}
+                />
+              ))}
+            </DropdownMenuSubContent>
+          </DropdownMenuSub>
+
+          {/* Not a row filter like its siblings: a selection re-scopes the
+              recents fetch itself (a server-side sources allowlist), while
+              empty keeps the default taxonomy — cron, tools, subagents,
+              messaging and kanban stay excluded from recents. The messaging
+              and cron sections are unaffected either way. */}
+          <DropdownMenuSub>
+            <DropdownMenuSubTrigger>Source</DropdownMenuSubTrigger>
+            <DropdownMenuSubContent className="max-h-80 overflow-y-auto">
+              {SOURCE_FILTERS.map(option => (
+                <OptionCheckbox
+                  checked={sourceFilter.includes(option.id)}
+                  key={option.id}
+                  onCheck={() => toggleSidebarSourceFilter(option.id)}
                   option={option}
                 />
               ))}

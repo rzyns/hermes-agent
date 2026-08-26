@@ -6,6 +6,7 @@ import { isPaneVisible, revealTreePane } from '@/components/pane-shell/tree/stor
 import { matchesQuery } from '@/hooks/use-media-query'
 import { connectionScopedAtom } from '@/lib/connection-scoped'
 import { type Codec, Codecs, persistentAtom } from '@/lib/persisted'
+import { SIDEBAR_SOURCE_OPTION_IDS } from '@/lib/sidebar-session-sources'
 import { arraysEqual, insertUniqueId, readKey } from '@/lib/storage'
 
 import { $paneStates, ensurePaneRegistered, setPaneOpen, setPaneWidthOverride, togglePane } from './panes'
@@ -45,6 +46,9 @@ const SIDEBAR_SHOW_ARCHIVED_STORAGE_KEY = 'hermes.desktop.sidebarShowArchived'
 const SIDEBAR_PROJECT_FILTER_STORAGE_KEY = 'hermes.desktop.sidebarProjectFilter'
 const SIDEBAR_PROFILE_FILTER_STORAGE_KEY = 'hermes.desktop.sidebarProfileFilter'
 const SIDEBAR_PR_FILTER_STORAGE_KEY = 'hermes.desktop.sidebarPrFilter'
+// Key inherited from the retired Settings → Sessions source picker so an
+// existing selection survives the move into the filter menu.
+const SIDEBAR_SOURCE_FILTER_STORAGE_KEY = 'hermes.desktop.sidebar.session-source-ids'
 const SIDEBAR_WORKSPACE_ORDER_STORAGE_KEY = 'hermes.desktop.workspaceOrder'
 const SIDEBAR_WORKSPACE_PARENT_ORDER_STORAGE_KEY = 'hermes.desktop.workspaceParentOrder'
 const SIDEBAR_PROJECT_ORDER_STORAGE_KEY = 'hermes.desktop.projectOrder'
@@ -362,6 +366,17 @@ export const $sidebarPrFilter = persistentAtom<PullRequestBucket[]>(
   listOf(PR_FILTERS)
 )
 
+// Which session sources the recents list is scoped to. Unlike its siblings this
+// is not a client-side row filter: empty means the default taxonomy (cron,
+// tools, subagents, messaging and kanban excluded server-side), and a selection
+// becomes a `sources` allowlist on the sidebar fetch itself, so the backend
+// windows over exactly the rows the view wants (see use-session-list-actions).
+export const $sidebarSourceFilter = persistentAtom<string[]>(
+  SIDEBAR_SOURCE_FILTER_STORAGE_KEY,
+  [],
+  listOf(SIDEBAR_SOURCE_OPTION_IDS)
+)
+
 export const $sidebarGrouping: ReadableAtom<SidebarGrouping> = computed(
   [$sidebarAgentsGrouped, $sidebarFlatGrouping, $sidebarAllProfilesGrouping, $showAllProfiles],
   (grouped, flat, allProfiles, showAll) => (grouped ? 'project' : showAll ? allProfiles : flat)
@@ -375,9 +390,16 @@ export const $sidebarOrdering: ReadableAtom<SidebarOrdering> = computed(
 )
 
 export const $sidebarFiltersActive: ReadableAtom<boolean> = computed(
-  [$sidebarStatusFilter, $sidebarProjectFilter, $sidebarProfileFilter, $sidebarPrFilter, $sidebarShowArchived],
-  (statuses, projects, profiles, prs, archived) =>
-    statuses.length > 0 || projects.length > 0 || profiles.length > 0 || prs.length > 0 || archived
+  [
+    $sidebarStatusFilter,
+    $sidebarProjectFilter,
+    $sidebarProfileFilter,
+    $sidebarPrFilter,
+    $sidebarSourceFilter,
+    $sidebarShowArchived
+  ],
+  (statuses, projects, profiles, prs, sources, archived) =>
+    statuses.length > 0 || projects.length > 0 || profiles.length > 0 || prs.length > 0 || sources.length > 0 || archived
 )
 
 /** Anything at all moved off the shipped view — what makes a reset worth
@@ -657,11 +679,16 @@ export function toggleSidebarPrFilter(bucket: PullRequestBucket) {
   toggleIn($sidebarPrFilter, bucket)
 }
 
+export function toggleSidebarSourceFilter(source: string) {
+  toggleIn($sidebarSourceFilter, source)
+}
+
 function clearSidebarFilters() {
   $sidebarStatusFilter.set([])
   $sidebarProjectFilter.set([])
   $sidebarProfileFilter.set([])
   $sidebarPrFilter.set([])
+  $sidebarSourceFilter.set([])
   $sidebarShowArchived.set(false)
 }
 

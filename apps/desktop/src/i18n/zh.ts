@@ -387,7 +387,7 @@ export const zh: Translations = {
       keysTools: '工具',
       keysSettings: '设置',
       mcp: 'MCP',
-      archivedChats: '会话',
+      archivedChats: '已归档对话',
       about: '关于',
       billing: '账单',
       notifications: '通知',
@@ -514,7 +514,7 @@ export const zh: Translations = {
       gateway: '网关连接…',
       keys: '搜索 API 密钥…',
       mcp: '搜索 MCP 服务器…',
-      sessions: '搜索会话…'
+      sessions: '搜索已归档会话…'
     },
     modeOptions: {
       light: { label: '明亮', description: '明亮的桌面界面' },
@@ -1330,16 +1330,6 @@ export const zh: Translations = {
       defaultDirDesc: '新会话默认从此文件夹开始，除非你选择其他目录。留空则使用你的 home 目录。',
       defaultDirUpdated: '默认项目目录已更新',
       defaultsTo: label => `默认使用 ${label}。`,
-      sidebarSourcesTitle: '侧边栏来源',
-      sidebarSourcesDesc:
-        '选择哪些会话来源显示在主侧边栏最近列表中。默认会保留 Hermes 内置的定时任务和消息平台分组；选择来源后只显示这些来源。',
-      sidebarSourcesDefaultMode: '内置侧边栏分组',
-      sidebarSourcesDefaultSummary: '主最近列表会排除定时任务、工具、子代理和消息平台；这些来源仍在各自分组中显示。',
-      sidebarSourcesCustomMode: '仅选中来源',
-      sidebarSourcesSelectedSummary: sources => `主最近列表仅显示：${sources}。`,
-      sidebarSourcesPresetLocal: 'CLI + TUI + WebUI',
-      sidebarSourcesUseDefault: '使用默认',
-      sidebarSourcesToggle: source => `在侧边栏显示 ${source} 会话`,
       change: '更改',
       choose: '选择',
       clear: '清除',

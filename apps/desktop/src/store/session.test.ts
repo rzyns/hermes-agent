@@ -24,7 +24,6 @@ import {
   $currentCwd,
   $selectedStoredSessionId,
   $sessions,
-  $sidebarSessionSourceIds,
   $unreadFinishedSessionIds,
   _resetLegacyDiscardForTests,
   applyConfiguredDefaultProjectDir,
@@ -48,7 +47,6 @@ import {
   setSelectedStoredSessionId,
   setSessionOwnerHint,
   setSessions,
-  setSidebarSessionSourceIds,
   shouldMigrateComposerScope,
   touchSessionActivity,
   workspaceCwdForNewSession
@@ -59,30 +57,6 @@ import {
   getRecentlySettledSessionIds,
   publishSessionState
 } from './session-states'
-
-const SIDEBAR_SOURCE_KEY = 'hermes.desktop.sidebar.session-source-ids'
-
-const createLocalStorageMock = (): Storage => {
-  const values = new Map<string, string>()
-
-  return {
-    get length() {
-      return values.size
-    },
-    clear: () => values.clear(),
-    getItem: key => values.get(key) ?? null,
-    key: index => Array.from(values.keys())[index] ?? null,
-    removeItem: key => values.delete(key),
-    setItem: (key, value) => values.set(key, value)
-  }
-}
-
-beforeEach(() => {
-  Object.defineProperty(window, 'localStorage', {
-    configurable: true,
-    value: createLocalStorageMock()
-  })
-})
 
 const session = (over: Partial<SessionInfo>): SessionInfo => makeSessionInfo({ id: 'live', ...over })
 
@@ -167,26 +141,6 @@ describe('computed $attentionSessionIds', () => {
   it('falls back to the runtime id for a session with no storedSessionId', () => {
     publishSessionState('rt1', { ...createClientSessionState(null), needsInput: true })
     expect($attentionSessionIds.get()).toEqual(['rt1'])
-  })
-})
-
-describe('setSidebarSessionSourceIds', () => {
-  afterEach(() => {
-    setSidebarSessionSourceIds([])
-    $sidebarSessionSourceIds.set([])
-    window.localStorage.removeItem(SIDEBAR_SOURCE_KEY)
-  })
-
-  it('normalizes, dedupes, persists, and clears the sidebar source allowlist', () => {
-    setSidebarSessionSourceIds([' CLI ', 'webui', 'cli'])
-
-    expect($sidebarSessionSourceIds.get()).toEqual(['cli', 'webui'])
-    expect(window.localStorage.getItem(SIDEBAR_SOURCE_KEY)).toBe(JSON.stringify(['cli', 'webui']))
-
-    setSidebarSessionSourceIds([])
-
-    expect($sidebarSessionSourceIds.get()).toEqual([])
-    expect(window.localStorage.getItem(SIDEBAR_SOURCE_KEY)).toBeNull()
   })
 })
 

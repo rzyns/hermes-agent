@@ -1,14 +1,17 @@
 import { beforeEach, describe, expect, it } from 'vitest'
 
 import {
+  $sidebarFiltersActive,
   $sidebarGrouping,
   $sidebarOrdering,
   $sidebarRowMeta,
+  $sidebarSourceFilter,
   $sidebarViewCustomized,
   resetSidebarView,
   setSidebarGrouping,
   setSidebarOrdering,
   toggleSidebarRowMeta,
+  toggleSidebarSourceFilter,
   toggleSidebarStatusFilter
 } from './layout'
 import { $showAllProfiles } from './profile'
@@ -74,5 +77,27 @@ describe('the sidebar as it ships', () => {
 
     expect($showAllProfiles.get()).toBe(true)
     expect($sidebarGrouping.get()).toBe('profile')
+  })
+
+  it('counts a source selection as an active filter, so the funnel lights up', () => {
+    expect($sidebarFiltersActive.get()).toBe(false)
+
+    toggleSidebarSourceFilter('cli')
+
+    expect($sidebarSourceFilter.get()).toEqual(['cli'])
+    expect($sidebarFiltersActive.get()).toBe(true)
+    expect($sidebarViewCustomized.get()).toBe(true)
+  })
+
+  it('clears the source selection on reset, back to the default taxonomy', () => {
+    toggleSidebarSourceFilter('cli')
+    toggleSidebarSourceFilter('webui')
+
+    expect($sidebarSourceFilter.get()).toEqual(['cli', 'webui'])
+
+    resetSidebarView()
+
+    expect($sidebarSourceFilter.get()).toEqual([])
+    expect($sidebarFiltersActive.get()).toBe(false)
   })
 })

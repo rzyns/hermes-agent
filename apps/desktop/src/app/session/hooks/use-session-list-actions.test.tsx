@@ -10,6 +10,7 @@ import {
   recoverActiveSourceAfterFailedGatewaySwitch,
   registerGatewaySwitchLifecycle
 } from '@/store/gateway-switch'
+import { $sidebarSourceFilter } from '@/store/layout'
 import {
   $cronSessions,
   $messagingPlatformTotals,
@@ -26,8 +27,7 @@ import {
   setSessionProfilesTruncated,
   setSessionProfilesUsage,
   setSessions,
-  setSessionsLoading,
-  setSidebarSessionSourceIds
+  setSessionsLoading
 } from '@/store/session'
 
 import { deferred } from '../../../test/deferred'
@@ -119,7 +119,7 @@ beforeEach(() => {
   setSessionProfilesTruncated({})
   setSessionProfilesUsage({})
   setSessionsLoading(false)
-  setSidebarSessionSourceIds([])
+  $sidebarSourceFilter.set([])
 })
 
 afterEach(() => {
@@ -132,7 +132,7 @@ afterEach(() => {
   setSessionProfilesTruncated({})
   setSessionProfilesUsage({})
   setSessionsLoading(false)
-  setSidebarSessionSourceIds([])
+  $sidebarSourceFilter.set([])
 })
 
 describe('refreshSessions identity + loading hygiene', () => {
@@ -434,7 +434,7 @@ describe('refreshSessions batches slices into one request', () => {
   })
 
   it('preserves the selected source allowlist through the batched recents request', async () => {
-    setSidebarSessionSourceIds(['cli', 'webui'])
+    $sidebarSourceFilter.set(['cli', 'webui'])
     listSidebarSessions.mockResolvedValue(
       sidebar({
         sessions: [row('cli-row', { source: 'cli' }), row('desktop-row', { source: 'desktop' })],

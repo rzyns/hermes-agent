@@ -29,7 +29,12 @@ diff against upstream stays reviewable.
 - **Session retitle** — `hermes sessions retitle` backfill with title provenance.
 - **Provider warnings** — transports surface `provider_warnings` on assistant messages.
 - **Desktop/web** — GitHub-dark colorblind theme, backend port-readiness detection,
-  reconnect recovery banner, session source tagging/filtering, kanban dashboard slots.
+  reconnect recovery banner, sidebar session-source filtering, kanban dashboard slots.
+  (2026-08-26: the source filter moved from a Settings → Sessions picker into the
+  sidebar funnel menu as a Source submenu — settings/i18n surface reverted to
+  upstream; the `recents_sources` fetch scoping and its `hermes_state.py` /
+  `profiles.py` backend halves are unchanged, and the electron remote splice now
+  forwards the allowlist to remote backends too.)
 - **Skills** — `skills/creative/html-artifact` (MIT, adapted from Anthropic's gallery).
 
 ### Hardening/fixes to upstream subsystems (upstream-PR candidates)

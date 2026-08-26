@@ -14,6 +14,7 @@ import {
   $pinnedSessionIds,
   $sessionsLimit,
   $sidebarFiltersActive,
+  $sidebarSourceFilter,
   bumpSessionsLimit,
   raiseSessionsLimit,
   SIDEBAR_FILTERED_PAGE_SIZE,
@@ -25,7 +26,6 @@ import {
   $messagingSessions,
   $selectedStoredSessionId,
   $sessions,
-  $sidebarSessionSourceIds,
   CRON_SECTION_LIMIT,
   mergeSessionPage,
   MESSAGING_SECTION_LIMIT,
@@ -108,7 +108,7 @@ export function useSessionListActions({ profileScope }: UseSessionListActionsArg
   const refreshMessagingSessionsRequestRef = useRef(0)
   const refreshSessionsRequestRef = useRef(0)
 
-  const sidebarSessionSourceIds = useStore($sidebarSessionSourceIds)
+  const sidebarSessionSourceIds = useStore($sidebarSourceFilter)
 
   const sidebarSourceFilter = useMemo(() => {
     const filter = sidebarSessionSourceFilter(sidebarSessionSourceIds)

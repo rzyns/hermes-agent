@@ -1,9 +1,7 @@
-import { useStore } from '@nanostores/react'
-import { useCallback, useEffect, useMemo, useState } from 'react'
+import { useCallback, useEffect, useState } from 'react'
 
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
-import { Switch } from '@/components/ui/switch'
 import { Tip } from '@/components/ui/tooltip'
 import {
   deleteSession,
@@ -16,19 +14,11 @@ import { useI18n } from '@/i18n'
 import { sessionTitle } from '@/lib/chat-runtime'
 import { pathLeaf } from '@/lib/display-path'
 import { triggerHaptic } from '@/lib/haptics'
-import { Archive, ArchiveOff, FolderOpen, Loader2, SlidersHorizontal, Trash2 } from '@/lib/icons'
-import { sessionSourceLabel } from '@/lib/session-source'
-import { SIDEBAR_LOCAL_CHAT_SOURCE_IDS, SIDEBAR_SOURCE_OPTION_IDS } from '@/lib/sidebar-session-sources'
+import { Archive, ArchiveOff, FolderOpen, Loader2, Trash2 } from '@/lib/icons'
 import { confirm } from '@/store/confirm'
 import { notify, notifyError } from '@/store/notifications'
 import { untombstoneSessions } from '@/store/projects'
-import {
-  $sidebarSessionSourceIds,
-  applyConfiguredDefaultProjectDir,
-  ensureDefaultWorkspaceCwd,
-  setSessions,
-  setSidebarSessionSourceIds
-} from '@/store/session'
+import { applyConfiguredDefaultProjectDir, ensureDefaultWorkspaceCwd, setSessions } from '@/store/session'
 import { forgetSessionUnread } from '@/store/session-unread'
 import type { HermesConfigRecord, SessionInfo } from '@/types/hermes'
 
@@ -128,7 +118,6 @@ export function SessionsSettings() {
   return (
     <SettingsContent>
       <DefaultProjectDirSetting />
-      <SidebarSourcesSetting />
 
       <AutoArchiveSetting />
 
@@ -189,84 +178,6 @@ export function SessionsSettings() {
         </div>
       )}
     </SettingsContent>
-  )
-}
-
-function SidebarSourcesSetting() {
-  const { t } = useI18n()
-  const s = t.settings.sessions
-  const selectedSources = useStore($sidebarSessionSourceIds)
-  const selectedSourceSet = useMemo(() => new Set(selectedSources), [selectedSources])
-  const defaultMode = selectedSources.length === 0
-
-  const localPresetActive =
-    selectedSources.length === SIDEBAR_LOCAL_CHAT_SOURCE_IDS.length &&
-    SIDEBAR_LOCAL_CHAT_SOURCE_IDS.every(source => selectedSourceSet.has(source))
-
-  const selectedSummary = selectedSources.map(source => sessionSourceLabel(source) ?? source).join(', ')
-
-  const useLocalPreset = useCallback(() => {
-    setSidebarSessionSourceIds(SIDEBAR_LOCAL_CHAT_SOURCE_IDS)
-  }, [])
-
-  const useDefault = useCallback(() => {
-    setSidebarSessionSourceIds([])
-  }, [])
-
-  const toggleSource = useCallback((source: string, checked: boolean) => {
-    setSidebarSessionSourceIds(current => {
-      if (checked) {
-        return [...current, source]
-      }
-
-      return current.filter(item => item !== source)
-    })
-  }, [])
-
-  return (
-    <div className="mb-6">
-      <SectionHeading icon={SlidersHorizontal} title={s.sidebarSourcesTitle} />
-      <p className="mb-2 text-[length:var(--conversation-caption-font-size)] text-(--ui-text-tertiary)">
-        {s.sidebarSourcesDesc}
-      </p>
-      <ListRow
-        action={
-          <div className="flex flex-wrap items-center justify-end gap-2">
-            <Button disabled={localPresetActive} onClick={useLocalPreset} size="sm" type="button" variant="textStrong">
-              {s.sidebarSourcesPresetLocal}
-            </Button>
-            <Button disabled={defaultMode} onClick={useDefault} size="sm" type="button" variant="text">
-              {s.sidebarSourcesUseDefault}
-            </Button>
-          </div>
-        }
-        description={defaultMode ? s.sidebarSourcesDefaultSummary : s.sidebarSourcesSelectedSummary(selectedSummary)}
-        title={defaultMode ? s.sidebarSourcesDefaultMode : s.sidebarSourcesCustomMode}
-      />
-      <div className="mt-1 grid gap-2 rounded-xl border border-border/50 bg-card/35 p-2 sm:grid-cols-2">
-        {SIDEBAR_SOURCE_OPTION_IDS.map(source => {
-          const label = sessionSourceLabel(source) ?? source
-
-          return (
-            <label
-              className="flex min-w-0 items-center gap-3 rounded-lg px-2.5 py-2 text-[length:var(--conversation-caption-font-size)] transition hover:bg-(--chrome-action-hover)"
-              key={source}
-            >
-              <span className="min-w-0 flex-1">
-                <span className="block truncate font-medium text-foreground">{label}</span>
-                <span className="block truncate font-mono text-[0.68rem] text-muted-foreground/60">{source}</span>
-              </span>
-              <Switch
-                aria-label={s.sidebarSourcesToggle(label)}
-                checked={selectedSourceSet.has(source)}
-                onCheckedChange={checked => toggleSource(source, checked)}
-                size="xs"
-              />
-            </label>
-          )
-        })}
-      </div>
-    </div>
   )
 }
 
