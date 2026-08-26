@@ -65,7 +65,8 @@ class TestNoOverlayFlag:
         monkeypatch.setenv("DISPLAY", ":0")
         monkeypatch.delenv("WAYLAND_DISPLAY", raising=False)
         monkeypatch.delenv("XDG_SESSION_TYPE", raising=False)
-        with patch("hermes_cli.config.load_config", return_value={}):
+        with patch("hermes_cli.config.load_config", return_value={}), \
+             patch("builtins.open", mock_open(read_data="Linux version 6.8.0-generic")):
             assert cua_backend._cua_no_overlay() is True
 
     @pytest.mark.linux_only
@@ -74,7 +75,8 @@ class TestNoOverlayFlag:
         monkeypatch.setenv("DISPLAY", ":0")
         monkeypatch.setenv("XDG_SESSION_TYPE", "x11")
         monkeypatch.delenv("WAYLAND_DISPLAY", raising=False)
-        with patch("hermes_cli.config.load_config", return_value={}):
+        with patch("hermes_cli.config.load_config", return_value={}), \
+             patch("builtins.open", mock_open(read_data="Linux version 6.8.0-generic")):
             assert cua_backend._cua_no_overlay() is True
 
     @pytest.mark.linux_only
