@@ -543,6 +543,14 @@ PROVIDER_REGISTRY: Dict[str, ProviderConfig] = {
         api_key_env_vars=("TOKENHUB_API_KEY",),
         base_url_env_var="TOKENHUB_BASE_URL",
     ),
+    "tencent-tokenplan": ProviderConfig(
+        id="tencent-tokenplan",
+        name="Tencent TokenPlan",
+        auth_type="api_key",
+        inference_base_url="https://api.lkeap.cloud.tencent.com/plan/anthropic",
+        api_key_env_vars=("TOKENPLAN_API_KEY",),
+        base_url_env_var="TOKENPLAN_BASE_URL",
+    ),
     "ollama-cloud": ProviderConfig(
         id="ollama-cloud",
         name="Ollama Cloud",
@@ -837,20 +845,11 @@ def _resolve_api_key_provider_secret(
 
 ZAI_ENDPOINTS = [
     # (id, base_url, probe_models, label)
-    ("global", "https://api.z.ai/api/paas/v4", ["glm-5"], "Global"),
-    ("cn", "https://open.bigmodel.cn/api/paas/v4", ["glm-5"], "China"),
-    (
-        "coding-global",
-        "https://api.z.ai/api/coding/paas/v4",
-        ["glm-5.3", "glm-5.2", "glm-5.1", "glm-5v-turbo", "glm-4.7"],
-        "Global (Coding Plan)",
-    ),
-    (
-        "coding-cn",
-        "https://open.bigmodel.cn/api/coding/paas/v4",
-        ["glm-5.3", "glm-5.2", "glm-5.1", "glm-5v-turbo", "glm-4.7"],
-        "China (Coding Plan)",
-    ),
+
+    ("global",        "https://api.z.ai/api/paas/v4",        ["glm-5"],   "Global"),
+    ("cn",            "https://open.bigmodel.cn/api/paas/v4", ["glm-5"],   "China"),
+    ("coding-global", "https://api.z.ai/api/coding/paas/v4",  ["glm-5.3", "glm-5.3-flash", "glm-5.2", "glm-5.1", "glm-5v-turbo", "glm-4.7"], "Global (Coding Plan)"),
+    ("coding-cn",     "https://open.bigmodel.cn/api/coding/paas/v4", ["glm-5.3", "glm-5.3-flash", "glm-5.2", "glm-5.1", "glm-5v-turbo", "glm-4.7"], "China (Coding Plan)"),
 ]
 
 
@@ -1343,8 +1342,20 @@ def _file_lock(
 
     # On Windows, msvcrt.locking needs the file to have content and the
     # file pointer at position 0. Ensure the lock file has at least 1 byte.
+    # Under real concurrency (many threads/processes racing this same
+    # ensure-content check) this write can collide with another holder's
+    # msvcrt byte-range lock on the same file and raise PermissionError --
+    # uncaught, since it happens before the retry loop below even starts.
+    # A stress test with 20 concurrent Hermes processes reproduced this
+    # deterministically on Windows. It's a best-effort convenience write
+    # (whoever gets there first wins); losing the race here just means the
+    # lock file already has content, so swallow the failure and proceed
+    # straight to the acquire-with-retry loop.
     if msvcrt and (not lock_path.exists() or lock_path.stat().st_size == 0):
-        lock_path.write_text(" ", encoding="utf-8")
+        try:
+            lock_path.write_text(" ", encoding="utf-8")
+        except (OSError, PermissionError):
+            pass
 
     with lock_path.open("r+" if msvcrt else "a+", encoding="utf-8") as lock_file:
         deadline = time.monotonic() + max(1.0, timeout_seconds)
@@ -2315,45 +2326,24 @@ def resolve_provider(
         "minimax-portal": "minimax-oauth", "minimax-global": "minimax-oauth", "minimax_oauth": "minimax-oauth",
         "alibaba_coding": "alibaba-coding-plan", "alibaba-coding": "alibaba-coding-plan",
         "alibaba_coding_plan": "alibaba-coding-plan",
-        "claude": "anthropic",
-        "claude-code": "anthropic",
-        "github": "copilot",
-        "github-copilot": "copilot",
-        "github-models": "copilot",
-        "github-model": "copilot",
-        "github-copilot-acp": "copilot-acp",
-        "copilot-acp-agent": "copilot-acp",
-        "aigateway": "ai-gateway",
-        "vercel": "ai-gateway",
-        "vercel-ai-gateway": "ai-gateway",
-        "opencode": "opencode-zen",
-        "zen": "opencode-zen",
-        "free": "opencode-free",
-        "opencode_free": "opencode-free",
-        "qwen-portal": "qwen-oauth",
-        "qwen-cli": "qwen-oauth",
-        "qwen-oauth": "qwen-oauth",
-        "hf": "huggingface",
-        "hugging-face": "huggingface",
-        "huggingface-hub": "huggingface",
-        "mimo": "xiaomi",
-        "xiaomi-mimo": "xiaomi",
-        "tencent": "tencent-tokenhub",
-        "tokenhub": "tencent-tokenhub",
-        "tencent-cloud": "tencent-tokenhub",
-        "tencentmaas": "tencent-tokenhub",
-        "aws": "bedrock",
-        "aws-bedrock": "bedrock",
-        "amazon-bedrock": "bedrock",
-        "amazon": "bedrock",
-        "go": "opencode-go",
-        "opencode-go-sub": "opencode-go",
-        "kilo": "kilocode",
-        "kilo-code": "kilocode",
-        "kilo-gateway": "kilocode",
-        "lmstudio": "lmstudio",
-        "lm-studio": "lmstudio",
-        "lm_studio": "lmstudio",
+
+        "claude": "anthropic", "claude-code": "anthropic",
+        "github": "copilot", "github-copilot": "copilot",
+        "github-models": "copilot", "github-model": "copilot",
+        "github-copilot-acp": "copilot-acp", "copilot-acp-agent": "copilot-acp",
+        "aigateway": "ai-gateway", "vercel": "ai-gateway", "vercel-ai-gateway": "ai-gateway",
+        "opencode": "opencode-zen", "zen": "opencode-zen",
+        "free": "opencode-free", "opencode_free": "opencode-free",
+        "qwen-portal": "qwen-oauth", "qwen-cli": "qwen-oauth", "qwen-oauth": "qwen-oauth",
+        "hf": "huggingface", "hugging-face": "huggingface", "huggingface-hub": "huggingface",
+        "mimo": "xiaomi", "xiaomi-mimo": "xiaomi",
+        "tencent": "tencent-tokenhub", "tokenhub": "tencent-tokenhub",
+        "tencent-cloud": "tencent-tokenhub", "tencentmaas": "tencent-tokenhub",
+        "tokenplan": "tencent-tokenplan", "tencent-lkeap": "tencent-tokenplan",
+        "aws": "bedrock", "aws-bedrock": "bedrock", "amazon-bedrock": "bedrock", "amazon": "bedrock",
+        "go": "opencode-go", "opencode-go-sub": "opencode-go",
+        "kilo": "kilocode", "kilo-code": "kilocode", "kilo-gateway": "kilocode",
+        "lmstudio": "lmstudio", "lm-studio": "lmstudio", "lm_studio": "lmstudio",
         # Local server aliases — route through the generic custom provider
         "ollama": "custom",
         "ollama_cloud": "ollama-cloud",

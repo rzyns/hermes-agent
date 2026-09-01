@@ -276,7 +276,7 @@ def test_default_non_stream_stale_timeout_auto_disables_for_local_endpoints(monk
 
     from run_agent import AIAgent
     agent = AIAgent(
-        model="qwen3:32b",
+        model="llama3:8b",
         provider="ollama-local",
         api_key="sk-dummy",
         base_url="http://127.0.0.1:11434/v1",

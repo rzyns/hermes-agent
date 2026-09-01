@@ -79,6 +79,7 @@ _profile_setup_command = late("_profile_setup_command")
 _profile_to_dict = late("_profile_to_dict")
 _resolve_profile_dir = late("_resolve_profile_dir")
 _spawn_hermes_action = late("_spawn_hermes_action")
+run_in_threadpool = late("run_in_threadpool")
 _strip_session_list_rows = late("_strip_session_list_rows")
 _write_profile_mcp_servers = late("_write_profile_mcp_servers")
 _write_profile_model = late("_write_profile_model")
@@ -792,6 +793,7 @@ async def list_profiles_endpoint():
 def _list_profiles_endpoint_sync():
     from hermes_cli import profiles as profiles_mod
     try:
+
         profiles = profiles_mod.list_profiles()
         return {"profiles": [_profile_to_dict(p) for p in profiles]}
     except Exception:

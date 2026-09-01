@@ -49,6 +49,7 @@ def test_metadata_as_string_does_not_crash():
         "requires_toolsets": [],
         "fallback_for_tools": [],
         "requires_tools": [],
+        "session_platforms": [],
     }
 
 
@@ -61,6 +62,7 @@ def test_metadata_as_none():
         "requires_toolsets": [],
         "fallback_for_tools": [],
         "requires_tools": [],
+        "session_platforms": [],
     }
 
 
@@ -73,6 +75,7 @@ def test_metadata_missing_entirely():
         "requires_toolsets": [],
         "fallback_for_tools": [],
         "requires_tools": [],
+        "session_platforms": [],
     }
 
 

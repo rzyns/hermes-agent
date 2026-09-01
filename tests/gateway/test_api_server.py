@@ -1312,8 +1312,8 @@ class TestHealthDetailedEndpoint:
             "exit_reason": None,
             "updated_at": "2026-04-14T00:00:00Z",
         }), patch("gateway.run._resolve_gateway_model", return_value="test/model"), patch(
-            "gateway.platforms.api_server.collect_runtime_readiness",
-            return_value={"status": "ok"},
+            "gateway.readiness.shutil.disk_usage",
+            return_value=types.SimpleNamespace(total=100, used=25, free=75),
         ):
             async with TestClient(TestServer(app)) as cli:
                 resp = await cli.get("/health/detailed")
@@ -1586,6 +1586,11 @@ class TestCapabilitiesEndpoint:
             assert data["features"]["chat_completions"] is True
             assert data["features"]["run_status"] is True
             assert data["features"]["run_events_sse"] is True
+            assert data["features"]["runs_idempotency"] == {
+                "supported": True,
+                "durable": True,
+                "retention_seconds": 86400,
+            }
             assert data["features"]["model_options"] is True
             assert data["features"]["session_continuity_header"] == "X-Hermes-Session-Id"
             assert data["endpoints"]["run_status"]["path"] == "/v1/runs/{run_id}"
@@ -1607,6 +1612,15 @@ class TestCapabilitiesEndpoint:
             assert authed.status == 200
             data = await authed.json()
             assert data["auth"]["required"] is True
+
+    @pytest.mark.asyncio
+    async def test_capabilities_reports_in_memory_idempotency_fallback(self, adapter):
+        adapter._run_idempotency_store._db_path = None
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            response = await cli.get("/v1/capabilities")
+            data = await response.json()
+        assert data["features"]["runs_idempotency"]["durable"] is False
 
 
 # ---------------------------------------------------------------------------

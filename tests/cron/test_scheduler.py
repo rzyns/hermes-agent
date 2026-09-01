@@ -224,6 +224,7 @@ class TestResolveDeliveryTarget:
             "platform": "telegram",
             "chat_id": "-1001",
             "thread_id": "17585",
+            "_resolved_from": "origin",
         }
 
     @pytest.mark.parametrize(
@@ -268,6 +269,7 @@ class TestResolveDeliveryTarget:
             "platform": platform,
             "chat_id": chat_id,
             "thread_id": None,
+            "_resolved_from": "origin_fallback",
         }
 
     def test_bare_matrix_delivery_uses_matrix_home_room(self, monkeypatch):
@@ -354,6 +356,7 @@ class TestResolveDeliveryTarget:
             "platform": "telegram",
             "chat_id": "-1003724596514",
             "thread_id": "17",
+            "_resolved_from": "explicit",
         }
 
     def test_explicit_telegram_topic_target_with_thread_id(self):
@@ -365,6 +368,7 @@ class TestResolveDeliveryTarget:
             "platform": "telegram",
             "chat_id": "-1003724596514",
             "thread_id": "17",
+            "_resolved_from": "explicit",
         }
 
     def test_explicit_telegram_topic_thread_survives_bare_directory_match(self):
@@ -381,6 +385,7 @@ class TestResolveDeliveryTarget:
             "platform": "telegram",
             "chat_id": "-1003724596514",
             "thread_id": "17",
+            "_resolved_from": "explicit",
         }
 
     def test_explicit_telegram_chat_id_without_thread_id(self):
@@ -392,6 +397,7 @@ class TestResolveDeliveryTarget:
             "platform": "telegram",
             "chat_id": "-1003724596514",
             "thread_id": None,
+            "_resolved_from": "explicit",
         }
 
     def test_human_friendly_label_resolved_via_channel_directory(self):
@@ -407,6 +413,7 @@ class TestResolveDeliveryTarget:
             "platform": "whatsapp",
             "chat_id": "12345678901234@lid",
             "thread_id": None,
+            "_resolved_from": "explicit",
         }
 
     def test_human_friendly_label_without_suffix_resolved(self):
@@ -421,6 +428,7 @@ class TestResolveDeliveryTarget:
             "platform": "telegram",
             "chat_id": "-1009999",
             "thread_id": None,
+            "_resolved_from": "explicit",
         }
 
     def test_human_friendly_topic_label_preserves_thread_id(self):
@@ -435,6 +443,7 @@ class TestResolveDeliveryTarget:
             "platform": "telegram",
             "chat_id": "-1009999",
             "thread_id": "17585",
+            "_resolved_from": "explicit",
         }
 
     def test_raw_id_not_mangled_when_directory_returns_none(self):
@@ -449,6 +458,7 @@ class TestResolveDeliveryTarget:
             "platform": "whatsapp",
             "chat_id": "12345@lid",
             "thread_id": None,
+            "_resolved_from": "explicit",
         }
 
     def test_explicit_slack_same_channel_preserves_origin_thread_id(self):
@@ -465,6 +475,7 @@ class TestResolveDeliveryTarget:
             "platform": "slack",
             "chat_id": "C0B3KEP3SD6",
             "thread_id": "1778485067.844139",
+            "_resolved_from": "explicit",
         }
 
     def test_explicit_slack_other_channel_does_not_inherit_origin_thread_id(self):
@@ -481,6 +492,7 @@ class TestResolveDeliveryTarget:
             "platform": "slack",
             "chat_id": "COTHERCHAN",
             "thread_id": None,
+            "_resolved_from": "explicit",
         }
 
     def test_explicit_slack_thread_target_overrides_origin_thread_id(self):
@@ -497,6 +509,7 @@ class TestResolveDeliveryTarget:
             "platform": "slack",
             "chat_id": "C0B3KEP3SD6",
             "thread_id": "1778500000.000001",
+            "_resolved_from": "explicit",
         }
 
     def test_bare_platform_uses_matching_origin_chat(self):
@@ -540,6 +553,7 @@ class TestResolveDeliveryTarget:
             "platform": "discord",
             "chat_id": "-1001234567890",
             "thread_id": "17585",
+            "_resolved_from": "explicit",
         }
 
     def test_explicit_discord_chat_id_without_thread_id(self):
@@ -551,6 +565,7 @@ class TestResolveDeliveryTarget:
             "platform": "discord",
             "chat_id": "9876543210",
             "thread_id": None,
+            "_resolved_from": "explicit",
         }
 
     def test_explicit_discord_channel_without_thread(self):
@@ -563,7 +578,9 @@ class TestResolveDeliveryTarget:
             "platform": "discord",
             "chat_id": "1001234567890",
             "thread_id": None,
+            "_resolved_from": "explicit",
         }
+
     def test_unresolved_target_still_delivered_as_written(self):
         """A stored job's platform-native target keeps delivering when neither
         parser nor directory recognizes it. Routing cron through
@@ -580,6 +597,7 @@ class TestResolveDeliveryTarget:
             "platform": "telegram",
             "chat_id": "ops-room",
             "thread_id": None,
+            "_resolved_from": "explicit",
         }
 
 
@@ -1602,6 +1620,10 @@ class TestRunJobSessionPersistence:
              patch(
                  "cron.scheduler.concurrent.futures.wait",
                  return_value=(set(), set()),
+             ), \
+             patch(
+                 "cron.scheduler._inactivity_watchdog_loop",
+                 return_value=True,
              ):
             mock_agent = mock_agent_cls.return_value
             mock_agent.get_activity_summary.return_value = {
@@ -2226,6 +2248,9 @@ class TestRunJobSessionPersistence:
                 return {"final_response": "ok"}
 
         class FakeFuture:
+            def done(self):
+                return False
+
             def result(self):
                 return {"final_response": "ok"}
 
@@ -3004,9 +3029,11 @@ class TestRunJobSkillBacked:
             register_env_passthrough(["NOTION_API_KEY"])
             return json.dumps({"success": True, "content": "# notion\nUse Notion."})
 
-        def _run_conversation(prompt):
+        def _run_conversation(prompt, *, task_id=None):
             from tools.env_passthrough import get_all_passthrough
 
+            assert isinstance(task_id, str)
+            assert task_id.startswith("cron:skill-env-job:")
             assert "NOTION_API_KEY" in get_all_passthrough()
             return {"final_response": "ok"}
 
@@ -3062,7 +3089,7 @@ class TestRunJobSkillBacked:
             register_credential_file("credentials/google_token.json")
             return json.dumps({"success": True, "content": "# google-workspace\nUse Google."})
 
-        def _run_conversation(prompt):
+        def _run_conversation(prompt, task_id=None):
             from tools.credential_files import _get_registered
 
             registered = _get_registered()
@@ -5060,11 +5087,8 @@ class TestCronDeliveryMirror:
         assert _target_matches_origin(origin, "telegram", "123", None) is False
         assert _target_matches_origin(origin, "telegram", "123", "99") is False
 
-    def test_delivery_does_not_mirror_fanout_non_origin_target(self):
-        """Even with the gate ON, a delivery to a chat that is NOT the job's
-        origin (explicit fan-out target) must not be mirrored — the mirror is
-        scoped to the origin conversation, and the fan-out chat may have no
-        session at all."""
+    def test_explicit_target_with_per_job_opt_in_is_mirrored(self):
+        """A per-job opt-in makes an explicit target a conversation surface."""
         from gateway.config import Platform
 
         pconfig = MagicMock()
@@ -5085,12 +5109,11 @@ class TestCronDeliveryMirror:
             }
             _deliver_result(job, "Here is today's summary.")
 
-        # Delivered to 999, but origin is 123 -> no mirror.
-        mirror_mock.assert_not_called()
+        mirror_mock.assert_called_once()
+        assert mirror_mock.call_args.args[1] == "999"
 
-    def test_delivery_mirrors_only_origin_target_in_fanout(self):
-        """deliver to BOTH origin and another chat: only the origin target is
-        mirrored."""
+    def test_per_job_opt_in_mirrors_every_explicit_fanout_target(self):
+        """A per-job opt-in applies to each explicitly addressed target."""
         from gateway.config import Platform
 
         pconfig = MagicMock()
@@ -5111,9 +5134,8 @@ class TestCronDeliveryMirror:
             }
             _deliver_result(job, "Here is today's summary.")
 
-        # Exactly one mirror, and it is the origin chat (123) — not 999.
-        mirror_mock.assert_called_once()
-        assert mirror_mock.call_args[0][1] == "123"
+        assert mirror_mock.call_count == 2
+        assert [call.args[1] for call in mirror_mock.call_args_list] == ["123", "999"]
 
     # --- multi-participant parity with send_message (user_id passthrough) ---
 

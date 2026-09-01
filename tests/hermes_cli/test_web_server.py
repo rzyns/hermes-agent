@@ -654,6 +654,36 @@ class TestWebServerEndpoints:
 
         assert opens == [True]
 
+    def test_decode_error_triggers_writable_heal(self, tmp_path, monkeypatch):
+        """UnicodeDecodeError — pysqlite failing to decode SQLite's own error
+        message over corrupt file bytes (#98924) — must route through the
+        same one-writable-open heal as malformed schema."""
+        import hermes_state
+        from hermes_cli import web_server
+
+        db_path = tmp_path / "state.db"
+        db_path.write_bytes(b"not-empty")
+        opens = []
+
+        class _OkDB:
+            _conn = None
+
+            def close(self):
+                pass
+
+        def scripted_open(*_args, **kwargs):
+            opens.append(kwargs.get("read_only", False))
+            if opens == [True]:
+                raise UnicodeDecodeError("utf-8", b"\x81", 0, 1, "invalid start byte")
+            return _OkDB()
+
+        monkeypatch.setattr(hermes_state, "SessionDB", scripted_open)
+
+        db = web_server._open_session_db_at_path(db_path, read_only=True)
+
+        assert isinstance(db, _OkDB)
+        assert opens == [True, False, True]
+
     def test_get_sessions_zero_byte_store_returns_empty_list(self):
         from hermes_constants import get_hermes_home
 
@@ -1199,6 +1229,11 @@ class TestWebServerEndpoints:
 
         # Bypass the managed-externally gate so we reach the docker install check.
         monkeypatch.setattr(web_server, "_dashboard_local_update_managed_externally", lambda: False)
+        # The shared admission gate (#91277 Phase 3) resolves the install
+        # method through hermes_cli.config directly.
+        monkeypatch.setattr(
+            "hermes_cli.config.detect_install_method", lambda *_a, **_k: "docker"
+        )
         monkeypatch.setattr(web_server, "detect_install_method", lambda _root: "docker")
         monkeypatch.setattr(web_server, "_spawn_hermes_action", fail_spawn)
         web_server._ACTION_PROCS.pop("hermes-update", None)
@@ -1234,6 +1269,12 @@ class TestWebServerEndpoints:
             raise AssertionError("APT-managed update guard should not spawn hermes update")
 
         monkeypatch.setattr(web_server, "_dashboard_local_update_managed_externally", lambda: False)
+        # The shared admission gate (#91277 Phase 3) resolves the install
+        # method through hermes_cli.config directly, so patch it there (the
+        # web_server module alias only feeds the /update/check endpoint).
+        monkeypatch.setattr(
+            "hermes_cli.config.detect_install_method", lambda *_a, **_k: "apt"
+        )
         monkeypatch.setattr(web_server, "detect_install_method", lambda _root: "apt")
         monkeypatch.setattr(web_server, "_spawn_hermes_action", fail_spawn)
         web_server._ACTION_PROCS.pop("hermes-update", None)
@@ -1755,6 +1796,46 @@ class TestWebServerEndpoints:
         assert not model_cfg.get("base_url"), "deleted endpoint's host still routed to"
         assert not model_cfg.get("provider")
         assert not get_env_value(env_var), "deleted endpoint's key still in .env"
+
+
+    def test_numeric_yaml_provider_key_can_be_activated_and_deleted(self):
+        """Hand-edited `providers: 2070:` (YAML int key) must still activate.
+
+        PyYAML loads unquoted 2070 as int; string lookup then 404ed, so
+        Desktop could list the endpoint but not assign or delete it.
+        """
+        from hermes_cli.config import get_config_path, load_config
+
+        get_config_path().write_text(
+            "model:\n"
+            "  provider: 2070\n"
+            "  default: Qwen.gguf\n"
+            "  base_url: http://192.168.1.10:8082/v1\n"
+            "providers:\n"
+            "  2070:\n"
+            "    name: 2070\n"
+            "    base_url: http://192.168.1.10:8082/v1\n"
+            "    model: Qwen.gguf\n",
+            encoding="utf-8",
+        )
+
+        listed = self.client.get("/api/providers/custom-endpoints")
+        assert listed.status_code == 200
+        assert "2070" in [e["id"] for e in listed.json()["endpoints"]]
+
+        activate = self.client.post(
+            "/api/providers/custom-endpoints/2070/activate", json={}
+        )
+        assert activate.status_code == 200, activate.text
+        assert activate.json()["provider"] == "2070"
+
+        deleted = self.client.request(
+            "DELETE", "/api/providers/custom-endpoints/2070"
+        )
+        assert deleted.status_code == 200, deleted.text
+        providers = load_config().get("providers") or {}
+        assert 2070 not in providers
+        assert "2070" not in providers
 
 
     def test_custom_endpoint_save_scopes_to_the_requested_profile(self):
@@ -4662,6 +4743,12 @@ class TestWebServerEndpoints:
             raise AssertionError("Nix update guard should not spawn hermes update")
 
         monkeypatch.setattr(web_server, "_dashboard_local_update_managed_externally", lambda: False)
+        # The shared admission gate resolves the install method through
+        # hermes_cli.config directly; keep the web_server alias patched too for
+        # the separate /update/check endpoint.
+        monkeypatch.setattr(
+            "hermes_cli.config.detect_install_method", lambda *_a, **_k: "nix"
+        )
         monkeypatch.setattr(web_server, "detect_install_method", lambda _root: "nix")
         monkeypatch.setattr(web_server, "_spawn_hermes_action", fail_spawn)
         web_server._ACTION_PROCS.pop("hermes-update", None)
@@ -6028,7 +6115,9 @@ class TestWebServerEndpoints:
 
     def test_headless_serve_disables_spa_even_with_a_dist(self, monkeypatch, tmp_path):
         """`hermes serve` (HERMES_SERVE_HEADLESS) must NOT serve the SPA even
-        when a built dist is present — only the API/WS surface is reachable."""
+        when a built dist is present. The exact root may serve Desktop's
+        token-only handshake page, but it must never serve the built SPA and
+        every non-root browser route remains unavailable."""
         from fastapi import FastAPI
         from starlette.testclient import TestClient
         import hermes_cli.web_server as ws
@@ -6041,11 +6130,16 @@ class TestWebServerEndpoints:
         monkeypatch.setenv("HERMES_SERVE_HEADLESS", "1")
         app_ = FastAPI()
         ws.mount_spa(app_)
+        client = TestClient(app_)
 
-        for route in ("/", "/chat"):
-            resp = TestClient(app_).get(route)
-            assert resp.status_code == 404
-            assert "web UI disabled" in resp.json()["error"]
+        root = client.get("/")
+        assert root.status_code == 200
+        assert "window.__HERMES_SESSION_TOKEN__" in root.text
+        assert "<body>UI</body>" not in root.text
+
+        chat = client.get("/chat")
+        assert chat.status_code == 404
+        assert "web UI disabled" in chat.json()["error"]
 
     def test_set_model_main_nous_applies_gateway_defaults(self, monkeypatch):
         """Switching the main provider to Nous calls apply_nous_managed_defaults
@@ -8956,6 +9050,69 @@ class TestNewEndpoints:
             pass
 
 # ---------------------------------------------------------------------------
+# Desktop-owned loopback backends are not gated by dashboard.public_url (#96490)
+# ---------------------------------------------------------------------------
+
+
+class TestDesktopLoopbackAuthExemption:
+    """``_desktop_loopback_auth_exempt`` decides the #96490 exemption."""
+
+    def test_exempt_with_desktop_env_and_session_token_on_loopback(self, monkeypatch):
+        import hermes_cli.web_server as web_server
+
+        monkeypatch.setenv("HERMES_DESKTOP", "1")
+        monkeypatch.setenv("HERMES_DASHBOARD_SESSION_TOKEN", "desktop-minted")
+        assert web_server._desktop_loopback_auth_exempt("127.0.0.1") is True
+        assert web_server._desktop_loopback_auth_exempt("::1") is True
+
+    def test_exempt_via_ssh_spawn_credentials_without_env_token(self, monkeypatch):
+        import hermes_cli.web_server as web_server
+
+        monkeypatch.setenv("HERMES_DESKTOP", "1")
+        monkeypatch.delenv("HERMES_DASHBOARD_SESSION_TOKEN", raising=False)
+        assert web_server._desktop_loopback_auth_exempt(
+            "127.0.0.1", ssh_session_token="tok"
+        )
+        assert web_server._desktop_loopback_auth_exempt(
+            "127.0.0.1", ssh_owner_nonce="nonce"
+        )
+
+    def test_not_exempt_without_desktop_env(self, monkeypatch):
+        import hermes_cli.web_server as web_server
+
+        monkeypatch.delenv("HERMES_DESKTOP", raising=False)
+        monkeypatch.setenv("HERMES_DASHBOARD_SESSION_TOKEN", "tok")
+        assert web_server._desktop_loopback_auth_exempt("127.0.0.1") is False
+
+    def test_not_exempt_without_any_credential(self, monkeypatch):
+        import hermes_cli.web_server as web_server
+
+        # HERMES_DESKTOP=1 alone is not enough: a plain serve with the env var
+        # exported must stay gated.
+        monkeypatch.setenv("HERMES_DESKTOP", "1")
+        monkeypatch.delenv("HERMES_DASHBOARD_SESSION_TOKEN", raising=False)
+        assert web_server._desktop_loopback_auth_exempt("127.0.0.1") is False
+
+    def test_not_exempt_on_non_loopback_bind(self, monkeypatch):
+        import hermes_cli.web_server as web_server
+
+        monkeypatch.setenv("HERMES_DESKTOP", "1")
+        monkeypatch.setenv("HERMES_DASHBOARD_SESSION_TOKEN", "tok")
+        assert web_server._desktop_loopback_auth_exempt("0.0.0.0") is False
+        assert web_server._desktop_loopback_auth_exempt("192.168.1.10") is False
+
+    def test_public_url_engages_gate_for_non_desktop_loopback(self, monkeypatch):
+        import hermes_cli.web_server as web_server
+
+        # Sanity: the base behaviour is untouched — a non-Desktop loopback
+        # serve with a public_url configured stays ticket-gated.
+        monkeypatch.delenv("HERMES_DESKTOP", raising=False)
+        assert web_server.should_require_dashboard_auth(
+            "127.0.0.1", frozenset({"dash.example.com"})
+        ) is True
+
+
+# ---------------------------------------------------------------------------
 # Model context length: normalize/denormalize + /api/model/info
 # ---------------------------------------------------------------------------
 
@@ -9033,7 +9190,6 @@ class TestModelContextLength:
                 "context_length": 50000,
             }
         })
-
         result = _denormalize_config_from_web({
             "model": "anthropic/claude-opus-4.6",
             "model_context_length": 0,
@@ -9046,9 +9202,7 @@ class TestModelContextLength:
         from hermes_cli.web_server import _denormalize_config_from_web
         from hermes_cli.config import save_config
 
-        # Disk has model as bare string
         save_config({"model": "anthropic/claude-sonnet-4"})
-
         result = _denormalize_config_from_web({
             "model": "anthropic/claude-sonnet-4",
             "model_context_length": 65000,
@@ -9063,7 +9217,6 @@ class TestModelContextLength:
         from hermes_cli.config import save_config
 
         save_config({"model": "anthropic/claude-sonnet-4"})
-
         result = _denormalize_config_from_web({
             "model": "anthropic/claude-sonnet-4",
             "model_context_length": 0,
@@ -9075,16 +9228,39 @@ class TestModelContextLength:
         from hermes_cli.web_server import _denormalize_config_from_web
         from hermes_cli.config import save_config
 
-        save_config({
-            "model": {"default": "test/model", "provider": "openrouter"}
-        })
-
+        save_config({"model": {"default": "test/model", "provider": "openrouter"}})
         result = _denormalize_config_from_web({
             "model": "test/model",
             "model_context_length": "32000",
         })
         assert isinstance(result["model"], dict)
         assert result["model"]["context_length"] == 32000
+
+    def test_denormalize_context_length_alone_is_applied(self):
+        """A context-window-only Settings diff must update the stored model."""
+        from hermes_cli.web_server import _denormalize_config_from_web
+        from hermes_cli.config import save_config
+
+        save_config({
+            "model": {"default": "anthropic/claude-sonnet-4", "provider": "anthropic",
+                      "context_length": 100000}
+        })
+        result = _denormalize_config_from_web({"model_context_length": 200000})
+        assert isinstance(result["model"], dict)
+        assert result["model"]["context_length"] == 200000
+        assert result["model"]["default"] == "anthropic/claude-sonnet-4"
+
+    def test_denormalize_model_alone_preserves_context_length(self):
+        """A model-only Settings diff must preserve the context override."""
+        from hermes_cli.web_server import _denormalize_config_from_web
+        from hermes_cli.config import save_config
+
+        save_config({
+            "model": {"default": "anthropic/claude-sonnet-4", "context_length": 150000}
+        })
+        result = _denormalize_config_from_web({"model": "anthropic/claude-opus-4.6"})
+        assert result["model"]["context_length"] == 150000
+        assert result["model"]["default"] == "anthropic/claude-opus-4.6"
 
 
 class TestDenormalizeProviderSwitch:
@@ -12310,6 +12486,66 @@ class TestServeIndexMissingIndex:
         assert "SPA-rebuilt" in resp.text
 
 
+class TestHeadlessServeTokenPage:
+    """Headless `hermes serve` must serve the Desktop token handshake page
+    at `/` when the dashboard auth gate is off (#94227).
+
+    The Electron renderer boots by fetching `/` and extracting
+    ``window.__HERMES_SESSION_TOKEN__`` for WebSocket auth. Headless serve
+    used to 404 every path, so after an update replaced the backend (and
+    the spawn-token env pin no longer matched the token the new backend
+    generated) the renderer was stuck with a stale token, /api/ws rejected
+    it, and the window white-screened (#95575).
+    """
+
+    @staticmethod
+    def _headless_client(monkeypatch, *, gated: bool):
+        from fastapi import FastAPI
+        from starlette.testclient import TestClient
+        import hermes_cli.web_server as ws
+
+        monkeypatch.setenv("HERMES_SERVE_HEADLESS", "1")
+        spa_app = FastAPI()
+        spa_app.state.auth_required = gated
+        ws.mount_spa(spa_app)
+        return TestClient(spa_app), ws
+
+    def test_root_serves_token_page_when_not_gated(self, monkeypatch):
+        import re
+
+        client, ws = self._headless_client(monkeypatch, gated=False)
+        resp = client.get("/")
+        assert resp.status_code == 200
+        assert resp.headers["content-type"].startswith("text/html")
+        assert "no-store" in resp.headers.get("cache-control", "")
+        # Must match the desktop's extraction regex exactly
+        # (apps/desktop/electron/dashboard-token.ts).
+        match = re.search(
+            r'window\.__HERMES_SESSION_TOKEN__\s*=\s*("(?:\\.|[^"\\])*")',
+            resp.text,
+        )
+        assert match, resp.text
+        import json as _json
+
+        assert _json.loads(match.group(1)) == ws._SESSION_TOKEN
+        assert "window.__HERMES_AUTH_REQUIRED__=false" in resp.text
+
+    def test_root_stays_404_json_when_auth_gated(self, monkeypatch):
+        client, ws = self._headless_client(monkeypatch, gated=True)
+        resp = client.get("/")
+        assert resp.status_code == 404
+        assert "web UI disabled" in resp.json()["error"]
+        assert ws._SESSION_TOKEN not in resp.text
+
+    def test_non_root_paths_stay_404_json(self, monkeypatch):
+        client, ws = self._headless_client(monkeypatch, gated=False)
+        for route in ("/chat", "/api/status-page", "/assets/index-abc.js"):
+            resp = client.get(route)
+            assert resp.status_code == 404
+            assert "web UI disabled" in resp.json()["error"]
+            assert ws._SESSION_TOKEN not in resp.text
+
+
 class TestHashedAssetCacheHeaders:
     """Hashed /assets/* responses must be immutable-cacheable; index.html
     must stay no-store so it always references the current hashes
@@ -12660,3 +12896,28 @@ class TestSessionPatchUnread:
     def test_patch_hidden_alone_is_accepted(self):
         resp = self.auth_client.patch("/api/sessions/s1", json={"hidden": True})
         assert resp.status_code == 200
+
+
+def test_mount_spa_dynamic_web_dist_recheck(tmp_path, monkeypatch):
+    from fastapi import FastAPI
+    from fastapi.testclient import TestClient
+    from hermes_cli import web_server
+
+    app = FastAPI()
+    dist = tmp_path / "web_dist"
+    monkeypatch.setattr(web_server, "WEB_DIST", dist)
+
+    web_server.mount_spa(app)
+    client = TestClient(app)
+
+    # 1. missing build -> 404
+    res1 = client.get("/")
+    assert res1.status_code == 404
+    assert res1.json()["error"] == "Frontend not built. Run: cd web && npm run build"
+
+    # 2. build created dynamically -> 200
+    dist.mkdir(parents=True, exist_ok=True)
+    (dist / "index.html").write_text("<html><body>Test</body></html>")
+    res2 = client.get("/")
+    assert res2.status_code == 200
+    assert "Test" in res2.text

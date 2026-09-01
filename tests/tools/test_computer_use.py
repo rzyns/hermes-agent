@@ -180,26 +180,13 @@ class TestSchema:
         modes = set(COMPUTER_USE_SCHEMA["parameters"]["properties"]["mode"]["enum"])
         assert modes == {"som", "vision", "ax"}
 
-    def test_schema_exposes_max_elements_cap_for_capture(self):
-        from tools.computer_use.schema import COMPUTER_USE_SCHEMA
-        props = COMPUTER_USE_SCHEMA["parameters"]["properties"]
-        assert "max_elements" in props
-        assert props["max_elements"]["type"] == "integer"
-        assert props["max_elements"].get("minimum", 1) >= 1
-
-    def test_schema_max_elements_documents_default_and_upper_bound(self):
-        """Schema description must agree with the runtime. The original PR
-        text said "Default 100" without a corresponding `default` field, and
-        had no upper bound — both Copilot findings.
+    def test_schema_no_longer_advertises_max_elements(self):
+        """max_elements was removed: captures always cap the surfaced element
+        window at the fixed default and spill the full tree to elements_file,
+        so there is no caller-tunable cap to document.
         """
         from tools.computer_use.schema import COMPUTER_USE_SCHEMA
-        from tools.computer_use.tool import (
-            _DEFAULT_MAX_ELEMENTS,
-            _MAX_ALLOWED_MAX_ELEMENTS,
-        )
-        prop = COMPUTER_USE_SCHEMA["parameters"]["properties"]["max_elements"]
-        assert prop.get("default") == _DEFAULT_MAX_ELEMENTS
-        assert prop.get("maximum") == _MAX_ALLOWED_MAX_ELEMENTS
+        assert "max_elements" not in COMPUTER_USE_SCHEMA["parameters"]["properties"]
 
 
 class TestRegistration:
@@ -870,20 +857,6 @@ class TestCaptureResponse:
         # the JSON view is partial and can re-issue with a tighter scope.
         assert "truncated to" in parsed["summary"]
 
-    def test_capture_ax_honors_explicit_max_elements_override(self):
-        from tools.computer_use import tool as cu_tool
-
-        fake_backend = self._ax_backend_with(600)
-        cu_tool.reset_backend_for_tests()
-        with patch.object(cu_tool, "_get_backend", return_value=fake_backend):
-            out = cu_tool.handle_computer_use(
-                {"action": "capture", "mode": "ax", "max_elements": 250}
-            )
-
-        parsed = json.loads(out)
-        assert len(parsed["elements"]) == 250
-        assert parsed["truncated_elements"] == 350
-
     def test_capture_ax_below_cap_is_unchanged(self):
         """Backwards-compat: small captures keep the full elements array and
         do not surface a `truncated_elements` field.
@@ -901,28 +874,10 @@ class TestCaptureResponse:
         assert "truncated_elements" not in parsed
         assert "truncated to" not in parsed["summary"]
 
-    def test_capture_ax_invalid_max_elements_falls_back_to_default(self):
-        """Malformed `max_elements` (string, negative, zero) must not silently
-        disable the cap and re-introduce the original unbounded behavior.
-        """
-        from tools.computer_use import tool as cu_tool
-
-        fake_backend = self._ax_backend_with(600)
-        cu_tool.reset_backend_for_tests()
-        for bad in ("not-a-number", 0, -10):
-            with patch.object(cu_tool, "_get_backend", return_value=fake_backend):
-                out = cu_tool.handle_computer_use(
-                    {"action": "capture", "mode": "ax", "max_elements": bad}
-                )
-            parsed = json.loads(out)
-            assert len(parsed["elements"]) == cu_tool._DEFAULT_MAX_ELEMENTS, (
-                f"bad max_elements={bad!r} disabled the cap"
-            )
-
-    def test_capture_ax_clamps_oversized_max_elements_to_hard_cap(self):
-        """A caller passing a very large `max_elements` must not be able to
-        disable the safeguard. The cap is clamped to a hard upper bound so
-        the context-blow-up protection cannot be bypassed by argument.
+    def test_capture_ax_ignores_stale_max_elements_argument(self):
+        """`max_elements` was removed from the schema; the surfaced window is a
+        fixed cap with the full tree spilled to elements_file. A stale caller
+        still passing max_elements must not be able to raise the cap.
         """
         from tools.computer_use import tool as cu_tool
 
@@ -933,35 +888,13 @@ class TestCaptureResponse:
                 {"action": "capture", "mode": "ax", "max_elements": 10_000}
             )
         parsed = json.loads(out)
-        assert len(parsed["elements"]) == cu_tool._MAX_ALLOWED_MAX_ELEMENTS
+        # Ignored: cap stays at the fixed default regardless of the argument.
+        assert len(parsed["elements"]) == cu_tool._DEFAULT_MAX_ELEMENTS
         assert parsed["total_elements"] == 5000
-        assert parsed["truncated_elements"] == 5000 - cu_tool._MAX_ALLOWED_MAX_ELEMENTS
+        assert parsed["truncated_elements"] == 5000 - cu_tool._DEFAULT_MAX_ELEMENTS
+        # The full tree is spilled so nothing is lost.
+        assert parsed.get("elements_file")
 
-    def test_capture_ax_summary_indices_match_returned_elements(self):
-        """When `max_elements` is below the human-summary's own line cap, the
-        summary must not index elements that aren't in the returned array.
-        Otherwise the model sees `#15` in the summary and finds no matching
-        entry in `elements`.
-        """
-        from tools.computer_use import tool as cu_tool
-
-        fake_backend = self._ax_backend_with(600)
-        cu_tool.reset_backend_for_tests()
-        with patch.object(cu_tool, "_get_backend", return_value=fake_backend):
-            out = cu_tool.handle_computer_use(
-                {"action": "capture", "mode": "ax", "max_elements": 5}
-            )
-        parsed = json.loads(out)
-        returned_indices = {e["index"] for e in parsed["elements"]}
-        summary_lines = parsed["summary"].splitlines()
-        indexed_lines = [ln for ln in summary_lines if ln.lstrip().startswith("#")]
-        for ln in indexed_lines:
-            idx_token = ln.lstrip().split()[0].lstrip("#")
-            idx = int(idx_token)
-            assert idx in returned_indices, (
-                f"summary references #{idx} but it is absent from elements payload "
-                f"(returned: {sorted(returned_indices)})"
-            )
 
     def test_capture_multimodal_summary_omits_truncation_note(self):
         """The som/vision multimodal envelope returns a screenshot, not an
@@ -1262,16 +1195,18 @@ class TestImageAwareTokenEstimator:
 
 
 # ---------------------------------------------------------------------------
-# Prompt guidance injection
+# Schema guidance
 # ---------------------------------------------------------------------------
 
-class TestPromptGuidance:
-    def test_computer_use_guidance_constant_exists(self):
-        from agent.prompt_builder import COMPUTER_USE_GUIDANCE
-        assert "background" in COMPUTER_USE_GUIDANCE.lower()
-        assert "element" in COMPUTER_USE_GUIDANCE.lower()
+class TestSchemaGuidance:
+    def test_computer_use_guidance_lives_in_schema(self):
+        from tools.computer_use.schema import COMPUTER_USE_SCHEMA
+
+        guidance = COMPUTER_USE_SCHEMA["description"]
+        assert "background" in guidance.lower()
+        assert "element" in guidance.lower()
         # Security callouts must remain
-        assert "password" in COMPUTER_USE_GUIDANCE.lower()
+        assert "password" in guidance.lower()
 
 
 # ---------------------------------------------------------------------------
@@ -2850,7 +2785,8 @@ class TestCaptureAppFilterNoMatch:
              "structuredContent": None},
         ]
 
-        backend.capture(mode="ax")
+        with patch("tools.computer_use.cua_backend.sys.platform", "linux"):
+            backend.capture(mode="ax")
 
         assert backend._active_pid == 200
         assert backend._active_window_id == 2
@@ -4268,10 +4204,10 @@ class TestStructuredElementsConsumption:
         # Vision mode stays free of AX element noise.
         assert cap.elements == []
 
-    def test_capture_app_screen_targets_desktop_window(self):
-        """capture(app='screen') resolves to the OS shell/desktop window
-        (Windows Progman) rather than an application window, so 'show me my
-        screen' works on cua-driver's window-oriented capture surface."""
+    def test_capture_app_desktop_targets_desktop_window(self):
+        """capture(app='desktop') resolves to the OS shell/desktop window
+        (Windows Progman) rather than an application window, preserving exact
+        shell targeting separately from composited app='screen' capture."""
         from tools.computer_use.cua_backend import CuaDriverBackend
 
         backend = CuaDriverBackend()
@@ -4302,7 +4238,7 @@ class TestStructuredElementsConsumption:
                     "structuredContent": None, "isError": False}
 
         backend._session.call_tool.side_effect = fake_call_tool
-        cap = backend.capture(mode="ax", app="screen")
+        cap = backend.capture(mode="ax", app="desktop")
 
         assert backend._active_window_id == 99
         assert cap.app == "Progman"
@@ -5117,59 +5053,6 @@ class TestBoundsSpaceNote:
                           bounds=(0, 0, 0, 0), app="")]
         assert _bounds_space_note(zero, 1455, 791) is None
         assert _bounds_space_note(zero, 0, 0) is None
-
-
-class TestEscalationEnrichment:
-    """Browser-class background_unavailable refusals gain a typed-page hint."""
-
-    def _refusal(self, **overrides):
-        from tools.computer_use.backend import ActionResult
-
-        kw = dict(
-            ok=False, action="type_text", message="refused",
-            code="background_unavailable",
-            escalation={"recommended": "foreground", "reason": "dropped"},
-            meta={"event_kind": "text_input",
-                  "target_class": "Chrome_WidgetWin_1"},
-        )
-        kw.update(overrides)
-        return ActionResult(**kw)
-
-    def test_browser_text_refusal_gains_page_alternative(self):
-        from tools.computer_use.tool import _enrich_escalation
-
-        enriched = _enrich_escalation(self._refusal())
-        # Driver's recommendation is never overridden — only augmented.
-        assert enriched["recommended"] == "foreground"
-        assert enriched["alternative"] == "page"
-        assert "cua_browser_type" in enriched["alternative_hint"]
-
-    def test_non_browser_target_untouched(self):
-        from tools.computer_use.tool import _enrich_escalation
-
-        res = self._refusal(meta={"event_kind": "text_input",
-                                  "target_class": "Notepad"})
-        assert "alternative" not in _enrich_escalation(res)
-
-    def test_non_foreground_recommendation_untouched(self):
-        from tools.computer_use.tool import _enrich_escalation
-
-        res = self._refusal(escalation={"recommended": "px"})
-        assert "alternative" not in _enrich_escalation(res)
-
-    def test_missing_escalation_passthrough(self):
-        from tools.computer_use.backend import ActionResult
-        from tools.computer_use.tool import _enrich_escalation
-
-        assert _enrich_escalation(
-            ActionResult(ok=True, action="click", message="ok")) is None
-
-    def test_enrichment_survives_action_payload(self):
-        from tools.computer_use.tool import _action_payload
-
-        payload = _action_payload(self._refusal())
-        assert payload["escalation"]["alternative"] == "page"
-        assert payload["verdict"]["decision"] == "escalate"
 
 
 class TestElementSpillFile:

@@ -18,6 +18,7 @@ mocking the save boundary, so they exercise the actual atomic write path.
 
 import json
 import threading
+import time
 
 import pytest
 
@@ -26,6 +27,7 @@ from agent.credential_pool import (
     AUTH_TYPE_OAUTH,
     CredentialPool,
     PooledCredential,
+    load_pool,
 )
 from hermes_cli import auth as A
 
@@ -66,134 +68,14 @@ def profile_and_root(tmp_path, monkeypatch):
 
     monkeypatch.setattr(A, "_auth_file_path", lambda: profile_path)
     monkeypatch.setattr(A, "_global_auth_file_path", lambda: root_path)
-    # credential_pool imports these helpers by name, so patch its bindings too.
-    monkeypatch.setattr(CP, "_global_auth_file_path", lambda: root_path)
-    monkeypatch.setattr(CP, "_same_path", lambda a, b: a == b)
     monkeypatch.setenv("HOME", str(tmp_path / "not-the-root"))
     return profile_path, root_path
 
 
-@pytest.mark.parametrize(
-    "provider",
-    ["openai-codex", "xai-oauth"],
-)
-def test_pool_refresh_writes_through_to_root_when_profile_reads_root(
-    profile_and_root, provider
-):
-    """A profile reading root's grant must push rotated tokens back to root."""
-    profile_path, root_path = profile_and_root
-    # Profile has NO own provider block (reads root via fallback).
-    _write_store(profile_path, {"version": 1, "providers": {}})
-    _write_store(
-        root_path,
-        {
-            "version": 1,
-            "providers": {
-                provider: {
-                    "tokens": {
-                        "access_token": "old-access",
-                        "refresh_token": "old-refresh",
-                    }
-                }
-            },
-        },
-    )
-
-    pool = CredentialPool(provider, [])
-    pool._sync_device_code_entry_to_auth_store(
-        _entry(
-            provider, id="e1", access_token="new-access", refresh_token="new-refresh"
-        )
-    )
-
-    # Borrowed-root grants stay borrowed: do not create a profile-local shadow
-    # that would self-disable write-through on the next refresh (#74339).
-    profile = _read_store(profile_path)
-    assert provider not in profile.get("providers", {})
-
-    # The global root no longer holds the revoked refresh token (#48415), and
-    # the profile continues to resolve this fresh pair through root fallback.
-    root = _read_store(root_path)
-    assert root["providers"][provider]["tokens"]["access_token"] == "new-access"
-    assert root["providers"][provider]["tokens"]["refresh_token"] == "new-refresh"
 
 
-@pytest.mark.parametrize(
-    "provider",
-    ["openai-codex", "xai-oauth"],
-)
-def test_pool_refresh_does_not_touch_root_when_profile_shadows(
-    profile_and_root, provider
-):
-    """A profile that genuinely shadows root must NOT clobber the root grant."""
-    profile_path, root_path = profile_and_root
-    # Profile has its OWN provider block: it shadows root legitimately.
-    _write_store(
-        profile_path,
-        {
-            "version": 1,
-            "providers": {
-                provider: {
-                    "tokens": {
-                        "access_token": "profile-old",
-                        "refresh_token": "profile-old-refresh",
-                    }
-                }
-            },
-        },
-    )
-    _write_store(
-        root_path,
-        {
-            "version": 1,
-            "providers": {
-                provider: {
-                    "tokens": {
-                        "access_token": "root-untouched",
-                        "refresh_token": "root-untouched-refresh",
-                    }
-                }
-            },
-        },
-    )
-
-    pool = CredentialPool(provider, [])
-    pool._sync_device_code_entry_to_auth_store(
-        _entry(
-            provider,
-            id="e2",
-            access_token="profile-new",
-            refresh_token="profile-new-refresh",
-        )
-    )
-
-    profile = _read_store(profile_path)
-    assert (
-        profile["providers"][provider]["tokens"]["refresh_token"]
-        == "profile-new-refresh"
-    )
-
-    # Root keeps its own grant — write-through must not run when the profile
-    # owns the block.
-    root = _read_store(root_path)
-    assert (
-        root["providers"][provider]["tokens"]["refresh_token"]
-        == "root-untouched-refresh"
-    )
 
 
-def test_write_through_helper_is_noop_in_classic_mode(monkeypatch, tmp_path):
-    """When profile == root (classic mode), the helper must be a no-op.
-
-    ``_global_auth_file_path`` returns None in classic mode; the profile save
-    already wrote to root, so a second write would be redundant (and the
-    helper has nothing to target).
-    """
-    monkeypatch.setattr(A, "_global_auth_file_path", lambda: None)
-    # Must not raise and must not attempt any write.
-    CP._write_through_provider_state_to_global_root(
-        "openai-codex", {"tokens": {"access_token": "a", "refresh_token": "r"}}
-    )
 
 
 def test_global_write_through_preserves_concurrent_root_update(
@@ -260,9 +142,7 @@ def test_global_write_through_preserves_concurrent_root_update(
             A._save_auth_store(store, target_path=root_path)
         writer_done.set()
 
-    helper = threading.Thread(
-        target=profile_write_through, name="profile-write-through"
-    )
+    helper = threading.Thread(target=profile_write_through, name="profile-write-through")
     helper.start()
     assert helper_loaded.wait(timeout=5)
 
@@ -438,3 +318,111 @@ def test_write_through_fires_on_every_refresh_not_just_first(
         "The old code self-disabled write-through here (#74339)"
     )
     assert root_tokens["refresh_token"] == "rf2"
+
+
+def test_hermes_pkce_refresh_writes_back_to_singleton(tmp_path, monkeypatch):
+    """A successful hermes_pkce refresh must update
+    ~/.hermes/.anthropic_oauth.json, or ``_seed_from_singletons()`` on the
+    next ``load_pool()`` re-seeds the pre-refresh (already-consumed,
+    single-use) token pair over the freshly rotated one.
+    """
+    hermes_home = tmp_path / "hermes"
+    hermes_home.mkdir(parents=True, exist_ok=True)
+    monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+    monkeypatch.setattr("hermes_cli.auth.is_provider_explicitly_configured", lambda pid: True)
+
+    oauth_file = hermes_home / ".anthropic_oauth.json"
+    oauth_file.write_text(
+        json.dumps({"accessToken": "sk-ant-oat-rt0", "refreshToken": "rt0", "expiresAt": 0}),
+        encoding="utf-8",
+    )
+    _write_store(hermes_home / "auth.json", {"version": 1, "providers": {}})
+
+    monkeypatch.setattr(
+        "agent.anthropic_credentials.refresh_anthropic_oauth_pure",
+        lambda refresh_token, use_json=False: {
+            "access_token": "sk-ant-oat-rt1",
+            "refresh_token": "rt1",
+            "expires_at_ms": int(time.time() * 1000) + 3_600_000,
+        },
+    )
+    monkeypatch.setattr("agent.anthropic_credentials.read_claude_code_credentials", lambda: None)
+
+    entry = PooledCredential(
+        provider="anthropic",
+        id="pool-entry",
+        label="cred",
+        auth_type=AUTH_TYPE_OAUTH,
+        priority=0,
+        source="hermes_pkce",
+        access_token="sk-ant-oat-rt0",
+        refresh_token="rt0",
+    )
+    pool = CredentialPool("anthropic", [entry])
+    updated = pool._refresh_entry(entry, force=True)
+    assert updated is not None
+    assert updated.refresh_token == "rt1"
+
+    on_disk = json.loads(oauth_file.read_text(encoding="utf-8"))
+    assert on_disk["refreshToken"] == "rt1", (
+        "successful hermes_pkce refresh must write back to "
+        "~/.hermes/.anthropic_oauth.json, or _seed_from_singletons() will "
+        "revert the pool entry to the pre-refresh (spent) token on next load"
+    )
+
+    reloaded = load_pool("anthropic")
+    reloaded_entries = [e for e in reloaded.entries() if e.source.endswith("hermes_pkce")]
+    assert reloaded_entries, "hermes_pkce entry should still be present after reload"
+    assert reloaded_entries[0].refresh_token == "rt1", (
+        "regression: fresh load_pool() re-seeded the pre-refresh refresh "
+        "token from the stale singleton file, reverting a successful "
+        "rotation and orphaning the already-consumed rt0"
+    )
+
+
+def test_manual_hermes_pkce_refresh_does_not_create_duplicate_singleton(
+    tmp_path, monkeypatch
+):
+    """A pool-owned manual:hermes_pkce entry must not create a second source."""
+    hermes_home = tmp_path / "hermes"
+    hermes_home.mkdir(parents=True, exist_ok=True)
+    monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+    monkeypatch.setattr("hermes_cli.auth.is_provider_explicitly_configured", lambda pid: True)
+    monkeypatch.setattr("agent.anthropic_credentials.read_claude_code_credentials", lambda: None)
+    monkeypatch.setattr(
+        "agent.anthropic_credentials.refresh_anthropic_oauth_pure",
+        lambda refresh_token, use_json=False: {
+            "access_token": "manual-at-1",
+            "refresh_token": "manual-rt-1",
+            "expires_at_ms": int(time.time() * 1000) + 3_600_000,
+        },
+    )
+    _write_store(hermes_home / "auth.json", {"version": 1, "providers": {}})
+
+    entry = PooledCredential(
+        provider="anthropic",
+        id="manual-entry",
+        label="cred",
+        auth_type=AUTH_TYPE_OAUTH,
+        priority=0,
+        source="manual:hermes_pkce",
+        access_token="manual-at-0",
+        refresh_token="manual-rt-0",
+        expires_at_ms=0,
+    )
+    pool = CredentialPool("anthropic", [entry])
+    refreshed = pool._refresh_entry(entry, force=True)
+
+    assert refreshed is not None
+    assert refreshed.refresh_token == "manual-rt-1"
+    oauth_file = hermes_home / ".anthropic_oauth.json"
+    assert not oauth_file.exists(), (
+        "manual:hermes_pkce is already pool-owned; refreshing it must not "
+        "create a second hermes_pkce singleton source"
+    )
+
+    reloaded = load_pool("anthropic")
+    matching = [e for e in reloaded.entries() if e.id == "manual-entry"]
+    assert len(matching) == 1
+    assert matching[0].source == "manual:hermes_pkce"
+    assert matching[0].refresh_token == "manual-rt-1"

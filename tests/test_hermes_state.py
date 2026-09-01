@@ -7160,7 +7160,7 @@ class TestOptimizeFts:
         db.create_session(session_id="s1", source="cli")  # write #1
         db.append_message(session_id="s1", role="user", content="still persists")
         assert len(db.get_messages("s1")) == 1
-        assert "FTS incremental merge failed: simulated merge failure" in caplog.text
+        assert "FTS incremental merge failed after commit: simulated merge failure" in caplog.text
 
 
 class TestAutoMaintenance:
