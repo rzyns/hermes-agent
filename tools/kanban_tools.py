@@ -366,16 +366,50 @@ def _goal_judge_available() -> bool:
     return client is not None and bool(model)
 
 
-def _goal_mode_handoff_rejection(task, evidence: str) -> Optional[str]:
-    """Return a rejection reason when a goal-mode terminal handoff is premature."""
+def _goal_mode_handoff_rejection(
+    task,
+    evidence: str,
+    *,
+    metadata: Optional[dict] = None,
+    artifacts: Optional[list[str]] = None,
+):
+    """Return ``(verdict, reason_or_None)`` for a goal-mode terminal handoff.
+
+    ``{"done", None}`` means the judge allows the handoff; anything else is
+    a rejection whose verdict disambiguates the guidance the caller gives
+    the worker (``continue`` = not done yet, ``blocked`` = judged
+    unachievable — see #100954).
+    """
     if not task or not task.goal_mode or not _goal_judge_available():
-        return None
+        return ("done", None)
     verdict = "done"
     reason = ""
     try:
+        raw_declared = _build_declared_artifact_readback_list(metadata, artifacts)
+        raw_failures = _verify_artifact_manifest_and_log(
+            raw_declared, "pre-judge readback"
+        )
+        manifest = _build_artifact_manifest_for_judge_gate(metadata, artifacts)
+        manifest_failures = _verify_artifact_manifest_and_log(
+            manifest, "pre-judge manifest readback"
+        )
+        readback_failures = raw_failures + manifest_failures
+        verification_output = _extract_verification_output(metadata)
+        if readback_failures:
+            manifest = []
+            failure_block = "Artifact readback failures:\n" + "\n".join(
+                readback_failures
+            )
+            verification_output = (
+                f"{failure_block}\n\n{verification_output}"
+                if verification_output
+                else failure_block
+            )
         verdict, reason, _, _, _ = judge_goal(
             goal=f"{task.title}\n\n{task.body or ''}".strip(),
             last_response=evidence.strip(),
+            artifact_manifest=manifest,
+            verification_output=verification_output,
         )
     except Exception as judge_exc:
         # Keep the existing fail-open semantics: an unavailable/broken
@@ -385,7 +419,7 @@ def _goal_mode_handoff_rejection(task, evidence: str) -> Optional[str]:
             judge_exc,
             exc_info=True,
         )
-    return reason if verdict != "done" else None
+    return (verdict, None if verdict == "done" else reason)
 
 
 # ---------------------------------------------------------------------------
@@ -918,62 +952,27 @@ def _handle_complete(args: dict, **kw) -> str:
             # Only enforce when a judge is actually reachable — see
             # _goal_judge_available for why an unavailable judge fails open.
             task = kb.get_task(conn, tid)
-            if task and task.goal_mode and _goal_judge_available():
-                verdict = "done"
-                reason = ""
-                try:
-                    # Run the producer-side readback gate in two passes:
-                    # 1) over every raw declared path, so a missing out-of-scratch
-                    #    file is surfaced to the judge instead of being silently
-                    #    dropped by the preservation gate;
-                    # 2) over the canonical content-bound manifest, so a managed
-                    #    artifact whose bytes no longer match its recorded hash
-                    #    is caught before the judge sees it.
-                    raw_declared = _build_declared_artifact_readback_list(
-                        metadata, artifacts
-                    )
-                    raw_failures = _verify_artifact_manifest_and_log(
-                        raw_declared, "pre-judge readback"
-                    )
-                    manifest = _build_artifact_manifest_for_judge_gate(
-                        metadata, artifacts
-                    )
-                    manifest_failures = _verify_artifact_manifest_and_log(
-                        manifest, "pre-judge manifest readback"
-                    )
-                    readback_failures = raw_failures + manifest_failures
-                    verification_output = _extract_verification_output(metadata)
-                    if readback_failures:
-                        manifest = []
-                        failure_block = "Artifact readback failures:\n" + "\n".join(
-                            readback_failures
-                        )
-                        verification_output = (
-                            f"{failure_block}\n\n{verification_output}"
-                            if verification_output
-                            else failure_block
-                        )
-                    verdict, reason, _, _, _ = judge_goal(
-                        goal=f"{task.title}\n\n{task.body or ''}".strip(),
-                        last_response=(summary or result or "").strip(),
-                        artifact_manifest=manifest,
-                        verification_output=verification_output,
-                    )
-                except Exception as judge_exc:
-                    # Defensive: judge_goal swallows its own errors, but if
-                    # it ever raises, fail open rather than wedge the worker.
-                    logger.warning(
-                        "goal judge check failed, allowing completion: %s",
-                        judge_exc,
-                        exc_info=True,
-                    )
-                if verdict != "done":
-                    return tool_error(
-                        f"Goal completion rejected by judge: {reason}. "
-                        f"To proceed, either: (1) provide explicit acceptance "
-                        f"evidence in your summary matching the task's criteria, "
-                        f"or (2) create continuation tasks with parents=[{tid}] "
-                        f"and keep this task alive."
+            gate_verdict, rejection = _goal_mode_handoff_rejection(
+                task,
+                (summary or result or "").strip(),
+                metadata=metadata,
+                artifacts=artifacts,
+            )
+            if gate_verdict == "blocked":
+                return tool_error(
+                    f"Goal completion rejected: judge ruled the goal "
+                    f"unachievable — {rejection}. The task will NOT complete "
+                    f"silently. Either re-scope the task with kanban_edit, "
+                    f"or record the block with kanban_block and hand the "
+                    f"decision to a human / reviewer."
+                )
+            if rejection is not None:
+                return tool_error(
+                    f"Goal completion rejected by judge: {rejection}. "
+                    f"To proceed, either: (1) provide explicit acceptance "
+                    f"evidence in your summary matching the task's criteria, "
+                    f"or (2) create continuation tasks with parents=[{tid}] "
+                    f"and keep this task alive."
                     )
 
             try:
@@ -1262,7 +1261,17 @@ def _handle_request_review(args: dict, **kw) -> str:
         kb, conn = _connect(board=board)
         try:
             task = kb.get_task(conn, tid)
-            rejection = _goal_mode_handoff_rejection(task, summary)
+            gate_verdict, rejection = _goal_mode_handoff_rejection(
+                task,
+                summary,
+                metadata=metadata,
+            )
+            if gate_verdict == "blocked":
+                return tool_error(
+                    f"Goal review handoff rejected: judge ruled the goal "
+                    f"unachievable — {rejection}. Record the block with "
+                    f"kanban_block instead of requesting review."
+                )
             if rejection is not None:
                 return tool_error(
                     f"Goal review handoff rejected by judge: {rejection}. "

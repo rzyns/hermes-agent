@@ -612,13 +612,13 @@ class TestBlueBubblesAttachmentDownload:
 
         cached_path = None
 
-        def mock_cache_image(data, ext):
+        async def mock_cache_image(data, ext):
             nonlocal cached_path
             cached_path = f"/tmp/test_image{ext}"
             return cached_path
 
         monkeypatch.setattr(
-            "gateway.platforms.bluebubbles.cache_image_from_bytes",
+            "gateway.platforms.bluebubbles.cache_image_from_bytes_async",
             mock_cache_image,
         )
 
@@ -647,13 +647,13 @@ class TestBlueBubblesAttachmentDownload:
 
         cached_path = None
 
-        def mock_cache_audio(data, ext):
+        async def mock_cache_audio(data, ext):
             nonlocal cached_path
             cached_path = f"/tmp/test_audio{ext}"
             return cached_path
 
         monkeypatch.setattr(
-            "gateway.platforms.bluebubbles.cache_audio_from_bytes",
+            "gateway.platforms.bluebubbles.cache_audio_from_bytes_async",
             mock_cache_audio,
         )
 
@@ -682,13 +682,13 @@ class TestBlueBubblesAttachmentDownload:
 
         cached_path = None
 
-        def mock_cache_doc(data, filename):
+        async def mock_cache_doc(data, filename):
             nonlocal cached_path
             cached_path = f"/tmp/{filename}"
             return cached_path
 
         monkeypatch.setattr(
-            "gateway.platforms.bluebubbles.cache_document_from_bytes",
+            "gateway.platforms.bluebubbles.cache_document_from_bytes_async",
             mock_cache_doc,
         )
 

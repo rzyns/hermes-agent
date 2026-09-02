@@ -2950,27 +2950,65 @@ def _worker_run_id_for(task_id: str) -> Optional[int]:
         return None
 
 
-def _goal_mode_handoff_rejection(task: Optional[kb.Task], evidence: str) -> Optional[str]:
-    """Apply the goal judge to every terminal worker handoff, including review."""
+def _goal_mode_handoff_rejection(
+    task: Optional[kb.Task],
+    evidence: str,
+    *,
+    metadata: Optional[dict] = None,
+):
+    """Apply the goal judge to every terminal worker handoff, including review.
+
+    Returns ``(verdict, reason_or_None)`` — ``"done"`` allows the handoff;
+    ``"blocked"`` means the judge ruled the goal unachievable (#100954);
+    ``"continue"``/``"wait"`` reject with the judge's reason.
+    """
     if task is None or not task.goal_mode:
-        return None
+        return ("done", None)
     try:
         from agent.auxiliary_client import get_text_auxiliary_client
 
         client, model = get_text_auxiliary_client("goal_judge")
     except Exception:
-        return None
+        return ("done", None)
     if client is None or not model:
-        return None
+        return ("done", None)
 
-    from hermes_cli.goals import judge_goal
+    from hermes_cli.goals import (
+        judge_goal,
+        _build_artifact_manifest_for_judge_gate,
+        _build_declared_artifact_readback_list,
+        _extract_verification_output,
+        _verify_artifact_manifest_and_log,
+    )
 
     verdict = "done"
     reason = ""
     try:
+        raw_declared = _build_declared_artifact_readback_list(metadata, None)
+        raw_failures = _verify_artifact_manifest_and_log(
+            raw_declared, "pre-judge readback"
+        )
+        manifest = _build_artifact_manifest_for_judge_gate(metadata, None)
+        manifest_failures = _verify_artifact_manifest_and_log(
+            manifest, "pre-judge manifest readback"
+        )
+        readback_failures = raw_failures + manifest_failures
+        verification_output = _extract_verification_output(metadata)
+        if readback_failures:
+            manifest = []
+            failure_block = "Artifact readback failures:\n" + "\n".join(
+                readback_failures
+            )
+            verification_output = (
+                f"{failure_block}\n\n{verification_output}"
+                if verification_output
+                else failure_block
+            )
         verdict, reason, _, _, _ = judge_goal(
             goal=f"{task.title}\n\n{task.body or ''}".strip(),
             last_response=evidence.strip(),
+            artifact_manifest=manifest,
+            verification_output=verification_output,
         )
     except Exception as judge_exc:
         import logging as _logging
@@ -2980,7 +3018,7 @@ def _goal_mode_handoff_rejection(task: Optional[kb.Task], evidence: str) -> Opti
             judge_exc,
             exc_info=True,
         )
-    return reason if verdict != "done" else None
+    return (verdict, None if verdict == "done" else reason)
 
 
 def _cmd_complete(args: argparse.Namespace) -> int:
@@ -3018,84 +3056,29 @@ def _cmd_complete(args: argparse.Namespace) -> int:
             # to every terminal handoff so request-review cannot bypass the
             # acceptance contract that protects complete.
             task = kb.get_task(conn, tid)
-            if task and task.goal_mode:
-                judge_available = False
-                try:
-                    from agent.auxiliary_client import get_text_auxiliary_client
-                    _client, _model = get_text_auxiliary_client("goal_judge")
-                    judge_available = _client is not None and bool(_model)
-                except Exception:
-                    pass
-                if judge_available:
-                    from hermes_cli.goals import (
-                        judge_goal,
-                        _build_artifact_manifest_for_judge_gate,
-                        _build_declared_artifact_readback_list,
-                        _extract_verification_output,
-                        _verify_artifact_manifest_and_log,
-                    )
-                    verdict = "done"
-                    reason = ""
-                    try:
-                        # Run the producer-side readback gate in two passes:
-                        # 1) over every raw declared path, so a missing out-of-scratch
-                        #    file is surfaced to the judge instead of being silently
-                        #    dropped by the preservation gate;
-                        # 2) over the canonical content-bound manifest, so a managed
-                        #    artifact whose bytes no longer match its recorded hash
-                        #    is caught before the judge sees it.
-                        raw_declared = _build_declared_artifact_readback_list(
-                            metadata, None
-                        )
-                        raw_failures = _verify_artifact_manifest_and_log(
-                            raw_declared, "pre-judge readback"
-                        )
-                        manifest = _build_artifact_manifest_for_judge_gate(
-                            metadata, None
-                        )
-                        manifest_failures = _verify_artifact_manifest_and_log(
-                            manifest, "pre-judge manifest readback"
-                        )
-                        readback_failures = raw_failures + manifest_failures
-                        verification_output = _extract_verification_output(
-                            metadata
-                        )
-                        if readback_failures:
-                            manifest = []
-                            failure_block = "Artifact readback failures:\n" + "\n".join(
-                                readback_failures
-                            )
-                            verification_output = (
-                                f"{failure_block}\n\n{verification_output}"
-                                if verification_output
-                                else failure_block
-                            )
-                        # judge_goal returns (verdict, reason, parse_failed,
-                        # wait_directive, transport_failed) — see
-                        # hermes_cli/goals.py. Unpacking fewer raises
-                        # ValueError into the fail-open handler below,
-                        # silently disabling the gate.
-                        verdict, reason, _, _, _ = judge_goal(
-                            goal=f"{task.title}\n\n{task.body or ''}".strip(),
-                            last_response=(summary or args.result or "").strip(),
-                            artifact_manifest=manifest,
-                            verification_output=verification_output,
-                        )
-                    except Exception as judge_exc:
-                        import logging as _logging
-                        _logging.getLogger(__name__).warning(
-                            "goal judge check failed, allowing completion: %s",
-                            judge_exc,
-                            exc_info=True,
-                        )
-                    if verdict != "done":
-                        print(
-                            f"kanban: goal completion of {tid} rejected by judge: {reason}. "
-                            f"Provide evidence matching the task's acceptance criteria.",
-                            file=sys.stderr,
-                        )
-                        failed.append(tid)
-                        continue
+            gate_verdict, rejection = _goal_mode_handoff_rejection(
+                task,
+                (summary or args.result or "").strip(),
+                metadata=metadata,
+            )
+            if gate_verdict == "blocked":
+                print(
+                    f"kanban: goal completion of {tid} rejected: judge ruled "
+                    f"the goal unachievable — {rejection}. Re-scope with "
+                    f"kanban edit, or record the block with kanban block "
+                    f"instead of completing.",
+                    file=sys.stderr,
+                )
+                failed.append(tid)
+                continue
+            if rejection is not None:
+                print(
+                    f"kanban: goal completion of {tid} rejected by judge: {rejection}. "
+                    f"Provide evidence matching the task's acceptance criteria.",
+                    file=sys.stderr,
+                )
+                failed.append(tid)
+                continue
 
             try:
                 ok = kb.complete_task(
@@ -3307,10 +3290,19 @@ def _cmd_request_review(args: argparse.Namespace) -> int:
             return 2
     reviewer = getattr(args, "reviewer", None)
     with kb.connect_closing() as conn:
-        rejection = _goal_mode_handoff_rejection(
+        gate_verdict, rejection = _goal_mode_handoff_rejection(
             kb.get_task(conn, tid),
             summary or "",
+            metadata=metadata,
         )
+        if gate_verdict == "blocked":
+            print(
+                f"kanban: goal review handoff of {tid} rejected: judge ruled "
+                f"the goal unachievable — {rejection}. Record the block with "
+                f"kanban block instead of requesting review.",
+                file=sys.stderr,
+            )
+            return 1
         if rejection is not None:
             print(
                 f"kanban: goal review handoff of {tid} rejected by judge: "

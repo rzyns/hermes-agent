@@ -86,8 +86,9 @@ class AnthropicTransport(ProviderTransport):
         import json
         from agent.anthropic_adapter import (
             _MCP_HERMES_NATIVE_TOOL_PREFIX,
-            _to_plain_data,
+            _OAUTH_TOOL_NAME_REVERSE_ALIASES,
             _sanitize_replay_block,
+            _to_plain_data,
         )
         from agent.transports.types import ToolCall
 
@@ -160,6 +161,12 @@ class AnthropicTransport(ProviderTransport):
                             name = single
                         elif _tool_registry.get_entry(bare):
                             name = bare
+                        elif bare in _OAUTH_TOOL_NAME_REVERSE_ALIASES:
+                            # OAuth wire alias (e.g. chat_history_lookup ->
+                            # session_search, #65365). Checked LAST so a real
+                            # tool actually registered under the wire name
+                            # still wins — same GH-25255 precedence.
+                            name = _OAUTH_TOOL_NAME_REVERSE_ALIASES[bare]
                 tool_calls.append(
                     ToolCall(
                         id=block.id,

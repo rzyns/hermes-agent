@@ -1154,6 +1154,7 @@ def test_first_install_nous_auto_configures_video_gen(monkeypatch):
         "FIRECRAWL_API_KEY",
         "FIRECRAWL_API_URL",
         "KEENABLE_API_KEY",
+        "TAVILY_API_KEY",
         "PARALLEL_API_KEY",
         "BROWSERBASE_API_KEY",
         "BROWSERBASE_PROJECT_ID",
@@ -1875,7 +1876,13 @@ def test_get_platform_tools_recovers_non_configurable_toolsets_from_composite():
     }
     fake_toolsets["hermes-_test_platform"] = {
         "description": "test composite",
-        "tools": ["web_search", "web_extract", "terminal", "process", "_test_special_tool"],
+        "tools": [
+            "web_search",
+            "web_extract",
+            "terminal",
+            "process_manage",
+            "_test_special_tool",
+        ],
         "includes": [],
     }
 

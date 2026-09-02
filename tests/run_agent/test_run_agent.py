@@ -3447,7 +3447,7 @@ class TestConcurrentToolExecution:
     def test_invoke_tool_handles_agent_level_tools(self, agent):
         """_invoke_tool should handle todo tool directly."""
         with patch("tools.todo_tool.todo_tool", return_value='{"ok":true}') as mock_todo:
-            result = agent._invoke_tool("todo", {"todos": []}, "task-1")
+            result = agent._invoke_tool("todo_list", {"todos": []}, "task-1")
             mock_todo.assert_called_once()
         assert "ok" in result
 
@@ -3539,7 +3539,7 @@ class TestConcurrentToolExecution:
         """Sequential and concurrent agent-level paths share post-hook ownership."""
         from agent.agent_runtime_helpers import agent_runtime_owns_post_tool_hook
 
-        for tool_name in ("todo", "session_search", "memory", "clarify", "delegate_task"):
+        for tool_name in ("todo_list", "session_search", "memory", "clarify", "delegate_task"):
             assert agent_runtime_owns_post_tool_hook(agent, tool_name) is True
 
         agent._context_engine_tool_names = {"context_query"}
@@ -4057,7 +4057,7 @@ class TestConcurrentToolExecution:
     def test_concurrent_direct_tool_emits_matching_post_tool_call_hook(self, agent, monkeypatch):
         """Concurrent direct/special tools must emit post_tool_call after a non-blocked pre hook."""
         agent._current_turn_id = "turn-concurrent-123"
-        tc1 = _mock_tool_call(name="todo", arguments='{"todos":[]}', call_id="c1")
+        tc1 = _mock_tool_call(name="todo_list", arguments='{"todos":[]}', call_id="c1")
         tc2 = _mock_tool_call(name="web_search", arguments='{"q":"parallel"}', call_id="c2")
         mock_msg = _mock_assistant_msg(content="", tool_calls=[tc1, tc2])
         messages = []
@@ -4082,7 +4082,7 @@ class TestConcurrentToolExecution:
         ):
             agent._execute_tool_calls_concurrent(mock_msg, messages, "task-1")
 
-        todo_posts = [call for call in post_calls if call["tool_name"] == "todo"]
+        todo_posts = [call for call in post_calls if call["tool_name"] == "todo_list"]
         assert len(todo_posts) == 1
         assert todo_posts[0]["tool_call_id"] == "c1"
         assert todo_posts[0]["task_id"] == "task-1"
@@ -4150,12 +4150,12 @@ class TestConcurrentToolExecution:
         monkeypatch.setattr("hermes_cli.lifecycle.has_hook", lambda name: True)
 
         with patch("tools.todo_tool.todo_tool", return_value='{"ok":true}') as mock_todo:
-            result = agent._invoke_tool("todo", {"todos": []}, "task-1", tool_call_id="todo-1")
+            result = agent._invoke_tool("todo_list", {"todos": []}, "task-1", tool_call_id="todo-1")
 
         mock_todo.assert_called_once()
         assert result == '{"ok":true}'
         post_call = next(call for call in hook_calls if call[0] == "post_tool_call")
-        assert post_call[1]["tool_name"] == "todo"
+        assert post_call[1]["tool_name"] == "todo_list"
         assert post_call[1]["tool_call_id"] == "todo-1"
         assert post_call[1]["status"] == "ok"
         assert post_call[1]["error_type"] is None
@@ -4168,7 +4168,7 @@ class TestConcurrentToolExecution:
             lambda *args, **kwargs: "Blocked by test policy",
         )
         with patch("tools.todo_tool.todo_tool", side_effect=AssertionError("should not run")) as mock_todo:
-            result = agent._invoke_tool("todo", {"todos": []}, "task-1")
+            result = agent._invoke_tool("todo_list", {"todos": []}, "task-1")
 
         assert json.loads(result) == {"error": "Blocked by test policy"}
         mock_todo.assert_not_called()
@@ -4215,7 +4215,7 @@ class TestConcurrentToolExecution:
 
     def test_sequential_agent_level_tool_emits_terminal_post_tool_hook(self, agent, monkeypatch):
         """Sequential built-in tool paths should also close observer tool spans."""
-        tool_call = _mock_tool_call(name="todo", arguments='{"todos":[]}', call_id="todo-1")
+        tool_call = _mock_tool_call(name="todo_list", arguments='{"todos":[]}', call_id="todo-1")
         mock_msg = _mock_assistant_msg(content="", tool_calls=[tool_call])
         messages = []
         hook_calls = []
@@ -4235,14 +4235,14 @@ class TestConcurrentToolExecution:
 
         mock_todo.assert_called_once()
         post_call = next(call for call in hook_calls if call[0] == "post_tool_call")
-        assert post_call[1]["tool_name"] == "todo"
+        assert post_call[1]["tool_name"] == "todo_list"
         assert post_call[1]["tool_call_id"] == "todo-1"
         assert post_call[1]["result"] == '{"ok":true}'
         assert post_call[1]["status"] == "ok"
 
     def test_sequential_agent_level_tool_execution_middleware_wraps_inline_dispatch(self, agent, monkeypatch):
         """Sequential built-in tool paths should expose the adaptive execution boundary."""
-        tool_call = _mock_tool_call(name="todo", arguments='{"todos":[]}', call_id="todo-1")
+        tool_call = _mock_tool_call(name="todo_list", arguments='{"todos":[]}', call_id="todo-1")
         mock_msg = _mock_assistant_msg(content="", tool_calls=[tool_call])
         messages = []
         hook_calls = []
@@ -4283,12 +4283,12 @@ class TestConcurrentToolExecution:
         assert seen["middleware_args"] == {"todos": [], "request_rewritten": True}
         mock_todo.assert_called_once_with(todos=[], merge=True, store=agent._todo_store)
         post_call = next(call for call in hook_calls if call[0] == "post_tool_call")
-        assert post_call[1]["tool_name"] == "todo"
+        assert post_call[1]["tool_name"] == "todo_list"
         assert post_call[1]["args"] == {"todos": [], "request_rewritten": True, "merge": True}
         assert post_call[1]["middleware_trace"] == [{"source": "request-test"}]
 
     def test_concurrent_agent_level_tool_preserves_request_middleware_trace(self, agent, monkeypatch):
-        tool_call = _mock_tool_call(name="todo", arguments='{"todos":[]}', call_id="todo-1")
+        tool_call = _mock_tool_call(name="todo_list", arguments='{"todos":[]}', call_id="todo-1")
         mock_msg = _mock_assistant_msg(content="", tool_calls=[tool_call])
         messages = []
         hook_calls = []
@@ -4319,7 +4319,7 @@ class TestConcurrentToolExecution:
             agent._execute_tool_calls_concurrent(mock_msg, messages, "task-1")
 
         post_call = next(call for call in hook_calls if call[0] == "post_tool_call")
-        assert post_call[1]["tool_name"] == "todo"
+        assert post_call[1]["tool_name"] == "todo_list"
         assert post_call[1]["args"] == {"todos": [], "request_rewritten": True}
         assert post_call[1]["middleware_trace"] == [{"source": "request-test"}]
 
@@ -4506,7 +4506,7 @@ class TestAgentRuntimePostHookOwnershipSync:
     """Exercise post-hook ownership through both agent-runtime tool paths."""
 
     _CASES = (
-        ("todo", {"todos": []}),
+        ("todo_list", {"todos": []}),
         ("session_search", {"query": "needle"}),
         ("memory", {"action": "view", "target": "memory"}),
         ("clarify", {"question": "Continue?"}),
@@ -4516,7 +4516,7 @@ class TestAgentRuntimePostHookOwnershipSync:
         ("annotate_preview", {"action": "clear"}),
         ("read_window_below", {}),
         ("setup_mcp", {"server": "linear", "action": "install"}),
-        ("tour", {"action": "stop"}),
+        ("gui_tour", {"action": "stop"}),
         ("delegate_task", {"goal": "Check the child path"}),
     )
 
@@ -6528,11 +6528,11 @@ class TestRunConversation:
         assert requested_caps == [65536, 65536]
 
     def test_ollama_glm_stop_after_tools_without_terminal_boundary_requests_continuation(self, agent):
-        """Ollama-hosted GLM responses can misreport truncated output as stop."""
+        """Local Ollama-hosted GLM (no :cloud suffix) misreports truncated output as stop."""
         self._setup_agent(agent)
         agent.base_url = "http://localhost:11434/v1"
         agent._base_url_lower = agent.base_url.lower()
-        agent.model = "glm-5.1:cloud"
+        agent.model = "glm-4-9b"  # local GLM — no :cloud suffix
 
         tool_turn = _mock_response(
             content="",
@@ -6572,11 +6572,18 @@ class TestRunConversation:
         assert third_call_messages[-1]["role"] == "user"
         assert "truncated by the output length limit" in third_call_messages[-1]["content"]
 
-
-
-
-
-
+    @pytest.mark.parametrize("base_url, model", [
+        ("https://ollama.com/v1", "glm-5.3-flash"),      # Ollama Cloud host (#72316)
+        ("http://localhost:11434/v1", "glm-5.1:cloud"),  # :cloud via local proxy (#98406)
+    ])
+    def test_ollama_cloud_glm_stop_is_never_rewritten(self, agent, base_url, model):
+        """Ollama Cloud reports finish_reason faithfully — an unpunctuated stop stays stop."""
+        self._setup_agent(agent)
+        agent.base_url = base_url
+        agent._base_url_lower = base_url.lower()
+        agent.model = model
+        unpunctuated = SimpleNamespace(content="Based on the results the best next step is to update the config", tool_calls=None)
+        assert agent._should_treat_stop_as_truncated("stop", unpunctuated, [{"role": "tool", "content": "r"}]) is False
 
     def test_length_thinking_exhausted_skips_continuation(self, agent):
         """When finish_reason='length' but content is only thinking, skip retries."""
@@ -6602,7 +6609,7 @@ class TestRunConversation:
         # Should have a user-friendly response (not None)
         assert result["final_response"] is not None
         assert "Thinking Budget Exhausted" in result["final_response"]
-        assert "/thinkon" in result["final_response"]
+        assert "/reasoning" in result["final_response"]
 
 
     def test_length_with_tool_calls_returns_partial_without_executing_tools(self, agent):
@@ -7618,7 +7625,7 @@ class TestRunConversation:
         self._setup_agent(agent)
         agent.base_url = "http://localhost:11434/v1"
         agent._base_url_lower = agent.base_url.lower()
-        agent.model = "glm-5.1:cloud"
+        agent.model = "glm-5.1"
 
         tool_turn = _mock_response(
             content="",
@@ -7659,7 +7666,7 @@ class TestRunConversation:
         agent.base_url = "http://my-proxy.internal:9000/v1"
         agent._base_url_lower = agent.base_url.lower()
         agent.provider = "ollama"
-        agent.model = "glm-5.1:cloud"
+        agent.model = "glm-5.1"
 
         tool_turn = _mock_response(
             content="",

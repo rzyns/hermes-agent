@@ -1333,7 +1333,7 @@ class TestRunJobSessionPersistence:
              patch("cron.scheduler._resolve_origin", return_value=None), \
              patch("hermes_cli.env_loader.load_hermes_dotenv"), \
              patch("hermes_cli.env_loader.reset_secret_source_cache"), \
-             patch("hermes_state.SessionDB", return_value=fake_db), \
+             patch("hermes_state.get_shared_session_db", return_value=fake_db), \
              patch(
                  "hermes_cli.runtime_provider.resolve_runtime_provider",
                  return_value={
@@ -1706,7 +1706,7 @@ class TestRunJobSessionPersistence:
             patch("cron.scheduler._resolve_origin", return_value=None),
             patch("hermes_cli.env_loader.load_hermes_dotenv"),
             patch("hermes_cli.env_loader.reset_secret_source_cache"),
-            patch("hermes_state.SessionDB", return_value=fake_db),
+            patch("hermes_state.get_shared_session_db", return_value=fake_db),
             patch(
                 "hermes_cli.runtime_provider.resolve_runtime_provider",
                 return_value={
@@ -2140,7 +2140,8 @@ class TestRunJobSessionPersistence:
                 return {"final_response": "ok"}
 
         with patch("cron.scheduler._hermes_home", tmp_path), \
-             patch("hermes_state.SessionDB", return_value=fake_db), \
+             patch("cron.scheduler._preflight_job_config", return_value=None), \
+             patch("hermes_state.get_shared_session_db", return_value=fake_db), \
              patch(
                  "hermes_cli.runtime_provider.resolve_runtime_provider",
                  return_value={
@@ -2199,7 +2200,8 @@ class TestRunJobSessionPersistence:
                 return {"final_response": "ok"}
 
         with patch("cron.scheduler._hermes_home", tmp_path), \
-             patch("hermes_state.SessionDB", return_value=fake_db), \
+             patch("cron.scheduler._preflight_job_config", return_value=None), \
+             patch("hermes_state.get_shared_session_db", return_value=fake_db), \
              patch(
                  "hermes_cli.runtime_provider.resolve_runtime_provider",
                  return_value={
@@ -2262,7 +2264,8 @@ class TestRunJobSessionPersistence:
         monkeypatch.setenv("HERMES_CRON_TIMEOUT", timeout_value)
 
         with patch("cron.scheduler._hermes_home", tmp_path), \
-             patch("hermes_state.SessionDB", return_value=fake_db), \
+             patch("cron.scheduler._preflight_job_config", return_value=None), \
+             patch("hermes_state.get_shared_session_db", return_value=fake_db), \
              patch(
                  "hermes_cli.runtime_provider.resolve_runtime_provider",
                  return_value={
@@ -2312,7 +2315,7 @@ class TestRunJobSessionPersistence:
              patch("cron.scheduler._resolve_origin", return_value=None), \
              patch("hermes_cli.env_loader.reset_secret_source_cache", _record_reset), \
              patch("hermes_cli.env_loader.load_hermes_dotenv", _record_load), \
-             patch("hermes_state.SessionDB", return_value=fake_db), \
+             patch("hermes_state.get_shared_session_db", return_value=fake_db), \
              patch(
                  "hermes_cli.runtime_provider.resolve_runtime_provider",
                  return_value={
@@ -2372,7 +2375,8 @@ class TestRunJobSessionPersistence:
                 return {"final_response": "ok"}
 
         with patch("cron.scheduler._hermes_home", tmp_path), \
-             patch("hermes_state.SessionDB", return_value=fake_db), \
+             patch("cron.scheduler._preflight_job_config", return_value=None), \
+             patch("hermes_state.get_shared_session_db", return_value=fake_db), \
              patch(
                  "hermes_cli.runtime_provider.resolve_runtime_provider",
                  return_value={
@@ -2505,7 +2509,7 @@ class TestRunJobConfigEnvVarExpansion:
              patch("cron.scheduler._resolve_origin", return_value=None), \
              patch("hermes_cli.env_loader.load_hermes_dotenv"), \
              patch("hermes_cli.env_loader.reset_secret_source_cache"), \
-             patch("hermes_state.SessionDB", return_value=fake_db), \
+             patch("hermes_state.get_shared_session_db", return_value=fake_db), \
              patch("hermes_cli.runtime_provider.resolve_runtime_provider",
                    return_value=self._RUNTIME), \
              patch("run_agent.AIAgent") as mock_agent_cls:
@@ -2588,60 +2592,6 @@ class TestRunJobConfigEnvVarExpansion:
             "config.yaml ${VAR} in fallback_providers was not expanded."
         )
 
-    def test_auth_fallback_switches_provider_and_model_together(self, tmp_path):
-        """Codex auth failure must produce OpenRouter+GLM, never OpenRouter+GPT."""
-        from hermes_cli.auth import AuthError
-
-        (tmp_path / "config.yaml").write_text(
-            "model:\n"
-            "  default: gpt-5.6-sol\n"
-            "  provider: openai-codex\n"
-            "fallback_providers:\n"
-            "  - provider: anthropic\n"
-            "  - provider: openrouter\n"
-            "    model: z-ai/glm-5.2\n",
-            encoding="utf-8",
-        )
-        job = {
-            "id": "auth-fallback",
-            "name": "auth fallback",
-            "prompt": "hi",
-            "provider_snapshot": "openai-codex",
-            "model_snapshot": "gpt-5.6-sol",
-        }
-        fake_db = MagicMock()
-        requested = []
-
-        def resolve_runtime(**kwargs):
-            requested.append(kwargs.get("requested"))
-            if kwargs.get("requested") in (None, "openai-codex"):
-                # Cron must retain the configured primary provider for drift
-                # comparison even when older/custom AuthError sites omit it.
-                raise AuthError("No Codex credentials stored")
-            assert kwargs["requested"] == "openrouter"
-            assert kwargs["target_model"] == "z-ai/glm-5.2"
-            return {**self._RUNTIME, "provider": "openrouter"}
-
-        with patch("cron.scheduler._hermes_home", tmp_path), \
-             patch("cron.scheduler._resolve_origin", return_value=None), \
-             patch("hermes_cli.env_loader.load_hermes_dotenv"), \
-             patch("hermes_cli.env_loader.reset_secret_source_cache"), \
-             patch("hermes_state.SessionDB", return_value=fake_db), \
-             patch("hermes_cli.runtime_provider.resolve_runtime_provider",
-                   side_effect=resolve_runtime), \
-             patch("tools.mcp_tool.discover_mcp_tools", return_value=[]), \
-             patch("run_agent.AIAgent") as mock_agent_cls:
-            mock_agent = MagicMock()
-            mock_agent.run_conversation.return_value = {"final_response": "ok"}
-            mock_agent_cls.return_value = mock_agent
-            success, _, _, error = run_job(job)
-
-        assert success is True
-        assert error is None
-        assert requested == [None, "openrouter"]
-        kwargs = mock_agent_cls.call_args.kwargs
-        assert kwargs["provider"] == "openrouter"
-        assert kwargs["model"] == "z-ai/glm-5.2"
 
     def test_fallback_chain_merges_providers_and_legacy_model(self, tmp_path, monkeypatch):
         """Cron uses get_fallback_chain so legacy fallback_model is not dropped."""
@@ -2673,31 +2623,6 @@ class TestRunJobConfigEnvVarExpansion:
         models = [e.get("model") for e in fb if isinstance(e, dict)]
         assert models == ["gpt-4o-mini", "claude-sonnet-4-6"]
 
-    def test_unexpanded_ref_passthrough_when_var_unset(self, tmp_path, monkeypatch):
-        """When the env var is not set, the literal ${VAR} is kept verbatim (not crashed)."""
-        (tmp_path / "config.yaml").write_text("model: ${_HERMES_TEST_CRON_UNSET_VAR}\n")
-        monkeypatch.delenv("_HERMES_TEST_CRON_UNSET_VAR", raising=False)
-
-        job = {"id": "unset-job", "name": "unset var test", "prompt": "hi"}
-        fake_db = MagicMock()
-
-        with patch("cron.scheduler._hermes_home", tmp_path), \
-             patch("cron.scheduler._resolve_origin", return_value=None), \
-             patch("hermes_cli.env_loader.load_hermes_dotenv"), \
-             patch("hermes_cli.env_loader.reset_secret_source_cache"), \
-             patch("hermes_state.SessionDB", return_value=fake_db), \
-             patch("hermes_cli.runtime_provider.resolve_runtime_provider",
-                   return_value=self._RUNTIME), \
-             patch("run_agent.AIAgent") as mock_agent_cls:
-            mock_agent = MagicMock()
-            mock_agent.run_conversation.return_value = {"final_response": "ok"}
-            mock_agent_cls.return_value = mock_agent
-            success, _, _, error = run_job(job)
-
-        assert success is True
-        kwargs = mock_agent_cls.call_args.kwargs
-        # Unresolved refs are kept verbatim — _expand_env_vars contract
-        assert kwargs["model"] == "${_HERMES_TEST_CRON_UNSET_VAR}"
 
     def test_transient_dns_fallback_switches_provider_and_model_together(self, tmp_path):
         """DNS blip during primary OAuth resolve must still walk fallback_providers.
@@ -2745,7 +2670,7 @@ class TestRunJobConfigEnvVarExpansion:
              patch("cron.scheduler._resolve_origin", return_value=None), \
              patch("hermes_cli.env_loader.load_hermes_dotenv"), \
              patch("hermes_cli.env_loader.reset_secret_source_cache"), \
-             patch("hermes_state.SessionDB", return_value=fake_db), \
+             patch("hermes_state.get_shared_session_db", return_value=fake_db), \
              patch("hermes_cli.runtime_provider.resolve_runtime_provider",
                    side_effect=resolve_runtime), \
              patch("tools.mcp_tool.discover_mcp_tools", return_value=[]), \
@@ -2762,6 +2687,88 @@ class TestRunJobConfigEnvVarExpansion:
         assert kwargs["provider"] == "xai"
         assert kwargs["model"] == "grok-4.5"
 
+
+    def test_auth_fallback_switches_provider_and_model_together(self, tmp_path):
+        """Codex auth failure must produce OpenRouter+GLM, never OpenRouter+GPT."""
+        from hermes_cli.auth import AuthError
+
+        (tmp_path / "config.yaml").write_text(
+            "model:\n"
+            "  default: gpt-5.6-sol\n"
+            "  provider: openai-codex\n"
+            "fallback_providers:\n"
+            "  - provider: anthropic\n"
+            "  - provider: openrouter\n"
+            "    model: z-ai/glm-5.2\n",
+            encoding="utf-8",
+        )
+        job = {
+            "id": "auth-fallback",
+            "name": "auth fallback",
+            "prompt": "hi",
+            "provider_snapshot": "openai-codex",
+            "model_snapshot": "gpt-5.6-sol",
+        }
+        fake_db = MagicMock()
+        requested = []
+
+        def resolve_runtime(**kwargs):
+            requested.append(kwargs.get("requested"))
+            if kwargs.get("requested") in (None, "openai-codex"):
+                # Cron must retain the configured primary provider for drift
+                # comparison even when older/custom AuthError sites omit it.
+                raise AuthError("No Codex credentials stored")
+            assert kwargs["requested"] == "openrouter"
+            assert kwargs["target_model"] == "z-ai/glm-5.2"
+            return {**self._RUNTIME, "provider": "openrouter"}
+
+        with patch("cron.scheduler._hermes_home", tmp_path), \
+             patch("cron.scheduler._resolve_origin", return_value=None), \
+             patch("hermes_cli.env_loader.load_hermes_dotenv"), \
+             patch("hermes_cli.env_loader.reset_secret_source_cache"), \
+             patch("hermes_state.get_shared_session_db", return_value=fake_db), \
+             patch("hermes_cli.runtime_provider.resolve_runtime_provider",
+                   side_effect=resolve_runtime), \
+             patch("tools.mcp_tool.discover_mcp_tools", return_value=[]), \
+             patch("run_agent.AIAgent") as mock_agent_cls:
+            mock_agent = MagicMock()
+            mock_agent.run_conversation.return_value = {"final_response": "ok"}
+            mock_agent_cls.return_value = mock_agent
+            success, _, _, error = run_job(job)
+
+        assert success is True
+        assert error is None
+        assert requested == [None, "openrouter"]
+        kwargs = mock_agent_cls.call_args.kwargs
+        assert kwargs["provider"] == "openrouter"
+        assert kwargs["model"] == "z-ai/glm-5.2"
+
+
+    def test_unexpanded_ref_passthrough_when_var_unset(self, tmp_path, monkeypatch):
+        """When the env var is not set, the literal ${VAR} is kept verbatim (not crashed)."""
+        (tmp_path / "config.yaml").write_text("model: ${_HERMES_TEST_CRON_UNSET_VAR}\n")
+        monkeypatch.delenv("_HERMES_TEST_CRON_UNSET_VAR", raising=False)
+
+        job = {"id": "unset-job", "name": "unset var test", "prompt": "hi"}
+        fake_db = MagicMock()
+
+        with patch("cron.scheduler._hermes_home", tmp_path), \
+             patch("cron.scheduler._resolve_origin", return_value=None), \
+             patch("hermes_cli.env_loader.load_hermes_dotenv"), \
+             patch("hermes_cli.env_loader.reset_secret_source_cache"), \
+             patch("hermes_state.get_shared_session_db", return_value=fake_db), \
+             patch("hermes_cli.runtime_provider.resolve_runtime_provider",
+                   return_value=self._RUNTIME), \
+             patch("run_agent.AIAgent") as mock_agent_cls:
+            mock_agent = MagicMock()
+            mock_agent.run_conversation.return_value = {"final_response": "ok"}
+            mock_agent_cls.return_value = mock_agent
+            success, _, _, error = run_job(job)
+
+        assert success is True
+        kwargs = mock_agent_cls.call_args.kwargs
+        # Unresolved refs are kept verbatim — _expand_env_vars contract
+        assert kwargs["model"] == "${_HERMES_TEST_CRON_UNSET_VAR}"
 
 class TestRunJobModelResolution:
     """Verify defensive model resolution for jobs stored with ``model: null``.
@@ -2793,7 +2800,7 @@ class TestRunJobModelResolution:
              patch("cron.scheduler._resolve_origin", return_value=None), \
              patch("hermes_cli.env_loader.load_hermes_dotenv"), \
              patch("hermes_cli.env_loader.reset_secret_source_cache"), \
-             patch("hermes_state.SessionDB", return_value=fake_db), \
+             patch("hermes_state.get_shared_session_db", return_value=fake_db), \
              patch("hermes_cli.runtime_provider.resolve_runtime_provider",
                    return_value=self._RUNTIME), \
              patch("run_agent.AIAgent") as mock_agent_cls:
@@ -2875,7 +2882,7 @@ class TestRunJobModelResolution:
              patch("cron.scheduler._resolve_origin", return_value=None), \
              patch("hermes_cli.env_loader.load_hermes_dotenv"), \
              patch("hermes_cli.env_loader.reset_secret_source_cache"), \
-             patch("hermes_state.SessionDB", return_value=fake_db), \
+             patch("hermes_state.get_shared_session_db", return_value=fake_db), \
              patch("hermes_cli.runtime_provider.resolve_runtime_provider",
                    return_value=self._RUNTIME), \
              patch("run_agent.AIAgent") as mock_agent_cls:
@@ -2963,7 +2970,7 @@ class TestRunJobModelResolution:
              patch("cron.scheduler._resolve_origin", return_value=None), \
              patch("hermes_cli.env_loader.load_hermes_dotenv"), \
              patch("hermes_cli.env_loader.reset_secret_source_cache"), \
-             patch("hermes_state.SessionDB", return_value=fake_db), \
+             patch("hermes_state.get_shared_session_db", return_value=fake_db), \
              patch("hermes_cli.runtime_provider.resolve_runtime_provider",
                    return_value=self._RUNTIME), \
              patch("run_agent.AIAgent") as mock_agent_cls:
@@ -2988,7 +2995,7 @@ class TestRunJobModelResolution:
              patch("cron.scheduler._resolve_origin", return_value=None), \
              patch("hermes_cli.env_loader.load_hermes_dotenv"), \
              patch("hermes_cli.env_loader.reset_secret_source_cache"), \
-             patch("hermes_state.SessionDB", return_value=fake_db), \
+             patch("hermes_state.get_shared_session_db", return_value=fake_db), \
              patch("hermes_cli.runtime_provider.resolve_runtime_provider",
                    return_value=self._RUNTIME), \
              patch("run_agent.AIAgent") as mock_agent_cls:
@@ -3041,7 +3048,7 @@ class TestRunJobSkillBacked:
              patch("cron.scheduler._resolve_origin", return_value=None), \
              patch("hermes_cli.env_loader.load_hermes_dotenv"), \
              patch("hermes_cli.env_loader.reset_secret_source_cache"), \
-             patch("hermes_state.SessionDB", return_value=fake_db), \
+             patch("hermes_state.get_shared_session_db", return_value=fake_db), \
              patch(
                  "hermes_cli.runtime_provider.resolve_runtime_provider",
                  return_value={

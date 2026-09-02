@@ -15,6 +15,7 @@ import json
 import logging
 import os
 import platform
+import re
 import secrets
 import stat
 import subprocess
@@ -225,7 +226,7 @@ def _is_claude_model(model: str | None) -> bool:
     return "claude" in (model or "").lower()
 
 
-_FAST_MODE_SUPPORTED_SUBSTRINGS = ("opus-4-6", "opus-4.6")
+_FAST_MODE_SUPPORTED_SUBSTRINGS = ("opus-4-8", "opus-4.8", "opus-5")
 
 # ── Max output token limits per Anthropic model ───────────────────────
 # Source: Anthropic docs + Cline model catalog.  Anthropic's API requires
@@ -432,13 +433,28 @@ def _forbids_sampling_params(model: str) -> bool:
 
 
 def _supports_fast_mode(model: str) -> bool:
-    """Return True for models that support Anthropic Fast Mode (speed=fast).
+    """Return True for models that accept the ``speed: "fast"`` request param.
 
-    Per Anthropic docs, fast mode is currently supported on Opus 4.6 only.
-    Sending ``speed: "fast"`` to any other Claude model (including Opus 4.7)
-    returns HTTP 400. This guard prevents silently 400'ing when stale config
-    or older callers leave fast mode enabled across a model upgrade.
+    Per the Anthropic fast-mode docs (research preview), the ``speed`` param
+    is supported on Opus 4.8 and Opus 5 — Claude API only. The matrix has
+    changed with nearly every Opus release, in both directions:
+
+    - Opus 4.6 HAD fast mode at launch and LOST it (2026-06-29): requests
+      with ``speed: "fast"`` do not error — they silently run at standard
+      speed and bill standard rates (``usage.speed: "standard"``). Keeping
+      4.6 in this allowlist would show users a fast toggle that does
+      nothing.
+    - Opus 4.7 never had it and hard-400s on the parameter.
+    - Dedicated ``…-fast`` model ids (e.g. OpenRouter's
+      ``claude-opus-4.8-fast``) select fast inference via the model field
+      itself and must NOT also receive the speed parameter.
+
+    Keep this an explicit allowlist rather than a version-floor check so a
+    model that drops fast mode again fails closed (standard speed) instead
+    of silently 400'ing.
     """
+    if "-fast" in model:
+        return False
     return any(v in model for v in _FAST_MODE_SUPPORTED_SUBSTRINGS)
 
 
@@ -516,6 +532,55 @@ def _detect_claude_code_version() -> str:
 _CLAUDE_CODE_SYSTEM_PREFIX = "You are Claude Code, Anthropic's official CLI for Claude."
 _MCP_TOOL_PREFIX = "mcp__"
 _MCP_HERMES_NATIVE_TOOL_PREFIX = "mcp__hermes__"
+
+# Anthropic's OAuth billing classifier fingerprints certain Hermes tool
+# schemas/prose as a third-party app and reroutes the request to the metered
+# extra-usage lane, surfacing as HTTP 400 "You're out of extra usage" on a
+# valid subscription token (#65365). Deterministic live A/B repros (issue
+# #65365 comments, replayed with the anthropic-ratelimit-unified-* response
+# headers as a lane oracle) isolated two independent triggers:
+#   - the ``session_search`` tool schema/name/prose, alone
+#   - the ``memory`` tool schema/name, alone
+# Both are aliased to neutral names on the OAuth wire only. normalize_response
+# reverses the mapping before dispatch, so tool behavior and API-key requests
+# are unchanged.
+_OAUTH_TOOL_NAME_ALIASES = {
+    "session_search": "chat_history_lookup",
+    "memory": "context_notes",
+}
+_OAUTH_TOOL_NAME_REVERSE_ALIASES = {
+    wire_name: name for name, wire_name in _OAUTH_TOOL_NAME_ALIASES.items()
+}
+
+# Aliases that are ALSO safe to substitute in free-form prose (system prompt
+# text, tool descriptions). Only unambiguous snake_case tool tokens qualify:
+# "memory" is ordinary English throughout the system prompt ("persistent
+# memory across sessions", "OS, CPU, memory, disk") and inside the memory
+# tool's own parameter docs (the ``target`` enum the model must still emit
+# verbatim), so rewriting it in prose would corrupt guidance the model has
+# to follow. Renaming a tool is a different operation from rewriting the
+# vocabulary that describes it — a model that follows unaliased "memory"
+# prose and calls ``memory`` still dispatches correctly: normalize_response
+# resolves the bare name through the tool registry regardless.
+_OAUTH_PROSE_ALIAS_NAMES = frozenset({"session_search"})
+
+# Word-boundary matchers so a prose substitution can't corrupt a longer
+# identifier that merely contains the token (project AGENTS.md / memory
+# snapshots can carry arbitrary text, e.g. a path like
+# ``tools/session_search_tool.py`` must not become
+# ``tools/chat_history_lookup_tool.py``). ``\b`` treats ``_`` as a word
+# char, so only the standalone token matches.
+_OAUTH_PROSE_ALIAS_PATTERNS = tuple(
+    (re.compile(rf"\b{re.escape(name)}\b"), _OAUTH_TOOL_NAME_ALIASES[name])
+    for name in sorted(_OAUTH_PROSE_ALIAS_NAMES)
+)
+
+
+def _apply_oauth_prose_aliases(text: str) -> str:
+    """Rewrite prose-safe tool-name tokens to their OAuth wire aliases."""
+    for pattern, wire_name in _OAUTH_PROSE_ALIAS_PATTERNS:
+        text = pattern.sub(wire_name, text)
+    return text
 
 
 def _get_claude_code_version() -> str:
@@ -886,9 +951,9 @@ def build_anthropic_kwargs(
     thinking block signatures are stripped (they are Anthropic-proprietary).
 
     When *fast_mode* is True, adds ``extra_body["speed"] = "fast"`` and the
-    fast-mode beta header for ~2.5x faster output throughput on Opus 4.6.
-    Currently only supported on native Anthropic endpoints (not third-party
-    compatible ones).
+    fast-mode beta header for ~2.5x faster output throughput on Opus 4.8 /
+    Opus 5. Currently only supported on native Anthropic endpoints (not
+    third-party compatible ones).
     """
     system, anthropic_messages = convert_messages_to_anthropic(
         messages, base_url=base_url, model=model
@@ -937,6 +1002,7 @@ def build_anthropic_kwargs(
                 text = text.replace("Hermes agent", "Claude Code")
                 text = text.replace("hermes-agent", "claude-code")
                 text = text.replace("Nous Research", "Anthropic")
+                text = _apply_oauth_prose_aliases(text)
                 block["text"] = text
 
         # 3. Normalize tool names so NOTHING goes on the OAuth wire with a
@@ -957,24 +1023,14 @@ def build_anthropic_kwargs(
         #    so any session with an MCP server configured still tripped the
         #    classifier. normalize_response reverses both forms via registry
         #    lookup so the dispatcher still sees the original name. GH-25255.
-        #
-        #    The normal map is not injective: a bare native tool named
-        #    ``honcho_search`` and an MCP server tool named ``mcp_honcho_search``
-        #    both become ``mcp__honcho_search``. Anthropic validates uniqueness
-        #    *after* this OAuth rewrite and rejects the request with HTTP 400
-        #    "tools: Tool names must be unique."  When such a collision is
-        #    present, put the bare Hermes-native tool under a reserved native
-        #    namespace (``mcp__hermes__honcho_search``) and leave the MCP tool at
-        #    ``mcp__honcho_search``. The response normalizer strips that reserved
-        #    namespace before registry dispatch.
-        tool_names: set[str] = set()
-        for tool in anthropic_tools or []:
-            if isinstance(tool, dict):
-                tool_name = tool.get("name")
-                if isinstance(tool_name, str):
-                    tool_names.add(tool_name)
-
-        def _default_oauth_wire_name(name: str) -> str:
+        # The normal prefix map is not injective: a bare native tool named
+        # ``honcho_search`` and an MCP server tool named ``mcp_honcho_search``
+        # both become ``mcp__honcho_search``. Anthropic validates uniqueness
+        # after this rewrite. Put the bare native tool under a reserved
+        # ``mcp__hermes__`` namespace when that collision exists; the response
+        # normalizer strips the namespace before registry dispatch.
+        def _normalize_to_mcp_wire(name: str) -> str:
+            """OAuth wire form of a tool name (no aliasing): mcp__<...>."""
             if name.startswith("mcp__"):
                 return name  # already correct, don't double-prefix
             if name.startswith("mcp_"):
@@ -982,9 +1038,14 @@ def build_anthropic_kwargs(
                 return "mcp__" + name[len("mcp_"):]
             return _MCP_TOOL_PREFIX + name  # bare name -> mcp__<name>
 
+        tool_names = {
+            tool["name"]
+            for tool in (anthropic_tools or [])
+            if isinstance(tool, dict) and isinstance(tool.get("name"), str)
+        }
         default_wire_to_names: Dict[str, set[str]] = {}
         for name in tool_names:
-            default_wire_to_names.setdefault(_default_oauth_wire_name(name), set()).add(name)
+            default_wire_to_names.setdefault(_normalize_to_mcp_wire(name), set()).add(name)
         colliding_native_tool_names = {
             name
             for originals in default_wire_to_names.values()
@@ -993,20 +1054,34 @@ def build_anthropic_kwargs(
             if not name.startswith("mcp_")
         }
 
+        # Wire names owned by tools that are NOT alias sources. An alias must
+        # never collide with one: two identical tool names in a single request
+        # is a hard 400. This mirrors the registered-tool-wins precedence in
+        # normalize_response.
+        claimed_wire_names = {
+            _normalize_to_mcp_wire(name)
+            for name in tool_names
+            if name not in _OAUTH_TOOL_NAME_ALIASES
+        }
+
         def _to_oauth_wire_name(name: str) -> str:
-            if name in colliding_native_tool_names:
-                return _MCP_HERMES_NATIVE_TOOL_PREFIX + name
-            if name.startswith("mcp__"):
-                return name  # already correct, don't double-prefix
-            if name.startswith("mcp_"):
-                # single-underscore native MCP tool -> promote to double
-                return "mcp__" + name[len("mcp_"):]
-            return _MCP_TOOL_PREFIX + name  # bare name -> mcp__<name>
+            original_name = name
+            if name in _OAUTH_TOOL_NAME_ALIASES:
+                aliased = _OAUTH_TOOL_NAME_ALIASES[name]
+                if _MCP_TOOL_PREFIX + aliased not in claimed_wire_names:
+                    name = aliased
+            if name == original_name and original_name in colliding_native_tool_names:
+                return _MCP_HERMES_NATIVE_TOOL_PREFIX + original_name
+            return _normalize_to_mcp_wire(name)
 
         if anthropic_tools:
             for tool in anthropic_tools:
                 if "name" in tool:
                     tool["name"] = _to_oauth_wire_name(tool["name"])
+                description = tool.get("description")
+                if isinstance(description, str):
+                    # Prose-safe aliases only — see _OAUTH_PROSE_ALIAS_NAMES.
+                    tool["description"] = _apply_oauth_prose_aliases(description)
 
         # 4. Apply the same normalization to tool names in message history
         #    (tool_use blocks) so replayed turns match the wire names above.
@@ -1040,8 +1115,18 @@ def build_anthropic_kwargs(
             # Anthropic has no tool_choice "none" — omit tools entirely to prevent use
             kwargs.pop("tools", None)
         elif isinstance(tool_choice, str):
-            # Specific tool name
-            kwargs["tool_choice"] = {"type": "tool", "name": tool_choice}
+            # Specific tool name. Under OAuth every tool on the wire is
+            # mcp__-prefixed and/or alias-renamed (see _to_oauth_wire_name
+            # above) — route the forced name through the same normalizer so
+            # tool_choice always matches the corresponding tools[] entry.
+            # Left un-normalized, a forced ``session_search``/``memory``
+            # choice would (a) still carry the literal trigger string onto
+            # the wire, defeating the alias, and (b) reference a tool name
+            # that no longer exists in ``tools[]``, which Anthropic rejects.
+            wire_tool_choice = tool_choice
+            if is_oauth:
+                wire_tool_choice = _to_oauth_wire_name(tool_choice)
+            kwargs["tool_choice"] = {"type": "tool", "name": wire_tool_choice}
 
     # Map reasoning_config to Anthropic's thinking parameter.
     # Claude 4.6+ models use adaptive thinking + output_config.effort.
@@ -1101,12 +1186,15 @@ def build_anthropic_kwargs(
         for _sampling_key in ("temperature", "top_p", "top_k"):
             kwargs.pop(_sampling_key, None)
 
-    # ── Fast mode (Opus 4.6 only) ────────────────────────────────────
+    # ── Fast mode (Opus 4.8 / Opus 5) ────────────────────────────────
     # Adds extra_body.speed="fast" + the fast-mode beta header for ~2.5x
-    # output speed. Per Anthropic docs, fast mode is only supported on
-    # Opus 4.6 — Opus 4.7 and other models 400 on the speed parameter.
+    # output speed. Per Anthropic docs the speed param is supported on
+    # Opus 4.8 and Opus 5 (research preview); Opus 4.7 400s on it and
+    # Opus 4.6 silently ignores it (standard speed, standard billing).
     # Only for native Anthropic endpoints — third-party providers would
-    # reject the unknown beta header and speed parameter.
+    # reject the unknown beta header and speed parameter, and Anthropic
+    # itself scopes fast mode to the Claude API (not Bedrock/Vertex/
+    # Foundry).
     if (
         fast_mode
         and not _is_third_party_anthropic_endpoint(base_url)
@@ -1235,12 +1323,21 @@ def create_anthropic_message(
                     for _event in stream:
                         try:
                             on_stream_event(_event)
+                        except TimeoutError:
+                            # The callback is the caller's deadline seam
+                            # (#99692: the host waiting on this summary has
+                            # already given up). Abandon the stream — the
+                            # ``with`` closes it — instead of streaming an
+                            # answer nobody will read.
+                            raise
                         except Exception:
                             logger.debug(
                                 "%son_stream_event callback failed",
                                 log_prefix, exc_info=True,
                             )
                 return stream.get_final_message()
+        except TimeoutError:
+            raise
         except Exception as exc:
             if not _is_stream_unavailable_error(exc):
                 raise
