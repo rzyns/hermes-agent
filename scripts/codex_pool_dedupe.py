@@ -11,8 +11,10 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import os
 import shutil
 import sys
+import tempfile
 from contextlib import ExitStack
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -325,6 +327,21 @@ def _payload_after_removals(file_plan: FilePlan) -> dict[str, Any]:
     return payload
 
 
+def _restore_backup_atomically(backup: Path, target: Path) -> None:
+    """Restore an exact backup without exposing a partially copied auth file."""
+    fd, temp_name = tempfile.mkstemp(
+        prefix=f".{target.name}.rollback-",
+        dir=target.parent,
+    )
+    os.close(fd)
+    temp_path = Path(temp_name)
+    try:
+        shutil.copy2(backup, temp_path)
+        os.replace(temp_path, target)
+    finally:
+        temp_path.unlink(missing_ok=True)
+
+
 def apply_plan(plan: RepairPlan) -> list[Path]:
     changed = [file_plan for file_plan in plan.files if file_plan.changed]
     if not changed:
@@ -348,6 +365,7 @@ def apply_plan(plan: RepairPlan) -> list[Path]:
                 raise RuntimeError(
                     f"{file_plan.path} changed after planning; refusing to apply stale plan"
                 )
+        backup_by_path: dict[Path, Path] = {}
         for file_plan in changed:
             backup = file_plan.path.with_name(
                 f"{file_plan.path.name}.bak-codex-pool-dedupe-{timestamp}"
@@ -356,11 +374,37 @@ def apply_plan(plan: RepairPlan) -> list[Path]:
                 raise FileExistsError(f"backup already exists: {backup}")
             shutil.copy2(file_plan.path, backup)
             backups.append(backup)
-        for file_plan in changed:
-            _save_auth_store(
-                _payload_after_removals(file_plan),
-                target_path=file_plan.path,
-            )
+            backup_by_path[file_plan.path] = backup
+        attempted: list[FilePlan] = []
+        try:
+            for file_plan in changed:
+                # Include the current file before writing: a writer that fails
+                # after replacing the destination must still be rolled back.
+                attempted.append(file_plan)
+                _save_auth_store(
+                    _payload_after_removals(file_plan),
+                    target_path=file_plan.path,
+                )
+        except Exception as write_error:
+            rollback_failures: list[str] = []
+            for file_plan in reversed(attempted):
+                try:
+                    _restore_backup_atomically(
+                        backup_by_path[file_plan.path],
+                        file_plan.path,
+                    )
+                except OSError as rollback_error:
+                    rollback_failures.append(
+                        f"{file_plan.path}: {rollback_error}"
+                    )
+            if rollback_failures:
+                details = "; ".join(rollback_failures)
+                raise RuntimeError(
+                    f"apply failed and rollback was incomplete: {details}"
+                ) from write_error
+            raise RuntimeError(
+                f"apply failed; restored {len(attempted)} attempted file(s) from backup"
+            ) from write_error
     return backups
 
 

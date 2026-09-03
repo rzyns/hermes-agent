@@ -222,3 +222,54 @@ def test_apply_acquires_profile_lock_before_root_lock(tmp_path, monkeypatch):
     dedupe.apply_plan(dedupe.build_plan(root))
 
     assert acquired == [profile_path, root_path]
+
+
+def test_apply_rejects_a_stale_plan_before_writing_backups(tmp_path):
+    root = tmp_path / ".hermes"
+    device = _row("device", "primary", "device_code", "account-A", "refresh-A")
+    duplicate = _row("duplicate", "duplicate", "manual:device_code", "account-A", "refresh-B")
+    root_path = root / "auth.json"
+    _write(root_path, _payload(device, [device, duplicate]))
+    plan = dedupe.build_plan(root)
+    changed_payload = _payload(device, [device, duplicate])
+    changed_payload["unrelated"] = "changed after planning"
+    _write(root_path, changed_payload)
+
+    with pytest.raises(RuntimeError, match="changed after planning"):
+        dedupe.apply_plan(plan)
+
+    assert not list(root.glob("auth.json.bak-codex-pool-dedupe-*"))
+    assert json.loads(root_path.read_text(encoding="utf-8"))["unrelated"] == "changed after planning"
+
+
+def test_apply_rolls_back_earlier_files_when_a_later_write_fails(tmp_path, monkeypatch):
+    root = tmp_path / ".hermes"
+    device = _row("device", "primary", "device_code", "account-A", "refresh-A")
+    duplicate = _row("duplicate", "duplicate", "manual:device_code", "account-A", "refresh-B")
+    root_path = root / "auth.json"
+    profile_path = root / "profiles" / "worker" / "auth.json"
+    _write(root_path, _payload(device, [device, duplicate]))
+    _write(profile_path, _payload(device, [device, duplicate]))
+    originals = {
+        root_path: root_path.read_bytes(),
+        profile_path: profile_path.read_bytes(),
+    }
+    real_save = dedupe._save_auth_store
+    calls = 0
+
+    def fail_second_write(payload, target_path=None):
+        nonlocal calls
+        calls += 1
+        if calls == 2:
+            raise OSError("synthetic second-write failure")
+        return real_save(payload, target_path=target_path)
+
+    monkeypatch.setattr(dedupe, "_save_auth_store", fail_second_write)
+
+    with pytest.raises(RuntimeError, match="restored 2 attempted file"):
+        dedupe.apply_plan(dedupe.build_plan(root))
+
+    assert root_path.read_bytes() == originals[root_path]
+    assert profile_path.read_bytes() == originals[profile_path]
+    assert len(list(root_path.parent.glob("auth.json.bak-codex-pool-dedupe-*"))) == 1
+    assert len(list(profile_path.parent.glob("auth.json.bak-codex-pool-dedupe-*"))) == 1
