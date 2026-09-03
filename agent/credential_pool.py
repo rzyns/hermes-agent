@@ -37,6 +37,7 @@ from hermes_cli.auth import (
     _load_auth_store,
     _load_provider_state,
     _load_provider_state_with_source,
+    _oauth_identity,
     _minimax_oauth_quarantine_on_terminal_refresh,
     _provider_state_transaction,
     _resolve_kimi_base_url,
@@ -1311,9 +1312,17 @@ class CredentialPool:
         though fresh credentials are sitting on disk — and every request
         fails with "no available entries (all exhausted or empty)".
 
-        Mirrors the Nous/Anthropic resync paths above.  Only applies to
-        device_code-sourced entries; env/API-key-sourced entries have no
-        auth.json shadow to sync from.
+        Mirrors the Nous/Anthropic resync paths above.  ``device_code`` is the
+        singleton mirror and always follows the singleton, including when a
+        re-auth changes accounts.  ``manual:device_code`` entries may be
+        independent accounts, so they follow only a singleton with the same
+        decodable account identity.
+
+        Commit 7380b48589 widened this path to ``manual:device_code`` without
+        the identity guard already required by the #39236 CLI re-auth fix.
+        Token inequality alone then collapsed independent accounts onto the
+        singleton.  Missing identity fails closed for manual entries; env/API-
+        key sources still have no auth.json shadow to sync from.
         """
         if self.provider != "openai-codex" or entry.source not in ("device_code", "manual:device_code"):
             return entry
@@ -1326,6 +1335,23 @@ class CredentialPool:
             tokens = state.get("tokens")
             if not isinstance(tokens, dict):
                 return entry
+            if entry.source == "manual:device_code":
+                entry_identity = _oauth_identity(entry.to_dict())
+                store_identity = _oauth_identity(tokens)
+                if not entry_identity or not store_identity:
+                    logger.debug(
+                        "Pool entry %s: not syncing manual Codex tokens because "
+                        "the entry or singleton account identity is undecodable",
+                        entry.id,
+                    )
+                    return entry
+                if entry_identity != store_identity:
+                    logger.debug(
+                        "Pool entry %s: not syncing manual Codex tokens because "
+                        "it belongs to a different account than the singleton",
+                        entry.id,
+                    )
+                    return entry
             store_access = tokens.get("access_token", "")
             store_refresh = tokens.get("refresh_token", "")
             # Adopt auth.json tokens when either side differs.  Codex refresh

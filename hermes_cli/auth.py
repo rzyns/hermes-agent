@@ -4626,13 +4626,13 @@ def _sync_codex_pool_entries(
       OAuth flow when the user logged in via ``hermes setup`` / the model
       picker.  Always synced with the fresh tokens.
     * ``manual:device_code`` — entries created by ``hermes auth add openai-codex``
-      that use the same device-code OAuth mechanism.  ONLY synced if the
-      entry's existing access_token matches the *previous* singleton
-      access_token (i.e. the entry is a legacy singleton-alias from the
-      #33000 workaround era).  Manual entries whose tokens never matched the
-      singleton represent INDEPENDENT accounts added via
-      ``hermes auth add openai-codex`` and must not be overwritten by a
-      re-auth that targeted a different account (regression for #39236).
+      that use the same device-code OAuth mechanism.  Synced if the entry's
+      existing access_token matches the *previous* singleton access_token (a
+      legacy singleton-alias from the #33000 workaround era), or if the entry
+      and the new singleton have the same decodable account identity.  The
+      identity rule covers same-account re-auths whose old pair was already
+      distinct but is now invalidated server-side.  Different-account and
+      undecodable entries remain independent (regression for #39236).
 
       The original #33538 fix refreshed every ``manual:device_code`` entry
       unconditionally.  That worked when ``manual:device_code`` only meant
@@ -4647,8 +4647,8 @@ def _sync_codex_pool_entries(
     * ``manual:api_key`` and any other non-device-code manual sources — those
       are independent credentials (an explicit API key, a different ChatGPT
       account, etc.) and must not be overwritten by a single re-auth.
-    * ``manual:device_code`` entries whose access_token does NOT match the
-      previous singleton — see above; these are independent accounts.
+    * ``manual:device_code`` entries that neither match the previous singleton
+      token nor share the new singleton's decodable identity — see above.
 
     Error markers (``last_status``, ``last_error_*``) are cleared ONLY on
     entries that actually had their tokens rewritten by this re-auth.
@@ -4673,6 +4673,7 @@ def _sync_codex_pool_entries(
     prev_at = None
     if isinstance(previous_singleton_tokens, dict):
         prev_at = previous_singleton_tokens.get("access_token") or None
+    new_identity = _oauth_identity(tokens)
     for entry in entries:
         if not isinstance(entry, dict):
             continue
@@ -4681,12 +4682,14 @@ def _sync_codex_pool_entries(
             # Singleton-seeded mirror — always refresh.
             refresh_this_entry = True
         elif source == "manual:device_code":
-            # Refresh only if this entry's existing access_token matches the
-            # previous singleton access_token (i.e. it is a true alias of the
-            # singleton from the #33000 workaround era).  An entry with its
-            # own distinct token material is an independent account and must
-            # be left alone (#39236).
-            refresh_this_entry = bool(prev_at and entry.get("access_token") == prev_at)
+            # Preserve legacy token-alias detection and also refresh a distinct
+            # stale pair when JWT claims prove it belongs to the account just
+            # re-authenticated.  Missing identities never broaden the update.
+            entry_identity = _oauth_identity(entry)
+            refresh_this_entry = bool(
+                (prev_at and entry.get("access_token") == prev_at)
+                or (new_identity and entry_identity == new_identity)
+            )
         else:
             # ``manual:api_key`` and any future non-device-code sources.
             refresh_this_entry = False
