@@ -50,6 +50,18 @@ def _jwt_with_exp(exp_epoch: int) -> str:
     return f"h.{encoded}.s"
 
 
+def _jwt_with_codex_account(account_id: str) -> str:
+    payload = {
+        "https://api.openai.com/auth": {
+            "chatgpt_account_id": account_id,
+        }
+    }
+    encoded = base64.urlsafe_b64encode(
+        json.dumps(payload, separators=(",", ":")).encode("utf-8")
+    ).rstrip(b"=").decode("utf-8")
+    return f"h.{encoded}.s"
+
+
 
 
 
@@ -440,6 +452,53 @@ def test_save_codex_tokens_clears_error_markers_only_on_refreshed_entries(tmp_pa
     assert acctB["last_status"] == "exhausted"  # not cleared
     assert acctB["last_error_code"] == 429
     assert acctB["last_error_reason"] == "quota_exhausted"
+
+
+def test_save_codex_tokens_refreshes_same_identity_manual_entry(tmp_path, monkeypatch):
+    """Same-account re-auth refreshes a distinct stale manual token pair."""
+    hermes_home = tmp_path / "hermes"
+    hermes_home.mkdir(parents=True, exist_ok=True)
+    old_singleton = _jwt_with_codex_account("account-other")
+    stale_same_account = _jwt_with_codex_account("account-A")
+    fresh_same_account = _jwt_with_codex_account("account-A")
+    (hermes_home / "auth.json").write_text(json.dumps({
+        "version": 1,
+        "providers": {
+            "openai-codex": {
+                "tokens": {
+                    "access_token": old_singleton,
+                    "refresh_token": "old-singleton-refresh",
+                }
+            }
+        },
+        "credential_pool": {
+            "openai-codex": [{
+                "id": "same-account-manual",
+                "source": "manual:device_code",
+                "auth_type": "oauth",
+                "access_token": stale_same_account,
+                "refresh_token": "stale-account-A-refresh",
+                "last_status": "dead",
+                "last_error_code": 401,
+            }]
+        },
+    }))
+    monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+
+    _save_codex_tokens(
+        {
+            "access_token": fresh_same_account,
+            "refresh_token": "fresh-account-A-refresh",
+        },
+        last_refresh="2026-09-03T00:00:00Z",
+    )
+
+    payload = json.loads((hermes_home / "auth.json").read_text())
+    entry = payload["credential_pool"]["openai-codex"][0]
+    assert entry["access_token"] == fresh_same_account
+    assert entry["refresh_token"] == "fresh-account-A-refresh"
+    assert entry["last_status"] is None
+    assert entry["last_error_code"] is None
 
 
 
