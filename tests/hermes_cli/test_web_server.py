@@ -52,7 +52,7 @@ _EXAMPLE_PLUGIN_FIXTURE = (
 
 
 @pytest.fixture
-def _install_example_plugin(_isolate_hermes_home):
+def _install_example_plugin(_isolate_hermes_home, monkeypatch):
     """Drop the example-dashboard fixture into the per-test HERMES_HOME
     user-plugins directory and force the web_server's dashboard plugin
     cache + API mount to rediscover it.
@@ -81,6 +81,10 @@ def _install_example_plugin(_isolate_hermes_home):
     if dst.exists():
         shutil.rmtree(dst)
     shutil.copytree(_EXAMPLE_PLUGIN_FIXTURE, dst)
+    # This fixture intentionally executes the copied test backend. Production
+    # user-plugin backends remain untrusted unless their root is explicitly
+    # allow-listed by the operator.
+    monkeypatch.setenv("HERMES_DASHBOARD_TRUSTED_PLUGIN_API_ROOTS", str(dst))
 
     # The dashboard now gates user-plugin asset serving + backend import
     # behind the ``plugins.enabled`` allow-list (GHSA-mcfc-hp25-cjv7).
