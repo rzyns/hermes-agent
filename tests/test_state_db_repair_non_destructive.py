@@ -69,6 +69,18 @@ import hermes_state
 import hermes_state_repair
 from hermes_state_repair import repair_state_db_schema
 
+
+@pytest.fixture(autouse=True)
+def _sufficient_repair_disk_space(monkeypatch, tmp_path):
+    """Keep repair semantics independent of the host volume's current fill level."""
+    usage = shutil.disk_usage(tmp_path)
+    monkeypatch.setattr(
+        hermes_state_repair.shutil,
+        "disk_usage",
+        lambda _path: usage._replace(used=0, free=usage.total),
+    )
+
+
 PAGE_SIZE = 4096
 
 

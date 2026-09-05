@@ -14,6 +14,7 @@ sqlite_master surgery path recovers the canonical data and self-heals on open.
 """
 import contextlib
 import json
+import shutil
 import sqlite3
 import subprocess
 import sys
@@ -27,6 +28,17 @@ import hermes_state_repair
 import hermes_state_wal
 from hermes_state import SessionDB, is_malformed_db_error
 from hermes_state_repair import repair_state_db_schema
+
+
+@pytest.fixture(autouse=True)
+def _sufficient_repair_disk_space(monkeypatch, tmp_path):
+    """Keep repair semantics independent of the host volume's current fill level."""
+    usage = shutil.disk_usage(tmp_path)
+    monkeypatch.setattr(
+        hermes_state_repair.shutil,
+        "disk_usage",
+        lambda _path: usage._replace(used=0, free=usage.total),
+    )
 
 
 def _build_healthy_db(db_path: Path) -> str:
@@ -499,9 +511,11 @@ def test_repair_reports_success_when_the_holder_already_healed_the_db(
 
 
 _REPAIR_SCRIPT = """
-import sys, json
+import sys, json, shutil
 sys.path.insert(0, {root!r})
 from hermes_state_repair import repair_state_db_schema
+usage = shutil.disk_usage({db!r})
+shutil.disk_usage = lambda _path: usage._replace(used=0, free=usage.total)
 print(json.dumps(repair_state_db_schema({db!r})), flush=True)
 """
 
