@@ -4255,12 +4255,17 @@ def test_gateway_dispatcher_retries_corrupt_board_after_quarantine(
         # The kanban dispatcher/notifier watcher loops were extracted from
         # gateway/run.py into gateway/kanban_watchers.py (god-file Phase 3),
         # so accept either filename for the time-travel mock.
-        if filename.endswith("gateway/run.py") or filename.endswith("gateway/kanban_watchers.py"):
+        if (
+            filename.endswith("gateway/run.py")
+            or filename.endswith("gateway/kanban_watchers.py")
+            or filename.endswith("gateway/kanban_watchers_dispatcher.py")
+        ):
             return next(time_values, 1301.0)
         return real_monotonic()
 
     monkeypatch.setattr("gateway.run.time.monotonic", _monotonic_for_gateway_dispatcher)
     monkeypatch.setattr("gateway.kanban_watchers.time.monotonic", _monotonic_for_gateway_dispatcher)
+    monkeypatch.setattr("gateway.kanban_watchers_dispatcher.time.monotonic", _monotonic_for_gateway_dispatcher)
 
     calls = {"tick": 0}
 
@@ -4277,7 +4282,7 @@ def test_gateway_dispatcher_retries_corrupt_board_after_quarantine(
             if args and getattr(fn, "__name__", "") == "_run_in_fresh_context"
             else fn
         )
-        if getattr(target, "__name__", "") == "_tick_once":
+        if getattr(target, "__name__", "") in {"_tick_once", "tick_once"}:
             calls["tick"] += 1
             if calls["tick"] >= 3:
                 runner._running = False

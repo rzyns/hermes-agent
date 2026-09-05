@@ -6102,18 +6102,9 @@ def test_connect_falls_back_to_delete_on_locking_protocol(tmp_path, monkeypatch,
     yet).
     """
     import sqlite3 as _sqlite3
+    import hermes_state_wal
+    from hermes_cli import kanban_db_connect as kbc
     from unittest.mock import patch as _patch
-
-    import hermes_state as _hs
-
-    # The fallback warning is deduped process-globally ("once per process per
-    # database" — _log_wal_fallback_once / _log_wal_reset_bug_once). Any earlier
-    # test in this file that opened a kanban.db already consumed the one-shot
-    # for that label, so without clearing it this test sees zero warnings and
-    # fails only when run as part of the file (it passes in isolation). Clear
-    # both dedup sets so the warning is emitted for this connect().
-    _hs._wal_fallback_warned_paths.clear()
-    _hs._wal_reset_bug_warned_paths.clear()
 
     home = tmp_path / ".hermes"
     home.mkdir()
@@ -6122,13 +6113,16 @@ def test_connect_falls_back_to_delete_on_locking_protocol(tmp_path, monkeypatch,
 
     # These tests exercise the WAL-attempt path; assume a fixed SQLite so the
     # WAL-reset vulnerability gate doesn't short-circuit before the pragma.
+    import hermes_state_wal as _hermes_state_wal
     monkeypatch.setattr(
-        _hs, "is_sqlite_wal_reset_vulnerable",
+        _hermes_state_wal, "is_sqlite_wal_reset_vulnerable",
         lambda version_info=None: False,
     )
+    _hermes_state_wal._wal_fallback_warned_paths.clear()
 
     # Clear module cache so a fresh connect() is attempted
     kb._INITIALIZED_PATHS.clear()
+    hermes_state_wal._wal_fallback_warned_paths.clear()
 
     real_connect = _sqlite3.connect
 
@@ -6149,7 +6143,7 @@ def test_connect_falls_back_to_delete_on_locking_protocol(tmp_path, monkeypatch,
 
     with _patch("hermes_cli.kanban_db.sqlite3.connect", side_effect=wal_blocking_connect):
         with caplog.at_level("ERROR", logger="hermes_state"):
-            conn = kb.connect()
+            conn = kbc.connect()
 
     # One fallback error, naming kanban.db
     errors = [
@@ -6170,6 +6164,8 @@ def test_connect_falls_back_to_delete_on_locking_protocol(tmp_path, monkeypatch,
 def test_connect_works_when_wal_is_silently_refused(tmp_path, monkeypatch, caplog):
     """kanban_db.connect() must stay usable when WAL silently no-ops to DELETE."""
     import sqlite3 as _sqlite3
+    import hermes_state_wal
+    from hermes_cli import kanban_db_connect as kbc
     from unittest.mock import patch as _patch
 
     home = tmp_path / ".hermes"
@@ -6178,10 +6174,10 @@ def test_connect_works_when_wal_is_silently_refused(tmp_path, monkeypatch, caplo
     monkeypatch.setattr(Path, "home", lambda: tmp_path)
 
     kb._INITIALIZED_PATHS.clear()
-    hermes_state._wal_fallback_warned_paths.clear()
+    hermes_state_wal._wal_fallback_warned_paths.clear()
     # Assume a fixed SQLite so the WAL-reset gate doesn't short-circuit.
     monkeypatch.setattr(
-        hermes_state, "is_sqlite_wal_reset_vulnerable",
+        hermes_state_wal, "is_sqlite_wal_reset_vulnerable",
         lambda version_info=None: False,
     )
 
@@ -6204,7 +6200,7 @@ def test_connect_works_when_wal_is_silently_refused(tmp_path, monkeypatch, caplo
         side_effect=wal_silent_noop_connect,
     ):
         with caplog.at_level("ERROR", logger="hermes_state"):
-            conn = kb.connect()
+            conn = kbc.connect()
 
     assert conn.execute("PRAGMA journal_mode").fetchone()[0].lower() == "delete"
     t = kb.create_task(conn, title="post-silent-fallback task")

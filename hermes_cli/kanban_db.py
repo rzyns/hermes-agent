@@ -106,6 +106,80 @@ from toolsets import get_toolset_names
 _log = logging.getLogger(__name__)
 
 
+def _row_get(row: Any, col: str, default: Any = None) -> Any:
+    """Return a SQLite row field, tolerating projections that omit it."""
+    if row is None or col not in row.keys():
+        return default
+    return row[col]
+
+
+def _json_dict(value: Any) -> dict:
+    """Decode a JSON object value; malformed and non-object values become empty."""
+    if not value:
+        return {}
+    try:
+        parsed = json.loads(value)
+    except Exception:
+        return {}
+    return parsed if isinstance(parsed, dict) else {}
+
+
+def _env_int(name: str, default: int, *, minimum: int = 0) -> int:
+    """Read a bounded integer environment override, falling back on invalid input."""
+    raw = os.environ.get(name, "").strip()
+    if raw:
+        try:
+            parsed = int(raw)
+        except ValueError:
+            return default
+        if parsed >= minimum:
+            return parsed
+    return default
+
+
+def _opt_int(value: Any) -> Optional[int]:
+    """Convert a nullable SQLite value to int."""
+    return int(value) if value is not None else None
+
+
+def _git_out(cwd: Path, *args: str, timeout: int = 30) -> Optional[str]:
+    """Run a bounded Git query and return non-empty stdout."""
+    try:
+        result = subprocess.run(
+            ["git", "-C", str(cwd), *args],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=timeout,
+            check=False,
+        )
+    except Exception:
+        return None
+    if result.returncode != 0:
+        return None
+    return (result.stdout or "").strip() or None
+
+
+def _host_prefix() -> str:
+    """Return the host component shared by this process's claim locks."""
+    return f"{_claimer_id().split(':', 1)[0]}:"
+
+
+def _insert_comment(
+    conn: sqlite3.Connection,
+    task_id: str,
+    author: str,
+    body: str,
+    created_at: int,
+) -> None:
+    """Insert a comment for callers already inside a write transaction."""
+    conn.execute(
+        "INSERT INTO task_comments (task_id, author, body, created_at) VALUES (?, ?, ?, ?)",
+        (task_id, author, body, created_at),
+    )
+
+
 # ---------------------------------------------------------------------------
 # Test-only hook for deterministic interleave verification.  Called inside
 # the heartbeat_claim_with_event write_txn, between the CAS UPDATE and the
@@ -2031,6 +2105,20 @@ class Event:
     payload: Optional[dict]
     created_at: int
     run_id: Optional[int] = None
+
+    @classmethod
+    def from_row(cls, row: sqlite3.Row) -> "Event":
+        run_id = _row_get(row, "run_id")
+        payload = None
+        if row["payload"]:
+            try:
+                payload = json.loads(row["payload"])
+            except Exception:
+                payload = None
+        return cls(
+            id=row["id"], task_id=row["task_id"], kind=row["kind"],
+            payload=payload, created_at=row["created_at"], run_id=_opt_int(run_id),
+        )
 
 
 @dataclass
@@ -8870,11 +8958,13 @@ def complete_task(
                            dep_wait_count = 0,
                            dep_wait_backstop_tripped = 0
                      WHERE id = ?
-                       AND status IN ('running', 'ready', 'blocked')
+                       AND status IN ('running', 'ready', 'blocked', 'review')
                     """,
                     (terminal_status, effective_result, now if terminal_status == "done" else None, task_id),
                 )
             else:
+                # The expected-run branch below remains claim-bound; only an
+                # unclaimed review row can be approved without a run id.
                 cur = conn.execute(
                     """
                     UPDATE tasks

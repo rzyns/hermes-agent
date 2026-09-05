@@ -2973,7 +2973,7 @@ def _goal_mode_handoff_rejection(
     if client is None or not model:
         return ("done", None)
 
-    from hermes_cli.goals import (
+    from tools.kanban_tools import (
         judge_goal,
         _build_artifact_manifest_for_judge_gate,
         _build_declared_artifact_readback_list,

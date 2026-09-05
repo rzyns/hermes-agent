@@ -17,6 +17,7 @@ import pytest
 
 from hermes_cli import kanban as kb_cli
 from hermes_cli import kanban_db as kb
+from hermes_cli import kanban_db_connect as kbc
 
 
 @pytest.fixture
@@ -33,7 +34,7 @@ def kanban_home(tmp_path, monkeypatch):
 
 @pytest.fixture
 def conn(kanban_home):
-    with kb.connect() as c:
+    with kbc.connect() as c:
         yield c
 
 
@@ -193,7 +194,7 @@ def _clear_kanban_cross_deps_discovery_cache(monkeypatch):
 
 
 def test_cli_promote_bulk_ids_promotes_all(kanban_home, capsys):
-    with kb.connect() as conn:
+    with kbc.connect() as conn:
         parent = kb.create_task(conn, title="parent")
         children = [
             kb.create_task(conn, title=f"c{i}", parents=[parent])
@@ -205,7 +206,7 @@ def test_cli_promote_bulk_ids_promotes_all(kanban_home, capsys):
     out = capsys.readouterr().out
     for c in children:
         assert c in out
-    with kb.connect() as conn:
+    with kbc.connect() as conn:
         for c in children:
             assert kb.get_task(conn, c).status == "ready"
 

@@ -28,25 +28,110 @@ through the board.
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import os
 import secrets
 import subprocess
+from pathlib import Path
 from typing import Any, Optional
 
 from agent.redact import redact_sensitive_text
-from hermes_cli.goals import (
-    judge_goal,
-    _build_artifact_manifest_for_judge_gate,
-    _build_declared_artifact_readback_list,
-    _extract_verification_output,
-    _verify_artifact_manifest_and_log,
-)
+from hermes_cli.goals import judge_goal
 from tools.registry import registry, tool_error
 from hermes_cli.config import cfg_get, load_config
 
 logger = logging.getLogger(__name__)
+
+JUDGE_VERIFICATION_OUTPUT_MAX_BYTES = 2000
+
+
+def _truncate_judge_text(text: str, limit: int) -> str:
+    encoded = text.encode("utf-8")
+    if len(encoded) <= limit:
+        return text
+    truncated = encoded[:limit]
+    while truncated and (truncated[-1] & 0xC0) == 0x80:
+        truncated = truncated[:-1]
+    return truncated.decode("utf-8", errors="ignore") + "… [truncated]"
+
+
+def _extract_verification_output(metadata: Optional[dict], top_level: Optional[str] = None) -> Optional[str]:
+    """Return byte-bounded verification evidence for the goal judge."""
+    raw = None
+    if isinstance(metadata, dict):
+        raw = metadata.get("verification_output")
+        if raw is None and isinstance(metadata.get("verification"), str):
+            raw = metadata["verification"]
+    raw = raw if raw is not None else top_level
+    text = str(raw).strip() if raw is not None else ""
+    if not text:
+        return None
+    framing = len("Verification/test output (bounded):\n\n\n".encode("utf-8"))
+    sentinel = len("… [truncated]".encode("utf-8"))
+    return _truncate_judge_text(text, max(0, JUDGE_VERIFICATION_OUTPUT_MAX_BYTES - framing - sentinel))
+
+
+def _build_declared_artifact_readback_list(metadata: Optional[dict], artifacts: Optional[list[str]]) -> list[dict[str, Any]]:
+    """Return one readback entry for every unique declared artifact path."""
+    raw = list(metadata.get("artifacts") or []) if isinstance(metadata, dict) else []
+    raw.extend(artifacts or [])
+    seen: set[str] = set()
+    entries = []
+    for item in raw:
+        path = str(item).strip()
+        if path and path not in seen:
+            seen.add(path)
+            entries.append({"source_path": path})
+    return entries
+
+
+def _build_artifact_manifest_for_judge_gate(metadata: Optional[dict], artifacts: Optional[list[str]]) -> list[dict[str, Any]]:
+    """Build the same content-bound manifest used by durable completion."""
+    merged = dict(metadata) if isinstance(metadata, dict) else {}
+    paths = [entry["source_path"] for entry in _build_declared_artifact_readback_list(merged, artifacts)]
+    if paths:
+        merged["artifacts"] = paths
+    try:
+        from hermes_cli.kanban_db import _artifact_manifest_from_metadata
+        return _artifact_manifest_from_metadata(merged)
+    except Exception as exc:
+        logger.debug("kanban goal judge: could not build artifact manifest: %s", exc)
+        return []
+
+
+def _verify_artifact_manifest_and_log(artifact_manifest: Optional[list[dict[str, Any]]], context: str) -> list[str]:
+    """Read back every declared artifact and verify any recorded SHA-256."""
+    failures: list[str] = []
+    for entry in artifact_manifest or []:
+        if not isinstance(entry, dict):
+            failures.append(f"invalid manifest entry: {entry!r}")
+            continue
+        path_text = entry.get("source_path") or entry.get("stored_path")
+        if not path_text:
+            failures.append("manifest entry missing source_path/stored_path")
+            continue
+        try:
+            path = Path(str(path_text)).expanduser().resolve(strict=False)
+        except OSError as exc:
+            failures.append(f"cannot resolve {path_text}: {exc}")
+            continue
+        if not path.is_file():
+            failures.append(f"declared artifact missing on disk: {path}")
+            continue
+        expected = entry.get("content_hash")
+        if expected:
+            try:
+                actual = hashlib.sha256(path.read_bytes()).hexdigest()
+            except OSError as exc:
+                failures.append(f"cannot hash {path}: {exc}")
+                continue
+            if actual != expected:
+                failures.append(f"hash mismatch for {path}: expected {expected[:16]}..., got {actual[:16]}...")
+    for failure in failures:
+        logger.warning("%s: %s", context, failure)
+    return failures
 
 
 # ---------------------------------------------------------------------------

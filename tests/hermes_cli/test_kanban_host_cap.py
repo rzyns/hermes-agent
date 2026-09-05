@@ -1,17 +1,16 @@
-"""Host-level concurrency accounting for Kanban dispatch (OOF-30 review).
+"""Host-level concurrency accounting + review-lane fairness (OOF-30 review).
 
-Two applicable gaps found in review of the original memory-guard PR:
+Three gaps found in review of the original memory-guard PR:
 
 1. The standalone daemon path (``hermes kanban daemon --force`` /
-   :func:`hermes_cli.kanban_db.run_daemon`) never resolved
+   :func:`hermes_cli.kanban_db_dispatch.run_daemon`) never resolved
    ``kanban.max_in_progress`` at all — the one shipped entry point that
    could still fan out an entire backlog in a single tick.
 2. ``max_in_progress`` was enforced per-board while the gateway dispatcher
    ticks every active board — N boards multiplied the host budget by N.
-
-This fork uses independent ready reviewer cards rather than dispatching a
-candidate directly from ``status='review'``. Reviewer cards therefore share
-the ordinary ready-lane budget and need no separate lane reservation.
+3. The ready loop consumed the entire shared spawn budget before the
+   review loop ran, so a sustained ready backlog starved autonomous
+   reviews indefinitely.
 """
 
 from __future__ import annotations
@@ -23,6 +22,8 @@ from pathlib import Path
 import pytest
 
 from hermes_cli import kanban_db as kb
+from hermes_cli import kanban_db_dispatch as kbd
+from hermes_cli import kanban_db_connect as kbc
 
 
 @pytest.fixture
@@ -70,15 +71,15 @@ def test_run_daemon_resolves_and_passes_max_in_progress(
         captured.update(kwargs)
         return kb.DispatchResult()
 
-    monkeypatch.setattr(kb, "dispatch_once", fake_dispatch_once)
+    monkeypatch.setattr(kbd, "dispatch_once", fake_dispatch_once)
     # No explicit config → the derived default must flow through.
-    monkeypatch.setattr(kb, "configured_max_in_progress", lambda: None)
-    monkeypatch.setattr(kb, "derive_default_max_in_progress", lambda sample=None: 3)
+    monkeypatch.setattr(kbd, "configured_max_in_progress", lambda: None)
+    monkeypatch.setattr(kbd, "derive_default_max_in_progress", lambda sample=None: 3)
 
     def on_tick(res):
         stop.set()
 
-    kb.run_daemon(interval=0.01, stop_event=stop, on_tick=on_tick)
+    kbd.run_daemon(interval=0.01, stop_event=stop, on_tick=on_tick)
 
     assert captured.get("max_in_progress") == 3
 
@@ -91,17 +92,17 @@ def test_run_daemon_explicit_config_wins(kanban_home, monkeypatch):
         captured.update(kwargs)
         return kb.DispatchResult()
 
-    monkeypatch.setattr(kb, "dispatch_once", fake_dispatch_once)
-    monkeypatch.setattr(kb, "configured_max_in_progress", lambda: 7)
+    monkeypatch.setattr(kbd, "dispatch_once", fake_dispatch_once)
+    monkeypatch.setattr(kbd, "configured_max_in_progress", lambda: 7)
     monkeypatch.setattr(
-        kb, "derive_default_max_in_progress",
+        kbd, "derive_default_max_in_progress",
         lambda sample=None: pytest.fail("derived default must not be consulted"),
     )
 
     def on_tick(res):
         stop.set()
 
-    kb.run_daemon(interval=0.01, stop_event=stop, on_tick=on_tick)
+    kbd.run_daemon(interval=0.01, stop_event=stop, on_tick=on_tick)
 
     assert captured.get("max_in_progress") == 7
 
@@ -122,7 +123,7 @@ def test_configured_max_in_progress_parsing(monkeypatch):
         monkeypatch.setattr(
             cfgmod, "load_config_readonly", lambda c=config: c
         )
-        assert kb.configured_max_in_progress() == expected, config
+        assert kbd.configured_max_in_progress() == expected, config
 
 
 # ---------------------------------------------------------------------------
@@ -137,15 +138,15 @@ def test_max_in_progress_counts_other_boards(
     kb.create_board("second")
 
     # Two workers already running on the second board.
-    with kb.connect(board="second") as conn:
+    with kbc.connect(board="second") as conn:
         for title in ("busy-1", "busy-2"):
             tid = kb.create_task(conn, title=title, assignee="alice")
             assert kb.claim_task(conn, tid) is not None
 
     spawns: list = []
-    with kb.connect() as conn:
+    with kbc.connect() as conn:
         kb.create_task(conn, title="wants-to-run", assignee="alice")
-        res = kb.dispatch_once(
+        res = kbd.dispatch_once(
             conn, spawn_fn=_fake_spawn_factory(spawns), max_in_progress=2,
         )
 
@@ -159,15 +160,15 @@ def test_max_in_progress_partial_budget_across_boards(
 ):
     kb.create_board("second")
 
-    with kb.connect(board="second") as conn:
+    with kbc.connect(board="second") as conn:
         tid = kb.create_task(conn, title="busy", assignee="alice")
         assert kb.claim_task(conn, tid) is not None
 
     spawns: list = []
-    with kb.connect() as conn:
+    with kbc.connect() as conn:
         for title in ("a", "b", "c"):
             kb.create_task(conn, title=title, assignee="alice")
-        res = kb.dispatch_once(
+        res = kbd.dispatch_once(
             conn, spawn_fn=_fake_spawn_factory(spawns), max_in_progress=2,
         )
 
@@ -184,20 +185,20 @@ def test_count_running_tasks_other_boards_fails_open(
         kb, "list_boards",
         lambda **k: (_ for _ in ()).throw(RuntimeError("boom")),
     )
-    assert kb.count_running_tasks_other_boards() == 0
+    assert kbd.count_running_tasks_other_boards() == 0
 
 
 def test_max_spawn_stays_per_board(kanban_home, all_assignees_spawnable):
     """``max_spawn`` keeps its historical per-board semantics."""
     kb.create_board("second")
-    with kb.connect(board="second") as conn:
+    with kbc.connect(board="second") as conn:
         tid = kb.create_task(conn, title="busy", assignee="alice")
         assert kb.claim_task(conn, tid) is not None
 
     spawns: list = []
-    with kb.connect() as conn:
+    with kbc.connect() as conn:
         kb.create_task(conn, title="a", assignee="alice")
-        res = kb.dispatch_once(
+        res = kbd.dispatch_once(
             conn, spawn_fn=_fake_spawn_factory(spawns), max_spawn=1,
         )
 
@@ -207,27 +208,108 @@ def test_max_spawn_stays_per_board(kanban_home, all_assignees_spawnable):
 
 
 # ---------------------------------------------------------------------------
-# 3. Independent reviewer cards share the host cap
+# 3. Review lane cannot be starved by a sustained ready backlog (P2)
 # ---------------------------------------------------------------------------
 
 
-def test_ready_reviewer_card_uses_shared_cap_without_spawning_candidate(
-    kanban_home, all_assignees_spawnable,
-):
-    """Spawn the reviewer card, not the candidate parked in review."""
-    spawns: list = []
-    with kb.connect() as conn:
-        candidate = kb.create_task(conn, title="candidate", assignee="alice")
-        _set_task_status(conn, candidate, "review")
-        reviewer = kb.create_task(conn, title="review candidate", assignee="reviewer")
-        conn.execute("UPDATE tasks SET priority = 100 WHERE id = ?", (reviewer,))
-        kb.create_task(conn, title="ordinary ready work", assignee="alice")
-        res = kb.dispatch_once(
-            conn, spawn_fn=_fake_spawn_factory(spawns), max_in_progress=1,
-        )
-        candidate_task = kb.get_task(conn, candidate)
+def _park_in_review(conn: sqlite3.Connection, title: str, assignee: str) -> str:
+    tid = kb.create_task(conn, title=title, assignee=assignee)
+    _set_task_status(conn, tid, "review")
+    return tid
 
-    assert spawns == [reviewer]
-    assert [row[0] for row in res.spawned] == [reviewer]
-    assert candidate_task is not None
-    assert candidate_task.status == "review"
+
+def test_review_lane_gets_reserved_slot_under_ready_backlog(
+    kanban_home, all_assignees_spawnable, monkeypatch,
+):
+    import hermes_cli.config as cfgmod
+    monkeypatch.setattr(
+        cfgmod, "load_config",
+        lambda *a, **k: {"kanban": {"review_dispatch": True}},
+    )
+
+    spawns: list = []
+    with kbc.connect() as conn:
+        for title in ("ready-1", "ready-2", "ready-3"):
+            kb.create_task(conn, title=title, assignee="alice")
+        review_id = _park_in_review(conn, "review-me", "reviewer")
+        res = kbd.dispatch_once(
+            conn, spawn_fn=_fake_spawn_factory(spawns), max_in_progress=2,
+        )
+
+    spawned_ids = [s[0] for s in res.spawned]
+    # Budget 2: one ready + the reserved review slot — never 2×ready.
+    assert len(spawned_ids) == 2
+    assert review_id in spawned_ids
+
+
+def test_review_reservation_released_when_no_review_work(
+    kanban_home, all_assignees_spawnable, monkeypatch,
+):
+    import hermes_cli.config as cfgmod
+    monkeypatch.setattr(
+        cfgmod, "load_config",
+        lambda *a, **k: {"kanban": {"review_dispatch": True}},
+    )
+
+    spawns: list = []
+    with kbc.connect() as conn:
+        for title in ("ready-1", "ready-2", "ready-3"):
+            kb.create_task(conn, title=title, assignee="alice")
+        res = kbd.dispatch_once(
+            conn, spawn_fn=_fake_spawn_factory(spawns), max_in_progress=2,
+        )
+
+    # No review work → ready lane keeps the full budget.
+    assert len(res.spawned) == 2
+
+
+def test_nonspawnable_review_does_not_tax_ready_budget(
+    kanban_home, monkeypatch,
+):
+    """Review tasks parked for humans (no real profile) release the slot."""
+    import hermes_cli.config as cfgmod
+    import hermes_cli.profiles as profmod
+
+    monkeypatch.setattr(
+        cfgmod, "load_config",
+        lambda *a, **k: {"kanban": {"review_dispatch": True}},
+    )
+    # Only 'alice' is a real profile; the review assignee is a human lane.
+    monkeypatch.setattr(
+        profmod, "profile_exists", lambda name: name == "alice"
+    )
+
+    spawns: list = []
+    with kbc.connect() as conn:
+        for title in ("ready-1", "ready-2"):
+            kb.create_task(conn, title=title, assignee="alice")
+        _park_in_review(conn, "human-review", "some-human")
+        res = kbd.dispatch_once(
+            conn, spawn_fn=_fake_spawn_factory(spawns), max_in_progress=2,
+        )
+
+    # Human-lane review is not spawnable → no reservation, ready gets both.
+    assert len(res.spawned) == 2
+
+
+def test_review_budget_still_bounded_by_shared_cap(
+    kanban_home, all_assignees_spawnable, monkeypatch,
+):
+    """The reservation caps the ready lane; it grants review no extra slots."""
+    import hermes_cli.config as cfgmod
+    monkeypatch.setattr(
+        cfgmod, "load_config",
+        lambda *a, **k: {"kanban": {"review_dispatch": True}},
+    )
+
+    spawns: list = []
+    with kbc.connect() as conn:
+        kb.create_task(conn, title="ready-1", assignee="alice")
+        for i in range(3):
+            _park_in_review(conn, f"review-{i}", "reviewer")
+        res = kbd.dispatch_once(
+            conn, spawn_fn=_fake_spawn_factory(spawns), max_in_progress=2,
+        )
+
+    # Budget 2 total across both lanes, reservation notwithstanding.
+    assert len(res.spawned) == 2
