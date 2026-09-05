@@ -98,6 +98,7 @@ async function poll() {
 
       return
     }
+
     timer = window.setTimeout(() => void poll(), POLL_ACTIVE_MS)
   } else {
     polling = false
@@ -112,6 +113,7 @@ export function watchLocalRuntimeJobs() {
   if (typeof window === 'undefined') {
     return
   }
+
   if (polling) {
     return
   }

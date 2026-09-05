@@ -13001,6 +13001,7 @@ async function startHermes() {
     const backendStartFailed = new Promise((_resolve, reject) => {
       rejectBackendStart = reject
     })
+
     hermesProcess.once('error', error => {
       releaseBackendChild(hermesProcess)
 

@@ -334,6 +334,7 @@ export function useSessionListActions({ profileScope }: UseSessionListActionsArg
           // whole list re-renders once per turn/broadcast for nothing.
           setSessions(prev => {
             const filteredPrevious = filterSidebarRows(prev)
+
             const incoming = dropTombstoned(
               carryForwardFailedProfileSessions(
                 filteredPrevious,
@@ -341,6 +342,7 @@ export function useSessionListActions({ profileScope }: UseSessionListActionsArg
                 recents.errors ?? result.errors
               )
             )
+
             const next = mergeSessionPage(filteredPrevious, incoming, sessionsToKeep())
 
             return sameCronSignature(filteredPrevious, next) ? filteredPrevious : next

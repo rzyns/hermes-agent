@@ -399,7 +399,12 @@ export const $sidebarFiltersActive: ReadableAtom<boolean> = computed(
     $sidebarShowArchived
   ],
   (statuses, projects, profiles, prs, sources, archived) =>
-    statuses.length > 0 || projects.length > 0 || profiles.length > 0 || prs.length > 0 || sources.length > 0 || archived
+    statuses.length > 0 ||
+    projects.length > 0 ||
+    profiles.length > 0 ||
+    prs.length > 0 ||
+    sources.length > 0 ||
+    archived
 )
 
 /** Anything at all moved off the shipped view — what makes a reset worth
