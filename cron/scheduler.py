@@ -508,6 +508,7 @@ def _is_cron_silence_response(text: str) -> bool:
 # Persistent pool for parallel cron jobs: tick() submits and returns; long jobs never block it.
 _parallel_pool: Optional[concurrent.futures.ThreadPoolExecutor] = None
 _parallel_pool_max_workers: Optional[int] = None
+_sequential_pool: Optional[concurrent.futures.ThreadPoolExecutor] = None
 _running_job_ids: set = set()
 _running_fire_owners: dict[str, dict[object, tuple[Optional[str], Path]]] = {}
 # Parent gateway threads synchronously waiting on restart-safe scope workers.
@@ -515,6 +516,66 @@ _running_fire_owners: dict[str, dict[object, tuple[Optional[str], Path]]] = {}
 # process sweep cannot reach the worker's transient scope.
 _restart_safe_waiter_job_ids: set[str] = set()
 _running_lock = threading.Lock()
+
+
+class _RuntimeContextIsolation:
+    """Reader/writer gate for jobs that temporarily change profile-wide runtime state."""
+
+    def __init__(self):
+        self._condition = threading.Condition(threading.Lock())
+        self._readers = 0
+        self._writer_active = False
+        self._writers_waiting = 0
+
+    def reserve_write(self) -> None:
+        with self._condition:
+            self._writers_waiting += 1
+            self._condition.notify_all()
+
+    def cancel_reserved_write(self) -> None:
+        with self._condition:
+            if self._writers_waiting > 0:
+                self._writers_waiting -= 1
+            self._condition.notify_all()
+
+    @contextlib.contextmanager
+    def read(self):
+        with self._condition:
+            while self._writer_active or self._writers_waiting:
+                self._condition.wait()
+            self._readers += 1
+        try:
+            yield
+        finally:
+            with self._condition:
+                self._readers -= 1
+                if self._readers == 0:
+                    self._condition.notify_all()
+
+    @contextlib.contextmanager
+    def write(self, *, reserved: bool = False):
+        with self._condition:
+            if not reserved:
+                self._writers_waiting += 1
+            try:
+                while self._writer_active or self._readers:
+                    self._condition.wait()
+                self._writer_active = True
+            finally:
+                self._writers_waiting -= 1
+        try:
+            yield
+        finally:
+            with self._condition:
+                self._writer_active = False
+                self._condition.notify_all()
+
+
+_runtime_context_isolation = _RuntimeContextIsolation()
+
+
+def _job_mutates_runtime_context(job: dict) -> bool:
+    return bool(str(job.get("profile") or "").strip())
 
 # Per in-flight id: time.time() claim instant + the future owning its release (``_FUTURE_PENDING``
 # until pool.submit returns). Past-allowance with no live future = leak; the sweep force-releases.
@@ -977,13 +1038,25 @@ def _get_parallel_pool(max_workers: Optional[int]) -> concurrent.futures.ThreadP
     return _parallel_pool
 
 
+def _get_sequential_pool() -> concurrent.futures.ThreadPoolExecutor:
+    """Single-worker pool for profile jobs that mutate shared process environment."""
+    global _sequential_pool
+    if _sequential_pool is None:
+        _sequential_pool = concurrent.futures.ThreadPoolExecutor(
+            max_workers=1, thread_name_prefix="cron-seq")
+    return _sequential_pool
+
+
 def _shutdown_parallel_pool() -> None:
-    """Shut down the persistent pool on process exit."""
-    global _parallel_pool, _parallel_pool_max_workers
+    """Shut down the persistent pools on process exit."""
+    global _parallel_pool, _parallel_pool_max_workers, _sequential_pool
     if _parallel_pool is not None:
         _parallel_pool.shutdown(wait=True, cancel_futures=False)
         _parallel_pool = None
         _parallel_pool_max_workers = None
+    if _sequential_pool is not None:
+        _sequential_pool.shutdown(wait=True, cancel_futures=False)
+        _sequential_pool = None
 
 
 atexit.register(_shutdown_parallel_pool)
@@ -1041,6 +1114,52 @@ def _get_hermes_home() -> Path:
     profile's home (its .env, config.yaml, scripts, skills).
     """
     return _hermes_home or get_hermes_home()
+
+
+@contextlib.contextmanager
+def _job_profile_context(job_id: str, profile: Optional[str]):
+    """Apply one job's profile home and dotenv environment, then restore both."""
+    raw_profile = str(profile or "").strip()
+    if not raw_profile:
+        yield None
+        return
+
+    global _hermes_home
+    prior_override = _hermes_home
+    env_snapshot = os.environ.copy()
+
+    from hermes_cli.profiles import normalize_profile_name, resolve_profile_env
+    from hermes_constants import reset_hermes_home_override, set_hermes_home_override
+
+    normalized_profile = normalize_profile_name(raw_profile)
+    try:
+        profile_home = Path(resolve_profile_env(normalized_profile)).resolve()
+    except (FileNotFoundError, ValueError) as exc:
+        logger.warning(
+            "Job '%s': configured profile %r no longer valid (%s) — "
+            "falling back to scheduler default",
+            job_id, raw_profile, exc)
+        yield None
+        return
+
+    override_token = None
+    try:
+        override_token = set_hermes_home_override(profile_home)
+        _hermes_home = profile_home
+        logger.info(
+            "Job '%s': using Hermes profile '%s' (%s)",
+            job_id, normalized_profile, profile_home)
+        yield normalized_profile
+    finally:
+        _hermes_home = prior_override
+        if override_token is not None:
+            reset_hermes_home_override(override_token)
+        added = set(os.environ) - set(env_snapshot)
+        for key in added:
+            os.environ.pop(key, None)
+        for key, value in env_snapshot.items():
+            if os.environ.get(key) != value:
+                os.environ[key] = value
 
 
 def _get_lock_paths() -> tuple[Path, Path]:
@@ -2288,6 +2407,20 @@ class _FireAudit:
 
 
 def run_job(
+    job: dict, *, defer_agent_teardown: Optional[list] = None, extra_prompt: Optional[str] = None,
+    cancel_event: Optional[_CancelEventLike] = None, execution_id: Optional[str] = None,
+) -> tuple[bool, str, str, Optional[str]]:
+    """Execute one job under its optional profile context."""
+    with _job_profile_context(job["id"], job.get("profile")):
+        return _run_job_impl(
+            job,
+            defer_agent_teardown=defer_agent_teardown,
+            extra_prompt=extra_prompt,
+            cancel_event=cancel_event,
+            execution_id=execution_id)
+
+
+def _run_job_impl(
     job: dict, *, defer_agent_teardown: Optional[list] = None, extra_prompt: Optional[str] = None,
     cancel_event: Optional[_CancelEventLike] = None, execution_id: Optional[str] = None,
 ) -> tuple[bool, str, str, Optional[str]]:
@@ -3600,18 +3733,26 @@ def _sweep_mcp_orphans() -> None:
         logger.debug("Post-tick MCP orphan cleanup failed: %s", _e)
 
 
-def _process_due_job(job: dict, adapters, loop, verbose: bool) -> bool:
+def _process_due_job(
+    job: dict, adapters, loop, verbose: bool, *, reserved_runtime_write: bool = False
+) -> bool:
     """Run one due job via the shared ``run_one_job`` body."""
-    # Claim only when the worker actually starts, so a queued lease can't expire first.
-    claimed = claim_job_for_fire(job["id"], return_job=True)
-    if not claimed:
-        finish_execution(
-            job["execution_id"], success=False, error="Fire claim lost; execution was not started.")
-        return True
-    # CAS returns the persisted record; bool fallback only for older test doubles.
-    claimed_job = dict(claimed) if isinstance(claimed, dict) else dict(job)
-    claimed_job["execution_id"] = job["execution_id"]
-    return run_one_job(claimed_job, adapters=adapters, loop=loop, verbose=verbose)
+    runtime_gate = (
+        _runtime_context_isolation.write(reserved=reserved_runtime_write)
+        if _job_mutates_runtime_context(job)
+        else _runtime_context_isolation.read())
+    with runtime_gate:
+        # Claim only when the worker actually starts, so a queued lease can't expire first.
+        claimed = claim_job_for_fire(job["id"], return_job=True)
+        if not claimed:
+            finish_execution(
+                job["execution_id"], success=False,
+                error="Fire claim lost; execution was not started.")
+            return True
+        # CAS returns the persisted record; bool fallback only for older test doubles.
+        claimed_job = dict(claimed) if isinstance(claimed, dict) else dict(job)
+        claimed_job["execution_id"] = job["execution_id"]
+        return run_one_job(claimed_job, adapters=adapters, loop=loop, verbose=verbose)
 
 
 def _submit_with_guard(job: dict, pool: concurrent.futures.ThreadPoolExecutor, process_job):
@@ -3662,6 +3803,9 @@ def _submit_with_guard(job: dict, pool: concurrent.futures.ThreadPoolExecutor, p
     if not try_register_running_job(job_id):
         logger.info("Job '%s' already running — skipping", job_label)
         return None
+    reserved_runtime_write = _job_mutates_runtime_context(job)
+    if reserved_runtime_write:
+        _runtime_context_isolation.reserve_write()
     # Record the attempt before dispatch; recovery marks abandoned rows unknown (no retry).
     try:
         execution = create_execution(job_id, source="builtin")
@@ -3669,6 +3813,8 @@ def _submit_with_guard(job: dict, pool: concurrent.futures.ThreadPoolExecutor, p
         _ctx = contextvars.copy_context()
     except Exception as execution_err:
         # Release the claim so the next tick retries instead of wedging "already running".
+        if reserved_runtime_write:
+            _runtime_context_isolation.cancel_reserved_write()
         release_running_job(job_id)
         _clear_run_claim_best_effort()
         logger.exception(
@@ -3677,13 +3823,16 @@ def _submit_with_guard(job: dict, pool: concurrent.futures.ThreadPoolExecutor, p
 
     def _run_and_release(j=dispatched_job, ctx=_ctx):
         try:
-            return ctx.run(process_job, j)
+            return ctx.run(
+                process_job, j, reserved_runtime_write=reserved_runtime_write)
         finally:
             release_running_job(j["id"])
 
     try:
         fut = pool.submit(_run_and_release)
     except Exception as submit_err:
+        if reserved_runtime_write:
+            _runtime_context_isolation.cancel_reserved_write()
         release_running_job(job_id)
         _clear_run_claim_best_effort()
         finish_execution(
@@ -3790,21 +3939,34 @@ def tick(
                 len(due_jobs),
                 _max_workers if _max_workers else "unbounded")
 
-        def _process_job(job: dict) -> bool:
-            return _process_due_job(job, adapters, loop, verbose)
+        def _process_job(job: dict, *, reserved_runtime_write: bool = False) -> bool:
+            return _process_due_job(
+                job, adapters, loop, verbose,
+                reserved_runtime_write=reserved_runtime_write)
 
-        # Persistent pool, non-blocking dispatch. Already-running jobs are skipped; mark_job_run
-        # re-arms next_run_at on completion, so no catch-up queue is needed.
+        # Profile jobs temporarily mutate process-global environment, so they use one ordered
+        # worker and exclude ordinary jobs through the reader/writer gate. Workdir-only jobs use
+        # task-scoped ContextVars and remain parallel.
+        sequential_jobs = [job for job in due_jobs if _job_mutates_runtime_context(job)]
+        parallel_jobs = [job for job in due_jobs if not _job_mutates_runtime_context(job)]
         _results: list = []
         _all_futures: list = []
-        pool = _get_parallel_pool(_max_workers)
-        for job in due_jobs:
-            fut = _submit_with_guard(job, pool, _process_job)
+        for job in sequential_jobs:
+            fut = _submit_with_guard(job, _get_sequential_pool(), _process_job)
             if fut is None:
                 continue
             _all_futures.append(fut)
             if not sync:
                 _results.append(True)  # optimistically counted
+        if parallel_jobs:
+            pool = _get_parallel_pool(_max_workers)
+            for job in parallel_jobs:
+                fut = _submit_with_guard(job, pool, _process_job)
+                if fut is None:
+                    continue
+                _all_futures.append(fut)
+                if not sync:
+                    _results.append(True)  # optimistically counted
 
         if sync:
             for f in concurrent.futures.as_completed(_all_futures):
