@@ -426,6 +426,13 @@ def _module_installed(module_name: str) -> bool:
         return False
 
 
+def _readiness_module_installed(module_name: str) -> bool:
+    """Module probe honoring the historical patch seam on the public facade."""
+    from hermes_cli import tools_config
+
+    return tools_config._module_installed(module_name)
+
+
 # Python deps installed via ``hermes tools`` aren't in the managed runtime's locked ``all`` sync, so a
 # runtime replacement snapshots this static allowlist before the old site-packages disappears and
 # restores it afterward. Derived from the pip hooks (minus ``--quiet``) so install args can't drift.
@@ -462,7 +469,9 @@ def _agent_browser_installed() -> bool:
 
 def _camofox_installed() -> bool:
     """True when the Camofox npm package ``_run_post_setup("camofox")`` installs is in node_modules."""
-    return (PROJECT_ROOT / "node_modules" / "@askjo" / "camofox-browser").exists()
+    from hermes_cli import tools_config
+
+    return (tools_config.PROJECT_ROOT / "node_modules" / "@askjo" / "camofox-browser").exists()
 
 
 def _lightpanda_installed() -> bool:
@@ -486,7 +495,8 @@ def _cloud_agent_browser_installed() -> bool:
 # installed-checks the hooks perform. ``xai_grok`` is absent — a credential bootstrap handled as an
 # auth check. Late-bound lambdas so tests can monkeypatch the underlying predicates.
 _POST_SETUP_READY: dict = {
-    **{key: (lambda m=module: _module_installed(m)) for key, (module, _args) in _RESTORABLE_PYTHON_TOOL_DEPENDENCIES.items()},
+    **{key: (lambda m=module: _readiness_module_installed(m))
+       for key, (module, _args) in _RESTORABLE_PYTHON_TOOL_DEPENDENCIES.items()},
     "agent_browser": lambda: _agent_browser_installed(),
     "browserbase": lambda: _cloud_agent_browser_installed(),
     "camofox": lambda: _camofox_installed(),

@@ -8,7 +8,7 @@ from functools import partial
 from typing import Callable, Optional
 
 from hermes_cli.cli_output import (
-    print_info as _print_info, print_success as _print_success, print_warning as _print_warning, prompt as _prompt,
+    print_info as _print_info, print_success as _print_success, print_warning as _print_warning, prompt as _cli_prompt,
 )
 from hermes_cli.colors import Colors, color
 from hermes_cli.config import cfg_get, get_env_value, load_config, save_config, save_env_value
@@ -21,6 +21,16 @@ logger = logging.getLogger("hermes_cli.tools_config")
 
 # tools_config-internal names (TOOL_CATEGORIES, _cfg_section, _prompt_choice, ...) are imported lazily
 # inside the functions that need them: tools_config re-imports this module, and tests patch those names there.
+
+
+def _prompt(*args, **kwargs):
+    """Provider prompt owner preserving the public facade's patch seam."""
+    from hermes_cli import tools_config
+
+    facade_prompt = tools_config.__dict__.get("_prompt")
+    if facade_prompt is not None and facade_prompt is not _prompt:
+        return facade_prompt(*args, **kwargs)
+    return _cli_prompt(*args, **kwargs)
 
 
 def _plugin_registry(module: str):
@@ -305,6 +315,15 @@ def _configure_tool_category(ts_key: str, cat: dict, config: dict, *, force_fres
         _print_info(f"  Skipped {name}")
         return
     _configure_provider(providers[provider_idx], config, force_fresh=force_fresh, reconfigure=reconfigure)
+
+
+def _configure_tool_category_for_reconfig(
+    ts_key: str, cat: dict, config: dict, *, force_fresh: bool = True,
+):
+    """Reconfigure-category facade seam retained after provider extraction."""
+    return _configure_tool_category(
+        ts_key, cat, config, force_fresh=force_fresh, reconfigure=True,
+    )
 
 
 def _web_tier_matches(provider: dict, config: dict) -> bool:

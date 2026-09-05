@@ -138,7 +138,10 @@ def _cua_driver_contract_status(binary: Optional[str] = None) -> dict:
 
 def _cua_driver_install_ready() -> bool:
     """Return whether an existing driver needs no install-time repair."""
-    return bool(_cua_driver_contract_status().get("ready")) and (
+    from hermes_cli import tools_config
+
+    resolved = _resolved_cua_driver_cmd()
+    return bool(resolved and tools_config._cua_driver_contract_status().get("ready")) and (
         sys.platform != "win32" or _cua_driver_autostart_registered_windows())
 
 
