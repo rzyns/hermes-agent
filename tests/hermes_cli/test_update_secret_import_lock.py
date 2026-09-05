@@ -65,8 +65,15 @@ secrets:
     return set(json.loads(line.removeprefix("LOADED_MODULES=")))
 
 
-def test_update_startup_does_not_import_bitwarden_or_cryptography(tmp_path):
-    loaded = _probe_startup_modules(tmp_path, ["hermes", "update", "--check"])
+@pytest.mark.parametrize(
+    "argv",
+    [
+        ["hermes", "update", "--check"],
+        ["hermes", "update-maintenance", "--capabilities"],
+    ],
+)
+def test_update_startup_does_not_import_bitwarden_or_cryptography(tmp_path, argv):
+    loaded = _probe_startup_modules(tmp_path, argv)
 
     assert "agent.secret_sources.bitwarden" not in loaded
     assert not any(
@@ -74,11 +81,18 @@ def test_update_startup_does_not_import_bitwarden_or_cryptography(tmp_path):
     )
 
 
-def test_complete_update_dispatch_does_not_import_cryptography(tmp_path):
+@pytest.mark.parametrize(
+    "argv",
+    [
+        ["hermes", "update", "--check"],
+        ["hermes", "update-maintenance", "--capabilities"],
+    ],
+)
+def test_complete_update_dispatch_does_not_import_cryptography(tmp_path, argv):
     """Building every CLI parser used to re-import Bitwarden via secrets_cli."""
     loaded = _probe_startup_modules(
         tmp_path,
-        ["hermes", "update", "--check"],
+        argv,
         run_main=True,
     )
 

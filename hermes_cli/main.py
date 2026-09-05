@@ -573,7 +573,7 @@ if sys.platform == "win32":
 from hermes_cli.config import get_hermes_home
 from hermes_cli.env_loader import load_hermes_dotenv
 
-# ``update`` must not import optional secret-manager libs before ``uv``
+# Update commands must not import optional secret-manager libs before ``uv``
 # replaces the environment: on Windows Bitwarden's cryptography import maps
 # ``_rust.pyd`` and the parent updater then blocks its own child installer.
 # Profile flags are already stripped, so argv[1] is the authoritative subcommand.
@@ -582,7 +582,7 @@ from hermes_cli.env_loader import load_hermes_dotenv
 # installation maintenance. See #73381.
 load_hermes_dotenv(
     project_env=PROJECT_ROOT / ".env",
-    load_external_secrets=sys.argv[1:2] != ["update"],
+    load_external_secrets=sys.argv[1:2] not in (["update"], ["update-maintenance"]),
 )
 
 # Bridge security.redact_secrets → HERMES_REDACT_SECRETS BEFORE hermes_logging
@@ -2652,6 +2652,7 @@ _BUILTIN_SUBCOMMANDS = frozenset(
         "resume",
         "send", "sessions", "setup",
         "skin", "skills", "slack", "status", "sync", "tools", "uninstall", "update",
+        "update-maintenance",
         "webhook", "whatsapp", "whatsapp-cloud", "worktree", "chat", "secrets", "security",
         "browser",
         "verify",

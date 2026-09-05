@@ -5,14 +5,15 @@ Each concern lives in ``update_cmd_<concern>.py`` and is re-imported here so
 main -> update_cmd -> update_cmd_*; ``_m()`` resolves ``hermes_cli.main`` at call time.
 """
 
+import json
 import logging
-from contextlib import suppress
 import os
 import shlex
 import shutil  # noqa: F401  (tests patch update_cmd.shutil.*; split modules resolve it here)
 import subprocess
 import sys
 import time as _time
+from contextlib import suppress
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -1164,27 +1165,19 @@ def _finish_already_up_to_date(
         sys.exit(1)
 
 
-def _apply_pulled_update(
-    git_cmd, branch, pre_pull_sha, _plan, opts, *, gateway_mode, is_fork, desktop_dir,
+def _apply_update_maintenance(
+    git_cmd, branch, pre_pull_sha, opts, *, gateway_mode, desktop_dir,
     had_desktop_app_before_update, pre_update_snapshot_id, _pre_update_plan,
-    _windows_gateway_resume) -> None:
-    """Post-pull phase: verify HEAD, sync Python/Node/web/Desktop, maintenance, fleet restart."""
-    _invalidate_update_cache()
-    post_pull_sha = _verify_head_after_pull(
-        git_cmd, branch, pre_pull_sha, in_place_update=_plan.in_place_update,
-        _windows_gateway_resume=_windows_gateway_resume)
-
+    _windows_gateway_resume, expected_sha, source_updated: bool,
+) -> None:
+    """Shared non-source phase for built-in and externally reconciled updates."""
     # Gateways still serve pre-pull modules until the restart phase; an interrupt before a
     # completed restart leaves this marker so the next update catches up even when git is
     # current. Distinct from ``.update-incomplete`` (venv/install repair).
     # See #95294.
-    _write_fleet_restart_pending_marker(expected_sha=post_pull_sha or "")
+    _write_fleet_restart_pending_marker(expected_sha=expected_sha or "")
     # Stale .pyc would ImportError on gateway restart when new source references new names.
     _sweep_bytecode_after_update(branch)
-
-    if is_fork and branch == "main":
-        _m()._sync_with_upstream_if_needed(
-            git_cmd, _m().PROJECT_ROOT, assume_yes=opts.assume_yes, input_fn=opts.gw_input_fn)
 
     # .[all], falling back to base + extras individually so one broken extra doesn't strip
     # the rest; the ownership preflight refuses first on foreign-owned (sudo-pip) venv files.
@@ -1199,7 +1192,10 @@ def _apply_pulled_update(
         desktop_dir, had_desktop_app_before_update=had_desktop_app_before_update)
 
     print()
-    print(f"✓ Code updated!{_branch_head_suffix(git_cmd, _m().PROJECT_ROOT)}")
+    if source_updated:
+        print(f"✓ Code updated!{_branch_head_suffix(git_cmd, _m().PROJECT_ROOT)}")
+    else:
+        print(f"✓ Source already reconciled; running maintenance{_branch_head_suffix(git_cmd, _m().PROJECT_ROOT)}")
 
     update_complete = _run_post_update_maintenance(
         assume_yes=opts.assume_yes, gateway_mode=gateway_mode,
@@ -1219,6 +1215,118 @@ def _apply_pulled_update(
     _verify_fleet_after_update(
         _restart, _pre_update_plan=_pre_update_plan, _windows_gateway_resume=_windows_gateway_resume,
         node_failures=node_failures, update_complete=update_complete)
+
+
+def _apply_pulled_update(
+    git_cmd, branch, pre_pull_sha, _plan, opts, *, gateway_mode, is_fork, desktop_dir,
+    had_desktop_app_before_update, pre_update_snapshot_id, _pre_update_plan,
+    _windows_gateway_resume) -> None:
+    """Post-pull phase: verify HEAD, sync fork, then run shared maintenance."""
+    _invalidate_update_cache()
+    post_pull_sha = _verify_head_after_pull(
+        git_cmd, branch, pre_pull_sha, in_place_update=_plan.in_place_update,
+        _windows_gateway_resume=_windows_gateway_resume)
+
+    if is_fork and branch == "main":
+        _m()._sync_with_upstream_if_needed(
+            git_cmd, _m().PROJECT_ROOT, assume_yes=opts.assume_yes, input_fn=opts.gw_input_fn)
+
+    _apply_update_maintenance(
+        git_cmd, branch, pre_pull_sha, opts, gateway_mode=gateway_mode,
+        desktop_dir=desktop_dir,
+        had_desktop_app_before_update=had_desktop_app_before_update,
+        pre_update_snapshot_id=pre_update_snapshot_id,
+        _pre_update_plan=_pre_update_plan,
+        _windows_gateway_resume=_windows_gateway_resume,
+        expected_sha=post_pull_sha,
+        source_updated=True,
+    )
+
+
+def _run_update_maintenance(args, *, gateway_mode: bool = False) -> None:
+    """Run the complete post-source-update pipeline without mutating git state."""
+    opts = _resolve_update_options(args, gateway_mode)
+    print("⚕ Running Hermes update maintenance...")
+    print()
+
+    _pre_update_plan = _begin_update_receipt_and_plan(args)
+    pre_update_snapshot_id = _m()._run_pre_update_backup(args)
+    _record_update_step(
+        "pre_update_backup", pre_update_snapshot_id is not None,
+        f"snapshot={pre_update_snapshot_id}" if pre_update_snapshot_id else "disabled or failed")
+
+    _windows_gateway_resume = _m()._pause_windows_gateways_for_update()
+    maintenance_completed = False
+    try:
+        if _m()._is_windows() and not getattr(args, "force_venv", False):
+            _clear_windows_venv_holders_or_exit(
+                args, gateway_mode, _windows_gateway_resume)
+
+        desktop_dir = _m().PROJECT_ROOT / "apps" / "desktop"
+        had_desktop_app_before_update = _desktop_app_present(desktop_dir)
+        git_cmd = _base_git_cmd()
+        branch = _current_branch_name(git_cmd) or "main"
+        expected_sha = _capture_head_sha(git_cmd, _m().PROJECT_ROOT)
+        _apply_update_maintenance(
+            git_cmd, branch, None, opts, gateway_mode=gateway_mode,
+            desktop_dir=desktop_dir,
+            had_desktop_app_before_update=had_desktop_app_before_update,
+            pre_update_snapshot_id=pre_update_snapshot_id,
+            _pre_update_plan=_pre_update_plan,
+            _windows_gateway_resume=_windows_gateway_resume,
+            expected_sha=expected_sha,
+            source_updated=False,
+        )
+        maintenance_completed = True
+    finally:
+        # The normal pipeline resumes Windows gateways as part of its restart
+        # outcome. Restore them here only when maintenance exited before that.
+        if not maintenance_completed:
+            _m()._resume_windows_gateways_after_update(_windows_gateway_resume)
+
+
+def cmd_update_maintenance(args) -> None:
+    """Fresh-process boundary used after external source reconciliation."""
+    if getattr(args, "capabilities", False):
+        print(json.dumps({
+            "schema": 1,
+            "command": "update-maintenance",
+            "requires_fresh_process": True,
+        }))
+        return
+
+    gateway_mode = bool(getattr(args, "gateway", False))
+    update_io_state = _m()._install_hangup_protection(gateway_mode=gateway_mode)
+    from hermes_cli.update_lock import (
+        UPDATE_EXIT_CONCURRENT,
+        UpdateLock,
+        describe_holder,
+    )
+
+    update_lock = UpdateLock()
+    if not update_lock.acquire():
+        print(
+            describe_holder(update_lock.holder)
+            if update_lock.holder is not None
+            else "Another Hermes update is already in progress."
+        )
+        _m()._finalize_update_output(update_io_state)
+        raise SystemExit(UPDATE_EXIT_CONCURRENT)
+
+    try:
+        _run_update_maintenance(args, gateway_mode=gateway_mode)
+    except SystemExit as exc:
+        code = exc.code if isinstance(exc.code, int) else 1
+        _m()._finalize_update_receipt(code, f"sys.exit({code})")
+        raise
+    except BaseException as exc:
+        _m()._finalize_update_receipt(1, f"{type(exc).__name__}: {exc}")
+        raise
+    else:
+        _m()._finalize_update_receipt(0, "completed at command boundary")
+    finally:
+        update_lock.release()
+        _m()._finalize_update_output(update_io_state)
 
 
 def _cmd_update_impl(args, gateway_mode: bool):

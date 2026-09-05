@@ -5,6 +5,13 @@ from __future__ import annotations
 from typing import Callable
 
 
+def _cmd_update_maintenance(args) -> None:
+    """Resolve the maintenance command only when it is invoked."""
+    from hermes_cli.update_cmd import cmd_update_maintenance
+
+    cmd_update_maintenance(args)
+
+
 def build_update_parser(subparsers, *, cmd_update: Callable) -> None:
     """Attach the ``update`` subcommand to ``subparsers``."""
     update_parser = subparsers.add_parser(
@@ -67,3 +74,29 @@ def build_update_parser(subparsers, *, cmd_update: Callable) -> None:
         help="Windows: mutate the venv even while other processes are running from its interpreter (desktop backend, gateway, terminals). Those processes keep native .pyd files locked, so the dependency sync will likely fail partway and strand the install half-updated. Use only if you know the detected holders are false positives.",
     )
     update_parser.set_defaults(func=cmd_update)
+
+    maintenance_parser = subparsers.add_parser(
+        "update-maintenance",
+        help="Run maintenance after externally reconciling Hermes source",
+        description="Run post-source-update maintenance without git source reconciliation",
+    )
+    maintenance_parser.add_argument(
+        "--gateway",
+        action="store_true",
+        default=False,
+        help="Gateway mode: use update/gateway-safe restart behavior",
+    )
+    maintenance_parser.add_argument(
+        "--yes",
+        "-y",
+        action="store_true",
+        default=False,
+        help="Assume yes for config migration prompts; API-key entry is skipped",
+    )
+    maintenance_parser.add_argument(
+        "--capabilities",
+        action="store_true",
+        default=False,
+        help="Print machine-readable maintenance command capabilities and exit",
+    )
+    maintenance_parser.set_defaults(func=_cmd_update_maintenance)
