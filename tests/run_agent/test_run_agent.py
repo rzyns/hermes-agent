@@ -146,6 +146,9 @@ def test_direct_session_db_flushes_share_marker_claim(agent):
                 self.rows.append(m["content"])
             return list(range(1, len(messages) + 1))
 
+        def flush_token_counts(self):
+            pass
+
     db = _BarrierDB()
     agent._session_db = db
     agent._session_db_created = True
@@ -10229,15 +10232,19 @@ class TestAnthropicInterruptHandler:
         from run_agent import AIAgent
         from agent.chat_completion_helpers import interruptible_api_call
 
-        agent = AIAgent(
-            api_key="test-key",
-            base_url="https://api.anthropic.com",
-            provider="anthropic",
-            model="claude-test",
-            quiet_mode=True,
-            skip_context_files=True,
-            skip_memory=True,
-        )
+        with patch(
+            "agent.anthropic_adapter.build_anthropic_client",
+            return_value=MagicMock(),
+        ):
+            agent = AIAgent(
+                api_key="test-key",
+                base_url="https://api.anthropic.com",
+                provider="anthropic",
+                model="claude-test",
+                quiet_mode=True,
+                skip_context_files=True,
+                skip_memory=True,
+            )
         agent.api_mode = "anthropic_messages"
         agent._interrupt_requested = False
         agent._anthropic_client = MagicMock()
