@@ -192,40 +192,44 @@ def _resolve_skill_dir(name: str, category: str = None) -> Path:
     return base / (category or "") / name
 
 
-def _iter_skill_dirs(root: Path):
-    from agent.skill_utils import is_excluded_skill_path
-    for skill_md in root.rglob("SKILL.md"):
-        if not is_excluded_skill_path(skill_md):
-            yield skill_md.parent
-
-
 def _find_skill(name: str) -> Optional[Dict[str, Any]]:
-    """Find a skill (local skills dir, then skills.external_dirs) -> ``{"path": Path}`` | None.
+    """Find a writable skill using the same local forms accepted by skill_view.
 
-    Accepts the bare dir name (``axolotl``; matches category-nested skills too) and the
-    categorized relative path (``mlops/axolotl``) — the two forms skill_view resolves. The
-    categorized form matches RELATIVE to the local root only (relative_to raises for external dirs)."""
-    from agent.skill_utils import get_all_skills_dirs
-    local_root = None
-    if "/" in name or "\\" in name:
-        try:
-            local_root = _skills_dir().resolve()
-        except OSError:
-            logger.debug(
-                "skills dir resolve failed; categorized lookups fall back to the unresolved path",
-                exc_info=True)
-            local_root = _skills_dir()
+    Skill Garden exposes repository skills through symlinked category entries,
+    so discovery must follow those links for patch/edit operations while delete
+    still refuses them at its destructive boundary.
+    """
+    from agent.skill_utils import get_all_skills_dirs, is_excluded_skill_path, iter_skill_index_files
+    from tools.path_security import has_traversal_component
+
+    def _safe_relative_lookup(candidate: str) -> bool:
+        candidate_path = Path(candidate)
+        return not candidate_path.is_absolute() and not has_traversal_component(candidate)
+
+    local_category_name = None
+    if ":" in name:
+        namespace, bare = name.split(":", 1)
+        if namespace and bare:
+            local_category_name = f"{namespace}/{bare}"
+
     for skills_dir in get_all_skills_dirs():
         if not skills_dir.exists():
             continue
-        for skill_dir in _iter_skill_dirs(skills_dir):
-            if skill_dir.name == name:
-                return {"path": skill_dir}
-            if local_root is not None:
-                resolved = skill_dir.resolve()
-                if (resolved.is_relative_to(local_root)
-                        and resolved.relative_to(local_root).as_posix() == name):  # POSIX form
-                    return {"path": skill_dir}
+
+        for direct_name in (name, local_category_name):
+            if not direct_name or not _safe_relative_lookup(direct_name):
+                continue
+            direct_path = skills_dir / direct_name
+            if is_excluded_skill_path(direct_path):
+                continue
+            if direct_path.is_dir() and (direct_path / "SKILL.md").exists():
+                return {"path": direct_path}
+
+        if local_category_name:
+            continue
+        for skill_md in iter_skill_index_files(skills_dir, "SKILL.md"):
+            if skill_md.parent.name == name:
+                return {"path": skill_md.parent}
     return None
 
 
@@ -261,7 +265,10 @@ def _find_skill_in_other_profiles(name: str) -> List[Tuple[str, Path]]:
         if not skills_dir.is_dir():
             continue
         with suppress(OSError):
-            hit = next((d for d in _iter_skill_dirs(skills_dir) if d.name == name), None)
+            from agent.skill_utils import iter_skill_index_files
+            hit_md = next((p for p in iter_skill_index_files(skills_dir, "SKILL.md")
+                           if p.parent.name == name), None)
+            hit = hit_md.parent if hit_md is not None else None
             if hit is not None:
                 matches.append((profile_name, hit))  # one match per profile is enough
     return matches

@@ -276,7 +276,13 @@ def _enable_wal(conn: sqlite3.Connection, db_label: str, require_wal: bool, curr
         if require_wal:
             raise WalUnsupportedError(str(exc)) from exc
         _log_wal_fallback_once(db_label, exc)
-        _set_journal_mode_no_wait(conn, "DELETE")
+        try:
+            _set_journal_mode_no_wait(conn, "DELETE")
+        except sqlite3.OperationalError as fallback_exc:
+            raise sqlite3.OperationalError(
+                f"{db_label}: journal_mode=WAL failed ({exc}); "
+                f"journal_mode=DELETE also failed ({fallback_exc})"
+            ) from fallback_exc
         return "delete"
 
 

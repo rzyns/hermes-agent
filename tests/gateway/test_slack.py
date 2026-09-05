@@ -8410,7 +8410,7 @@ class TestTrackingStructureBounds:
         adapter._reacting_message_ids.update(
             {"1000.000002", "999.999999", "1000.000004", "1000.000001", "1000.000003"}
         )
-        adapter._discard_oldest_slack_timestamps(
+        adapter._discard_oldest_by_thread_ts(
             adapter._reacting_message_ids,
             len(adapter._reacting_message_ids)
             - adapter._REACTING_MESSAGE_IDS_MAX // 2,

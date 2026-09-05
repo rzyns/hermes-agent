@@ -163,33 +163,37 @@ class MCPServerHealthMixin:
         """Exercise the session; raise on a genuine connection failure. ``ping`` first (cheap,
         OPTIONAL); on -32601 latch ``_ping_unsupported`` (reset per transport connection) and fall
         back to ``list_tools`` when the server advertises tools, else the -32601 propagates."""
-        async def list_tools():
-            await asyncio.wait_for(self.session.list_tools(), timeout=_KEEPALIVE_RPC_TIMEOUT)
-        if not self._ping_unsupported:
-            try:
-                await asyncio.wait_for(self.session.send_ping(), timeout=_KEEPALIVE_RPC_TIMEOUT)
-                return
-            except Exception as exc:
-                if _is_method_not_found_error(exc):
-                    if not self._advertises_tools():  # ping definitively unsupported, nothing to fall back to
-                        raise
-                    self._ping_unsupported = True
-                    logger.info("MCP server '%s': does not implement the optional 'ping' utility (-32601); "
-                                "using 'list_tools' for keepalive on this connection.", self.name)
-                elif isinstance(exc, (TimeoutError, asyncio.TimeoutError)) and self._advertises_tools():
-                    # A server that silently drops ping looks like a dead transport: confirm with
-                    # list_tools before declaring it dead, else propagate the original failure.
-                    try:
-                        await list_tools()
-                    except Exception:
-                        raise exc from None
-                    self._ping_unsupported = True  # latch so later keepalives skip the 30s wait
-                    logger.info("MCP server '%s': ping timed out but list_tools succeeded — server "
-                                "silently drops ping; using 'list_tools' for keepalive on this connection.", self.name)
+        # Keepalive and tools/list_changed refreshes share the ClientSession's
+        # response streams. Serialize every probe RPC with refresh/list calls
+        # so ping cannot consume or close a concurrent refresh response.
+        async with self._rpc_lock:
+            async def list_tools():
+                await asyncio.wait_for(self.session.list_tools(), timeout=_KEEPALIVE_RPC_TIMEOUT)
+            if not self._ping_unsupported:
+                try:
+                    await asyncio.wait_for(self.session.send_ping(), timeout=_KEEPALIVE_RPC_TIMEOUT)
                     return
-                else:
-                    raise  # closed transport, expired session, etc. — real failure
-        await list_tools()
+                except Exception as exc:
+                    if _is_method_not_found_error(exc):
+                        if not self._advertises_tools():  # ping definitively unsupported, nothing to fall back to
+                            raise
+                        self._ping_unsupported = True
+                        logger.info("MCP server '%s': does not implement the optional 'ping' utility (-32601); "
+                                    "using 'list_tools' for keepalive on this connection.", self.name)
+                    elif isinstance(exc, (TimeoutError, asyncio.TimeoutError)) and self._advertises_tools():
+                        # A server that silently drops ping looks like a dead transport: confirm with
+                        # list_tools before declaring it dead, else propagate the original failure.
+                        try:
+                            await list_tools()
+                        except Exception:
+                            raise exc from None
+                        self._ping_unsupported = True  # latch so later keepalives skip the 30s wait
+                        logger.info("MCP server '%s': ping timed out but list_tools succeeded — server "
+                                    "silently drops ping; using 'list_tools' for keepalive on this connection.", self.name)
+                        return
+                    else:
+                        raise  # closed transport, expired session, etc. — real failure
+            await list_tools()
 
     def _mark_session_proven(self) -> None:
         """Record that the session demonstrated real health (keepalive or tool-call success).

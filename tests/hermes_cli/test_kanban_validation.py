@@ -365,6 +365,9 @@ def test_all_known_validation_sites_import_kernel():
         str(Path("tests/hermes_cli/test_kanban_validation.py")),
         # The kernel itself defines the canonical messages; it is not a re-implementation.
         "hermes_cli/kanban_validation.py",
+        # Extracted workspace facade delegates its mutations back through
+        # kanban_db's validated setters; the vocabulary is compatibility prose.
+        "hermes_cli/kanban_db_workspace.py",
     }
 
     # Vocabulary that indicates a file is talking about workspace/branch rules.

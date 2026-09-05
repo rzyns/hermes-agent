@@ -169,7 +169,7 @@ class TestDetectAudioEnvironmentTermuxFallback:
         # This test simulates Termux even when the suite itself runs under
         # WSL. Keep the host-only WSL audio guard from overriding the simulated
         # Android environment.
-        monkeypatch.setattr("tools.voice_mode._is_wsl", lambda: False)
+        monkeypatch.setattr("tools.voice_mode._is_wsl2_env", lambda: False)
 
         # No sounddevice — we go down the Termux:API branch.
         monkeypatch.setattr(

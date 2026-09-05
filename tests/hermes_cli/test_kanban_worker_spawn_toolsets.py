@@ -146,7 +146,7 @@ def test_default_spawn_clears_parent_approval_context(monkeypatch, tmp_path):
     from tools import approval
 
     monkeypatch.setattr(kb, "_resolve_hermes_argv", lambda: ["hermes"])
-    monkeypatch.setattr(approval, "_get_approval_mode", lambda: "manual")
+    monkeypatch.setattr(approval.approval_context, "_get_approval_mode", lambda: "manual")
     monkeypatch.setattr(approval, "_YOLO_MODE_FROZEN", False)
     captured = {}
 

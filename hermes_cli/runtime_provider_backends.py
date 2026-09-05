@@ -225,6 +225,45 @@ def _resolve_bedrock_runtime(requested_provider: str, model_cfg: Dict[str, Any],
 # ── External-process (agent CLI over stdio, e.g. ACP) ──────────────────────────────────────
 
 
+def _resolve_external_provider_factory_runtime(requested_provider: str) -> Optional[Dict[str, Any]]:
+    """Resolve a factory-backed external-process provider before built-in auth aliases.
+
+    A plugin alias may intentionally overlap a bundled auth alias. The plugin
+    owns that identity when it registers both an external-process profile and
+    a client factory. Canonical disabled config still applies when selection
+    happened through an alias.
+    """
+    from hermes_cli.config import is_provider_enabled
+    from providers import get_provider_client_factory, resolve_provider_profile
+
+    profile = resolve_provider_profile(requested_provider)
+    factory = get_provider_client_factory(requested_provider)
+    if profile is None or profile.auth_type != "external_process" or factory is None:
+        return None
+
+    rp = _rp()
+    config = rp.load_config()
+    providers_cfg = config.get("providers") if isinstance(config, dict) else None
+    canonical_block = providers_cfg.get(profile.name) if isinstance(providers_cfg, dict) else None
+    if isinstance(canonical_block, dict) and not is_provider_enabled(canonical_block):
+        raise ValueError(
+            f"provider {profile.name!r} is disabled in config "
+            f"(providers.{profile.name}.enabled: false)"
+        )
+
+    base_url = str(profile.base_url or "").strip().rstrip("/")
+    if not base_url:
+        raise rp.AuthError(f"External-process provider {profile.name!r} has no base URL.")
+    return rp._runtime(
+        profile.name,
+        profile.api_mode or "chat_completions",
+        base_url,
+        f"{profile.name}-external-process",
+        source="external-provider-factory",
+        requested_provider=requested_provider,
+    )
+
+
 def _is_external_process_provider(provider: str) -> bool:
     """Keyed on the registered provider's auth_type (CLI registry first, then the profile registry
     so the check works before the CLI registry has been extended)."""

@@ -91,6 +91,15 @@ def _resolve_origin(job: dict) -> Optional[dict]:
     return None
 
 
+_ORIGINAL_RESOLVE_ORIGIN = _resolve_origin
+
+
+def _active_scheduler_seam(name: str, original):
+    """Honor both the pre-split scheduler seam and the defining-module seam."""
+    scheduler_value = getattr(_sched, name, original)
+    return scheduler_value if scheduler_value is not original else globals()[name]
+
+
 def _cron_mirror_delivery_enabled(job: dict, cfg: Optional[dict] = None) -> bool:
     """Whether a cron delivery is also mirrored into the target chat's session transcript.
 
@@ -139,7 +148,7 @@ def _target_mirror_eligible(
     never write transcripts into arbitrary explicitly-addressed chats. Untagged broadcasts
     (``all``, bare-platform home) are never eligible. ``origin_match`` may be precomputed."""
     if origin_match is None:
-        origin = _resolve_origin(job) or {}
+        origin = _active_scheduler_seam("_resolve_origin", _ORIGINAL_RESOLVE_ORIGIN)(job) or {}
         origin_match = _target_matches_origin(
             origin, target.get("platform", ""), target.get("chat_id", ""), target.get("thread_id"))
     if origin_match:
@@ -559,7 +568,7 @@ def _home_target(platform_name: str, chat_id: str, resolved_from: Optional[str] 
 
 def _resolve_single_delivery_target(job: dict, deliver_value: str) -> Optional[dict]:
     """Resolve one concrete auto-delivery target for a cron job."""
-    origin = _resolve_origin(job)
+    origin = _active_scheduler_seam("_resolve_origin", _ORIGINAL_RESOLVE_ORIGIN)(job)
     if deliver_value == "local":
         return None
     # Must precede the generic platform:chat_id split so the profile name isn't parsed as chat_id.
@@ -1473,7 +1482,7 @@ def _prepare_target_delivery(
     chat_id = target["chat_id"]
     thread_id = target.get("thread_id")
 
-    origin = _resolve_origin(job) or {}
+    origin = _active_scheduler_seam("_resolve_origin", _ORIGINAL_RESOLVE_ORIGIN)(job) or {}
     origin_thread = origin.get("thread_id")
     if origin_thread and not thread_id:
         logger.warning(
@@ -1627,7 +1636,7 @@ def _deliver_result(
     # Targets acked with NO evidence (bare SendResult(success=True) — Slack/Matrix/Mattermost);
     # persisted as ``last_delivery_unverified`` so `hermes cron list` shows it.
     unverified_targets: list = []
-    if wrap_response:
+    if wrap_response and not job.get("no_agent"):
         task_name = job.get("name", job["id"])
         delivery_content = (
             f"Cronjob Response: {task_name}\n"

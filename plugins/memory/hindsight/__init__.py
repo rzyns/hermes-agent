@@ -14,6 +14,7 @@ import asyncio
 import atexit
 import contextlib
 import contextvars
+import importlib
 import json
 import logging
 import os
@@ -53,6 +54,12 @@ _RETAIN_CONTEXT_DEFAULT = "conversation between Hermes Agent and the User"
 
 def _ensure_client_dependency() -> None:
     """Lazily install the Hindsight client (``tools.lazy_deps``) before importing it."""
+    for module_name in ("hindsight_client", "hindsight"):
+        try:
+            importlib.import_module(module_name)
+            return
+        except ImportError:
+            pass
     try:
         from tools.lazy_deps import ensure as _lazy_ensure
         _lazy_ensure("memory.hindsight", prompt=False)
@@ -566,15 +573,13 @@ class HindsightMemoryProvider(MemoryProvider):
     def _is_retain_op_complete(self, bank_id: str, op_id: str) -> bool:
         """True when a server-side retain op is done or gone (completed ops are evicted,
         so 404 = no longer pending). Transient errors -> False, caller keeps waiting."""
-        from hindsight_client_api.exceptions import NotFoundException
-
         try:
             resp = self._run_hindsight_operation(
                 lambda client: client.operations.get_operation_status(bank_id=bank_id, operation_id=op_id)
             )
-        except NotFoundException:
-            return True
         except Exception as exc:
+            if getattr(exc, "status", None) == 404 or getattr(exc, "status_code", None) == 404:
+                return True
             logger.debug("Prefetch: operation status check failed for %s: %s", op_id, exc)
             return False
         return str(getattr(resp, "status", "") or "").lower() in {"completed", "failed"}

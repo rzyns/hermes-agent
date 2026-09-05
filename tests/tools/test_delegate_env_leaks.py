@@ -380,6 +380,7 @@ def test_delegated_child_budget_exhaustion_does_not_record_parent_failure(
     from agent.delegation_context import delegated_child_context
     from agent.turn_finalizer import finalize_turn
     from hermes_cli import kanban_db as _kb
+    from hermes_cli import kanban_db_dispatch as _kbd
 
     # Set up a real temp kanban board so any mistaken mutation would have
     # somewhere to land, within the profile's guarded Kanban root.
@@ -420,7 +421,7 @@ def test_delegated_child_budget_exhaustion_does_not_record_parent_failure(
     monkeypatch.setenv("HERMES_KANBAN_TASK", parent_tid)
     monkeypatch.setenv("HERMES_KANBAN_RUN_ID", str(parent_run_id))
 
-    with patch.object(_kb, "_record_task_failure", record_spy):
+    with patch.object(_kbd, "_record_task_failure", record_spy):
         with delegated_child_context(overlay={
             "HERMES_KANBAN_TASK": None,
             "HERMES_KANBAN_RUN_ID": None,
@@ -453,12 +454,16 @@ def test_delegated_child_budget_exhaustion_does_not_record_parent_failure(
 
     # Sanity: outside delegated context, the same conditions DO record failure.
     calls = []
+    # The extracted dispatcher export is the finalizer's call seam; route the
+    # spy through the monolithic implementation, which already supports the
+    # expected_run_id CAS, so the compatibility retry is not counted as a
+    # second logical failure record.
     real_record = _kb._record_task_failure
     def recording_record(*args, **kwargs):
         calls.append((args, kwargs))
         return real_record(*args, **kwargs)
 
-    with patch.object(_kb, "_record_task_failure", side_effect=recording_record):
+    with patch.object(_kbd, "_record_task_failure", side_effect=recording_record):
         result = finalize_turn(
             agent,
             final_response=None,

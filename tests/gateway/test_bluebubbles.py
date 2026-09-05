@@ -69,7 +69,7 @@ class TestBlueBubblesConfigLoading:
 
 class TestBlueBubblesSendMessageTargetParsing:
     def test_e164_phone_target_is_explicit(self):
-        from tools.send_message_tool import _parse_target_ref
+        from tools.send_message_targets import _parse_target_ref
 
         assert _parse_target_ref("bluebubbles", "+15551234567") == (
             "+15551234567",

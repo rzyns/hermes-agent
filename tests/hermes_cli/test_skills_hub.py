@@ -508,11 +508,12 @@ def test_resolve_install_target_uses_dynamic_skills_dir_without_module_constant(
     constant can install skills.
     """
     import tools.skills_hub as hub
+    from tools.skills_hub_install import _resolve_install_target_path
 
     monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
     monkeypatch.delitem(hub.__dict__, "SKILLS_DIR", raising=False)
 
-    target = hub._resolve_install_target_path(
+    target = _resolve_install_target_path(
         "research/long-research",
         "long-research",
     )
@@ -643,13 +644,14 @@ def test_do_update_pins_install_to_locked_source(monkeypatch):
     resolve to a same-named skill in another registry.
     """
     import tools.skills_hub as hub
+    import tools.skills_hub_install as hub_install
     import hermes_cli.skills_hub as cli_hub
 
     sink = StringIO()
     console = Console(file=sink, force_terminal=False, color_system=None)
     calls = []
 
-    monkeypatch.setattr(hub, "check_for_skill_updates", lambda **_kwargs: [
+    monkeypatch.setattr(hub_install, "check_for_skill_updates", lambda **_kwargs: [
         {"name": "reddit", "identifier": "reddit", "source": "clawhub",
          "status": "update_available"},
     ])
@@ -672,14 +674,15 @@ def test_do_install_refuses_unknown_pinned_source(monkeypatch, hub_env):
     Falling back to the full source router is what allowed a foreign registry
     to satisfy the install.
     """
-    import tools.skills_hub as hub
+    import tools.skills_hub_github as hub_github
+    import tools.skills_hub_search as hub_search
 
     sink = StringIO()
     console = Console(file=sink, force_terminal=False, color_system=None)
     resolved = []
 
-    monkeypatch.setattr(hub, "create_source_router", lambda auth=None: [])
-    monkeypatch.setattr(hub, "GitHubAuth", lambda: object())
+    monkeypatch.setattr(hub_search, "create_source_router", lambda auth=None: [])
+    monkeypatch.setattr(hub_github, "GitHubAuth", lambda: object())
     monkeypatch.setattr(
         "hermes_cli.skills_hub._resolve_short_name",
         lambda name, sources, c: resolved.append(name) or "",
@@ -699,14 +702,16 @@ def test_handle_skills_slash_search_accepts_chatconsole_without_status_errors():
         "identifier": "skills-sh/example/kubernetes",
     })()]
 
-    with patch("tools.skills_hub.unified_search", return_value=results), \
-         patch("tools.skills_hub.create_source_router", return_value={}), \
-         patch("tools.skills_hub.GitHubAuth"):
+    with patch("tools.skills_hub_search.unified_search", return_value=results), \
+         patch("tools.skills_hub_search.create_source_router", return_value={}), \
+         patch("tools.skills_hub_github.GitHubAuth"):
         handle_skills_slash("/skills search kubernetes", console=ChatConsole())
 
 def test_do_install_scans_with_resolved_identifier(monkeypatch, tmp_path, hub_env):
     import tools.skills_guard as guard
     import tools.skills_hub as hub
+    import tools.skills_hub_install as hub_install
+    import tools.skills_hub_search as hub_search
 
     canonical_identifier = "skills-sh/anthropics/skills/frontend-design"
 
@@ -742,8 +747,8 @@ def test_do_install_scans_with_resolved_identifier(monkeypatch, tmp_path, hub_en
         )
 
     monkeypatch.setattr(hub, "ensure_hub_dirs", lambda: None)
-    monkeypatch.setattr(hub, "create_source_router", lambda auth: [_ResolvedSource()])
-    monkeypatch.setattr(hub, "quarantine_bundle", lambda bundle: q_path)
+    monkeypatch.setattr(hub_search, "create_source_router", lambda auth: [_ResolvedSource()])
+    monkeypatch.setattr(hub_install, "quarantine_bundle", lambda bundle: q_path)
     monkeypatch.setattr(hub, "HubLockFile", lambda: type("Lock", (), {"get_installed": lambda self, name: None})())
     monkeypatch.setattr(guard, "scan_skill", _scan_skill)
     monkeypatch.setattr(guard, "format_scan_report", lambda result: "scan ok")
@@ -771,7 +776,7 @@ def test_looks_like_direct_github_identifier_classifies_source_boundaries():
     assert not _looks_like_direct_github_identifier("https://github.com/rzyns/hermes-stuff")
 
 def test_resolve_source_prefers_matching_github_tap_over_registry_collision():
-    from tools.skills_hub import SkillBundle, SkillMeta
+    from tools.skills_hub_models import SkillBundle, SkillMeta
     from hermes_cli.skills_hub import _resolve_source_meta_and_bundle
 
     class _RegistrySource:
@@ -837,7 +842,7 @@ def test_resolve_source_prefers_matching_github_tap_over_registry_collision():
     assert "references/kanban-artifact-planning.md" in bundle.files
 
 def test_resolve_source_does_not_fall_back_for_github_tree_url_collision():
-    from tools.skills_hub import SkillBundle, SkillMeta
+    from tools.skills_hub_models import SkillBundle, SkillMeta
     from hermes_cli.skills_hub import _resolve_source_meta_and_bundle
 
     class _UnavailableGitHubSource:
@@ -876,7 +881,7 @@ def test_resolve_source_does_not_fall_back_for_github_tree_url_collision():
     assert matched is None
 
 def test_resolve_source_does_not_fall_back_when_direct_github_ref_unavailable():
-    from tools.skills_hub import SkillBundle, SkillMeta
+    from tools.skills_hub_models import SkillBundle, SkillMeta
     from hermes_cli.skills_hub import _resolve_source_meta_and_bundle
 
     class _UnavailableGitHubSource:
@@ -923,7 +928,7 @@ def test_resolve_source_does_not_fall_back_when_direct_github_ref_unavailable():
 def test_do_install_github_tree_url_persists_identifier_and_ref_metadata(monkeypatch, tmp_path, hub_env):
     import tools.skills_hub as hub
     import tools.skills_guard as guard
-    from tools.skills_hub import SkillBundle, SkillMeta
+    from tools.skills_hub_models import SkillBundle, SkillMeta
 
     tree_url = "https://github.com/rzyns/hermes-stuff/tree/main/skills/plan"
 
@@ -960,7 +965,7 @@ def test_do_install_github_tree_url_persists_identifier_and_ref_metadata(monkeyp
 
     RealHubLockFile = hub.HubLockFile
     monkeypatch.setattr(hub, "HubLockFile", lambda: RealHubLockFile(hub.LOCK_FILE))
-    monkeypatch.setattr(hub, "create_source_router", lambda auth: [_GitHubTreeSource()])
+    monkeypatch.setattr("tools.skills_hub_search.create_source_router", lambda auth: [_GitHubTreeSource()])
     monkeypatch.setattr(
         guard, "scan_skill",
         lambda skill_path, source="community": guard.ScanResult(
@@ -1020,8 +1025,8 @@ def test_do_install_scans_official_bundles_with_source_provenance(
         )
 
     monkeypatch.setattr(hub, "ensure_hub_dirs", lambda: None)
-    monkeypatch.setattr(hub, "create_source_router", lambda auth: [_OfficialSource()])
-    monkeypatch.setattr(hub, "quarantine_bundle", lambda bundle: q_path)
+    monkeypatch.setattr("tools.skills_hub_search.create_source_router", lambda auth: [_OfficialSource()])
+    monkeypatch.setattr("tools.skills_hub_install.quarantine_bundle", lambda bundle: q_path)
     monkeypatch.setattr(hub, "HubLockFile", lambda: type("Lock", (), {"get_installed": lambda self, name: None})())
     monkeypatch.setattr(guard, "scan_skill", _scan_skill)
     monkeypatch.setattr(guard, "format_scan_report", lambda result: "scan ok")
@@ -1203,7 +1208,7 @@ def test_browse_skills_dedup_uses_identifier_not_name(monkeypatch):
     fix, both were keyed by name so only one survived deduplication. After the
     fix, each unique identifier produces a distinct result.
     """
-    from tools.skills_hub import SkillMeta
+    from tools.skills_hub_models import SkillMeta
     from hermes_cli.skills_hub import browse_skills
 
     airbnb = SkillMeta(
@@ -1220,9 +1225,7 @@ def test_browse_skills_dedup_uses_identifier_not_name(monkeypatch):
         "search": lambda self, q, limit=500: [airbnb, booking],
     })()
 
-    # browse_skills() imports create_source_router locally from tools.skills_hub,
-    # so the patch must target the source module, not hermes_cli.skills_hub.
-    with patch("tools.skills_hub.create_source_router", return_value=[mock_src]):
+    with patch("tools.skills_hub_search.create_source_router", return_value=[mock_src]):
         result = browse_skills(page=1, page_size=50)
 
     names = [item["name"] for item in result["items"]]
@@ -1269,7 +1272,7 @@ def test_do_inspect_falls_back_to_local_skill_when_hub_miss(monkeypatch, tmp_pat
     monkeypatch.setattr(skills_sync, "_read_manifest", lambda: {})
 
     # Prevent do_inspect from trying real network sources (which time out).
-    monkeypatch.setattr(hub, "create_source_router", lambda auth: [])
+    monkeypatch.setattr("tools.skills_hub_search.create_source_router", lambda auth: [])
 
     # _find_all_skills must use the real scanner so the local skill is visible.
     # hub_env patches tools.skills_hub.SKILLS_DIR but _find_all_skills lives in
@@ -1334,7 +1337,7 @@ def test_do_inspect_prefers_hub_when_both_exist(monkeypatch, tmp_path, hub_env):
 
     monkeypatch.setattr(hub, "HubLockFile", lambda: _DummyLockFile([]))
     monkeypatch.setattr(skills_sync, "_read_manifest", lambda: {})
-    monkeypatch.setattr(hub, "create_source_router", lambda auth: [_HubSource()])
+    monkeypatch.setattr("tools.skills_hub_search.create_source_router", lambda auth: [_HubSource()])
 
     sink = StringIO()
     console = Console(file=sink, force_terminal=False, color_system=None)
@@ -1355,7 +1358,7 @@ def test_do_inspect_errors_cleanly_for_truly_missing_skill(monkeypatch, tmp_path
     monkeypatch.setattr(skills_sync, "_read_manifest", lambda: {})
     monkeypatch.setattr(skills_tool, "SKILLS_DIR", hub.SKILLS_DIR)
     monkeypatch.setattr(skills_tool, "_get_disabled_skill_names", lambda: set())
-    monkeypatch.setattr(hub, "create_source_router", lambda auth: [])
+    monkeypatch.setattr("tools.skills_hub_search.create_source_router", lambda auth: [])
 
     sink = StringIO()
     console = Console(file=sink, force_terminal=False, color_system=None)
@@ -1379,7 +1382,7 @@ def test_inspect_skill_returns_local_fallback_dict(monkeypatch, tmp_path, hub_en
     monkeypatch.setattr(skills_tool, "_get_disabled_skill_names", lambda: set())
     monkeypatch.setattr(hub, "HubLockFile", lambda: _DummyLockFile([]))
     monkeypatch.setattr(skills_sync, "_read_manifest", lambda: {})
-    monkeypatch.setattr(hub, "create_source_router", lambda auth: [])
+    monkeypatch.setattr("tools.skills_hub_search.create_source_router", lambda auth: [])
 
     result = inspect_skill("prog-local-skill")
     assert result is not None
@@ -1398,7 +1401,7 @@ def test_inspect_skill_returns_none_for_truly_missing(monkeypatch, tmp_path, hub
     monkeypatch.setattr(skills_tool, "_get_disabled_skill_names", lambda: set())
     monkeypatch.setattr(hub, "HubLockFile", lambda: _DummyLockFile([]))
     monkeypatch.setattr(skills_sync, "_read_manifest", lambda: {})
-    monkeypatch.setattr(hub, "create_source_router", lambda auth: [])
+    monkeypatch.setattr("tools.skills_hub_search.create_source_router", lambda auth: [])
 
     result = inspect_skill("no-such-skill-anywhere")
     assert result is None
@@ -1423,7 +1426,7 @@ def test_do_inspect_local_fallback_does_not_print_false_error(monkeypatch, tmp_p
     monkeypatch.setattr(skills_tool, "_get_disabled_skill_names", lambda: set())
     monkeypatch.setattr(hub, "HubLockFile", lambda: _DummyLockFile([]))
     monkeypatch.setattr(skills_sync, "_read_manifest", lambda: {})
-    monkeypatch.setattr(hub, "create_source_router", lambda auth: [])
+    monkeypatch.setattr("tools.skills_hub_search.create_source_router", lambda auth: [])
 
     sink = StringIO()
     console = Console(file=sink, force_terminal=False, color_system=None)
@@ -1447,7 +1450,7 @@ def test_do_browse_reports_live_per_source_progress():
     a slow source blocks. The page is still rendered once, after the full
     result set is merged and trust-sorted."""
     from hermes_cli.skills_hub import do_browse
-    from tools.skills_hub import SkillMeta
+    from tools.skills_hub_models import SkillMeta
 
     meta = SkillMeta(
         name="demo", description="d", source="official",
@@ -1469,9 +1472,9 @@ def test_do_browse_reports_live_per_source_progress():
     sink = StringIO()
     console = Console(file=sink, force_terminal=False, color_system=None, width=120)
 
-    with patch("tools.skills_hub.create_source_router", return_value=[]), \
-         patch("tools.skills_hub.GitHubAuth"), \
-         patch("tools.skills_hub.parallel_search_sources", side_effect=fake_parallel):
+    with patch("tools.skills_hub_search.create_source_router", return_value=[]), \
+         patch("tools.skills_hub_github.GitHubAuth"), \
+         patch("tools.skills_hub_search.parallel_search_sources", side_effect=fake_parallel):
         do_browse(page=1, page_size=20, console=console)
 
     assert captured.get("called"), "parallel_search_sources was not invoked"
@@ -1493,9 +1496,9 @@ def test_do_search_identifier_column_does_not_truncate_long_slug():
     # wrapped (not ellipsis-truncated).
     console = Console(file=sink, force_terminal=False, color_system=None, width=40)
 
-    with patch("tools.skills_hub.unified_search", return_value=[_LONG_RESULT]), \
-         patch("tools.skills_hub.create_source_router", return_value={}), \
-         patch("tools.skills_hub.GitHubAuth"):
+    with patch("tools.skills_hub_search.unified_search", return_value=[_LONG_RESULT]), \
+         patch("tools.skills_hub_search.create_source_router", return_value={}), \
+         patch("tools.skills_hub_github.GitHubAuth"):
         do_search("weather", console=console)
 
     output = sink.getvalue()

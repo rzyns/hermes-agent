@@ -741,6 +741,7 @@ def _restore_or_build_system_prompt(agent, system_message, conversation_history)
         from hermes_cli.lifecycle import invoke_hook as _invoke_hook
         _invoke_hook(
             "on_session_start", session_id=agent.session_id, model=agent.model,
+            provider=getattr(agent, "provider", None),
             platform=getattr(agent, "platform", None) or "",
         )
     except Exception as exc:
@@ -1480,11 +1481,22 @@ def run_conversation(
     # Opt-in runtime: api_mode == codex_app_server hands the whole turn to the codex
     # app-server subprocess (see agent/transports/codex_app_server_session.py).
     if agent.api_mode == "codex_app_server":
-        return agent._run_codex_app_server_turn(
+        result = agent._run_codex_app_server_turn(
             user_message=s.user_message, original_user_message=s.original_user_message,
             messages=s.messages, effective_task_id=s.effective_task_id,
             should_review_memory=s._should_review_memory,
         )
+        from agent.turn_finalizer import notify_session_end_once
+        notify_session_end_once(
+            agent,
+            effective_task_id=s.effective_task_id,
+            turn_id=result.get("codex_turn_id") if isinstance(result, dict) else None,
+            completed=bool(isinstance(result, dict) and result.get("completed")),
+            failed=bool(isinstance(result, dict) and result.get("failed")),
+            interrupted=bool(isinstance(result, dict) and result.get("interrupted")),
+            turn_exit_reason="codex_app_server",
+        )
+        return result
 
     while (s.api_call_count < agent.max_iterations and agent.iteration_budget.remaining > 0) or agent._budget_grace_call:
         if _run_phase(begin_iteration, agent, s).action == "break":

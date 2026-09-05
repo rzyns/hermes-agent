@@ -2073,7 +2073,7 @@ class TestCuratorConsolidationDeleteGuard:
 
     def test_background_review_patch_requires_skill_view_first(self, tmp_path, monkeypatch):
         from tools.skills_tool import skill_view
-        from tools.skill_manager_tool import _reset_background_review_read_marks
+        from tools.skill_manager_guards import _reset_background_review_read_marks
 
         _reset_background_review_read_marks()
         with _curator_pass(tmp_path, monkeypatch=monkeypatch):

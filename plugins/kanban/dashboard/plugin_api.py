@@ -35,6 +35,7 @@ from hermes_cli import kanban_db_dispatch as kbd
 from hermes_cli import kanban_db_workspace as kbw
 from hermes_cli import kanban_diagnostics as kd
 from hermes_cli.kanban_db import KANBAN_ATTACHMENT_MAX_BYTES, _collision_free_path, _safe_attachment_name
+from hermes_constants import get_default_hermes_root
 
 log = logging.getLogger(__name__)
 
@@ -70,6 +71,50 @@ def _resolve_board(board: Optional[str]) -> Optional[str]:
     if normed and normed != kanban_db.DEFAULT_BOARD and not kanban_db.board_exists(normed):
         raise HTTPException(status_code=404, detail=f"board {normed!r} does not exist")
     return normed
+
+
+def _materialize_only_route_guard(board: Optional[str], task_id: str) -> Optional[dict[str, Any]]:
+    """Return durable route metadata for guarded Agent Research targets."""
+    effective_board = board or kanban_db.get_current_board()
+    if effective_board != "agent-research-intake":
+        return None
+    register = get_default_hermes_root() / "artifacts" / "attention-intake" / "register.jsonl"
+    try:
+        lines = register.read_text(encoding="utf-8").splitlines()
+    except OSError:
+        return None
+    for line in lines:
+        if not line.strip() or task_id not in line:
+            continue
+        try:
+            row = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        routed = str(row.get("routed_to_task") or "")
+        target_board = str(row.get("routed_to_board") or row.get("routed_to_board_requested") or "")
+        target_task = routed
+        if "/" in routed:
+            target_board, target_task = routed.split("/", 1)
+        materialization = row.get("route_materialization")
+        if (
+            target_board == "agent-research-intake"
+            and target_task == task_id
+            and isinstance(materialization, dict)
+            and materialization.get("mode") == "materialize_only"
+        ):
+            return row
+    return None
+
+
+def _raise_materialize_only_route_guard(board: Optional[str], task_id: str) -> None:
+    if _materialize_only_route_guard(board, task_id):
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                "Cannot move materialize_only routed target to ready from the dashboard. "
+                "Record explicit route authorization before dispatching this follow-up."
+            ),
+        )
 
 
 def _existing_board_slug(slug: str) -> str:
@@ -464,6 +509,81 @@ def remove_attachment(attachment_id: int, board: Optional[str] = Query(None)):
         return {"ok": True, "id": attachment_id}
 
 
+# --- Attention Intake link-drop -----------------------------------------------
+
+class CreateIntakeLinkBody(BaseModel):
+    url: str
+    context: Optional[str] = None
+    note: Optional[str] = None
+    board: str = "attention-intake"
+    assignee: str = "link-analyst"
+    triage: bool = True
+    priority: int = 0
+    idempotency_key: Optional[str] = None
+    skills: Optional[list[str]] = None
+    max_runtime_seconds: Optional[int] = None
+
+
+@router.post("/intake-links")
+def create_intake_link(payload: CreateIntakeLinkBody):
+    # Link-drop is intentionally pinned to Attention Intake; a selected board
+    # in the dashboard must not redirect the capture.
+    effective_board = "attention-intake"
+    conn = _conn(board=effective_board)
+    try:
+        from hermes_cli import kanban_intake_link as kil
+
+        task_id = kil.create_intake_link(
+            conn,
+            url=payload.url,
+            context=payload.context,
+            note=payload.note,
+            board=effective_board,
+            assignee=payload.assignee,
+            triage=payload.triage,
+            priority=payload.priority,
+            skills=payload.skills,
+            max_runtime_seconds=payload.max_runtime_seconds,
+            idempotency_key=payload.idempotency_key,
+            source="dashboard",
+        )
+        task = kanban_db.get_task(conn, task_id)
+        return {"task": _task_dict(task) if task else None}
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    finally:
+        conn.close()
+
+
+@router.get("/intake-links/health")
+def get_intake_link_health(
+    task_id: Optional[str] = Query(None, description="Inspect one task id"),
+    board: Optional[str] = Query(None, description="Board slug"),
+):
+    from hermes_cli import kanban_intake_link_health as kih
+
+    board_resolved = board or "attention-intake"
+    conn = _conn(board=board_resolved)
+    try:
+        if task_id:
+            row = conn.execute("SELECT body FROM tasks WHERE id = ?", (task_id,)).fetchone()
+            if not row:
+                raise HTTPException(status_code=404, detail=f"task {task_id!r} not found")
+            return kih.check_register_for_task(
+                task_id, row[0] or "", hermes_home=get_default_hermes_root()
+            )
+        return kih.scan_board_for_health(
+            conn, board=board_resolved, hermes_home=get_default_hermes_root()
+        )
+    except HTTPException:
+        raise
+    except Exception as exc:
+        log.exception("intake-link-health error")
+        raise HTTPException(status_code=500, detail=str(exc))
+    finally:
+        conn.close()
+
+
 # --- PATCH /tasks/:id  and  POST /tasks/bulk ---------------------------------
 
 class UpdateTaskBody(BaseModel):
@@ -576,10 +696,15 @@ _OVERRIDE_OPS = (
 )
 
 
-def _patch_status(conn, task_id: str, payload: UpdateTaskBody, review_assignee_deferred: bool) -> None:
+def _patch_status(
+    conn, task_id: str, payload: UpdateTaskBody, review_assignee_deferred: bool,
+    board: Optional[str] = None,
+) -> None:
     """PATCH status phase: 400 on a rejected verb, 409 when the transition is refused
     (naming the blocking parent(s) for ``ready`` so the UI renders an actionable toast)."""
     s = payload.status
+    if s == "ready":
+        _raise_materialize_only_route_guard(board, task_id)
     if s == "archived":
         ok = kanban_db.archive_task(conn, task_id)
     else:
@@ -629,7 +754,7 @@ def update_task(task_id: str, payload: UpdateTaskBody, board: Optional[str] = Qu
             with _map_errors(409, RuntimeError):
                 _require_ok(kanban_db.assign_task(conn, task_id, payload.assignee or None))
         if payload.status is not None:
-            _patch_status(conn, task_id, payload, review_assignee_deferred)
+            _patch_status(conn, task_id, payload, review_assignee_deferred, board)
         for wanted, apply, _refused in _OVERRIDE_OPS:
             if wanted(payload):
                 with _map_errors(400, ValueError, RuntimeError):

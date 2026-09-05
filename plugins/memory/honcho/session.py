@@ -371,7 +371,12 @@ class HonchoSessionManager(SessionAuthMixin, SessionPeersMixin, SessionContextMi
 
     def stop_async_writer(self) -> None:
         """Join the async writer WITHOUT flushing (saveMessages: false must still exit cleanly)."""
-        if self._async_queue is not None and self._async_thread is not None and self._async_thread.is_alive():
+        alive = getattr(self._async_thread, "is_alive", None)
+        if (
+            self._async_queue is not None
+            and self._async_thread is not None
+            and (not callable(alive) or alive())
+        ):
             self._async_queue.put(_ASYNC_SHUTDOWN)
             self._async_thread.join(timeout=10)
 

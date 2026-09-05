@@ -530,7 +530,7 @@ def test_section3_probes_no_key_endpoint_with_singular_default_model(monkeypatch
         probed["api_key"] = api_key
         return ["live-model-1", "live-model-2", "live-model-3"]
 
-    monkeypatch.setattr("hermes_cli.models.should_use_ollama_native_catalog", lambda *a, **k: False)
+    monkeypatch.setattr("hermes_cli.models_local.should_use_ollama_native_catalog", lambda *a, **k: False)
     monkeypatch.setattr("hermes_cli.models.cached_fetch_api_models", _fake_fetch)
 
     user_providers = {

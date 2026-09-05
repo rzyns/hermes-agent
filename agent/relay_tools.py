@@ -46,10 +46,18 @@ def execute(
         return runtime.relay.ToolExecutionResult(raw_result["json"])
 
     try:
+        relay_kwargs = {
+            "handle": parent,
+            "metadata": _jsonable(metadata or {}),
+        }
+        # relay 0.8 added tool-call correlation. Keep older relay releases
+        # usable when the caller has no id to propagate.
+        if tool_call_id:
+            relay_kwargs["tool_call_id"] = tool_call_id
         managed = _run_awaitable(
             runtime.run_in_session_async(
                 session, runtime.relay.tools.execute, tool_name, _jsonable(args), invoke,
-                handle=parent, metadata=_jsonable(metadata or {}), tool_call_id=tool_call_id or None,
+                **relay_kwargs,
             )
         )
     except BaseException as exc:

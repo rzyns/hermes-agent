@@ -26,6 +26,8 @@ from typing import Any, Optional
 
 from agent.delegation_context import child_env_lookup
 from hermes_cli import kanban_db as kb
+from hermes_cli import kanban_db_connect as kbc
+
 from hermes_cli import kanban_intake_link as kil
 from hermes_cli import kanban_intake_link_health as kih
 from hermes_cli import kanban_swarm as ks
@@ -2973,7 +2975,7 @@ def _goal_mode_handoff_rejection(
     if client is None or not model:
         return ("done", None)
 
-    from tools.kanban_tools import (
+    from hermes_cli.goals import (
         judge_goal,
         _build_artifact_manifest_for_judge_gate,
         _build_declared_artifact_readback_list,
@@ -3616,7 +3618,7 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
             ],
             "skipped_unassigned": res.skipped_unassigned,
             "skipped_nonspawnable": res.skipped_nonspawnable,
-            "skipped_external": _skipped_external_to_dicts(res.skipped_external),
+            "skipped_external": _skipped_external_to_dicts(getattr(res, "skipped_external", [])),
             "skipped_per_profile_capped": [
                 {"task_id": tid, "assignee": who, "current": current}
                 for (tid, who, current) in res.skipped_per_profile_capped
@@ -3874,7 +3876,7 @@ def _cmd_watch(args: argparse.Namespace) -> int:
 
 
 def _cmd_stats(args: argparse.Namespace) -> int:
-    with kb.connect_closing() as conn:
+    with kbc.connect_closing() as conn:
         stats = kb.board_stats(conn)
     if getattr(args, "json", False):
         print(json.dumps(stats, indent=2, ensure_ascii=False))

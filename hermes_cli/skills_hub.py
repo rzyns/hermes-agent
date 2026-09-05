@@ -246,7 +246,8 @@ def _resolve_source_meta_and_bundle(identifier: str, sources):
     """
     ordered_sources = list(sources)
     if _looks_like_direct_github_identifier(identifier):
-        github_sources = [src for src in ordered_sources if _try(src.source_id) == "github"]
+        github_sources = [src for src in ordered_sources
+                          if _try(getattr(src, "source_id", lambda: "")) == "github"]
         if github_sources:
             ordered_sources = github_sources
 

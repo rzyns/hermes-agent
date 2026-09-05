@@ -7,7 +7,7 @@ import textwrap
 import types
 
 import pytest
-from hermes_cli import main_tui_launch
+from hermes_cli import _startup_fast, main_tui_launch
 
 
 def _args(**overrides):
@@ -423,13 +423,13 @@ def test_termux_fast_cli_launch_defers_version_to_ultrafast_path(monkeypatch, ma
 
 
 def test_termux_ultrafast_version_runs_before_heavy_startup(
-    monkeypatch, capsys, main_mod
+    monkeypatch, capsys
 ):
     monkeypatch.setenv("TERMUX_VERSION", "1")
     monkeypatch.delenv("HERMES_TERMUX_DISABLE_FAST_CLI", raising=False)
     monkeypatch.setattr(sys, "argv", ["hermes", "--version"])
 
-    assert main_mod._try_termux_ultrafast_version() is True
+    assert _startup_fast.try_fast_version() is True
 
     out = capsys.readouterr().out
     assert "Hermes Agent v" in out
@@ -438,7 +438,7 @@ def test_termux_ultrafast_version_runs_before_heavy_startup(
     assert "OpenAI SDK:" in out
 
 
-def test_read_openai_version_fast(monkeypatch, tmp_path, main_mod):
+def test_read_openai_version_fast(monkeypatch, tmp_path):
     package_dir = tmp_path / "openai"
     package_dir.mkdir()
     (package_dir / "_version.py").write_text(
@@ -447,7 +447,7 @@ def test_read_openai_version_fast(monkeypatch, tmp_path, main_mod):
     )
     monkeypatch.setattr(sys, "path", [str(tmp_path)])
 
-    assert main_mod._read_openai_version_fast() == "9.8.7"
+    assert _startup_fast.read_openai_version() == "9.8.7"
 
 
 def test_termux_fast_cli_launch_skips_help(monkeypatch, main_mod):
@@ -887,13 +887,13 @@ def test_run_and_exit_oneshot_cleans_global_runtime_before_hard_exit(
     )
     monkeypatch.setitem(
         sys.modules,
-        "tools.browser_tool",
-        _mod("tools.browser_tool", _emergency_cleanup_all_sessions=lambda: events.append("browser")),
+        "tools.browser_tool_lifecycle",
+        _mod("tools.browser_tool_lifecycle", _emergency_cleanup_all_sessions=lambda: events.append("browser")),
     )
     monkeypatch.setitem(
         sys.modules,
-        "tools.mcp_tool",
-        _mod("tools.mcp_tool", shutdown_mcp_servers=lambda: events.append("mcp")),
+        "tools.mcp_tool_lifecycle",
+        _mod("tools.mcp_tool_lifecycle", shutdown_mcp_servers=lambda: events.append("mcp")),
     )
     monkeypatch.setitem(
         sys.modules,
@@ -934,12 +934,12 @@ def test_run_and_exit_oneshot_still_exits_when_global_cleanup_raises(
     )
     monkeypatch.setitem(
         sys.modules,
-        "tools.browser_tool",
+        "tools.browser_tool_lifecycle",
         types.SimpleNamespace(_emergency_cleanup_all_sessions=lambda: events.append("browser")),
     )
     monkeypatch.setitem(
         sys.modules,
-        "tools.mcp_tool",
+        "tools.mcp_tool_lifecycle",
         types.SimpleNamespace(shutdown_mcp_servers=_raise_mcp),
     )
     monkeypatch.setitem(
@@ -1653,10 +1653,10 @@ def test_launch_tui_exports_model_provider_and_toolsets(monkeypatch, main_mod):
         assert active_path_during_call.exists()
         return 1
 
-    monkeypatch.setattr(main_mod.subprocess, "call", fake_call)
+    monkeypatch.setattr(main_tui_launch.subprocess, "call", fake_call)
 
     with pytest.raises(SystemExit):
-        main_mod._launch_tui(
+        main_tui_launch._launch_tui(
             model="nous/hermes-test", provider="nous", toolsets="web, terminal"
         )
 
@@ -1699,18 +1699,18 @@ def test_launch_tui_worktree_validates_relative_python_against_final_cwd(
     monkeypatch.setattr(cli_mod, "_setup_worktree", lambda: {"path": str(worktree)})
     monkeypatch.setattr(cli_mod, "_cleanup_worktree", lambda _info: None)
     monkeypatch.setattr(
-        main_mod,
+        main_tui_launch,
         "_make_tui_argv",
         lambda tui_dir, tui_dev: (["node", "dist/entry.js"], Path(".")),
     )
     monkeypatch.setattr(
-        main_mod.subprocess,
+        main_tui_launch.subprocess,
         "call",
         lambda argv, cwd=None, env=None: captured.update({"env": env}) or 1,
     )
 
     with pytest.raises(SystemExit):
-        main_mod._launch_tui(worktree=True)
+        main_tui_launch._launch_tui(worktree=True)
 
     assert captured["env"]["HERMES_CWD"] == str(worktree)
     assert captured["env"]["HERMES_PYTHON"] == str(relative_python)
@@ -1738,18 +1738,18 @@ def test_launch_tui_applies_terminal_backend_config(
     monkeypatch.delenv("TERMINAL_DOCKER_EXTRA_ARGS", raising=False)
 
     monkeypatch.setattr(
-        main_mod,
+        main_tui_launch,
         "_make_tui_argv",
         lambda tui_dir, tui_dev: (["node", "dist/entry.js"], Path(".")),
     )
     monkeypatch.setattr(
-        main_mod.subprocess,
+        main_tui_launch.subprocess,
         "call",
         lambda argv, cwd=None, env=None: captured.update({"env": env}) or 1,
     )
 
     with pytest.raises(SystemExit):
-        main_mod._launch_tui()
+        main_tui_launch._launch_tui()
 
     assert captured["env"]["TERMINAL_ENV"] == "docker"
     assert captured["env"]["TERMINAL_DOCKER_IMAGE"] == "example/hermes-tools:latest"
@@ -1760,15 +1760,15 @@ def test_launch_tui_exit_code_42_relaunches_update(monkeypatch, main_mod):
     from unittest.mock import patch
 
     monkeypatch.setattr(
-        main_mod,
+        main_tui_launch,
         "_make_tui_argv",
         lambda tui_dir, tui_dev: (["node", "dist/entry.js"], Path(".")),
     )
-    monkeypatch.setattr(main_mod.subprocess, "call", lambda *args, **kwargs: 42)
+    monkeypatch.setattr(main_tui_launch.subprocess, "call", lambda *args, **kwargs: 42)
 
     with patch("hermes_cli.relaunch.relaunch") as mock_relaunch:
         with pytest.raises(SystemExit) as exc:
-            main_mod._launch_tui()
+            main_tui_launch._launch_tui()
 
     assert exc.value.code == 42
     mock_relaunch.assert_called_once_with(["update"], preserve_inherited=False)
@@ -1779,18 +1779,18 @@ def test_launch_tui_drops_stale_resume_env_without_resume_arg(monkeypatch, main_
 
     monkeypatch.setenv("HERMES_TUI_RESUME", "stale-missing-session")
     monkeypatch.setattr(
-        main_mod,
+        main_tui_launch,
         "_make_tui_argv",
         lambda tui_dir, tui_dev: (["node", "dist/entry.js"], Path(".")),
     )
     monkeypatch.setattr(
-        main_mod.subprocess,
+        main_tui_launch.subprocess,
         "call",
         lambda argv, cwd=None, env=None: captured.update({"env": env}) or 1,
     )
 
     with pytest.raises(SystemExit):
-        main_mod._launch_tui()
+        main_tui_launch._launch_tui()
 
     assert "HERMES_TUI_RESUME" not in captured["env"]
 
@@ -1800,23 +1800,23 @@ def test_launch_tui_sets_resume_env_from_resume_arg(monkeypatch, main_mod):
 
     monkeypatch.setenv("HERMES_TUI_RESUME", "stale-missing-session")
     monkeypatch.setattr(
-        main_mod,
+        main_tui_launch,
         "_make_tui_argv",
         lambda tui_dir, tui_dev: (["node", "dist/entry.js"], Path(".")),
     )
     monkeypatch.setattr(
-        main_mod.subprocess,
+        main_tui_launch.subprocess,
         "call",
         lambda argv, cwd=None, env=None: captured.update({"env": env}) or 1,
     )
 
     with pytest.raises(SystemExit):
-        main_mod._launch_tui(resume_session_id="20260518_000000_goodid")
+        main_tui_launch._launch_tui(resume_session_id="20260518_000000_goodid")
 
     assert captured["env"]["HERMES_TUI_RESUME"] == "20260518_000000_goodid"
 
 
-def test_make_tui_argv_dev_prebuilds_hermes_ink(monkeypatch, main_mod, tmp_path):
+def test_make_tui_argv_dev_prebuilds_hermes_ink(monkeypatch, tmp_path):
     tui_dir = tmp_path / "ui-tui"
     tsx = tui_dir / "node_modules" / ".bin" / "tsx"
     ink_dir = tui_dir / "packages" / "hermes-ink"
@@ -1827,7 +1827,7 @@ def test_make_tui_argv_dev_prebuilds_hermes_ink(monkeypatch, main_mod, tmp_path)
     monkeypatch.setattr(main_tui_launch, "_ensure_tui_node", lambda: None)
     monkeypatch.setattr(main_tui_launch, "_tui_need_npm_install", lambda _tui_dir: False)
     monkeypatch.delenv("HERMES_TUI_DIR", raising=False)
-    monkeypatch.setattr(main_mod.shutil, "which", lambda bin_name: f"/usr/bin/{bin_name}")
+    monkeypatch.setattr(main_tui_launch.shutil, "which", lambda bin_name: f"/usr/bin/{bin_name}")
 
     calls = []
 
@@ -1835,7 +1835,7 @@ def test_make_tui_argv_dev_prebuilds_hermes_ink(monkeypatch, main_mod, tmp_path)
         calls.append((cmd, cwd))
         return types.SimpleNamespace(returncode=0, stdout="", stderr="")
 
-    monkeypatch.setattr(main_mod.subprocess, "run", fake_run)
+    monkeypatch.setattr(main_tui_launch.subprocess, "run", fake_run)
 
     argv, cwd = main_tui_launch._make_tui_argv(tui_dir, tui_dev=True)
 
@@ -1845,8 +1845,6 @@ def test_make_tui_argv_dev_prebuilds_hermes_ink(monkeypatch, main_mod, tmp_path)
 
 
 def test_print_tui_exit_summary_includes_resume_and_token_totals(monkeypatch, capsys):
-    import hermes_cli.main as main_mod
-
     class _FakeDB:
         def get_session(self, session_id):
             assert session_id == "20260409_000001_abc123"
@@ -1869,7 +1867,7 @@ def test_print_tui_exit_summary_includes_resume_and_token_totals(monkeypatch, ca
         sys.modules, "hermes_state", types.SimpleNamespace(SessionDB=lambda: _FakeDB())
     )
 
-    main_mod._print_tui_exit_summary("20260409_000001_abc123")
+    main_tui_launch._print_tui_exit_summary("20260409_000001_abc123")
     out = capsys.readouterr().out
 
     assert "Resume this session with:" in out
@@ -1881,8 +1879,6 @@ def test_print_tui_exit_summary_includes_resume_and_token_totals(monkeypatch, ca
 def test_print_tui_exit_summary_prefers_actual_active_session_file(
     monkeypatch, capsys, tmp_path
 ):
-    import hermes_cli.main as main_mod
-
     seen = []
 
     class _FakeDB:
@@ -1909,7 +1905,7 @@ def test_print_tui_exit_summary_prefers_actual_active_session_file(
         sys.modules, "hermes_state", types.SimpleNamespace(SessionDB=lambda: _FakeDB())
     )
 
-    main_mod._print_tui_exit_summary("startup_resume", str(active))
+    main_tui_launch._print_tui_exit_summary("startup_resume", str(active))
     out = capsys.readouterr().out
 
     assert seen == ["actual_session"]

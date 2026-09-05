@@ -21,7 +21,7 @@ _WEIXIN_TARGET_RE = re.compile(r"^\s*((?:wxid|gh|v\d+|wm|wb)_[A-Za-z0-9_-]+|[A-Z
 _YUANBAO_TARGET_RE = re.compile(r"^\s*((?:group|direct):[^:]+)\s*$")
 # E.164 phone recipients ("+1555..."): the '+' fails the isdigit() rule and the channel directory
 # cannot resolve a raw number, so keep the '+' and treat it as explicit.
-_PHONE_PLATFORMS = frozenset({"photon", "signal", "sms", "whatsapp"})
+_PHONE_PLATFORMS = frozenset({"bluebubbles", "photon", "signal", "sms", "whatsapp"})
 _E164_TARGET_RE = re.compile(r"^\s*\+(\d{7,15})\s*$")
 _PHOTON_DM_GUID_RE = re.compile(r"^any;-;\+\d{6,}$")  # mirrors _DM_CHAT_GUID_RE in the photon adapter
 # WhatsApp JIDs (@g.us, @s.whatsapp.net, @lid, broadcast/newsletter) and Buzz UUIDs are native targets
@@ -126,7 +126,12 @@ def _parse_target_ref(platform_name: str, target_ref: str):
     if parser is not None:
         parsed = parser(target_ref)
         if parsed is _UNRESOLVED:
-            return None, None, False
+            # Native parsers may reject channel/reference syntax while a
+            # platform still supports generic E.164 targets.
+            if platform_name in _PHONE_PLATFORMS and _E164_TARGET_RE.fullmatch(target_ref):
+                parsed = None
+            else:
+                return None, None, False
         if parsed is not None:
             return parsed[0], parsed[1], True
     if platform_name in _PHONE_PLATFORMS and _E164_TARGET_RE.fullmatch(target_ref):

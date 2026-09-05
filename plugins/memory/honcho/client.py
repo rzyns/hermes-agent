@@ -498,7 +498,13 @@ class HonchoClientConfig:
         candidates: list[tuple[str, str]] = []
         gateway = slug(gateway_session_key)
         if gateway:
-            candidates.append(("gateway_session_key", self._enforce_session_id_limit(gateway, gateway_session_key or gateway)))
+            gateway_name = self._with_peer_prefix(gateway)
+            gateway_original = (
+                f"{self.peer_name}:{gateway_session_key or gateway}"
+                if self.session_peer_prefix and self.peer_name
+                else gateway_session_key or gateway
+            )
+            candidates.append(("gateway_session_key", self._enforce_session_id_limit(gateway_name, gateway_original)))
         if session_id:
             candidates.append(("session_id", self._with_peer_prefix(session_id)))
         if manual := self.sessions.get(cwd):
@@ -526,7 +532,13 @@ class HonchoClientConfig:
 
         cwd = cwd or os.getcwd()
         if gateway_session_key and _slug(gateway_session_key):
-            return self._enforce_session_id_limit(_slug(gateway_session_key), gateway_session_key)
+            gateway = self._with_peer_prefix(_slug(gateway_session_key))
+            original = (
+                f"{self.peer_name}:{gateway_session_key}"
+                if self.session_peer_prefix and self.peer_name
+                else gateway_session_key
+            )
+            return self._enforce_session_id_limit(gateway, original)
         if self.session_strategy == "per-session" and session_id:
             return self._with_peer_prefix(session_id)
         manual = self.sessions.get(cwd)

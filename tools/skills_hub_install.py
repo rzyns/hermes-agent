@@ -57,6 +57,31 @@ def _resolve_lock_install_path(install_path: str, skill_name: str) -> Path:
     return target
 
 
+def _resolve_install_target_path(install_path: str, skill_name: str) -> Path:
+    """Resolve an install destination without following its final component.
+
+    Installs may replace an existing final-path symlink by unlinking the link
+    itself. Parent/category components still must not redirect outside the
+    active profile's skills directory.
+    """
+    from tools.skills_hub import _skills_dir
+    normalized = _normalize_lock_install_path(install_path, skill_name)
+    parts = normalized.split("/")
+    skills_dir = _skills_dir()
+    skills_root = skills_dir.resolve()
+
+    parent = skills_dir
+    for part in parts[:-1]:
+        parent = parent / part
+        if _is_path_redirect(parent):
+            raise ValueError(f"Unsafe install path: {install_path}")
+
+    parent_resolved = parent.resolve()
+    if not parent_resolved.is_relative_to(skills_root):
+        raise ValueError(f"Unsafe install path: {install_path}")
+    return parent / parts[-1]
+
+
 def quarantine_bundle(bundle: SkillBundle) -> Path:
     """Write a skill bundle to the quarantine directory for scanning."""
     from tools.skills_hub import _quarantine_dir, ensure_hub_dirs
@@ -151,12 +176,15 @@ def install_from_quarantine(
         raise ValueError(f"Unsafe quarantine path: {quarantine_path}")
 
     install_rel_path = f"{safe_category}/{safe_skill_name}" if safe_category else safe_skill_name
-    # Same validator the uninstaller uses, so a lock entry can never point at a
-    # symlink-redirected target.
-    install_dir = _resolve_lock_install_path(install_rel_path, safe_skill_name)
+    # Installation may replace a final-path symlink, but category components
+    # must remain real directories under the active skills root.
+    install_dir = _resolve_install_target_path(install_rel_path, safe_skill_name)
     _check_install_target(install_dir)
     if install_dir.exists():
-        shutil.rmtree(install_dir)
+        if _is_path_redirect(install_dir):
+            install_dir.unlink()
+        else:
+            shutil.rmtree(install_dir)
 
     try:
         skill_size = (quarantine_path / "SKILL.md").stat().st_size

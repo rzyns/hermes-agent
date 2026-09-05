@@ -20,13 +20,27 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 import sqlite3
 from pathlib import Path
 from unittest.mock import patch
 
+import pytest
+
 import hermes_state
 import hermes_state_repair
 from hermes_state_repair import _MAX_MALFORMED_BACKUPS, _MAX_PERSISTENT_REPAIR_ATTEMPTS, _backup_db_file, _existing_malformed_backups, _persistent_repair_attempts_exhausted, _prune_malformed_backups, _record_repair_outcome, _repair_ledger_path, repair_state_db_schema
+
+
+@pytest.fixture(autouse=True)
+def _sufficient_repair_disk_space(monkeypatch, tmp_path):
+    """Keep repair semantics independent of the host volume's current fill level."""
+    usage = shutil.disk_usage(tmp_path)
+    monkeypatch.setattr(
+        hermes_state_repair.shutil,
+        "disk_usage",
+        lambda _path: usage._replace(used=0, free=usage.total),
+    )
 
 
 def _make_unrepairable_db(tmp_path: Path) -> Path:

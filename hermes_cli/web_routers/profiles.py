@@ -33,7 +33,9 @@ from hermes_cli.web_server_profiles import (
     _fallback_profile_dicts, _hub_action_name, _write_profile_mcp_servers,
 )
 from hermes_cli.web_server_sessions import _open_session_db_at_path
-from starlette.concurrency import run_in_threadpool
+from hermes_cli.web_deps import late, late_attr
+
+run_in_threadpool = late("run_in_threadpool")
 from hermes_cli.web_models import (
     ProfileCreate, ProfileActiveUpdate, ProfileExport, ProfileImport, ProfileRename,
     ProfileSoulUpdate, ProfileDescriptionUpdate, ProfileModelUpdate, ProfileDescribeAuto,
@@ -642,9 +644,13 @@ def post_profiles_sessions_pull_requests(body: SessionPrScanBody):
 
 @router.get("/api/profiles")
 async def list_profiles_endpoint():
+    return await run_in_threadpool(late_attr("_list_profiles_endpoint_sync"))
+
+
+def _list_profiles_endpoint_sync():
     from hermes_cli import profiles as profiles_mod
     try:
-        profiles = await run_in_threadpool(profiles_mod.list_profiles)
+        profiles = profiles_mod.list_profiles()
         return {"profiles": [_profile_to_dict(p) for p in profiles]}
     except Exception:
         _log.exception("GET /api/profiles failed; falling back to profile directory scan")

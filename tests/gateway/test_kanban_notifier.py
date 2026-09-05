@@ -134,7 +134,7 @@ def test_kanban_notifier_skips_unchanged_corrupt_board_after_first_failure(tmp_p
     # The zero-subscription fast path is a separate concern; keep this test on
     # the corrupt-open/backoff path by declaring that the board has work to
     # notify.
-    monkeypatch.setattr(kb, "count_notify_subs", lambda board=None: 1)
+    monkeypatch.setattr(kbn, "count_notify_subs", lambda **_kwargs: 1)
 
     def fake_connect(*_args, board=None, **_kwargs):
         connect_calls.append(board)
@@ -142,7 +142,7 @@ def test_kanban_notifier_skips_unchanged_corrupt_board_after_first_failure(tmp_p
             db_path, backup_path, "integrity_check returned 'bad btree'"
         )
 
-    monkeypatch.setattr(kb, "connect", fake_connect)
+    monkeypatch.setattr(kbc, "connect", fake_connect)
 
     runner = _make_runner(RecordingAdapter())
     asyncio.run(_run_two_notifier_ticks(monkeypatch, runner))

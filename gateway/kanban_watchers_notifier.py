@@ -8,6 +8,7 @@ per-subscription delivery (``_KanbanNotification``) live here.
 from __future__ import annotations
 
 import re
+import sqlite3
 from pathlib import Path
 from typing import Any, Callable, Optional
 
@@ -118,6 +119,8 @@ class _Collector:
         # secondary-profile sub here would lose it.
         self.active_platforms = _platform_names(runner.adapters).union(
             *(_platform_names(m) for m in self.profile_adapters.values()))
+        self.disabled_corrupt_boards = getattr(runner, "_kanban_notifier_corrupt_boards", {})
+        runner._kanban_notifier_corrupt_boards = self.disabled_corrupt_boards
 
     def collect(self) -> list[dict]:
         if not self.active_platforms:
@@ -138,7 +141,7 @@ class _Collector:
                 logger.debug("kanban notifier: skipping duplicate board slug %s for DB %s", slug, resolved_db_path)
                 continue
             seen_db_paths.add(resolved_db_path)
-            self.collect_board(slug)
+            self.collect_board(slug, db_path=db_path)
         return self.deliveries
 
     def _board_has_subs(self, slug: str) -> bool:
@@ -189,14 +192,25 @@ class _Collector:
                      len(events), sub["task_id"], slug, old_cursor, cursor)
         return {"sub": sub, "old_cursor": old_cursor, "cursor": cursor, "events": events, "task": task, "board": slug}
 
-    def collect_board(self, slug: str) -> None:
+    def collect_board(self, slug: str, db_path: Optional[str] = None) -> None:
         """Claim events on one board, appending delivery dicts to ``deliveries``."""
         if not self._board_has_subs(slug):
             return
         kb = self.kb
         try:
+            path = Path(db_path).expanduser().resolve() if db_path else kb.kanban_db_path(slug).resolve()
+            stat = path.stat()
+            fingerprint = (str(path), stat.st_size, stat.st_mtime_ns)
+        except OSError:
+            fingerprint = (str(db_path or slug), None, None)
+        if self.disabled_corrupt_boards.get(slug) == fingerprint:
+            return
+        try:
             conn = _kbc().connect(board=slug)
         except Exception as exc:
+            corrupt_type = getattr(kb, "KanbanDbCorruptError", sqlite3.DatabaseError)
+            if isinstance(exc, (sqlite3.DatabaseError, corrupt_type)):
+                self.disabled_corrupt_boards[slug] = fingerprint
             logger.debug("kanban notifier: cannot open board %s: %s", slug, exc)
             return
         try:

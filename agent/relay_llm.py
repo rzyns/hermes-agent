@@ -8,7 +8,7 @@ import contextvars
 import inspect
 import json
 import logging
-from collections.abc import Callable, Iterator
+from collections.abc import Callable, Iterator, Mapping
 from functools import partial
 from types import SimpleNamespace
 from typing import Any
@@ -720,7 +720,7 @@ def _provider_request(
                 final[key] = intercepted[key]
         _restore_provider_message_extensions(original, final, baseline=baseline, intercepted=intercepted)
     headers = getattr(request, "headers", None)
-    if isinstance(headers, dict):
+    if isinstance(headers, Mapping):
         headers = {k: v for k, v in headers.items() if str(k).lower() not in _RELAY_INTERNAL_PROVIDER_HEADERS}
     # Relay's managed-call trace header maps to ``extra_headers`` for known SDK adapters and custom
     # requests that already use that container; other native transports take protocol kwargs directly

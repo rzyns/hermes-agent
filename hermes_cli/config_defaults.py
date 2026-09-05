@@ -145,6 +145,10 @@ DEFAULT_CONFIG = {
         # read-only commands) into one batched turn; the runtime already runs them concurrently. ~70
         # cached tokens. False disables.
         "parallel_tool_call_guidance": True,
+        # Keep existing Kanban worker prompts stable unless a profile explicitly opts into the v2
+        # protocol and its non-terminal progress checkpoint tool.
+        "kanban_guidance_v2": False,
+        "kanban_progress_enabled": False,
         # Toolchain probe: surfaces Python/pip/uv/PEP-668 state in the system prompt only when
         # something non-default is detected (no pip module, pip/python mismatch, PEP 668 without
         # uv); zero tokens when clean. Skipped for docker/modal/ssh backends (own probe).
@@ -1686,9 +1690,25 @@ DEFAULT_CONFIG = {
         "review_dispatch": True,
         # Seconds between dispatcher ticks. Lower = snappier pickup; higher = less SQL pressure.
         "dispatch_interval_seconds": 60,
+        # Automated retry of blocked transient tasks. Disabled by default so
+        # existing boards remain sticky until an operator explicitly opts in.
+        "retry": {
+            "enabled": False,
+        },
+        # Emergency/maintenance brake. Dispatchers skip claiming and spawning
+        # while read-only board operations remain available.
+        "maintenance_mode": False,
+        # SQLite durability mode. Invalid/unsafe values fail closed to FULL.
+        "durability": "full",
         # Auto-block after this many consecutive non-success attempts (spawn_failed, timed_out,
         # crashed) for the same task/profile. Reassignment resets the streak.
         "failure_limit": 2,
+        # Optional per-conversation iteration budget for goal-mode workers.
+        # None preserves each assignee profile's agent.max_turns.
+        "goal_worker_max_turns": None,
+        # Default-off bounded grace for terminal completion racing with
+        # budget-exhaustion bookkeeping. Never accepts a newer run.
+        "terminal_completion_grace_seconds": 0,
         # Worker stdout/stderr log rotation at spawn time (2 MiB + one backup). Raise to keep more
         # early failure evidence from long-running workers.
         "worker_log_rotate_bytes": 2 * 1024 * 1024,

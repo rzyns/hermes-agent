@@ -103,7 +103,7 @@ def test_misbehaving_subscriber_does_not_break_dispatcher(kanban_home):
         conn = kbc.connect()
         try:
             result = kbd.dispatch_once(conn, spawn_fn=lambda *a, **k: 1)
-            assert isinstance(result, kb.DispatchResult)
+            assert result.__class__.__name__ == "DispatchResult"
         finally:
             conn.close()
     finally:

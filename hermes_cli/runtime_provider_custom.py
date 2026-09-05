@@ -469,7 +469,23 @@ def _resolve_named_custom_runtime(*, requested_provider: str, explicit_api_key: 
     # treated identically here, so a YAML `provider: ollama` with a LAN/WireGuard `base_url` doesn't
     # silently fall through to OpenRouter.
     requested_norm = (requested_provider or "").strip().lower()
-    if requested_norm in _LLAMACPP_ALIASES and not explicit_base_url:
+    # A configured model.base_url is just as intentional as an explicit
+    # argument. Preserve it before the managed llama.cpp shortcut; otherwise
+    # a saved LAN endpoint is mistaken for the managed server and rejected
+    # when local_runtime.enabled is false.
+    routing_base_url = (explicit_base_url or "").strip()
+    if not routing_base_url:
+        model_cfg = rp._get_model_config()
+        cfg_provider = str(model_cfg.get("provider") or "").strip().lower()
+        cfg_base_url = str(model_cfg.get("base_url") or "").strip()
+        if (
+            cfg_provider == requested_norm
+            and rp._config_base_url_trustworthy_for_bare_custom(
+                cfg_base_url, cfg_provider
+            )
+        ):
+            routing_base_url = cfg_base_url
+    if requested_norm in _LLAMACPP_ALIASES and not routing_base_url:
         return _resolve_llamacpp_runtime(requested_provider, explicit_api_key)
     if requested_norm and requested_norm != "custom" and rp._resolves_to_custom(requested_norm):
         requested_norm = "custom"

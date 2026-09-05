@@ -18,6 +18,7 @@ from agent.context_compressor import (
 from agent.lazy_forward import forward as _forward, forward_static as _forward_static
 from agent.memory_manager import sanitize_context
 from agent.redact import redact_sensitive_text
+from agent.runtime_cwd import resolve_agent_cwd
 from agent.tool_dispatch_helpers import _is_multimodal_tool_result, _multimodal_text_summary
 from agent.trajectory import convert_scratchpad_to_think, save_trajectory as _save_trajectory_to_file
 from agent.transcript_repair import sync_flushed_message_markers
@@ -453,7 +454,7 @@ class SessionPersistenceMixin:
                 "session_id": self.session_id, "model": self.model, "base_url": self.base_url, "platform": self.platform,
                 "session_start": self.session_start.isoformat(), "last_updated": datetime.now().isoformat(),
                 "system_prompt": redact_sensitive_text(self._cached_system_prompt or ""), "tools": self.tools or [],
-                "message_count": len(cleaned), "messages": cleaned,
+                "cwd": str(resolve_agent_cwd()), "message_count": len(cleaned), "messages": cleaned,
             }
             atomic_json_write(log_file, entry, indent=2, default=str)
         except Exception as e:

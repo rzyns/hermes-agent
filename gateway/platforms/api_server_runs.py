@@ -564,6 +564,8 @@ def _make_approval_notify(self, run: _RunLaunch, *, _api_server) -> Callable[[Di
             allow_permanent=event.get("allow_permanent") is not False)))
         self._set_run_status(run_id, "waiting_for_approval", last_event="approval.request", approval=event)
         with suppress(Exception):
+            self._run_events_producer.emit_event(run_id, "approval.request", event)
+        with suppress(Exception):
             loop.call_soon_threadsafe(q.put_nowait, event)
 
     return _approval_notify

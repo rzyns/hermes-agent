@@ -1,10 +1,11 @@
 """Tests for model_tools.py — function call dispatch, agent-loop interception, legacy toolsets."""
 
 import json
-from unittest.mock import patch
+from unittest.mock import ANY, call, patch
 
 
 from model_tools import (
+    TOOL_TO_TOOLSET_MAP,
     handle_function_call,
     get_all_tool_names,
     get_toolset_for_tool,
@@ -30,13 +31,13 @@ class TestHandleFunctionCall:
         assert "totally_fake_tool_xyz" in result["error"]
 
     def test_exception_returns_json_error(self):
-        # Even if something goes wrong, should return valid JSON
-        result = handle_function_call("web_search", None)  # None args may cause issues
+        # Dispatch failures are contained and returned as valid JSON.
+        with patch("model_tools.registry.dispatch", side_effect=RuntimeError("boom")):
+            result = handle_function_call("web_search", {"q": "test"})
         parsed = json.loads(result)
         assert isinstance(parsed, dict)
         assert "error" in parsed
-        assert len(parsed["error"]) > 0
-        assert "error" in parsed["error"].lower() or "failed" in parsed["error"].lower()
+        assert "boom" in parsed["error"]
 
     def test_tool_hooks_receive_session_and_tool_call_ids(self):
         with (
@@ -570,7 +571,7 @@ class TestCoerceNumberInfNan:
         assert _coerce_number("inf") == "inf"
 
     def test_negative_inf_returns_original_string(self):
-        from model_tools import _coerce_number
+        from tools.arg_coercion import _coerce_number
         assert _coerce_number("-inf") == "-inf"
 
     def test_nan_returns_original_string(self):
@@ -578,14 +579,14 @@ class TestCoerceNumberInfNan:
         assert _coerce_number("nan") == "nan"
 
     def test_infinity_spelling_returns_original_string(self):
-        from model_tools import _coerce_number
+        from tools.arg_coercion import _coerce_number
         # Python's float() parses "Infinity" too — still not JSON-safe.
         assert _coerce_number("Infinity") == "Infinity"
 
     def test_coerced_result_is_strict_json_safe(self):
         """Whatever _coerce_number returns for inf/nan must round-trip
         through strict (allow_nan=False) json.dumps without raising."""
-        from model_tools import _coerce_number
+        from tools.arg_coercion import _coerce_number
         for s in ("inf", "-inf", "nan", "Infinity"):
             result = _coerce_number(s)
             json.dumps({"x": result}, allow_nan=False)  # must not raise

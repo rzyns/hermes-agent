@@ -7,6 +7,7 @@ slots) lazily at call time so monkeypatching the source module keeps working.
 
 from __future__ import annotations
 
+import importlib
 import logging
 from typing import Any, Awaitable, Callable, Dict, List, Optional
 
@@ -179,7 +180,8 @@ def lazy_ensure(feature: str) -> None:
         raise ImportError(str(exc))
 
 
-def cached_sdk_client(slot: str, env_var: str, missing_key_error: str, feature: str, factory: Callable[[str], Any]) -> Any:
+def cached_sdk_client(slot: str, env_var: str, missing_key_error: str, feature: str,
+                      factory: Callable[[str], Any], sdk_module: str | None = None) -> Any:
     """Lazy-build + cache a vendor SDK client on ``tools.web_tools.<slot>`` (so tests that
     reset ``tools.web_tools._<vendor>_client = None`` see fresh state). Raises ValueError
     when the key is unset."""
@@ -190,7 +192,13 @@ def cached_sdk_client(slot: str, env_var: str, missing_key_error: str, feature: 
     api_key = provider_env(env_var)
     if not api_key:
         raise ValueError(missing_key_error)
-    lazy_ensure(feature)
+    if sdk_module is None:
+        lazy_ensure(feature)
+    else:
+        try:
+            importlib.import_module(sdk_module)
+        except ImportError:
+            lazy_ensure(feature)
     client = factory(api_key)
     setattr(_wt, slot, client)
     return client

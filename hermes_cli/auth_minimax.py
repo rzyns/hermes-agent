@@ -13,6 +13,7 @@ import json
 import time
 import uuid
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any, Callable, Dict, Optional, TYPE_CHECKING
 from hermes_cli.auth_constants import (
     AuthError, MINIMAX_OAUTH_GRANT_TYPE, MINIMAX_OAUTH_REFRESH_SKEW_SECONDS, MINIMAX_OAUTH_SCOPE,
@@ -24,6 +25,7 @@ if TYPE_CHECKING:  # annotation-only; the runtime import would be a cycle
 logger = logging.getLogger("hermes_cli.auth")
 
 _MINIMAX_OAUTH_ERROR_BODY_LIMIT = 16 * 1024
+MINIMAX_OAUTH_REFRESH_TIMEOUT_SECONDS = 15.0
 
 
 def _minimax_response_error_text(response: httpx.Response, *, limit: int = _MINIMAX_OAUTH_ERROR_BODY_LIMIT) -> str:
@@ -158,10 +160,27 @@ def _minimax_poll_token(
     raise _minimax_err("MiniMax OAuth timed out before authorization completed.", "timeout")
 
 
-def _minimax_save_auth_state(auth_state: Dict[str, Any]) -> None:
-    """Persist MiniMax OAuth state to Hermes auth store (~/.hermes/auth.json)."""
-    from hermes_cli.auth import _save_active_provider_state
-    _save_active_provider_state("minimax-oauth", auth_state)
+def _minimax_save_auth_state(
+    auth_state: Dict[str, Any],
+    *,
+    source_path: Optional[Path] = None,
+    set_active: bool = True,
+) -> None:
+    """Persist MiniMax OAuth state to the auth store that owns it."""
+    from hermes_cli import auth as auth_mod
+
+    active_path = auth_mod._auth_file_path()
+    if source_path is not None and not auth_mod._same_path(source_path, active_path):
+        auth_mod._persist_provider_state_to_store(
+            "minimax-oauth", auth_state, source_path, set_active=set_active,
+        )
+        return
+    with auth_mod._auth_store_lock():
+        auth_store = auth_mod._load_auth_store()
+        auth_mod._store_provider_state(
+            auth_store, "minimax-oauth", auth_state, set_active=set_active,
+        )
+        auth_mod._save_auth_store(auth_store)
 
 
 def _minimax_oauth_login(*, region: str = "global", open_browser: bool = True, timeout_seconds: float = 15.0) -> Dict[str, Any]:
@@ -224,71 +243,235 @@ def _minimax_oauth_login(*, region: str = "global", open_browser: bool = True, t
     return auth_state
 
 
-def _refresh_minimax_oauth_state(state: Dict[str, Any], *, timeout_seconds: float = 15.0, force: bool = False) -> Dict[str, Any]:
-    """Refresh MiniMax OAuth access token if close to expiry (or forced)."""
-    from hermes_cli.auth import _minimax_save_auth_state
-    if not state.get("refresh_token"):
-        raise _minimax_err("MiniMax OAuth state has no refresh_token; please re-login.", "no_refresh_token", relogin=True)
-    try:
-        expires_at = datetime.fromisoformat(state.get("expires_at", "")).timestamp()
-    except Exception:
-        expires_at = 0.0
-    if not force and (expires_at - time.time()) > MINIMAX_OAUTH_REFRESH_SKEW_SECONDS:
-        return state
+def refresh_minimax_oauth_pure(
+    state: Dict[str, Any],
+    *,
+    timeout_seconds: float = MINIMAX_OAUTH_REFRESH_TIMEOUT_SECONDS,
+) -> Dict[str, Any]:
+    """Refresh MiniMax OAuth tokens without mutating an auth store."""
+    refresh_token = state.get("refresh_token")
+    if not refresh_token:
+        raise _minimax_err(
+            "MiniMax OAuth state has no refresh_token; please re-login.",
+            "no_refresh_token",
+            relogin=True,
+        )
+    portal_base_url = state.get("portal_base_url")
+    if not portal_base_url:
+        raise _minimax_err(
+            "MiniMax OAuth state has no portal_base_url; please re-login.",
+            "no_portal_base_url",
+            relogin=True,
+        )
 
     with httpx.Client(timeout=httpx.Timeout(timeout_seconds), follow_redirects=True) as client:
         response = _minimax_post_form(
             client,
-            f"{state['portal_base_url']}/oauth/token",
-            data={"grant_type": "refresh_token", "client_id": state["client_id"], "refresh_token": state["refresh_token"]},
+            f"{portal_base_url}/oauth/token",
+            data={
+                "grant_type": "refresh_token",
+                "client_id": state["client_id"],
+                "refresh_token": refresh_token,
+            },
             headers=_FORM_JSON_HEADERS,
         )
-        # Non-200 reads a STREAMED body, so it must run inside the client context (iter_bytes()
-        # after close raises StreamClosed); the 200 body was already read by _minimax_post_form.
         if response.status_code != 200:
             body = _minimax_response_error_text(response)
             body_lower = body.lower()
-            relogin = any(m in body_lower for m in ("invalid_grant", "refresh_token_reused", "invalid_refresh_token"))
+            relogin = any(
+                marker in body_lower
+                for marker in ("invalid_grant", "refresh_token_reused", "invalid_refresh_token")
+            )
             raise _minimax_err(
-                f"MiniMax OAuth refresh failed: {body or response.reason_phrase}", "refresh_failed", relogin=relogin,
+                f"MiniMax OAuth refresh failed: {body or response.reason_phrase}",
+                "refresh_failed",
+                relogin=relogin,
             )
     payload = response.json()
     if payload.get("status") != "success":
-        raise _minimax_err("MiniMax OAuth refresh did not return success.", "refresh_failed", relogin=True)
-    new_state = {
-        **state,
+        raise _minimax_err(
+            "MiniMax OAuth refresh did not return success.",
+            "refresh_failed",
+            relogin=True,
+        )
+    return {
         "access_token": payload["access_token"],
-        "refresh_token": payload.get("refresh_token", state["refresh_token"]),
+        "refresh_token": payload.get("refresh_token") or refresh_token,
         **_minimax_expiry_fields(payload["expired_in"]),
     }
-    _minimax_save_auth_state(new_state)
+
+
+def _refresh_minimax_oauth_state(
+    state: Dict[str, Any],
+    *,
+    timeout_seconds: float = MINIMAX_OAUTH_REFRESH_TIMEOUT_SECONDS,
+    force: bool = False,
+    source_path: Optional[Path] = None,
+    set_active: bool = True,
+) -> Dict[str, Any]:
+    """Refresh MiniMax OAuth state and write it back to its owning store."""
+    from hermes_cli import auth as auth_mod
+
+    if not state.get("refresh_token"):
+        raise _minimax_err(
+            "MiniMax OAuth state has no refresh_token; please re-login.",
+            "no_refresh_token",
+            relogin=True,
+        )
+
+    def needs_refresh(candidate: Dict[str, Any]) -> bool:
+        try:
+            expires_at = datetime.fromisoformat(candidate.get("expires_at", "")).timestamp()
+        except Exception:
+            expires_at = 0.0
+        return force or (expires_at - time.time()) <= MINIMAX_OAUTH_REFRESH_SKEW_SECONDS
+
+    active_path = auth_mod._auth_file_path()
+    target_is_root = source_path is not None and not auth_mod._same_path(source_path, active_path)
+    if target_is_root:
+        lock_timeout = max(float(auth_mod.AUTH_LOCK_TIMEOUT_SECONDS), timeout_seconds + 5.0)
+        with auth_mod._provider_state_transaction(
+            "minimax-oauth", timeout_seconds=lock_timeout,
+        ) as (_auth_store, source_state, locked_source_path):
+            if not isinstance(source_state, dict):
+                raise _minimax_err(
+                    "MiniMax OAuth session was removed; please re-login.",
+                    "not_logged_in",
+                    relogin=True,
+                )
+            if not needs_refresh(source_state):
+                return source_state
+            try:
+                updated_fields = auth_mod.refresh_minimax_oauth_pure(
+                    source_state, timeout_seconds=timeout_seconds,
+                )
+            except AuthError as exc:
+                if _is_terminal_minimax_oauth_refresh_error(exc):
+                    quarantined = dict(source_state)
+                    _minimax_oauth_quarantine_on_terminal_refresh(
+                        quarantined, exc, persist=False,
+                    )
+                    auth_mod._persist_provider_state_to_store(
+                        "minimax-oauth",
+                        quarantined,
+                        locked_source_path,
+                        set_active=False,
+                    )
+                raise
+            new_state = {**source_state, **updated_fields}
+            auth_mod._persist_provider_state_to_store(
+                "minimax-oauth",
+                new_state,
+                locked_source_path,
+                set_active=set_active,
+            )
+            return new_state
+
+    if not needs_refresh(state):
+        return state
+    updated_fields = auth_mod.refresh_minimax_oauth_pure(
+        state, timeout_seconds=timeout_seconds,
+    )
+    new_state = {**state, **updated_fields}
+    auth_mod._minimax_save_auth_state(
+        new_state, source_path=source_path, set_active=set_active,
+    )
     return new_state
 
 
-def _minimax_oauth_quarantine_on_terminal_refresh(state: Dict[str, Any], exc: AuthError) -> None:
-    """Wipe dead tokens from auth.json after a terminal refresh failure (fail fast, no network retry)."""
+def _is_terminal_minimax_oauth_refresh_error(exc: Exception) -> bool:
+    """Return whether retrying the same MiniMax OAuth refresh token cannot succeed."""
+    if not isinstance(exc, AuthError):
+        return False
+    return (
+        exc.provider == "minimax-oauth"
+        and exc.code in {
+            "refresh_failed",
+            "no_refresh_token",
+            "no_portal_base_url",
+            "invalid_grant",
+            "invalid_token",
+            "refresh_token_reused",
+        }
+        and bool(exc.relogin_required)
+    )
+
+
+def _minimax_oauth_quarantine_on_terminal_refresh(
+    state: Dict[str, Any],
+    exc: AuthError,
+    *,
+    persist: bool = True,
+    source_path: Optional[Path] = None,
+    set_active: bool = True,
+) -> None:
+    """Wipe dead tokens after a terminal refresh failure."""
     from hermes_cli.auth import _minimax_save_auth_state, _quarantine_flat_oauth_state
+
     if not (exc.relogin_required and state.get("refresh_token")):
         return
     _quarantine_flat_oauth_state(state, "minimax-oauth", exc)
-    try:
-        _minimax_save_auth_state(state)
-    except Exception as _save_exc:
-        logger.debug("MiniMax OAuth: failed to persist quarantined state: %s", _save_exc)
+    if persist:
+        _minimax_save_auth_state(
+            state, source_path=source_path, set_active=set_active,
+        )
+
+
+def _resolve_minimax_oauth_source_path(
+    auth_store: Dict[str, Any],
+    in_memory_state: Optional[Dict[str, Any]] = None,
+) -> Optional[Path]:
+    """Return the profile/root auth path that owns a MiniMax OAuth grant."""
+    from hermes_cli import auth as auth_mod
+
+    active_path = auth_mod._auth_file_path()
+    providers = auth_store.get("providers")
+    if isinstance(providers, dict) and isinstance(providers.get("minimax-oauth"), dict):
+        return active_path
+    global_path = auth_mod._global_auth_file_path()
+    if in_memory_state and in_memory_state.get("refresh_token"):
+        if global_path is not None:
+            global_store = auth_mod._load_global_auth_store()
+            global_providers = global_store.get("providers") if global_store else None
+            if isinstance(global_providers, dict) and isinstance(
+                global_providers.get("minimax-oauth"), dict,
+            ):
+                return global_path
+        return active_path
+    return global_path if global_path is not None else active_path
 
 
 def _minimax_fresh_state() -> Dict[str, Any]:
-    """Load the MiniMax OAuth state and refresh it if near expiry; quarantine on terminal failure."""
-    from hermes_cli.auth import _refresh_minimax_oauth_state, get_provider_auth_state
-    state = get_provider_auth_state("minimax-oauth")
+    """Load and source-safely refresh the current MiniMax OAuth state."""
+    from hermes_cli import auth as auth_mod
+
+    state = auth_mod.get_provider_auth_state("minimax-oauth")
     if not state or not state.get("access_token"):
         raise _minimax_err(
-            "Not logged into MiniMax OAuth. Run `hermes model` and select MiniMax (OAuth).", "not_logged_in", relogin=True,
+            "Not logged into MiniMax OAuth. Run `hermes model` and select MiniMax (OAuth).",
+            "not_logged_in",
+            relogin=True,
         )
+    with auth_mod._auth_store_lock():
+        auth_store = auth_mod._load_auth_store()
+        source_path = _resolve_minimax_oauth_source_path(auth_store, state)
+        live_state = auth_mod._load_provider_state(auth_store, "minimax-oauth")
+        if live_state is None and source_path is not None and not auth_mod._same_path(
+            source_path, auth_mod._auth_file_path(),
+        ):
+            raise _minimax_err(
+                "MiniMax OAuth session was removed; please re-login.",
+                "not_logged_in",
+                relogin=True,
+            )
     try:
-        return _refresh_minimax_oauth_state(state)
+        return auth_mod._refresh_minimax_oauth_state(
+            state, source_path=source_path, set_active=False,
+        )
     except AuthError as exc:
-        _minimax_oauth_quarantine_on_terminal_refresh(state, exc)
+        auth_mod._minimax_oauth_quarantine_on_terminal_refresh(
+            state, exc, source_path=source_path, set_active=False,
+        )
         raise
 
 

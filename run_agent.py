@@ -1517,6 +1517,8 @@ import tempfile  # noqa: F401,E402
 
 
 _PLUGIN_COMPAT_LAZY = {
+    '_SafeWriter': ('agent.process_bootstrap', '_SafeWriter'),
+    '_is_destructive_command': ('agent.tool_dispatch_helpers', '_is_destructive_command'),
     'COMPRESSED_SUMMARY_METADATA_KEY': ('agent.context_compressor', 'COMPRESSED_SUMMARY_METADATA_KEY'),
     'ContextCompressor': ('agent.context_compressor', 'ContextCompressor'),
     'DEFAULT_AGENT_IDENTITY': ('agent.prompt_builder', 'DEFAULT_AGENT_IDENTITY'),

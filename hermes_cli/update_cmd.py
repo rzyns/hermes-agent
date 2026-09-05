@@ -708,7 +708,7 @@ def _reconcile_diverged_checkout(git_cmd, branch: str, pre_pull_sha) -> None:
 def _rollback_if_pulled_syntax_error(git_cmd, pre_pull_sha) -> None:
     """Post-pull syntax guard: roll back to *pre_pull_sha* and ``sys.exit(1)`` when a critical
     file no longer compiles (a bad admin-merge past CI must not brick the CLI)."""
-    syntax_ok, failing_path, syntax_error = _validate_critical_files_syntax(_m().PROJECT_ROOT)
+    syntax_ok, failing_path, syntax_error = _m()._validate_critical_files_syntax(_m().PROJECT_ROOT)
     if syntax_ok:
         return
     print()

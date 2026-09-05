@@ -591,11 +591,17 @@ def normalize_skill_lookup_name(identifier: str) -> str:
         if identifier_path.is_relative_to(root):
             return str(identifier_path.relative_to(root))
     try:
-        return str(identifier_path.resolve().relative_to(primary_root.resolve()))
+        resolved_identifier = identifier_path.resolve()
+        for root in trusted_roots:
+            try:
+                return str(resolved_identifier.relative_to(root.resolve()))
+            except ValueError:
+                continue
     except Exception:
-        logger.debug("Skill identifier %r is an absolute path outside trusted skills "
-                     "roots — passing through unchanged (skill_view will reject it)", raw_identifier)
-        return raw_identifier
+        pass
+    logger.debug("Skill identifier %r is an absolute path outside trusted skills "
+                 "roots — passing through unchanged (skill_view will reject it)", raw_identifier)
+    return raw_identifier
 
 
 def _resolve_for_skill_ownership(path) -> Path:

@@ -6,6 +6,7 @@ from __future__ import annotations
 import logging
 import contextvars
 import json
+import os
 import threading
 import time
 from concurrent.futures import TimeoutError as FuturesTimeoutError
@@ -652,10 +653,26 @@ class _ChildRun:
         # Worker thread handle so the timeout diagnostic can dump its stack.
         worker_thread_holder: Dict[str, Optional[threading.Thread]] = {"t": None}
 
+        # Snapshot the child's non-run-scoped environment without mutating the
+        # process-global mapping shared by the parent and sibling children.
+        # Tombstone every run-scoped key unconditionally: a parent-side key
+        # introduced after this snapshot must still remain invisible here.
+        from agent.delegation_context import (
+            DELEGATED_CHILD_ENV_MARKER,
+            _RUN_SCOPED_ENV_VARS,
+            delegated_child_context,
+            scrub_run_scoped_env,
+        )
+        child_env_overlay = scrub_run_scoped_env(dict(os.environ))
+        child_env_overlay.update({key: None for key in _RUN_SCOPED_ENV_VARS})
+        child_env_overlay[DELEGATED_CHILD_ENV_MARKER] = "1"
+
         def _run_with_thread_capture():
             worker_thread_holder["t"] = threading.current_thread()
-            from agent.delegation_context import delegated_child_context
-            with delegated_child_context(str(getattr(child, "session_id", "") or "")):
+            with delegated_child_context(
+                str(getattr(child, "session_id", "") or ""),
+                overlay=child_env_overlay,
+            ):
                 return child.run_conversation(
                     user_message=self.goal, task_id=self.child_task_id, stream_callback=self.relay_text,
                 )

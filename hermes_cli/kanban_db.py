@@ -18370,3 +18370,14 @@ def request_review_phase(
             run_id=run_id,
         )
     return _ret(True)
+
+
+# Extracted infrastructure remains the canonical transaction/cleanup seam.
+# Keep this facade's crash-safe lifecycle implementation while routing these
+# primitives through the split modules so retries and late-bound workspace
+# helpers behave identically on both import paths.
+from hermes_cli import kanban_db_connect as _kanban_db_connect  # noqa: E402
+from hermes_cli import kanban_db_workspace as _kanban_db_workspace  # noqa: E402
+
+write_txn = _kanban_db_connect.write_txn
+_cleanup_workspace = _kanban_db_workspace._cleanup_workspace

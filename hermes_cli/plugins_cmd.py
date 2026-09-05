@@ -12,8 +12,9 @@ import subprocess
 import sys
 import tempfile
 import urllib.parse
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, NoReturn, Optional
 
 from hermes_constants import get_hermes_home
 from hermes_cli._subprocess_compat import noninteractive_git_env
@@ -77,7 +78,7 @@ def _is_tty() -> bool:
     return sys.stdin.isatty() and sys.stdout.isatty()
 
 
-def _fail(console, message: str) -> None:
+def _fail(console, message: str) -> NoReturn:
     """Print *message* and exit 1."""
     console.print(message)
     sys.exit(1)
@@ -160,6 +161,107 @@ def _scan_plugin_tree(plugin_dir: Path, identifier: str, *, force: bool, scan_de
 
 # Highest ``manifest_version`` this installer understands; breaking schema changes bump it.
 _SUPPORTED_MANIFEST_VERSION = 1
+_INSTALL_SOURCE_FILE = ".hermes-plugin-source.json"
+
+
+@dataclass(frozen=True)
+class PluginInstallSource:
+    """Validated Git source and installed-file inventory for a plugin."""
+
+    git_url: str
+    subdir: Optional[str]
+    source_files: tuple[str, ...] = ()
+
+    def identifier(self) -> str:
+        return f"{self.git_url}#{self.subdir}" if self.subdir else self.git_url
+
+
+def _installed_source_files(target: Path) -> tuple[str, ...]:
+    """Inventory source-owned files without descending into Git metadata."""
+    files: list[str] = []
+    for root, dirnames, filenames in os.walk(target, followlinks=False):
+        dirnames[:] = [name for name in dirnames if name not in {".git", "__pycache__"}]
+        root_path = Path(root)
+        for filename in filenames:
+            path = root_path / filename
+            relative = path.relative_to(target).as_posix()
+            if relative != _INSTALL_SOURCE_FILE and not path.is_symlink():
+                files.append(relative)
+    return tuple(sorted(files))
+
+
+def _write_install_source(target: Path, source: PluginInstallSource) -> None:
+    """Persist update provenance after a successful Git installation."""
+    payload = {
+        "schema_version": 1,
+        "git_url": source.git_url,
+        "subdir": source.subdir,
+        "source_files": list(source.source_files or _installed_source_files(target)),
+    }
+    (target / _INSTALL_SOURCE_FILE).write_text(
+        json.dumps(payload, indent=2) + "\n", encoding="utf-8")
+
+
+def _read_install_source(target: Path) -> Optional[PluginInstallSource]:
+    """Read and validate recorded Git provenance for a git-less install."""
+    receipt = target / _INSTALL_SOURCE_FILE
+    if not receipt.is_file():
+        return None
+    try:
+        payload = json.loads(receipt.read_text(encoding="utf-8"))
+        if not isinstance(payload, dict) or payload.get("schema_version") != 1:
+            raise ValueError("unsupported schema")
+        git_url = payload.get("git_url")
+        subdir = payload.get("subdir")
+        source_files = payload.get("source_files")
+        if not isinstance(git_url, str) or not git_url:
+            raise ValueError("git_url must be a non-empty string")
+        if subdir is not None and (not isinstance(subdir, str) or not subdir):
+            raise ValueError("subdir must be null or a non-empty string")
+        if not isinstance(source_files, list) or not all(
+            isinstance(item, str)
+            and item
+            and not Path(item).is_absolute()
+            and ".." not in Path(item).parts
+            and "\\" not in item
+            for item in source_files
+        ):
+            raise ValueError("source_files must contain safe relative paths")
+        source = PluginInstallSource(git_url, subdir, tuple(source_files))
+        if _resolve_git_url(source.identifier()) != (git_url, subdir):
+            raise ValueError("source fields do not resolve canonically")
+        return source
+    except (OSError, ValueError, TypeError, json.JSONDecodeError) as exc:
+        raise PluginOperationError(
+            f"Invalid install provenance in {receipt.name}: {exc}") from exc
+
+
+def _backup_user_plugin_files(target: Path, source: PluginInstallSource, backup: Path) -> None:
+    """Copy files not owned by the prior source tree into a temporary backup."""
+    source_owned = set(source.source_files)
+    for root, dirnames, filenames in os.walk(target, followlinks=False):
+        dirnames[:] = [name for name in dirnames if name not in {".git", "__pycache__"}]
+        root_path = Path(root)
+        for filename in filenames:
+            path = root_path / filename
+            relative = path.relative_to(target)
+            if relative.as_posix() == _INSTALL_SOURCE_FILE or relative.as_posix() in source_owned or path.is_symlink():
+                continue
+            destination = backup / relative
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(path, destination)
+
+
+def _restore_user_plugin_files(backup: Path, target: Path) -> None:
+    """Restore preserved user-owned files after a clean source reinstall."""
+    if not backup.is_dir():
+        return
+    for path in backup.rglob("*"):
+        if not path.is_file() or path.is_symlink():
+            continue
+        destination = target / path.relative_to(backup)
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(path, destination)
 
 
 def _plugins_dir() -> Path:
@@ -405,15 +507,28 @@ def _display_after_install(plugin_dir: Path, identifier: str) -> None:
 
 
 def _require_installed_plugin(name: str, plugins_dir: Path, console) -> Path:
-    """The plugin path if it exists; else exit 1 (invalid name, or a listing of installed plugins)."""
+    """Resolve a top-level or model-provider plugin, or exit with an inventory."""
     try:
         target = _sanitize_plugin_name(name, plugins_dir, allow_subdir=True)
     except ValueError as e:
         _fail(console, f"[red]Error:[/red] {e}")
-    if not target.exists():
-        installed = ", ".join(d.name for d in plugins_dir.iterdir() if d.is_dir()) or "(none)"
-        _fail(console, f"[red]Error:[/red] Plugin '{name}' not found in {plugins_dir}.\nInstalled plugins: {installed}")
-    return target
+    if target.exists():
+        return target
+
+    model_providers_dir = plugins_dir / "model-providers"
+    if "/" not in name and "\\" not in name and model_providers_dir.is_dir():
+        provider_target = _sanitize_plugin_name(name, model_providers_dir)
+        if provider_target.exists():
+            return provider_target
+
+    installed_names = [
+        path.name for path in plugins_dir.iterdir()
+        if path.is_dir() and path.name != "model-providers"
+    ]
+    if model_providers_dir.is_dir():
+        installed_names.extend(path.name for path in model_providers_dir.iterdir() if path.is_dir())
+    installed = ", ".join(sorted(installed_names)) or "(none)"
+    _fail(console, f"[red]Error:[/red] Plugin '{name}' not found in {plugins_dir}.\nInstalled plugins: {installed}")
 
 
 # ── Install metadata + git plumbing ─────────────────────────────────────────────────────────
@@ -576,7 +691,14 @@ def _read_manifest_for_install(plugin_dir: Path) -> dict:
     return manifest
 
 
-def _swap_in_plugin(tmp_target: Path, target: Path, backup: Path, old_metadata: dict, new_metadata: dict) -> None:
+def _swap_in_plugin(
+    tmp_target: Path,
+    target: Path,
+    backup: Path,
+    old_metadata: dict,
+    new_metadata: dict,
+    install_source: PluginInstallSource,
+) -> None:
     """Move the validated clone into place and persist metadata; on any failure restore the
     previous tree (if one was replaced) and the previous metadata sidecar, then re-raise."""
     replaced_existing = target.exists()
@@ -584,6 +706,7 @@ def _swap_in_plugin(tmp_target: Path, target: Path, backup: Path, old_metadata: 
         os.replace(target, backup)
     try:
         os.replace(tmp_target, target)
+        _write_install_source(target, install_source)
         _write_install_metadata(new_metadata)
     except Exception:
         if target.exists():
@@ -603,6 +726,7 @@ def _install_plugin_core(
     force: bool,
     ref: Optional[str] = None,
     scan_decision_cb=None,
+    expected_target: Optional[Path] = None,
 ) -> tuple[Path, dict, str]:
     """Clone a Git plugin and atomically record its source and exact revision."""
     requested_revision = _normalize_exact_revision(ref) if ref is not None else None
@@ -629,10 +753,18 @@ def _install_plugin_core(
         manifest = _read_manifest_for_install(tmp_target)
         plugin_name = manifest.get("name") or (
             subdir.rstrip("/").rsplit("/", 1)[-1] if subdir else _repo_name_from_url(git_url))
+        install_root = plugins_dir
+        if manifest.get("kind") == "model-provider":
+            install_root = plugins_dir / "model-providers"
+            install_root.mkdir(parents=True, exist_ok=True)
         try:
-            target = _sanitize_plugin_name(plugin_name, plugins_dir)
+            target = _sanitize_plugin_name(plugin_name, install_root)
         except ValueError as e:
             raise PluginOperationError(str(e)) from e
+        if expected_target is not None and target.resolve() != expected_target.resolve():
+            raise PluginOperationError(
+                "Recorded plugin source now resolves to a different install target "
+                f"('{target}' instead of '{expected_target}'). Refusing update.")
         _check_manifest_version(manifest, plugin_name)
         # Scan BEFORE anything is moved into place; raises PluginScanBlocked when blocked.
         _scan_plugin_tree(tmp_target, identifier, force=force, scan_decision_cb=scan_decision_cb)
@@ -651,7 +783,14 @@ def _install_plugin_core(
             **old_metadata,
             plugin_name: {"pinned": requested_revision is not None, "revision": installed_revision, "source": source},
         }
-        _swap_in_plugin(tmp_target, target, Path(tmp) / "previous-plugin", old_metadata, new_metadata)
+        _swap_in_plugin(
+            tmp_target,
+            target,
+            Path(tmp) / "previous-plugin",
+            old_metadata,
+            new_metadata,
+            PluginInstallSource(git_url=git_url, subdir=subdir),
+        )
 
     if not _looks_like_plugin_dir(target):
         logger.warning("%s has no plugin.yaml / __init__.py; may not be a valid plugin", plugin_name)
@@ -768,15 +907,26 @@ def cmd_install(
 
 
 def _pull_plugin_update(target: Path, pinned_msg, not_git_msg, before_pull=None) -> str:
-    """Shared ``update`` core: refuse pinned / non-git checkouts, ``git pull``, record the new
-    revision. Returns the pull output; raises :class:`PluginOperationError` on any refusal.
+    """Shared ``update`` core: refuse pinned installs, pull Git checkouts, or cleanly reinstall
+    git-less subdirectory installs from recorded provenance. Returns the update output.
     *pinned_msg(install_record)* / *not_git_msg()* build the caller-specific error text."""
     metadata = _read_install_metadata()
     install_record = metadata.get(target.name, {})
     if install_record.get("pinned") is True:
         raise PluginOperationError(pinned_msg(install_record))
     if not (target / ".git").exists():
-        raise PluginOperationError(not_git_msg())
+        source = _read_install_source(target)
+        if source is None:
+            raise PluginOperationError(not_git_msg())
+        if before_pull is not None:
+            before_pull()
+        with tempfile.TemporaryDirectory() as backup_dir:
+            backup = Path(backup_dir) / "user-files"
+            _backup_user_plugin_files(target, source, backup)
+            _install_plugin_core(
+                source.identifier(), force=True, expected_target=target)
+            _restore_user_plugin_files(backup, target)
+        return "Reinstalled from recorded source."
     if before_pull is not None:
         before_pull()
     ok, output = _git_pull_plugin_dir(target)

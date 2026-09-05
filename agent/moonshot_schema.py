@@ -107,8 +107,10 @@ def _fill_missing_type(node: Dict[str, Any]) -> Dict[str, Any]:
     """
     node_type = node.get("type")
     if isinstance(node_type, list):
-        concrete = next((t for t in node_type if isinstance(t, str) and t not in {"", "null"}), "string")
-        return {**node, "type": concrete}
+        concrete = next((t for t in node_type if isinstance(t, str) and t not in {"", "null"}), None)
+        if concrete is not None:
+            return {**node, "type": concrete}
+        node = {key: value for key, value in node.items() if key != "type"}
     if "type" in node and node_type not in {None, ""}:
         return node
 

@@ -92,6 +92,12 @@ async function poll() {
   const anyRunning = $localRuntimeJobs.get().some(j => j.status === 'running')
 
   if (anyRunning) {
+    if (typeof window === 'undefined') {
+      polling = false
+      timer = null
+
+      return
+    }
     timer = window.setTimeout(() => void poll(), POLL_ACTIVE_MS)
   } else {
     polling = false
@@ -103,6 +109,9 @@ async function poll() {
 // Call after starting a job AND on app boot (to rediscover work started
 // before a reload).
 export function watchLocalRuntimeJobs() {
+  if (typeof window === 'undefined') {
+    return
+  }
   if (polling) {
     return
   }

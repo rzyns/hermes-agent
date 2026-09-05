@@ -21,6 +21,7 @@ from dataclasses import field
 from hermes_cli.sqlite_util import add_column_if_missing as _add_column_if_missing
 from pathlib import Path
 from typing import Any
+from typing import Callable
 from typing import Optional
 
 
@@ -1132,7 +1133,12 @@ def _execute_boundary_with_retry(conn: sqlite3.Connection, sql: str) -> None:
 
 
 @contextlib.contextmanager
-def write_txn(conn: sqlite3.Connection, *, allow_nested: bool = False):
+def write_txn(
+    conn: sqlite3.Connection,
+    *,
+    on_committed: Optional[Callable[[], None]] = None,
+    allow_nested: bool = False,
+):
     """IMMEDIATE write transaction; a claim CAS inside is atomic — at most one
     concurrent writer succeeds.
 
@@ -1150,6 +1156,12 @@ def write_txn(conn: sqlite3.Connection, *, allow_nested: bool = False):
                 "must opt in explicitly with write_txn(conn, allow_nested=True) "
                 "(savepoint semantics; the inner RELEASE is not durable until "
                 "the outer transaction commits)."
+            )
+        if on_committed is not None:
+            raise RuntimeError(
+                "write_txn: on_committed cannot be combined with allow_nested "
+                "savepoint composition -- the callback would fire before the "
+                "outer transaction is durable."
             )
         savepoint = f"hermes_nested_{secrets.token_hex(8)}"
         conn.execute(f"SAVEPOINT {savepoint}")
@@ -1189,3 +1201,8 @@ def write_txn(conn: sqlite3.Connection, *, allow_nested: bool = False):
 # Late-bound origin namespace (see module docstring); imported LAST so this
 # module is fully populated before ``kanban_db`` imports from it.
 from hermes_cli import kanban_db as _kb  # noqa: E402
+
+# Both import paths share one initialization cache.  Invalidating the facade's
+# cache must force the next extracted-module connection through its integrity
+# guard rather than being masked by a private second cache.
+_INITIALIZED_PATHS = _kb._INITIALIZED_PATHS

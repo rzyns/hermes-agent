@@ -2726,6 +2726,7 @@ _AGENT_COMMANDS = {None, "chat", "acp", "rl"}
 _AGENT_SUBCOMMANDS = {
     "cron": ("cron_command", {"run", "tick"}),
     "gateway": ("gateway_command", {"run"}),
+    "mcp": ("mcp_action", {"serve"}),
 }
 
 
@@ -3464,6 +3465,7 @@ import tempfile  # noqa: F401,E402
 
 _PLUGIN_COMPAT_LAZY = {
     'line_input': ('hermes_cli.cli_output', 'line_input'),
+    '_validate_critical_files_syntax': ('hermes_cli.update_cmd', '_validate_critical_files_syntax'),
 }
 
 _plugin_compat_prev_getattr = __getattr__

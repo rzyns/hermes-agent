@@ -446,6 +446,14 @@ def _close_agent(agent, session_db) -> None:
         memory_args = (session_messages,) if isinstance(session_messages, list) else ()
         _quietly("memory/context cleanup", lambda: agent.shutdown_memory_provider(*memory_args))
         _quietly("agent cleanup", lambda: agent.close())
+        _quietly(
+            "MCP cleanup",
+            lambda: __import__("tools.mcp_tool", fromlist=["shutdown_mcp_servers"]).shutdown_mcp_servers(),
+        )
+        _quietly(
+            "auxiliary cleanup",
+            lambda: __import__("agent.auxiliary_client", fromlist=["shutdown_cached_clients"]).shutdown_cached_clients(),
+        )
     # agent.close() ends the session but leaves the connection open; close it to checkpoint the WAL.
     if session_db is not None:
         _quietly("session store cleanup", lambda: session_db.close())

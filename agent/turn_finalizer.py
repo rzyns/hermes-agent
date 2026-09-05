@@ -67,19 +67,35 @@ def _record_kanban_budget_exhausted(
         )
         _conn = _kbc.connect()
         try:
-            _kbd._record_task_failure(
-                _conn,
-                kanban_task,
-                error=(
+            if hasattr(_conn, "execute"):
+                task = _kb.get_task(_conn, kanban_task)
+                status = getattr(task, "status", None)
+                if isinstance(status, str) and status != "running":
+                    return
+            failure_kwargs = {
+                "error": (
                     f"Iteration budget exhausted ({api_call_count}/{max_iterations}) — "
                     "task could not complete within the allowed iterations"
                 ),
-                outcome="timed_out",
-                release_claim=True,
-                end_run=True,
-                expected_run_id=expected_run_id,
-                event_payload_extra={"overhead_envelope": overhead_envelope},
-            )
+                "outcome": "timed_out",
+                "release_claim": True,
+                "end_run": True,
+                "expected_run_id": expected_run_id,
+                "event_payload_extra": {
+                    "budget_used": overhead_envelope["budget_used"],
+                    "budget_max": overhead_envelope["budget_max"],
+                    "overhead_envelope": overhead_envelope,
+                },
+            }
+            try:
+                _kbd._record_task_failure(_conn, kanban_task, **failure_kwargs)
+            except TypeError as exc:
+                # The extracted dispatcher temporarily lagged the monolithic
+                # DB's run-id guard. Keep both exports usable while converging.
+                if "expected_run_id" not in str(exc):
+                    raise
+                failure_kwargs.pop("expected_run_id")
+                _kbd._record_task_failure(_conn, kanban_task, **failure_kwargs)
         finally:
             with suppress(Exception):
                 _conn.close()
@@ -161,14 +177,17 @@ def notify_session_end_once(
     if key in seen:
         return False
     seen.add(key)
-    _invoke_hook_safely(
-        "on_session_end", logger,
+    hook_fields = dict(
         session_id=session_id, task_id=task, turn_id=turn,
         completed=completed, failed=failed, interrupted=interrupted,
         turn_exit_reason=turn_exit_reason,
-        model=getattr(agent, "model", None), provider=getattr(agent, "provider", None),
+        model=getattr(agent, "model", None),
         platform=getattr(agent, "platform", None) or "",
     )
+    provider = getattr(agent, "provider", None)
+    if provider is not None:
+        hook_fields["provider"] = provider
+    _invoke_hook_safely("on_session_end", logger, **hook_fields)
     return True
 
 
@@ -190,6 +209,11 @@ def _resolve_budget_fallback(
     preserved_verification_fallback)``."""
     budget_exhausted = (
         api_call_count >= agent.max_iterations or agent.iteration_budget.remaining <= 0
+    )
+    should_record_kanban_exhaustion = (
+        final_response is None
+        and budget_exhausted
+        and is_dispatcher_owned_worker_context()
     )
     preserved_verification_fallback = False
     if (
@@ -223,7 +247,7 @@ def _resolve_budget_fallback(
     # was eligible, so the dispatcher learns the worker could not complete.
     _kanban_task = (
         child_env_lookup("HERMES_KANBAN_TASK")
-        if budget_exhausted and is_dispatcher_owned_worker_context()
+        if should_record_kanban_exhaustion
         else None
     )
     # If running as a kanban worker, signal the dispatcher that the worker could not complete (rather than

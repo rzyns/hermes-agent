@@ -55,6 +55,8 @@ except ImportError:
             f"Install with: {sys.executable} -m pip install 'fastapi' 'uvicorn[standard]'"
         )
 
+from starlette.concurrency import run_in_threadpool
+
 WEB_DIST = Path(os.environ["HERMES_WEB_DIST"]) if "HERMES_WEB_DIST" in os.environ else Path(__file__).parent / "web_dist"
 _log = logging.getLogger(__name__)
 
@@ -396,7 +398,12 @@ _QUERY_TOKEN_API_PATHS: frozenset[str] = frozenset({"/api/files/download"})
 
 
 def _has_valid_query_token(request: Request, path: str) -> bool:
-    if path not in _QUERY_TOKEN_API_PATHS:
+    allowed = path in _QUERY_TOKEN_API_PATHS
+    # EventSource cannot attach the session-token header. Keep its query-token
+    # exception constrained to the dynamic run-events endpoint.
+    if path.startswith("/api/runs/") and path.endswith("/events"):
+        allowed = True
+    if not allowed:
         return False
     token = request.query_params.get("token", "")
     return bool(token) and hmac.compare_digest(token.encode(), _SESSION_TOKEN.encode())
@@ -415,6 +422,26 @@ def _require_token(request: Request) -> None:
         ok = getattr(request.state, "session", None) is not None
     else:
         ok = _has_valid_session_token(request)
+    if not ok:
+        raise HTTPException(status_code=401, detail="Unauthorized")
+
+
+def _require_token_or_query(request: Request) -> None:
+    """Authorize a dashboard request, allowing a query token for EventSource.
+
+    Native ``EventSource`` cannot attach the dashboard's session-token header,
+    so the run-events stream uses the same ephemeral token in ``?token=``.
+    Gated deployments continue to rely on the authenticated session cookie.
+    """
+    if getattr(request.app.state, "auth_required", False):
+        ok = getattr(request.state, "session", None) is not None
+    else:
+        ok = _has_valid_session_token(request)
+        if not ok:
+            token = request.query_params.get("token", "")
+            ok = bool(token) and hmac.compare_digest(
+                token.encode(), _SESSION_TOKEN.encode()
+            )
     if not ok:
         raise HTTPException(status_code=401, detail="Unauthorized")
 
@@ -927,6 +954,7 @@ from hermes_cli.web_routers import (  # noqa: E402
     messaging as _messaging_routes,
     oauth as _oauth_routes,
     cron as _cron_routes,
+    runs as _runs_routes,
     mcp as _mcp_routes,
     ops as _ops_routes,
     skills as _skills_routes,
@@ -935,6 +963,18 @@ from hermes_cli.web_routers import (  # noqa: E402
     chat_ws as _chat_ws_routes,
     dashboard_ui as _dashboard_ui_routes,
 )
+from hermes_cli import web_server_cron as _web_server_cron  # noqa: E402
+
+# Facade seams retained for callers and tests that predate the router split.
+# Route code late-binds the patch-sensitive threadpool seam back through this
+# module; the implementation itself remains owned by the extracted modules.
+_resolve_api_server_base_url = _runs_routes._resolve_api_server_base_url
+_resolve_api_server_key = _runs_routes._resolve_api_server_key
+_run_events_unavailable_bytes = _runs_routes._run_events_unavailable_bytes
+_run_events_unavailable_frame = _runs_routes._run_events_unavailable_frame
+_call_cron_for_profile = _web_server_cron._call_cron_for_profile
+_list_cron_jobs_sync = _cron_routes._list_cron_jobs_sync
+_list_profiles_endpoint_sync = _profiles_routes._list_profiles_endpoint_sync
 
 app.include_router(_files_routes.router)
 app.include_router(_git_routes.router)
@@ -954,6 +994,7 @@ app.include_router(_messaging_routes.router)
 app.include_router(_oauth_routes.router)
 app.include_router(_sessions_routes.manage_router)
 app.include_router(_status_routes.logs_router)
+app.include_router(_runs_routes.router)
 app.include_router(_cron_routes.router)
 app.include_router(_mcp_routes.router)
 app.include_router(_ops_routes.router)

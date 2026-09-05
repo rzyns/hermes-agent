@@ -33,6 +33,7 @@ class TraceState:
     trace_id: str
     root_ctx: Any
     root_span: Any
+    session_id: str = ""
     generations: Dict[str, Any] = field(default_factory=dict)
     tools: Dict[str, Any] = field(default_factory=dict)
     pending_tools_by_name: Dict[str, list] = field(default_factory=dict)
@@ -542,7 +543,7 @@ def _start_root_trace(task_key: str, *, task_id: str, session_id: str, platform:
         root_span.update_trace(input=trace_input)
 
     _debug(f"started trace {trace_id} for {task_key}")
-    return TraceState(trace_id=trace_id, root_ctx=root_ctx, root_span=root_span)
+    return TraceState(trace_id=trace_id, root_ctx=root_ctx, root_span=root_span, session_id=session_id)
 
 
 def _start_child_observation(state: TraceState, *, name: str, as_type: str, input_value: Any,
@@ -902,6 +903,33 @@ def on_api_request_error(*, task_id: str = "", session_id: str = "", api_call_co
         _finish_trace(task_key, output={"error": error_metadata})
     else:
         state.last_updated_at = time.time()
+
+
+def on_session_end(
+    *,
+    session_id: str = "",
+    completed: Any = None,
+    interrupted: Any = None,
+    model: str = "",
+    platform: str = "",
+    **_: Any,
+) -> None:
+    """Close abnormal-exit traces for one session without touching unrelated sessions."""
+    with _STATE_LOCK:
+        keys = [
+            key
+            for key, state in _TRACE_STATE.items()
+            if not session_id or state.session_id == session_id
+        ]
+    output = {
+        "finalized_by": "on_session_end",
+        "completed": completed,
+        "interrupted": interrupted,
+        "model": model,
+        "platform": platform,
+    }
+    for key in keys:
+        _finish_trace(key, output=output)
 
 
 def on_session_finalize(*, session_id: str = "", reason: str = "", **_: Any) -> None:

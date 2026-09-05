@@ -86,8 +86,7 @@ class MCPServerRunMixin:
                     if self._rpc_lock.locked() or any(not t.done() for t in self._inflight_tasks):
                         continue
                     try:
-                        async with self._rpc_lock:
-                            await self._keepalive_probe()
+                        await self._keepalive_probe()
                     except Exception as exc:
                         root = _errors._unwrap_exception_group(exc)
                         logger.warning("MCP server '%s' keepalive failed, triggering reconnect (state: connected → "

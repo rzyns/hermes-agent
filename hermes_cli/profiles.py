@@ -437,6 +437,11 @@ def build_alias_map() -> dict[str, str]:
     return result
 
 
+def _profile_alias_map() -> dict[str, str]:
+    """Backward-compatible private alias for the single-pass alias map."""
+    return build_alias_map()
+
+
 # ProfileInfo
 
 @dataclass
@@ -693,7 +698,7 @@ def list_profiles() -> List[ProfileInfo]:
         profiles.append(_profile_info("default", default_home, is_default=True))
     named = _iter_named_profile_dirs()
     if named:
-        alias_map = build_alias_map()  # ONCE, not per profile (was the dominant cost)
+        alias_map = _profile_alias_map()  # ONCE, not per profile (was the dominant cost)
         for entry in named:
             alias_name = alias_map.get(normalize_profile_name(entry.name))
             profiles.append(_profile_info(entry.name, entry, is_default=False, alias_name=alias_name))

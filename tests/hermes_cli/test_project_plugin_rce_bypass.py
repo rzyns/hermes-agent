@@ -142,7 +142,7 @@ class TestApiPathSanitizer:
         d = self._dashboard_dir(tmp_path)
         (d / "backend").mkdir()
         (d / "backend" / "routes.py").write_text("router = None\n")
-        out = web_server._safe_plugin_api_relpath(
+        out = _web_server_dashboard._safe_plugin_api_relpath(
             "backend/routes.py", dashboard_dir=d
         )
         assert out == "backend/routes.py"
@@ -155,7 +155,7 @@ class TestApiPathSanitizer:
     ])
     def test_absolute_path_rejected(self, tmp_path, payload):
         d = self._dashboard_dir(tmp_path)
-        assert web_server._safe_plugin_api_relpath(payload, dashboard_dir=d) is None
+        assert _web_server_dashboard._safe_plugin_api_relpath(payload, dashboard_dir=d) is None
 
     @pytest.mark.parametrize("payload", [
         "../../../etc/passwd",
@@ -170,7 +170,7 @@ class TestApiPathSanitizer:
     @pytest.mark.parametrize("payload", [None, "", "   ", 42, [], {}])
     def test_non_string_or_empty_rejected(self, tmp_path, payload):
         d = self._dashboard_dir(tmp_path)
-        assert web_server._safe_plugin_api_relpath(payload, dashboard_dir=d) is None
+        assert _web_server_dashboard._safe_plugin_api_relpath(payload, dashboard_dir=d) is None
 
 
 # ---------------------------------------------------------------------------
@@ -415,7 +415,7 @@ class TestMountApiRoutesRefusesUntrusted:
         )
         with patch("importlib.util.spec_from_file_location") as spec:
             spec.return_value = None  # loader is None -> early continue, safe
-            web_server._mount_plugin_api_routes()
+            _web_server_dashboard._mount_plugin_api_routes()
         assert spec.call_count == 1
         called_path = Path(spec.call_args.args[1])
         assert called_path.name == "api.py"
@@ -426,7 +426,7 @@ class TestMountApiRoutesRefusesUntrusted:
         web_server._dashboard_plugins_cache = [plugin]
         with patch("importlib.util.spec_from_file_location") as spec:
             spec.return_value = None  # loader is None -> early continue, safe
-            web_server._mount_plugin_api_routes()
+            _web_server_dashboard._mount_plugin_api_routes()
         assert spec.call_count == 1
         # First positional arg after module_name is the resolved api path.
         called_path = Path(spec.call_args.args[1])

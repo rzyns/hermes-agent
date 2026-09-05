@@ -13,6 +13,8 @@ from dataclasses import dataclass
 from typing import Any, Callable, Dict, Optional
 from urllib.parse import urlparse
 
+from agent.delegation_context import child_env_lookup
+
 logger = logging.getLogger(__name__)
 
 from hermes_cli import auth as auth_mod
@@ -122,6 +124,11 @@ def _detect_api_mode_for_url(base_url: str) -> Optional[str]:
     if mandated:
         return mandated
     path = urlparse(normalized).path.rstrip("/")
+    # MiniMax's direct APIs also expose an OpenAI-compatible /v1 endpoint.
+    # Keep explicit regional/direct endpoint overrides on that wire shape even
+    # though the provider overlay defaults to the native /anthropic transport.
+    if hostname in {"api.minimax.chat", "api.minimaxi.com"} and path.endswith("/v1"):
+        return "chat_completions"
     if path.endswith(("/anthropic", "/anthropic/v1")) or (hostname == "api.kimi.com" and "/coding" in normalized):
         # Direct native Anthropic host: realign with providers.determine_api_mode, which already maps this
         # host to anthropic_messages. The exact-hostname match rejects lookalike subdomains
@@ -397,7 +404,7 @@ def resolve_requested_provider(requested: Optional[str] = None) -> str:
     cfg_provider = _get_model_config().get("provider")
     if isinstance(cfg_provider, str) and cfg_provider.strip():
         return cfg_provider.strip().lower()
-    return _getenv("HERMES_INFERENCE_PROVIDER", "").strip().lower() or "auto"
+    return child_env_lookup("HERMES_INFERENCE_PROVIDER", "").strip().lower() or "auto"
 
 
 # ── extracted collaborators (re-exported; see module docstring) ────────────────────────────
@@ -409,9 +416,10 @@ from hermes_cli.runtime_provider_custom import (  # noqa: E402,F401
     _try_resolve_from_custom_pool, canonical_custom_identity, find_custom_provider_identity,
     find_custom_provider_identity_by_model, has_named_custom_provider, is_routable_provider,
 )
-from hermes_cli.runtime_provider_backends import (  # noqa: E402,F401
+from hermes_cli.runtime_provider_backends import (
     _is_external_process_provider, _resolve_azure_foundry_runtime, _resolve_bedrock_runtime,
-    _resolve_external_process_runtime, _resolve_openrouter_runtime,
+    _resolve_external_process_runtime, _resolve_external_provider_factory_runtime,
+    _resolve_openrouter_runtime,
 )
 
 
@@ -500,8 +508,15 @@ def _refresh_nous_pool_entry(pool: CredentialPool, entry: Any, pool_api_key: str
 def _resolve_from_pool(provider: str, requested_provider: str, model_cfg: Dict[str, Any], explicit_api_key, explicit_base_url,
                        target_model) -> Optional[Dict[str, Any]]:
     """Runtime from the provider's credential pool, or None to continue down the ladder."""
-    should_use_pool = provider != "openrouter" or _openrouter_should_use_pool(requested_provider, model_cfg, explicit_api_key,
-                                                                             explicit_base_url)
+    # MiniMax OAuth access tokens are refreshed by its dedicated runtime
+    # resolver. A pool entry may contain the pre-refresh token, so it must not
+    # preempt that resolver.
+    should_use_pool = provider not in {"openrouter", "minimax-oauth"} or (
+        provider == "openrouter"
+        and _openrouter_should_use_pool(
+            requested_provider, model_cfg, explicit_api_key, explicit_base_url
+        )
+    )
     try:
         pool = load_pool(provider) if should_use_pool else None
     except Exception:
@@ -827,6 +842,9 @@ def resolve_runtime_provider(*, requested: Optional[str] = None, explicit_api_ke
     OpenCode Zen/Go where different models route through different API surfaces)."""
     requested_provider = resolve_requested_provider(requested)
     _raise_if_provider_disabled(requested_provider)
+    external_runtime = _resolve_external_provider_factory_runtime(requested_provider)
+    if external_runtime is not None:
+        return external_runtime
     return next(r for r in _ladder_rungs(requested_provider, explicit_api_key, explicit_base_url, target_model) if r)
 
 

@@ -406,6 +406,15 @@ def _run_job_script(
         return False, f"Script execution failed: {exc}"
 
 
+_ORIGINAL_RUN_JOB_SCRIPT = _run_job_script
+
+
+def _active_run_job_script():
+    """Honor monkeypatches on either the legacy scheduler or split module."""
+    scheduler_value = getattr(_sched, "_run_job_script", _ORIGINAL_RUN_JOB_SCRIPT)
+    return scheduler_value if scheduler_value is not _ORIGINAL_RUN_JOB_SCRIPT else _run_job_script
+
+
 def _start_heartbeat_thread(loop_fn, name: str, fail_log) -> Optional[threading.Thread]:
     """Start ``loop_fn`` on a daemon thread inside a copy of the current context (multiplexed
     profile ContextVars). On failure calls ``fail_log()`` inside the except (traceback intact) and
@@ -432,7 +441,7 @@ def _run_job_script_with_claim_heartbeat(
     claim = job.get("run_claim")
     owner = str(claim.get("by") or "") if isinstance(claim, dict) else ""
     if not (isinstance(schedule, dict) and schedule.get("kind") == "once" and owner):
-        return _run_job_script(script_path, workdir=workdir, cancel_event=cancel_event)
+        return _active_run_job_script()(script_path, workdir=workdir, cancel_event=cancel_event)
 
     job_id = str(job.get("id") or "")
     stop = threading.Event()
@@ -450,10 +459,10 @@ def _run_job_script_with_claim_heartbeat(
             "Job '%s': could not start script run_claim heartbeat", job_id, exc_info=True),
     )
     if heartbeat_thread is None:
-        return _run_job_script(script_path, workdir=workdir, cancel_event=cancel_event)
+        return _active_run_job_script()(script_path, workdir=workdir, cancel_event=cancel_event)
 
     try:
-        return _run_job_script(script_path, workdir=workdir, cancel_event=cancel_event)
+        return _active_run_job_script()(script_path, workdir=workdir, cancel_event=cancel_event)
     finally:
         stop.set()
         # Bounded join: the heartbeat may be blocked on another process's jobs-file lock.
