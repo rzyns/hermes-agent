@@ -1321,6 +1321,42 @@ class _CodexStreamGuard:
             _close_quietly(self._client, "owner-thread close after timeout failed")
 
 
+def _completion_to_chat_stream_chunks(completion: Any) -> List[Any]:
+    """Convert a collected chat completion into the stream shape callers requested."""
+    choices = getattr(completion, "choices", None) or []
+    if not choices:
+        return []
+    choice = choices[0]
+    message = getattr(choice, "message", None)
+    tool_call_deltas = None
+    if message is not None and getattr(message, "tool_calls", None):
+        tool_call_deltas = []
+        for index, tool_call in enumerate(message.tool_calls):
+            function = getattr(tool_call, "function", None)
+            tool_call_deltas.append(SimpleNamespace(
+                index=index, id=getattr(tool_call, "id", None),
+                type=getattr(tool_call, "type", None) or "function",
+                function=SimpleNamespace(
+                    name=getattr(function, "name", None),
+                    arguments=getattr(function, "arguments", None),
+                ),
+            ))
+    delta = SimpleNamespace(
+        role=getattr(message, "role", "assistant") if message is not None else "assistant",
+        content=getattr(message, "content", None) if message is not None else None,
+        tool_calls=tool_call_deltas,
+    )
+    stream_choice = SimpleNamespace(
+        index=getattr(choice, "index", 0), delta=delta,
+        finish_reason=getattr(choice, "finish_reason", None),
+    )
+    return [SimpleNamespace(
+        id=getattr(completion, "id", None), object="chat.completion.chunk",
+        created=getattr(completion, "created", None), model=getattr(completion, "model", None),
+        choices=[stream_choice], usage=getattr(completion, "usage", None),
+    )]
+
+
 class _CodexCompletionsAdapter:
     """Drop-in shim routing chat.completions.create() kwargs through Codex Responses streaming."""
 
@@ -1495,7 +1531,10 @@ class _CodexCompletionsAdapter:
         choice = SimpleNamespace(
             index=0, message=message, finish_reason="stop" if not tool_calls_raw else "tool_calls"
         )
-        return SimpleNamespace(choices=[choice], model=model, usage=usage)
+        completion = SimpleNamespace(choices=[choice], model=model, usage=usage)
+        if kwargs.get("stream"):
+            return _completion_to_chat_stream_chunks(completion)
+        return completion
 
 
 class _ChatShim:
@@ -4173,6 +4212,72 @@ def _effective_provider_for_client(client: Any, fallback: str) -> str:
 # client (auth, base URL, headers, API format) from (provider, model). Never read auth env vars ad-hoc.
 
 
+class _AsyncSyncIterator:
+    """Expose a blocking iterator through the async-iterator protocol."""
+    _DONE = object()
+
+    def __init__(self, iterator: Any):
+        self._iterator = iter(iterator)
+
+    def __aiter__(self):
+        return self
+
+    async def __anext__(self):
+        import asyncio
+
+        def _next_or_done():
+            try:
+                return next(self._iterator)
+            except StopIteration:
+                return self._DONE
+
+        item = await asyncio.to_thread(_next_or_done)
+        if item is self._DONE:
+            raise StopAsyncIteration
+        return item
+
+
+class _AsyncExternalCompletionsAdapter:
+    """Run plugin-owned synchronous completions off the event loop."""
+
+    def __init__(self, sync_completions: Any):
+        self._sync = sync_completions
+
+    async def create(self, **kwargs: Any) -> Any:
+        import asyncio
+        result = await asyncio.to_thread(self._sync.create, **kwargs)
+        if kwargs.get("stream") and not hasattr(result, "choices") and hasattr(result, "__iter__"):
+            return _AsyncSyncIterator(result)
+        return result
+
+
+class _AsyncExternalProviderClient:
+    """Async facade for a provider factory that returned a synchronous client."""
+
+    def __init__(self, sync_client: Any):
+        self._sync_client = sync_client
+        self.api_key = getattr(sync_client, "api_key", None)
+        self.base_url = getattr(sync_client, "base_url", None)
+        self.chat = SimpleNamespace(
+            completions=_AsyncExternalCompletionsAdapter(sync_client.chat.completions),
+        )
+
+    def close(self) -> None:
+        close_fn = getattr(self._sync_client, "close", None)
+        if callable(close_fn) and not inspect.iscoroutinefunction(close_fn):
+            close_fn()
+
+
+def _to_async_external_client(sync_client: Any, model: Optional[str]) -> Tuple[Any, Optional[str]]:
+    """Preserve native async plugin clients; bridge synchronous ones safely."""
+    create_fn = getattr(
+        getattr(getattr(sync_client, "chat", None), "completions", None), "create", None,
+    )
+    if inspect.iscoroutinefunction(create_fn):
+        return sync_client, model
+    return _AsyncExternalProviderClient(sync_client), model
+
+
 def _to_async_client(sync_client, model: str, is_vision: bool = False):
     """Sync client → async counterpart, preserving Codex routing (``is_vision`` adds the Copilot vision header)."""
     from openai import AsyncOpenAI
@@ -4678,6 +4783,32 @@ def _resolve_api_key_branch(req: _ResolveRequest, pconfig: Any, resolve_creds: C
     return _route_client(req, client, final_model)
 
 
+def _resolve_minimax_oauth_branch(req: _ResolveRequest) -> _ResolveResult:
+    """MiniMax OAuth uses refreshed runtime credentials on the Anthropic Messages wire."""
+    try:
+        from agent.anthropic_adapter import build_anthropic_client
+        from hermes_cli.auth import resolve_minimax_oauth_runtime_credentials
+
+        creds = resolve_minimax_oauth_runtime_credentials()
+        api_key = str(creds.get("api_key", "")).strip()
+        base_url = str(creds.get("base_url", "")).strip().rstrip("/")
+        if not api_key or not base_url:
+            logger.warning(
+                "resolve_provider_client: minimax-oauth credentials are incomplete "
+                "(run: hermes auth add minimax-oauth)"
+            )
+            return None, None
+        default_model = _get_aux_model_for_provider(req.provider) or "MiniMax-M2.7-highspeed"
+        final_model = _normalize_resolved_model(req.model or default_model, req.provider) or default_model
+        real_client = build_anthropic_client(api_key, base_url)
+        client = AnthropicAuxiliaryClient(real_client, final_model, api_key, base_url, is_oauth=True)
+        logger.debug("resolve_provider_client: %s (%s)", req.provider, final_model)
+        return _route_client(req, client, final_model)
+    except Exception as exc:
+        logger.warning("resolve_provider_client: minimax-oauth runtime credentials failed: %s", exc)
+        return None, None
+
+
 def _resolve_external_process_branch(req: _ResolveRequest, creds: Dict[str, Any]) -> _ResolveResult:
     """PROVIDER_REGISTRY ``external_process`` providers, served via their registered profile."""
     provider = req.provider
@@ -4735,6 +4866,8 @@ def _resolve_registry_branch(req: _ResolveRequest) -> _ResolveResult:
                         "resolve_provider_client: unknown provider %r", provider)
         return None, None
     auth_type = pconfig.auth_type
+    if auth_type == "oauth_minimax":
+        return _resolve_minimax_oauth_branch(req)
     if auth_type == "api_key":
         return _resolve_api_key_branch(req, pconfig, resolve_api_key_provider_credentials)
     if auth_type == "external_process":
@@ -4786,6 +4919,57 @@ def resolve_provider_client(
     # Keep the pre-alias name so a custom_providers entry named like a built-in alias
     # (e.g. "kimi" → "kimi-coding") is still reachable via the named-custom branch.
     original_provider = (provider or "").strip().lower()
+    # External-process plugins own their aliases and transport. Resolve that identity before
+    # bundled alias normalization (notably ``claude-code`` -> ``anthropic``).
+    from providers import (
+        ExternalProviderClientUnavailableError,
+        get_provider_client_factory,
+        resolve_provider_profile,
+    )
+    external_profile = resolve_provider_profile(original_provider, base_url=explicit_base_url)
+    if external_profile is not None and external_profile.auth_type == "external_process":
+        try:
+            from hermes_cli.config import is_provider_enabled, load_config_readonly
+            full_cfg = load_config_readonly()
+            providers_cfg = full_cfg.get("providers") if isinstance(full_cfg, dict) else None
+            if isinstance(providers_cfg, dict):
+                for provider_name in dict.fromkeys((original_provider, external_profile.name)):
+                    provider_cfg = providers_cfg.get(provider_name)
+                    if isinstance(provider_cfg, dict) and not is_provider_enabled(provider_cfg):
+                        raise ValueError(
+                            f"provider {provider_name!r} is disabled in config "
+                            f"(providers.{provider_name}.enabled: false)"
+                        )
+        except ImportError:
+            pass
+        client_factory = get_provider_client_factory(original_provider, base_url=explicit_base_url)
+        if client_factory is None:
+            raise ExternalProviderClientUnavailableError(
+                f"External-process provider '{external_profile.name}' was selected, but its "
+                "client factory is not available. Reinstall or repair the provider plugin."
+            )
+        external_base_url = str(explicit_base_url or external_profile.base_url or "").strip().rstrip("/")
+        if not external_base_url:
+            raise ExternalProviderClientUnavailableError(
+                f"External-process provider '{external_profile.name}' has no base URL."
+            )
+        external_api_key = (
+            str(explicit_api_key or "").strip()
+            or f"{external_profile.name}-external-process"
+        )
+        final_model = _normalize_resolved_model(
+            model or _get_aux_model_for_provider(external_profile.name) or _read_main_model_for_aux(),
+            external_profile.name,
+        )
+        client = client_factory(api_key=external_api_key, base_url=external_base_url)
+        if client is None:
+            raise ExternalProviderClientUnavailableError(
+                f"External-process provider '{external_profile.name}' client factory returned no client. "
+                "Reinstall or repair the provider plugin."
+            )
+        logger.debug("resolve_provider_client: external provider factory %s (%s)",
+                     external_profile.name, final_model)
+        return _to_async_external_client(client, final_model) if async_mode else (client, final_model)
     provider = _normalize_aux_provider(provider)
     # MoA chokepoint: "moa" is not an HTTP provider; resolve to the aggregator so direct callers don't
     # dead-end in unknown-provider. Unresolvable preset → leave untouched for the normal diagnostic.
@@ -5847,6 +6031,8 @@ def _dedupe_tool_names(tools: list, provider: str, model: str) -> list:
     seen: set = set()
     deduped: list = []
     for tool in tools:
+        if isinstance(tool, dict) and not str(tool.get("type") or "").strip():
+            tool = {**tool, "type": "function"}
         name = (tool.get("function") or {}).get("name", "")
         if name and name in seen:
             logger.warning("_build_call_kwargs: duplicate tool name '%s' removed (provider=%s model=%s)", name, provider, model)
