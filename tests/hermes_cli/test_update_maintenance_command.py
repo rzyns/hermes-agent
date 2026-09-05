@@ -46,6 +46,11 @@ def test_update_maintenance_runs_shared_pipeline_without_source_reconciliation(
     )
 
     monkeypatch.setattr(
+        update_cmd,
+        "_invalidate_update_cache",
+        lambda: calls.append(("invalidate",)),
+    )
+    monkeypatch.setattr(
         update_cmd._m(),
         "_install_hangup_protection",
         lambda gateway_mode=False: output_state,
@@ -100,11 +105,12 @@ def test_update_maintenance_runs_shared_pipeline_without_source_reconciliation(
 
     args.func(args)
 
-    maintenance = calls[0]
+    assert calls[0] == ("invalidate",)
+    maintenance = calls[1]
     assert maintenance[:5] == ("maintenance", ["git"], "main", None, opts)
     assert maintenance[5]["source_updated"] is False
     assert maintenance[5]["expected_sha"] == "abc123"
-    assert calls[1:] == [
+    assert calls[2:] == [
         ("receipt", 0, "completed at command boundary"),
         ("finalize", output_state),
     ]

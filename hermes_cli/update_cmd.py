@@ -1245,6 +1245,9 @@ def _apply_pulled_update(
 
 def _run_update_maintenance(args, *, gateway_mode: bool = False) -> None:
     """Run the complete post-source-update pipeline without mutating git state."""
+    # Source was reconciled by an external updater, so every profile's cached
+    # ahead/behind result describes the old HEAD and must be discarded.
+    _invalidate_update_cache()
     opts = _resolve_update_options(args, gateway_mode)
     print("⚕ Running Hermes update maintenance...")
     print()
