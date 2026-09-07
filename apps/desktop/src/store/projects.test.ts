@@ -194,11 +194,13 @@ describe('all-profile tree request overlap', () => {
 
   const payload = (id: string) => ({
     projects: [{ id, label: id, path: '/repo', repos: [], sessionCount: 0 }],
-    active_id: id, scoped_session_ids: []
+    active_id: id,
+    scoped_session_ids: []
   })
 
   it.each(['gateway', 'activation', 'scope round trip', 'profile round trip'])(
-    'does not share or publish the previous flight after a %s switch', async switchKind => {
+    'does not share or publish the previous flight after a %s switch',
+    async switchKind => {
       const old = deferred<unknown>()
       const fresh = deferred<unknown>()
       vi.mocked(hermes.hermesApi).mockReturnValueOnce(old.promise).mockReturnValueOnce(fresh.promise)
@@ -258,12 +260,17 @@ describe('all-profile tree request overlap', () => {
     const old = deferred<unknown>()
     const fresh = deferred<unknown>()
     const started = deferred<void>()
-    vi.mocked(hermes.hermesApi).mockReturnValueOnce(old.promise).mockImplementationOnce(() => {
-      started.resolve()
+    vi.mocked(hermes.hermesApi)
+      .mockReturnValueOnce(old.promise)
+      .mockImplementationOnce(() => {
+        started.resolve()
 
-      return fresh.promise
-    })
-    activeGateway.mockReturnValue({ connectionState: 'open', request: vi.fn().mockResolvedValue({ cwd: '/repo' }) } as never)
+        return fresh.promise
+      })
+    activeGateway.mockReturnValue({
+      connectionState: 'open',
+      request: vi.fn().mockResolvedValue({ cwd: '/repo' })
+    } as never)
     $projectTree.set(payload('target').projects)
     const pendingOld = refreshProjectTree()
     await Promise.all(Array.from({ length: 8 }, () => moveSessionToProject('session', 'target')))
@@ -284,7 +291,8 @@ describe('all-profile tree request overlap', () => {
   })
 
   it.each(['queued before timeout', 'started after timeout'])(
-    'preserves mutation freshness when %s while the backend scan may still run', async timing => {
+    'preserves mutation freshness when %s while the backend scan may still run',
+    async timing => {
       const old = deferred<unknown>()
       const fresh = deferred<unknown>()
 
@@ -292,9 +300,7 @@ describe('all-profile tree request overlap', () => {
 
       const pendingOld = refreshProjectTree()
 
-      const queued = timing === 'queued before timeout'
-        ? refreshProjectTree({ afterMutation: true })
-        : null
+      const queued = timing === 'queued before timeout' ? refreshProjectTree({ afterMutation: true }) : null
 
       old.reject(new Error('HTTP request timed out'))
       await pendingOld
@@ -334,7 +340,8 @@ describe('all-profile tree request overlap', () => {
     const calls = vi.mocked(hermes.hermesApi).mock.calls.length
     response.resolve({
       projects: [{ id: 'burst', label: 'Burst', path: null, repos: [], sessionCount: 0 }],
-      active_id: 'burst', scoped_session_ids: []
+      active_id: 'burst',
+      scoped_session_ids: []
     })
     await Promise.all(pending)
 
