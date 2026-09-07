@@ -12,12 +12,14 @@ import {
   $projectScope,
   $projectsRpcAvailable,
   $projectTree,
+  $projectTreeLoading,
   $worktreeRefreshToken,
   ALL_PROJECTS,
   createProject,
   enterProject,
   exitProjectScope,
   fetchProjectSessions,
+  moveSessionToProject,
   openProjectCreate,
   pickProjectFolder,
   projectIdForCwd,
@@ -55,7 +57,8 @@ vi.mock('@/lib/desktop-fs', () => ({
 vi.mock('@/store/gateway', () => ({
   $gateway: atom(null),
   activeGateway: vi.fn(),
-  ensureActiveGatewayOpen: vi.fn()
+  ensureActiveGatewayOpen: vi.fn(),
+  gatewayActivationEpoch: vi.fn(() => 0)
 }))
 
 vi.mock('@/lib/desktop-git', async importOriginal => ({
@@ -90,12 +93,14 @@ const notify = vi.mocked(notifications.notify)
 
 function deferred<T>() {
   let resolve!: (value: T) => void
+  let reject!: (reason: unknown) => void
 
-  const promise = new Promise<T>(done => {
+  const promise = new Promise<T>((done, fail) => {
     resolve = done
+    reject = fail
   })
 
-  return { promise, resolve }
+  return { promise, resolve, reject }
 }
 
 describe('project scope', () => {
@@ -173,6 +178,169 @@ describe('projects RPC profile forwarding', () => {
 
     expect(request).not.toHaveBeenCalled()
     setShowAllProfiles(false)
+  })
+})
+
+describe('all-profile tree request overlap', () => {
+  beforeEach(() => {
+    vi.clearAllMocks()
+    vi.mocked(hermes.hermesApi).mockReset()
+    setShowAllProfiles(true)
+    $projectTree.set([])
+    activeGateway.mockReturnValue({ connectionState: 'open', request: vi.fn() } as never)
+  })
+
+  afterEach(() => setShowAllProfiles(false))
+
+  const payload = (id: string) => ({
+    projects: [{ id, label: id, path: '/repo', repos: [], sessionCount: 0 }],
+    active_id: id, scoped_session_ids: []
+  })
+
+  it.each(['gateway', 'activation', 'scope round trip', 'profile round trip'])(
+    'does not share or publish the previous flight after a %s switch', async switchKind => {
+      const old = deferred<unknown>()
+      const fresh = deferred<unknown>()
+      vi.mocked(hermes.hermesApi).mockReturnValueOnce(old.promise).mockReturnValueOnce(fresh.promise)
+      const pendingOld = refreshProjectTree()
+
+      if (switchKind === 'gateway') {
+        activeGateway.mockReturnValue({ connectionState: 'open', request: vi.fn() } as never)
+      } else if (switchKind === 'activation') {
+        vi.mocked(gw.gatewayActivationEpoch).mockReturnValue(gw.gatewayActivationEpoch() + 1)
+      } else if (switchKind === 'scope round trip') {
+        setShowAllProfiles(false)
+        setShowAllProfiles(true)
+      } else {
+        const profile = $activeGatewayProfile.get()
+        $activeGatewayProfile.set('other')
+        $activeGatewayProfile.set(profile)
+      }
+
+      const pendingFresh = refreshProjectTree()
+      const calls = vi.mocked(hermes.hermesApi).mock.calls.length
+      old.resolve(payload('old'))
+      await pendingOld
+      const interimTree = $projectTree.get()
+      const interimLoading = $projectTreeLoading.get()
+      fresh.resolve(payload('fresh'))
+      await pendingFresh
+
+      expect(calls).toBe(2)
+      expect(interimTree).toEqual([])
+      expect(interimLoading).toBe(true)
+      expect($projectTree.get()).toEqual(payload('fresh').projects)
+      expect($projectTreeLoading.get()).toBe(false)
+    }
+  )
+
+  it('ignores stale failures and does not clear a newer loading state', async () => {
+    const old = deferred<unknown>()
+    const fresh = deferred<unknown>()
+    vi.mocked(hermes.hermesApi).mockReturnValueOnce(old.promise).mockReturnValueOnce(fresh.promise)
+    $projectsRpcAvailable.set(null)
+    const pendingOld = refreshProjectTree()
+    vi.mocked(gw.gatewayActivationEpoch).mockReturnValue(gw.gatewayActivationEpoch() + 1)
+    const pendingFresh = refreshProjectTree()
+    old.reject(new Error('unknown method: projects.tree'))
+    await pendingOld
+    const interimCapability = $projectsRpcAvailable.get()
+    const interimLoading = $projectTreeLoading.get()
+    fresh.resolve(payload('fresh'))
+    await pendingFresh
+
+    expect(interimCapability).toBeNull()
+    expect(interimLoading).toBe(true)
+    expect($projectsRpcAvailable.get()).toBe(true)
+  })
+
+  it('queues one post-mutation read for overlapping moves, not for ordinary joiners', async () => {
+    const old = deferred<unknown>()
+    const fresh = deferred<unknown>()
+    const started = deferred<void>()
+    vi.mocked(hermes.hermesApi).mockReturnValueOnce(old.promise).mockImplementationOnce(() => {
+      started.resolve()
+
+      return fresh.promise
+    })
+    activeGateway.mockReturnValue({ connectionState: 'open', request: vi.fn().mockResolvedValue({ cwd: '/repo' }) } as never)
+    $projectTree.set(payload('target').projects)
+    const pendingOld = refreshProjectTree()
+    await Promise.all(Array.from({ length: 8 }, () => moveSessionToProject('session', 'target')))
+    expect(hermes.hermesApi).toHaveBeenCalledTimes(1)
+    old.resolve(payload('before-move'))
+    await pendingOld
+    // Bounded synchronization: the trailing read must have started by the time
+    // the old read's callers settle; do not hang waiting for a missing request.
+    expect(hermes.hermesApi).toHaveBeenCalledTimes(2)
+    await started.promise
+    const joiners = Array.from({ length: 40 }, () => refreshProjectTree())
+    fresh.resolve(payload('after-move'))
+    await Promise.all(joiners)
+
+    expect($projectTree.get()).toEqual(payload('after-move').projects)
+    expect(hermes.hermesApi).toHaveBeenCalledTimes(2)
+    expect($projectTreeLoading.get()).toBe(false)
+  })
+
+  it.each(['queued before timeout', 'started after timeout'])(
+    'preserves mutation freshness when %s while the backend scan may still run', async timing => {
+      const old = deferred<unknown>()
+      const fresh = deferred<unknown>()
+
+      vi.mocked(hermes.hermesApi).mockReturnValueOnce(old.promise).mockReturnValueOnce(fresh.promise)
+
+      const pendingOld = refreshProjectTree()
+
+      const queued = timing === 'queued before timeout'
+        ? refreshProjectTree({ afterMutation: true })
+        : null
+
+      old.reject(new Error('HTTP request timed out'))
+      await pendingOld
+      const pendingFresh = queued ?? refreshProjectTree({ afterMutation: true })
+      const joiners = Array.from({ length: 40 }, () => refreshProjectTree())
+      const paths = vi.mocked(hermes.hermesApi).mock.calls.map(([options]) => options.path)
+      fresh.resolve(payload('after-mutation'))
+      await Promise.all([pendingFresh, ...joiners])
+
+      expect(paths).toHaveLength(2)
+      expect(new URL(paths[0], 'http://test').searchParams.has('after_mutation')).toBe(false)
+      expect(new URL(paths[1], 'http://test').searchParams.get('after_mutation')).toBe('true')
+      expect($projectTree.get()).toEqual(payload('after-mutation').projects)
+      expect(hermes.hermesApi).toHaveBeenCalledTimes(2)
+    }
+  )
+
+  it('releases a failed flight so a later refresh can retry', async () => {
+    const failed = deferred<unknown>()
+    vi.mocked(hermes.hermesApi).mockReturnValueOnce(failed.promise).mockResolvedValueOnce(payload('retry'))
+    $projectsRpcAvailable.set(null)
+    const pending = [refreshProjectTree(), refreshProjectTree()]
+    failed.reject(new Error('unknown method: projects.tree'))
+    await Promise.all(pending)
+    expect($projectTreeLoading.get()).toBe(false)
+    expect($projectsRpcAvailable.get()).toBe(false)
+    await refreshProjectTree()
+    expect(hermes.hermesApi).toHaveBeenCalledTimes(2)
+    expect($projectTree.get()).toEqual(payload('retry').projects)
+    expect($projectsRpcAvailable.get()).toBe(true)
+  })
+
+  it('shares one pending REST read across a burst and publishes its result for all waiters', async () => {
+    const response = deferred<unknown>()
+    vi.mocked(hermes.hermesApi).mockReturnValue(response.promise)
+    const pending = Array.from({ length: 40 }, () => refreshProjectTree())
+    const calls = vi.mocked(hermes.hermesApi).mock.calls.length
+    response.resolve({
+      projects: [{ id: 'burst', label: 'Burst', path: null, repos: [], sessionCount: 0 }],
+      active_id: 'burst', scoped_session_ids: []
+    })
+    await Promise.all(pending)
+
+    expect(calls).toBe(1)
+    expect($projectTree.get().map(project => project.id)).toEqual(['burst'])
+    expect(hermes.hermesApi).toHaveBeenCalledTimes(1)
   })
 })
 

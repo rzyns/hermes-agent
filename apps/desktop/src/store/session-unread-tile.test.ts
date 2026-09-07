@@ -4,6 +4,14 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 // one. A tile is never $selectedStoredSessionId, so keying either half on the
 // selection left a tiled session's dot green with no way to clear it.
 
+// Keep the real state factory, but do not load its unrelated transcript renderer
+// (image zoom, media and session-link UI) just to construct an empty session.
+vi.mock('@/components/assistant-ui/directive-text', () => ({
+  formatRefValue: () => {
+    throw new Error('Unread state transitions must not render transcript references')
+  }
+}))
+
 describe('completed-unread dot follows the focused session', () => {
   beforeEach(() => {
     vi.resetModules()

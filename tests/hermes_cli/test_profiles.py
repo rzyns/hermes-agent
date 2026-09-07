@@ -115,10 +115,9 @@ class TestCreateProfile:
 
 
     def test_seeds_placeholder_env_file(self, profile_env):
-        """Fresh profiles get their own .env (owner-only) so channel/env
-        writes are profile-scoped from day one instead of falling through
-        to the shell environment / root install."""
-        import stat
+        """Fresh profiles get their own .env so channel/env writes are
+        profile-scoped from day one instead of falling through to the
+        shell environment / root install."""
         profile_dir = create_profile("coder", no_alias=True)
         env_path = profile_dir / ".env"
         assert env_path.exists()
@@ -128,8 +127,16 @@ class TestCreateProfile:
             line.startswith("#") or not line.strip()
             for line in content.splitlines()
         )
-        mode = stat.S_IMODE(env_path.stat().st_mode)
-        assert mode == 0o600
+
+    @pytest.mark.parametrize("host", [
+        pytest.param("linux", marks=pytest.mark.linux_only),
+        pytest.param("macos", marks=pytest.mark.macos_only),
+    ])
+    def test_placeholder_env_is_owner_only_on_posix(self, profile_env, host):
+        # Windows st_mode does not verify ACLs; check real POSIX permissions only.
+        import stat
+        profile_dir = create_profile("coder", no_alias=True)
+        assert stat.S_IMODE((profile_dir / ".env").stat().st_mode) == 0o600
 
 
     def test_fresh_profile_inherits_a_usable_model(self, profile_env):
@@ -265,7 +272,6 @@ class TestBackfillProfileEnvs:
     .env, copied from the default install so credentials don't break."""
 
     def test_copies_default_env_into_envless_profiles(self, profile_env):
-        import stat
         tmp_path = profile_env
         (tmp_path / ".hermes" / ".env").write_text("OPENROUTER_API_KEY=root-key\n")
         p1 = create_profile("old1", no_alias=True)
@@ -279,7 +285,22 @@ class TestBackfillProfileEnvs:
         assert sorted(backfilled) == ["old1", "old2"]
         for p in (p1, p2):
             assert (p / ".env").read_text() == "OPENROUTER_API_KEY=root-key\n"
-            assert stat.S_IMODE((p / ".env").stat().st_mode) == 0o600
+
+    @pytest.mark.parametrize("host", [
+        pytest.param("linux", marks=pytest.mark.linux_only),
+        pytest.param("macos", marks=pytest.mark.macos_only),
+    ])
+    def test_backfilled_env_is_owner_only_on_posix(self, profile_env, host):
+        import stat
+        default_env = profile_env / ".hermes" / ".env"
+        default_env.write_text("OPENROUTER_API_KEY=root-key\n")
+        default_env.chmod(0o644)
+        profile_dir = create_profile("old", no_alias=True)
+        (profile_dir / ".env").unlink()
+
+        assert backfill_profile_envs(quiet=True) == ["old"]
+        assert stat.S_IMODE((profile_dir / ".env").stat().st_mode) == 0o600
+        assert stat.S_IMODE(default_env.stat().st_mode) == 0o644
 
 
     def test_placeholder_when_default_has_no_env(self, profile_env):
@@ -617,7 +638,11 @@ class TestAliasCollision:
 class TestWrapperScript:
     """Tests for create_wrapper_script() and remove_wrapper_script()."""
 
-    def test_creates_sh_on_posix(self, profile_env, monkeypatch):
+    @pytest.mark.parametrize("host", [
+        pytest.param("linux", marks=pytest.mark.linux_only),
+        pytest.param("macos", marks=pytest.mark.macos_only),
+    ])
+    def test_creates_sh_on_posix(self, profile_env, monkeypatch, host):
         monkeypatch.setattr("hermes_cli.profiles.shutil.which", lambda name: "/opt/hermes/bin/hermes")
         from hermes_cli.profiles import create_wrapper_script
         wrapper = create_wrapper_script("mybot")
@@ -626,6 +651,16 @@ class TestWrapperScript:
         content = wrapper.read_text()
         assert content.startswith("#!/bin/sh")
         assert "exec /opt/hermes/bin/hermes -p mybot" in content
+        assert '"$@"' in content
+        assert os.access(wrapper, os.X_OK)
+
+    @pytest.mark.windows_only
+    def test_creates_bat_on_windows(self, profile_env):
+        wrapper = create_wrapper_script("mybot")
+        assert wrapper == profile_env / ".local" / "bin" / "mybot.bat"
+        content = wrapper.read_text(encoding="utf-8")
+        assert content.startswith("@echo off")
+        assert "hermes -p mybot %*" in content.splitlines()
 
 
     @pytest.mark.windows_only
@@ -698,11 +733,14 @@ class TestFindAliasForProfile:
             list_profiles,
         )
         create_profile("steve", no_alias=True)
-        create_wrapper_script("qiaobusi", target="steve")
+        wrapper = create_wrapper_script("qiaobusi", target="steve")
         info = next(p for p in list_profiles() if p.name == "steve")
         assert info.alias_name == "qiaobusi"
         assert info.alias_path is not None
-        assert info.alias_path.name == "qiaobusi"
+        assert info.alias_path == wrapper
+        expected_name = "qiaobusi.bat" if sys.platform == "win32" else "qiaobusi"
+        assert info.alias_path.name == expected_name
+        assert " -p steve " in info.alias_path.read_text(encoding="utf-8")
 
     def test_list_profiles_builds_alias_map_once(self, profile_env, monkeypatch):
         """Profile listing must not rescan ~/.local/bin once per profile."""

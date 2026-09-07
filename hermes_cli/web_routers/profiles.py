@@ -9,6 +9,7 @@ Shared helpers are reached via the late-binding seam in :mod:`hermes_cli.web_dep
 so a test's ``monkeypatch.setattr(<owning module>, "_helper", ...)`` keeps working.
 """
 
+import asyncio
 import contextlib
 import copy
 import functools
@@ -23,8 +24,11 @@ import time
 from collections import OrderedDict
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple
+from weakref import WeakKeyDictionary
 
-from fastapi import APIRouter, HTTPException, Query
+import anyio
+from anyio.lowlevel import RunVar
+from fastapi import APIRouter, HTTPException, Query, Request
 
 from hermes_cli.web_deps import late
 from hermes_cli.web_server_config import _apply_main_model_assignment, _normalize_main_model_assignment
@@ -567,8 +571,61 @@ def _merge_profile_tree(
         existing["previewSessions"] = previews[:preview_limit]
 
 
+# RunVar is event-loop local, not a ContextVar copied independently into requests.
+# Each app gets separate flights/capacity; fresh TestClient loops cannot inherit tasks.
+_PROJECT_TREE_RUN_STATE: RunVar = RunVar("profiles_project_tree_state")
+
+
 @sessions_router.get("/api/profiles/projects/tree")
-def get_profiles_projects_tree(preview_limit: int = 3, session_limit: int = 2000):
+async def get_profiles_projects_tree(
+    request: Request, preview_limit: int = 3, session_limit: int = 2000,
+    after_mutation: bool = False,
+):
+    import os
+    from hermes_constants import _get_platform_default_hermes_home, get_hermes_home_override
+
+    states = _PROJECT_TREE_RUN_STATE.get(None)
+    if states is None:
+        states = WeakKeyDictionary()
+        _PROJECT_TREE_RUN_STATE.set(states)
+    if request.app not in states:
+        # Never spend the default pool's tokens on scans or their queued awaiters.
+        states[request.app] = (anyio.CapacityLimiter(2), {})
+    limiter, flights = states[request.app]
+    # Key by lexical scope inputs: resolving the root or warning on a fallback
+    # home can touch disk. Keep that work inside the single dedicated worker.
+    # Aliases may get separate flights; different scopes must never share one.
+    env_home = os.environ.get("HERMES_HOME", "")
+    key = (str(_get_platform_default_hermes_home()), env_home,
+           get_hermes_home_override() or env_home.strip(), preview_limit, session_limit)
+    task = flights.get(key)
+    if after_mutation and task is not None:
+        # A disconnected HTTP reader can leave a pre-write scan running. Drain
+        # it before selecting a successor, without spending a worker token or
+        # swallowing this waiter's cancellation. Fresh waiters on the same
+        # prior scan re-read the registry and share the successor.
+        try:
+            await asyncio.shield(task)
+        except Exception:
+            pass  # A failed pre-write scan says nothing about the fresh read.
+        task = flights.get(key)
+    if task is None:
+        async def build():
+            try:
+                return await anyio.to_thread.run_sync(
+                    _build_profiles_projects_tree, preview_limit, session_limit, limiter=limiter)
+            finally:
+                flights.pop(key, None)
+
+        task = asyncio.create_task(build())
+        flights[key] = task
+        # Retrieve failures even when every HTTP waiter has disconnected.
+        task.add_done_callback(lambda done: None if done.cancelled() else done.exception())
+    # A cancelled client must not remove the flight while its worker still runs.
+    return await asyncio.shield(task)
+
+
+def _build_profiles_projects_tree(preview_limit: int, session_limit: int):
     """Project tree for every profile at once, for the all-profiles sidebar.
 
     ``projects.tree`` over JSON-RPC answers for the backend's own profile only; this runs the

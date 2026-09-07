@@ -14,7 +14,7 @@ import { desktopGit } from '@/lib/desktop-git'
 import { isMissingRestEndpoint, isMissingRpcMethod } from '@/lib/gateway-rpc'
 import { isUnderPath } from '@/lib/path-compare'
 import { persistentAtom } from '@/lib/persisted'
-import { $gateway, activeGateway, ensureActiveGatewayOpen } from '@/store/gateway'
+import { $gateway, activeGateway, ensureActiveGatewayOpen, gatewayActivationEpoch } from '@/store/gateway'
 import { setSidebarAgentsGrouped } from '@/store/layout'
 import { notify } from '@/store/notifications'
 import {
@@ -245,7 +245,7 @@ export async function followActiveSessionCwd(cwd: string): Promise<void> {
     return
   }
 
-  await Promise.all([refreshProjects(), refreshProjectTree()])
+  await Promise.all([refreshProjects(), refreshProjectTree({ afterMutation: true })])
 
   // Resolve only after the refresh, so a just-created/auto project is in the tree.
   const projectId = projectIdForCwd(target)
@@ -388,6 +388,16 @@ const PROJECT_TREE_PREVIEW_LIMIT = 3
 const PROJECT_TREE_REQUEST_TIMEOUT_MS = 60_000
 
 let projectTreeRefreshGeneration = 0
+let projectScopeGeneration = 0
+
+// Identity alone cannot detect leaving and re-entering the same scope while a
+// read is pending. Observe transitions even when nobody starts another read.
+const invalidateProjectScope = (): void => {
+  projectScopeGeneration += 1
+}
+
+$profileScope.listen(invalidateProjectScope)
+$activeGatewayProfile.listen(invalidateProjectScope)
 
 function applyProjectTreePayload(res: ProjectTreePayload): void {
   const scoped = new Set(res.scoped_session_ids ?? [])
@@ -461,9 +471,9 @@ async function refreshProjectTreeOn(context: ActiveProjectsContext): Promise<voi
 // Pull the authoritative project tree (overview structure + counts + preview
 // sessions + the scoped-session-id set). Best-effort: a failure leaves the
 // cached tree intact so the sidebar doesn't flicker.
-export async function refreshProjectTree(): Promise<void> {
+export async function refreshProjectTree(options?: { afterMutation?: boolean }): Promise<void> {
   if ($profileScope.get() === ALL_PROFILES) {
-    await refreshProjectTreeAcrossProfiles()
+    await refreshProjectTreeAcrossProfiles(options?.afterMutation)
 
     return
   }
@@ -479,28 +489,92 @@ export async function refreshProjectTree(): Promise<void> {
 // backend's own profile, so it can only ever describe a slice of this view;
 // the REST fan-out reads every profile's databases directly instead of asking
 // us to hold a backend open per profile just to draw lanes.
-async function refreshProjectTreeAcrossProfiles(): Promise<void> {
-  const generation = ++projectTreeRefreshGeneration
+interface AllProfilesTreeFlight {
+  gateway: HermesGateway | null
+  activationEpoch: number
+  scope: string
+  scopeGeneration: number
+  generation: number
+  promise: Promise<void>
+  trailing?: Promise<void>
+  afterMutation: boolean
+}
+
+let allProfilesTreeFlight: AllProfilesTreeFlight | null = null
+
+function stillOnAllProfilesTreeFlight(flight: AllProfilesTreeFlight): boolean {
+  return (
+    activeGateway() === flight.gateway &&
+    gatewayActivationEpoch() === flight.activationEpoch &&
+    $profileScope.get() === flight.scope &&
+    projectScopeGeneration === flight.scopeGeneration &&
+    projectTreeRefreshGeneration === flight.generation
+  )
+}
+
+function refreshProjectTreeAcrossProfiles(afterMutation = false): Promise<void> {
+  if (allProfilesTreeFlight && stillOnAllProfilesTreeFlight(allProfilesTreeFlight)) {
+    const flight = allProfilesTreeFlight
+
+    // A pre-write snapshot cannot reconcile a completed mutation. Queue at
+    // most one successor for this flight; ordinary polling/render joins never
+    // request a successor, including while that trailing read is in progress.
+    if (afterMutation) {
+      flight.trailing ??= flight.promise.then(() => {
+        if (stillOnAllProfilesTreeFlight(flight)) {
+          return refreshProjectTreeAcrossProfiles(true)
+        }
+      })
+
+      return flight.trailing
+    }
+
+    return flight.promise
+  }
+
+  const flight: AllProfilesTreeFlight = {
+    gateway: activeGateway(),
+    activationEpoch: gatewayActivationEpoch(),
+    scope: $profileScope.get(),
+    scopeGeneration: projectScopeGeneration,
+    generation: ++projectTreeRefreshGeneration,
+    afterMutation,
+    promise: Promise.resolve()
+  }
+
+  allProfilesTreeFlight = flight
+  flight.promise = readProjectTreeAcrossProfiles(flight).finally(() => {
+    if (allProfilesTreeFlight === flight) {
+      allProfilesTreeFlight = null
+    }
+  })
+
+  return flight.promise
+}
+
+async function readProjectTreeAcrossProfiles(flight: AllProfilesTreeFlight): Promise<void> {
   $projectTreeLoading.set(true)
 
   try {
     const res = await hermesApi<ProjectTreePayload>({
-      path: `/api/profiles/projects/tree?preview_limit=${PROJECT_TREE_PREVIEW_LIMIT}`,
+      path: `/api/profiles/projects/tree?preview_limit=${PROJECT_TREE_PREVIEW_LIMIT}${flight.afterMutation ? '&after_mutation=true' : ''}`,
       timeoutMs: PROJECT_TREE_REQUEST_TIMEOUT_MS
     })
 
     // A profile switch mid-flight leaves this payload describing the wrong
     // scope; the newer refresh owns the tree.
-    if (generation !== projectTreeRefreshGeneration || $profileScope.get() !== ALL_PROFILES) {
+    if (!stillOnAllProfilesTreeFlight(flight)) {
       return
     }
 
     applyProjectTreePayload(res)
     markProjectsRpcSuccess()
   } catch (err) {
-    markProjectsRpcFailure(err)
+    if (stillOnAllProfilesTreeFlight(flight)) {
+      markProjectsRpcFailure(err)
+    }
   } finally {
-    if (generation === projectTreeRefreshGeneration) {
+    if (stillOnAllProfilesTreeFlight(flight)) {
       $projectTreeLoading.set(false)
     }
   }
@@ -569,7 +643,7 @@ export async function moveSessionToProject(
         : s
     )
   )
-  void refreshProjectTree()
+  void refreshProjectTree({ afterMutation: true })
 }
 
 export interface RepoDiscoveryPolicy {
@@ -730,7 +804,7 @@ export async function scanAndRecordRepos(force = false): Promise<void> {
     // context, so skipping on mismatch keeps a stale scan from publishing into
     // the newly focused profile.
     if (stillOnProjectsContext(context)) {
-      await refreshProjectTree()
+      await refreshProjectTree({ afterMutation: true })
     }
   } catch {
     state.completedSignature = undefined
@@ -835,7 +909,7 @@ async function persistOrRollback(snap: ProjectsSnapshot, write: () => Promise<vo
 
 const reconcileProjects = (): void => {
   void refreshProjects()
-  void refreshProjectTree()
+  void refreshProjectTree({ afterMutation: true })
 }
 
 // Map a ProjectInfo (list shape) onto a minimal overview tree node so a created
@@ -1086,7 +1160,7 @@ export async function deleteProject(id: string): Promise<void> {
   await persistOrRollback(snap, async () => {
     applyPayload(await gatewayRequest<ProjectsPayload>('projects.delete', projectParams({ id })))
   })
-  void refreshProjectTree()
+  void refreshProjectTree({ afterMutation: true })
 }
 
 export async function setActiveProject(id: null | string): Promise<void> {
