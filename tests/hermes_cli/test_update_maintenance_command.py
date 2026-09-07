@@ -2,7 +2,9 @@ import argparse
 import json
 from types import SimpleNamespace
 
-from hermes_cli import update_cmd
+import pytest
+
+from hermes_cli import update_cmd, update_cmd_maint
 from hermes_cli.subcommands.update import build_update_parser
 
 
@@ -32,10 +34,17 @@ def test_update_maintenance_capabilities_are_side_effect_free(monkeypatch, capsy
     }
 
 
+@pytest.mark.parametrize("backup_mode", ["quick", "full"])
+@pytest.mark.parametrize("no_backup", [False, True])
 def test_update_maintenance_runs_shared_pipeline_without_source_reconciliation(
-    monkeypatch,
+    monkeypatch, tmp_path, capsys, backup_mode, no_backup,
 ):
     calls = []
+    backups = []
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    (tmp_path / "config.yaml").write_text(
+        f"updates:\n  pre_update_backup: {backup_mode}\n", encoding="utf-8"
+    )
     output_state = {"sentinel": True}
     opts = SimpleNamespace(
         active_lazy_features=[],
@@ -74,7 +83,11 @@ def test_update_maintenance_runs_shared_pipeline_without_source_reconciliation(
         update_cmd, "_begin_update_receipt_and_plan", lambda args: "plan"
     )
     monkeypatch.setattr(
-        update_cmd._m(), "_run_pre_update_backup", lambda args: "snapshot"
+        update_cmd_maint, "_run_quick_snapshots",
+        lambda: backups.append("quick") or "snapshot",
+    )
+    monkeypatch.setattr(
+        update_cmd_maint, "_run_full_backup", lambda: backups.append("full")
     )
     monkeypatch.setattr(update_cmd, "_record_update_step", lambda *args: None)
     monkeypatch.setattr(
@@ -101,7 +114,10 @@ def test_update_maintenance_runs_shared_pipeline_without_source_reconciliation(
             )
         ),
     )
-    args = _parser().parse_args(["update-maintenance", "--yes", "--gateway"])
+    argv = ["update-maintenance", "--yes", "--gateway"]
+    if no_backup:
+        argv.append("--no-backup")
+    args = _parser().parse_args(argv)
 
     args.func(args)
 
@@ -110,6 +126,13 @@ def test_update_maintenance_runs_shared_pipeline_without_source_reconciliation(
     assert maintenance[:5] == ("maintenance", ["git"], "main", None, opts)
     assert maintenance[5]["source_updated"] is False
     assert maintenance[5]["expected_sha"] == "abc123"
+    assert maintenance[5]["pre_update_snapshot_id"] == (
+        None if no_backup else "snapshot"
+    )
+    assert backups == ([] if no_backup else (
+        ["quick", "full"] if backup_mode == "full" else ["quick"]
+    ))
+    assert ("skipped (--no-backup)" in capsys.readouterr().out) is no_backup
     assert calls[2:] == [
         ("receipt", 0, "completed at command boundary"),
         ("finalize", output_state),

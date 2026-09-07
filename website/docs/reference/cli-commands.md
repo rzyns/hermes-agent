@@ -1804,6 +1804,30 @@ Additional behavior:
 - **Legacy `hermes.service` warning.** If Hermes detects a pre-rename `hermes.service` systemd unit (instead of the current `hermes-gateway.service`), it prints a one-time migration hint so you can avoid flap-loop issues.
 - **Exit codes.** `0` on success, `1` on pull/install/post-install errors, `2` on unexpected working-tree changes that block `git pull`.
 
+## `hermes update-maintenance`
+
+```bash
+hermes update-maintenance [--gateway] [--yes] [--no-backup] [--capabilities]
+```
+
+Runs the shared post-source-update maintenance pipeline after you have reconciled
+Hermes source externally, without pulling, switching branches, or reconciling git
+changes. Run it in a fresh process so maintenance uses the updated source.
+
+Backups follow `updates.pre_update_backup` (default: `quick`). To skip both the
+quick state snapshots and any configured full zip backup for this run:
+
+```bash
+hermes update-maintenance --no-backup
+```
+
+`--no-backup` overrides the backup configuration for this invocation only; it does
+not skip the remaining maintenance or restart steps. Use it only when you accept
+running without a new pre-maintenance recovery snapshot. `--yes` / `-y` accepts
+config migration prompts while skipping API-key entry. `--gateway` selects
+gateway-safe behavior; `--capabilities` prints command metadata and exits without
+running maintenance.
+
 ## Maintenance commands
 
 | Command | Description |

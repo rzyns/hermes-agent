@@ -87,6 +87,12 @@ def build_update_parser(subparsers, *, cmd_update: Callable) -> None:
         help="Gateway mode: use update/gateway-safe restart behavior",
     )
     maintenance_parser.add_argument(
+        "--no-backup",
+        action="store_true",
+        default=False,
+        help="Skip ALL pre-maintenance backups for this run (both the quick state snapshot and the full zip; overrides updates.pre_update_backup)",
+    )
+    maintenance_parser.add_argument(
         "--yes",
         "-y",
         action="store_true",
