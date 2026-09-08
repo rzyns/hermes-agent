@@ -598,7 +598,7 @@ def _get_platform_tools(config: dict, platform: str, *, include_default_mcp_serv
         enabled_toolsets = _prune_toolsets_stripped_by_disabled(enabled_toolsets, disabled_names)
 
     if explicitly_configured and toolset_names:
-        _warn_all_invalid_platform_toolsets(platform, platform_toolsets[platform])
+        _warn_all_invalid_platform_toolsets(platform, platform_toolsets[platform], config)
     return enabled_toolsets
 
 
@@ -660,13 +660,29 @@ def _merge_mcp_servers(
     return result | explicit_mcp_servers
 
 
-def _warn_all_invalid_platform_toolsets(platform: str, explicit: list) -> None:
-    """Warn once when an explicit platform list has only invalid names (``hermes`` for ``hermes-cli`` → no
-    native tools), at session tool resolution rather than only in update/doctor."""
+def unknown_startup_toolsets(names: List[str], config: dict) -> List[str]:
+    """Diagnostic-only validation: pending plugin/MCP names are not registry errors.
+
+    The nowait helpers use the profile's cache while discovery is in flight and
+    live names once it finishes. Never register cached names or change selection;
+    runtime tool resolution must still use the actual registry.
+    """
     from toolsets import validate_toolset
 
+    candidates = [name for name in names if not validate_toolset(name)]
+    if not candidates:
+        return []
+    known = set((config.get("mcp_servers") or {}).keys())
+    known |= _get_plugin_toolset_keys() | enabled_mcp_server_names(config)
+    return [name for name in candidates if name not in known and not validate_toolset(name)]
+
+
+def _warn_all_invalid_platform_toolsets(platform: str, explicit: list, config: dict) -> None:
+    """Warn once when an explicit platform list has only invalid names (``hermes`` for ``hermes-cli`` → no
+    native tools), at session tool resolution rather than only in update/doctor."""
     named = [str(t) for t in explicit if isinstance(t, str) and t]
-    if named and not any(validate_toolset(t) for t in named) and platform not in _warned_invalid_platform_toolsets:
+    if (named and platform not in _warned_invalid_platform_toolsets
+            and len(unknown_startup_toolsets(named, config)) == len(named)):
         _warned_invalid_platform_toolsets.add(platform)
         logger.warning(
             "platform '%s' has no valid toolsets configured (unknown "
